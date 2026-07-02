@@ -1,6 +1,8 @@
 //! Interactive terminal UI built on ratatui.
 
 mod app;
+mod config_editor;
+mod setup;
 mod ui;
 
 use std::time::Duration;
@@ -27,12 +29,11 @@ fn event_loop(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
     while !app.quit {
         app.tick();
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    app.on_key(key);
-                }
-            }
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            app.on_key(key);
         }
     }
     Ok(())

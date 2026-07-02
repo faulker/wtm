@@ -64,6 +64,14 @@ pub fn run(dir: &Path, args: &[&str]) -> Result<String> {
     }
 }
 
+/// Runs git and reports only whether it exited zero. Used for predicate
+/// commands like `diff --quiet` where a clean non-zero exit means "differs",
+/// not "failed". Only a failure to spawn git is surfaced as an error.
+pub fn run_predicate(dir: &Path, args: &[&str]) -> Result<bool> {
+    let output = Command::new("git").args(args).current_dir(dir).output()?;
+    Ok(output.status.success())
+}
+
 /// Returns the repository root (main worktree) containing `dir`.
 pub fn repo_root(dir: &Path) -> Result<PathBuf> {
     // `--show-toplevel` gives the current worktree's root; resolve the main
@@ -128,6 +136,24 @@ pub fn parse_worktree_porcelain(out: &str) -> Vec<Worktree> {
         result.push(wt);
     }
     result
+}
+
+/// Lists local branch names, most recently committed first.
+pub fn local_branches(dir: &Path) -> Result<Vec<String>> {
+    let out = run(
+        dir,
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname:short)",
+            "refs/heads",
+        ],
+    )?;
+    Ok(out
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 /// True if `branch` exists as a local branch.
@@ -219,6 +245,352 @@ pub fn diff(dir: &Path) -> Result<String> {
     run(dir, &["diff", "HEAD"])
 }
 
+/// One entry from `git stash list`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StashEntry {
+    pub index: u32,
+    /// Full reflog subject, e.g. "WIP on main: 1a2b3c4 fix parser".
+    pub message: String,
+    /// Branch the stash was taken on.
+    pub branch: String,
+}
+
+/// One local branch with the metadata shown in `wtm branch list`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BranchDetail {
+    pub name: String,
+    pub upstream: Option<String>,
+    pub ahead: u32,
+    pub behind: u32,
+    /// Subject line of the branch's tip commit.
+    pub subject: String,
+    /// Relative commit date, e.g. "2 days ago".
+    pub date: String,
+}
+
+/// One commit from `git log`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LogEntry {
+    pub hash: String,
+    pub subject: String,
+    pub author: String,
+    /// Relative author date, e.g. "3 hours ago".
+    pub date: String,
+}
+
+/// Stages every change in `dir` (`git add -A`).
+pub fn stage_all(dir: &Path) -> Result<()> {
+    run(dir, &["add", "-A"])?;
+    Ok(())
+}
+
+/// Stages only `paths` (`git add -- <paths>`).
+pub fn stage_paths(dir: &Path, paths: &[String]) -> Result<()> {
+    let mut args = vec!["add", "--"];
+    args.extend(paths.iter().map(String::as_str));
+    run(dir, &args)?;
+    Ok(())
+}
+
+/// True when the index holds staged changes ready to commit.
+pub fn has_staged_changes(dir: &Path) -> Result<bool> {
+    // `diff --cached --quiet` exits non-zero precisely when something is staged.
+    Ok(!run_predicate(dir, &["diff", "--cached", "--quiet"])?)
+}
+
+/// Commits the staged changes with `message`.
+pub fn commit(dir: &Path, message: &str) -> Result<()> {
+    run(dir, &["commit", "-m", message])?;
+    Ok(())
+}
+
+/// Abbreviated hash of HEAD.
+pub fn short_hash(dir: &Path) -> Result<String> {
+    run(dir, &["rev-parse", "--short", "HEAD"])
+}
+
+/// Subject line of the HEAD commit.
+pub fn head_subject(dir: &Path) -> Result<String> {
+    run(dir, &["log", "-1", "--format=%s"])
+}
+
+/// Number of files touched by the HEAD commit. `--root` makes this work for
+/// the very first commit, which has no parent to diff against.
+pub fn head_files_changed(dir: &Path) -> Result<usize> {
+    let out = run(
+        dir,
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "--root",
+            "HEAD",
+        ],
+    )?;
+    Ok(out.lines().filter(|l| !l.is_empty()).count())
+}
+
+/// Stashes changes including untracked files (`git stash push -u`).
+pub fn stash_push(dir: &Path, message: Option<&str>) -> Result<String> {
+    let mut args = vec!["stash", "push", "-u"];
+    if let Some(m) = message {
+        args.push("-m");
+        args.push(m);
+    }
+    run(dir, &args)
+}
+
+/// Lists stash entries, newest first.
+pub fn stash_list(dir: &Path) -> Result<Vec<StashEntry>> {
+    // 0x1f (unit separator) keeps the selector and subject apart safely.
+    let out = run(dir, &["stash", "list", "--format=%gd\u{1f}%gs"])?;
+    Ok(parse_stash_list(&out))
+}
+
+/// Runs `git stash <verb>` on an optional specific entry index.
+fn stash_op(dir: &Path, verb: &str, index: Option<u32>) -> Result<String> {
+    let selector = index.map(|i| format!("stash@{{{i}}}"));
+    let mut args = vec!["stash", verb];
+    if let Some(s) = selector.as_deref() {
+        args.push(s);
+    }
+    run(dir, &args)
+}
+
+/// Applies and drops a stash entry (`git stash pop`).
+pub fn stash_pop(dir: &Path, index: Option<u32>) -> Result<String> {
+    stash_op(dir, "pop", index)
+}
+
+/// Applies a stash entry without dropping it (`git stash apply`).
+pub fn stash_apply(dir: &Path, index: Option<u32>) -> Result<String> {
+    stash_op(dir, "apply", index)
+}
+
+/// Drops a stash entry (`git stash drop`).
+pub fn stash_drop(dir: &Path, index: Option<u32>) -> Result<String> {
+    stash_op(dir, "drop", index)
+}
+
+/// True when HEAD has an upstream tracking branch configured.
+pub fn has_upstream(dir: &Path) -> bool {
+    run_predicate(
+        dir,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    )
+    .unwrap_or(false)
+}
+
+/// Pulls the current branch. Fast-forward only by default; `rebase` rebases
+/// local commits onto the upstream instead.
+pub fn pull(dir: &Path, rebase: bool) -> Result<String> {
+    let mode = if rebase { "--rebase" } else { "--ff-only" };
+    run(dir, &["pull", mode])
+}
+
+/// Pushes the current branch to its existing upstream.
+pub fn push(dir: &Path, force_with_lease: bool) -> Result<String> {
+    let mut args = vec!["push"];
+    if force_with_lease {
+        args.push("--force-with-lease");
+    }
+    run(dir, &args)
+}
+
+/// Pushes `branch` to `remote` and records it as the upstream (`push -u`).
+pub fn push_set_upstream(
+    dir: &Path,
+    remote: &str,
+    branch: &str,
+    force_with_lease: bool,
+) -> Result<String> {
+    let mut args = vec!["push"];
+    if force_with_lease {
+        args.push("--force-with-lease");
+    }
+    args.push("-u");
+    args.push(remote);
+    args.push(branch);
+    run(dir, &args)
+}
+
+/// Names of the repository's configured remotes.
+pub fn remotes(dir: &Path) -> Result<Vec<String>> {
+    let out = run(dir, &["remote"])?;
+    Ok(out
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Fetches every remote and prunes deleted remote branches.
+pub fn fetch_all_prune(dir: &Path) -> Result<String> {
+    run(dir, &["fetch", "--all", "--prune"])
+}
+
+/// Creates branch `name` (optionally starting at `from`) without a worktree.
+pub fn branch_create(dir: &Path, name: &str, from: Option<&str>) -> Result<()> {
+    let mut args = vec!["branch", name];
+    if let Some(f) = from {
+        args.push(f);
+    }
+    run(dir, &args)?;
+    Ok(())
+}
+
+/// Deletes branch `name`; `force` uses `-D` (delete even if unmerged).
+pub fn branch_delete_flag(dir: &Path, name: &str, force: bool) -> Result<()> {
+    let flag = if force { "-D" } else { "-d" };
+    run(dir, &["branch", flag, name])?;
+    Ok(())
+}
+
+/// Renames branch `old` to `new` (`git branch -m`).
+pub fn branch_rename(dir: &Path, old: &str, new: &str) -> Result<()> {
+    run(dir, &["branch", "-m", old, new])?;
+    Ok(())
+}
+
+/// Lists local branches with upstream tracking, tip subject, and date,
+/// most recently committed first.
+pub fn branch_details(dir: &Path) -> Result<Vec<BranchDetail>> {
+    // Fields are separated by 0x1f so subjects containing spaces stay intact.
+    let format = "--format=%(refname:short)\u{1f}%(upstream:short)\u{1f}\
+                  %(upstream:track)\u{1f}%(contents:subject)\u{1f}%(committerdate:relative)";
+    let out = run(
+        dir,
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            format,
+            "refs/heads",
+        ],
+    )?;
+    Ok(parse_branch_details(&out))
+}
+
+/// Recent commits reachable from HEAD in `dir` (newest first).
+pub fn log(dir: &Path, count: u32) -> Result<Vec<LogEntry>> {
+    let count = count.to_string();
+    let out = run(
+        dir,
+        &[
+            "log",
+            "-n",
+            &count,
+            "--date=relative",
+            "--format=%h\u{1f}%s\u{1f}%an\u{1f}%ad",
+        ],
+    )?;
+    Ok(parse_log(&out))
+}
+
+/// Finds a remote-tracking ref matching `branch` (e.g. "origin/feature"),
+/// searching each configured remote. Returns the short `<remote>/<branch>`
+/// form for use as a branch base.
+pub fn find_remote_ref(dir: &Path, branch: &str) -> Result<Option<String>> {
+    for remote in remotes(dir)? {
+        let refname = format!("refs/remotes/{remote}/{branch}");
+        if run_predicate(dir, &["show-ref", "--verify", "--quiet", &refname])? {
+            return Ok(Some(format!("{remote}/{branch}")));
+        }
+    }
+    Ok(None)
+}
+
+/// Parses `git stash list` output formatted as `<selector>\x1f<subject>`.
+pub fn parse_stash_list(out: &str) -> Vec<StashEntry> {
+    out.lines()
+        .filter_map(|line| {
+            let (selector, subject) = line.split_once('\u{1f}')?;
+            let index = selector
+                .strip_prefix("stash@{")?
+                .strip_suffix('}')?
+                .parse()
+                .ok()?;
+            Some(StashEntry {
+                index,
+                message: subject.to_string(),
+                branch: parse_stash_branch(subject),
+            })
+        })
+        .collect()
+}
+
+/// Extracts the branch name from a stash reflog subject like
+/// "WIP on main: ..." or "On main: my message".
+fn parse_stash_branch(subject: &str) -> String {
+    let rest = subject
+        .strip_prefix("WIP on ")
+        .or_else(|| subject.strip_prefix("On "))
+        .unwrap_or(subject);
+    match rest.split_once(':') {
+        Some((branch, _)) => branch.to_string(),
+        None => String::new(),
+    }
+}
+
+/// Parses `branch_details` output (one branch per line, 0x1f-separated fields).
+pub fn parse_branch_details(out: &str) -> Vec<BranchDetail> {
+    out.lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\u{1f}');
+            let name = fields.next()?.to_string();
+            let upstream = fields.next().unwrap_or("");
+            let track = fields.next().unwrap_or("");
+            let subject = fields.next().unwrap_or("").to_string();
+            let date = fields.next().unwrap_or("").to_string();
+            let (ahead, behind) = parse_track(track);
+            Some(BranchDetail {
+                name,
+                upstream: (!upstream.is_empty()).then(|| upstream.to_string()),
+                ahead,
+                behind,
+                subject,
+                date,
+            })
+        })
+        .collect()
+}
+
+/// Parses a `%(upstream:track)` value such as "[ahead 1, behind 2]",
+/// "[ahead 3]", "[gone]", or "" into ahead/behind counts.
+fn parse_track(track: &str) -> (u32, u32) {
+    let mut ahead = 0;
+    let mut behind = 0;
+    for part in track.trim_matches(['[', ']']).split(',') {
+        let part = part.trim();
+        if let Some(n) = part.strip_prefix("ahead ") {
+            ahead = n.parse().unwrap_or(0);
+        } else if let Some(n) = part.strip_prefix("behind ") {
+            behind = n.parse().unwrap_or(0);
+        }
+    }
+    (ahead, behind)
+}
+
+/// Parses `git log` output formatted as `<hash>\x1f<subject>\x1f<author>\x1f<date>`.
+pub fn parse_log(out: &str) -> Vec<LogEntry> {
+    out.lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\u{1f}');
+            Some(LogEntry {
+                hash: fields.next()?.to_string(),
+                subject: fields.next().unwrap_or("").to_string(),
+                author: fields.next().unwrap_or("").to_string(),
+                date: fields.next().unwrap_or("").to_string(),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,5 +648,60 @@ mod tests {
     fn parses_empty_output() {
         assert!(parse_worktree_porcelain("").is_empty());
         assert!(parse_status_porcelain("").is_empty());
+        assert!(parse_stash_list("").is_empty());
+        assert!(parse_branch_details("").is_empty());
+        assert!(parse_log("").is_empty());
+    }
+
+    #[test]
+    fn parses_stash_list_entries() {
+        let out = "stash@{0}\u{1f}WIP on main: 1a2b3c4 fix parser\n\
+                   stash@{1}\u{1f}On feature/login: my saved work\n";
+        let entries = parse_stash_list(out);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].index, 0);
+        assert_eq!(entries[0].branch, "main");
+        assert_eq!(entries[0].message, "WIP on main: 1a2b3c4 fix parser");
+        assert_eq!(entries[1].index, 1);
+        assert_eq!(entries[1].branch, "feature/login");
+    }
+
+    #[test]
+    fn parses_track_variants() {
+        assert_eq!(parse_track("[ahead 1, behind 2]"), (1, 2));
+        assert_eq!(parse_track("[ahead 3]"), (3, 0));
+        assert_eq!(parse_track("[behind 4]"), (0, 4));
+        assert_eq!(parse_track("[gone]"), (0, 0));
+        assert_eq!(parse_track(""), (0, 0));
+    }
+
+    #[test]
+    fn parses_branch_details_with_and_without_upstream() {
+        let out = "main\u{1f}origin/main\u{1f}[ahead 1, behind 2]\u{1f}latest work\u{1f}2 days ago\n\
+                   feature\u{1f}\u{1f}\u{1f}wip\u{1f}5 minutes ago\n";
+        let details = parse_branch_details(out);
+        assert_eq!(details.len(), 2);
+        assert_eq!(details[0].name, "main");
+        assert_eq!(details[0].upstream.as_deref(), Some("origin/main"));
+        assert_eq!(details[0].ahead, 1);
+        assert_eq!(details[0].behind, 2);
+        assert_eq!(details[0].subject, "latest work");
+        assert_eq!(details[0].date, "2 days ago");
+        assert_eq!(details[1].name, "feature");
+        assert_eq!(details[1].upstream, None);
+        assert_eq!(details[1].ahead, 0);
+    }
+
+    #[test]
+    fn parses_log_entries() {
+        let out = "1a2b3c4\u{1f}fix parser\u{1f}Ada\u{1f}3 hours ago\n\
+                   5d6e7f8\u{1f}add tests\u{1f}Grace\u{1f}yesterday\n";
+        let entries = parse_log(out);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].hash, "1a2b3c4");
+        assert_eq!(entries[0].subject, "fix parser");
+        assert_eq!(entries[0].author, "Ada");
+        assert_eq!(entries[0].date, "3 hours ago");
+        assert_eq!(entries[1].hash, "5d6e7f8");
     }
 }
