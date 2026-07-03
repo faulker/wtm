@@ -388,6 +388,39 @@ pub fn revert_file(ctx: &Ctx, name: &str, path: &str, untracked: bool) -> Result
     git::revert_file(Path::new(&info.path), path, untracked).map_err(Into::into)
 }
 
+/// Derives a `.gitignore` glob from a file path: `*.ext` when the file has an
+/// extension, otherwise the bare file name (which git ignores at any depth).
+pub fn ignore_pattern(path: &str) -> String {
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path);
+    match Path::new(name).extension().and_then(|e| e.to_str()) {
+        Some(ext) if !ext.is_empty() => format!("*.{ext}"),
+        _ => name.to_string(),
+    }
+}
+
+/// Appends `pattern` on its own line to the `.gitignore` at the root of the
+/// worktree named `name`, creating the file if it does not exist. Returns
+/// `false` without writing when the exact pattern is already present.
+pub fn add_to_gitignore(ctx: &Ctx, name: &str, pattern: &str) -> Result<bool> {
+    let info = find(ctx, name)?.ok_or_else(|| not_found(ctx, name))?;
+    let path = Path::new(&info.path).join(".gitignore");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    if existing.lines().any(|line| line.trim() == pattern) {
+        return Ok(false);
+    }
+    let mut content = existing;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(pattern);
+    content.push('\n');
+    std::fs::write(&path, content).with_context(|| format!("writing {}", path.display()))?;
+    Ok(true)
+}
+
 /// Absolute path of the worktree named `name`.
 pub fn path(ctx: &Ctx, name: &str) -> Result<String> {
     let info = find(ctx, name)?.ok_or_else(|| not_found(ctx, name))?;
@@ -1015,5 +1048,14 @@ mod tests {
     fn worktree_name_falls_back_to_dir() {
         assert_eq!(worktree_name(&Some("b".into()), Path::new("/x/y")), "b");
         assert_eq!(worktree_name(&None, Path::new("/x/y")), "y");
+    }
+
+    #[test]
+    fn ignore_pattern_uses_extension_or_bare_name() {
+        assert_eq!(ignore_pattern("src/foo.log"), "*.log");
+        assert_eq!(ignore_pattern("build/app.tmp"), "*.tmp");
+        // No extension: fall back to the bare file name.
+        assert_eq!(ignore_pattern("bin/Makefile"), "Makefile");
+        assert_eq!(ignore_pattern(".env"), ".env");
     }
 }

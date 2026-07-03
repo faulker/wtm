@@ -12,7 +12,9 @@ use ratatui::widgets::{
     ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
 };
 
-use super::app::{App, BranchMode, CommitFocus, StashMode, View, filtered_branches};
+use super::app::{
+    App, BranchMode, CommitFocus, DiffRow, IgnorePrompt, StashMode, View, filtered_branches,
+};
 use super::config_editor::{ConfigEditor, FIELD_ROWS, ROWS as CONFIG_ROWS};
 use super::setup::{REVIEW_ROWS, SetupWizard, Step, location_preview};
 use crate::config::{DEFAULT_LOCATION, LOCATION_PRESETS};
@@ -40,10 +42,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             name,
             files,
             marked,
+            rows,
             selected,
             content,
             scroll,
             confirm_revert,
+            ignore_prompt,
             ..
         } => draw_diff(
             frame,
@@ -51,10 +55,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             name,
             files,
             marked,
+            rows,
             *selected,
             content,
             *scroll,
             *confirm_revert,
+            ignore_prompt.as_ref(),
         ),
         View::Log {
             name,
@@ -249,8 +255,16 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
-/// The per-file changes view: a checklist of changed files on the left and the
-/// highlighted file's diff on the right.
+/// Path of the changed file under the cursor row, or "" on a folder row.
+fn current_diff_path<'a>(rows: &[DiffRow], files: &'a [StatusEntry], selected: usize) -> &'a str {
+    super::app::current_file_index(rows, selected)
+        .and_then(|i| files.get(i))
+        .map(|f| f.path.as_str())
+        .unwrap_or("")
+}
+
+/// The per-file changes view: a folder tree of changed files on the left and
+/// the highlighted file's diff on the right.
 #[allow(clippy::too_many_arguments)]
 fn draw_diff(
     frame: &mut Frame,
@@ -258,10 +272,12 @@ fn draw_diff(
     name: &str,
     files: &[StatusEntry],
     marked: &[bool],
+    rows: &[DiffRow],
     selected: usize,
     content: &str,
     scroll: u16,
     confirm_revert: bool,
+    ignore_prompt: Option<&IgnorePrompt>,
 ) {
     if files.is_empty() {
         let para = Paragraph::new(Line::from("no uncommitted changes".dim()))
@@ -273,22 +289,58 @@ fn draw_diff(
     let [list_area, diff_area] =
         Layout::horizontal([Constraint::Length(36), Constraint::Min(20)]).areas(area);
 
-    // Left: the changed files with a [x]/[ ] commit checkbox.
-    let items: Vec<ListItem> = files
+    // Left: the changed files as a folder tree, each row with a commit
+    // checkbox. Folder rows show an aggregate mark ([x] all, [ ] none, [~]
+    // some) over the files beneath them.
+    let items: Vec<ListItem> = rows
         .iter()
-        .enumerate()
-        .map(|(i, f)| {
-            let checked = marked.get(i).copied().unwrap_or(false);
-            let check = if checked {
-                Span::styled("[x] ", Style::new().fg(Color::Green))
-            } else {
-                Span::styled("[ ] ", Style::new().dim())
-            };
-            ListItem::new(Line::from(vec![
-                check,
-                Span::styled(format!("{:<3}", f.code.trim()), status_style(&f.code)),
-                Span::raw(f.path.clone()),
-            ]))
+        .map(|row| match row {
+            DiffRow::Folder {
+                prefix,
+                label,
+                depth,
+            } => {
+                let indent = "  ".repeat(*depth);
+                let states: Vec<bool> = files
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, f)| f.path.starts_with(prefix.as_str()))
+                    .map(|(i, _)| marked.get(i).copied().unwrap_or(false))
+                    .collect();
+                let check = if states.iter().all(|s| *s) {
+                    Span::styled("[x] ", Style::new().fg(Color::Green))
+                } else if states.iter().any(|s| *s) {
+                    Span::styled("[~] ", Style::new().fg(ACCENT))
+                } else {
+                    Span::styled("[ ] ", Style::new().dim())
+                };
+                ListItem::new(Line::from(vec![
+                    check,
+                    Span::raw(indent),
+                    Span::styled(format!("{label}/"), Style::new().fg(ACCENT).bold()),
+                ]))
+            }
+            DiffRow::File {
+                index,
+                label,
+                depth,
+            } => {
+                let indent = "  ".repeat(*depth);
+                let checked = marked.get(*index).copied().unwrap_or(false);
+                let check = if checked {
+                    Span::styled("[x] ", Style::new().fg(Color::Green))
+                } else {
+                    Span::styled("[ ] ", Style::new().dim())
+                };
+                let code = files.get(*index).map(|f| f.code.trim()).unwrap_or("");
+                let style = files.get(*index).map(|f| status_style(&f.code)).unwrap_or_default();
+                ListItem::new(Line::from(vec![
+                    check,
+                    Span::raw(indent),
+                    Span::styled(format!("{code:<3}"), style),
+                    Span::raw(label.clone()),
+                ]))
+            }
         })
         .collect();
     let list = List::new(items)
@@ -298,17 +350,33 @@ fn draw_diff(
     let mut state = ListState::default().with_selected(Some(selected));
     frame.render_stateful_widget(list, list_area, &mut state);
 
-    // Right: the diff of the highlighted file.
-    let path = files.get(selected).map(|f| f.path.as_str()).unwrap_or("");
-    let lines: Vec<Line> = if content.is_empty() {
-        vec![Line::from("no textual diff (binary or empty)".dim())]
-    } else {
-        content.lines().map(diff_line).collect()
+    // Right: the diff of the highlighted file, or a folder header when the
+    // cursor rests on a folder row.
+    let (title, lines): (String, Vec<Line>) = match rows.get(selected) {
+        Some(DiffRow::Folder { prefix, .. }) => {
+            let count = files
+                .iter()
+                .filter(|f| f.path.starts_with(prefix.as_str()))
+                .count();
+            (
+                format!("folder · {prefix}"),
+                vec![Line::from(
+                    format!("{count} changed file(s) under {prefix}").dim(),
+                )],
+            )
+        }
+        _ => {
+            let path = current_diff_path(rows, files, selected);
+            let lines = if content.is_empty() {
+                vec![Line::from("no textual diff (binary or empty)".dim())]
+            } else {
+                content.lines().map(diff_line).collect()
+            };
+            (format!("diff · {path}"), lines)
+        }
     };
     let total = lines.len();
-    let para = Paragraph::new(lines)
-        .block(panel(format!("diff · {path}")))
-        .scroll((scroll, 0));
+    let para = Paragraph::new(lines).block(panel(title)).scroll((scroll, 0));
     frame.render_widget(para, diff_area);
     let mut sb_state = ScrollbarState::new(total.saturating_sub(diff_area.height as usize))
         .position(scroll as usize);
@@ -321,10 +389,12 @@ fn draw_diff(
     );
 
     if confirm_revert {
-        let label = files
-            .get(selected)
-            .map(|f| format!("discard all changes to '{}'?", f.path))
-            .unwrap_or_else(|| "discard changes?".to_string());
+        let label = current_diff_path(rows, files, selected);
+        let label = if label.is_empty() {
+            "discard changes?".to_string()
+        } else {
+            format!("discard all changes to '{label}'?")
+        };
         draw_confirm_popup(
             frame,
             area,
@@ -333,6 +403,43 @@ fn draw_diff(
             "y to discard · Esc to cancel",
         );
     }
+
+    if let Some(prompt) = ignore_prompt {
+        draw_ignore_prompt(frame, area, prompt);
+    }
+}
+
+/// Popup for adding the highlighted file to `.gitignore`: ignore just this file,
+/// or a glob pattern that matches every file like it.
+fn draw_ignore_prompt(frame: &mut Frame, area: Rect, prompt: &IgnorePrompt) {
+    let popup = centered(area, 64, 7);
+    frame.render_widget(Clear, popup);
+    let option = |selected: bool, label: String| -> Line<'static> {
+        let marker = if selected { "▌ ● " } else { "  ○ " };
+        let style = if selected {
+            Style::new().bg(SELECTION_BG).bold()
+        } else {
+            Style::new()
+        };
+        Line::from(vec![
+            Span::styled(marker.to_string(), style.fg(ACCENT)),
+            Span::styled(label, style),
+        ])
+    };
+    let (exact, glob) = if prompt.is_folder {
+        ("just this folder", "all folders like it")
+    } else {
+        ("just this file", "all files like it")
+    };
+    let lines = vec![
+        Line::from("add to .gitignore:"),
+        Line::from(""),
+        option(prompt.selected == 0, format!("{exact}: {}", prompt.file)),
+        option(prompt.selected == 1, format!("{glob}: {}", prompt.pattern)),
+        Line::from(""),
+        Line::from("↑/↓ choose · Enter confirm · Esc cancel".dim()),
+    ];
+    frame.render_widget(Paragraph::new(lines).block(panel("ignore")), popup);
 }
 
 /// Colors one diff line by its prefix.
@@ -361,7 +468,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("↑/↓", "select"),
             ("Enter", "changes"),
             ("n", "new"),
-            ("C", "commit"),
+            ("⇧C", "commit"),
             ("s", "stash"),
             ("p", "pull"),
             ("⇧P", "push"),
@@ -377,12 +484,13 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ..
         } => &[("y", "discard changes"), ("Esc", "cancel")],
         View::Diff { .. } => &[
-            ("↑/↓", "file"),
+            ("↑/↓", "row"),
             ("PgUp/PgDn", "scroll diff"),
-            ("Space", "mark for commit"),
-            ("C", "commit"),
+            ("Space", "mark file/folder"),
+            ("⇧C", "commit"),
             ("s", "stash file"),
-            ("R", "revert file"),
+            ("⇧R", "revert file"),
+            ("i", "ignore file/folder"),
             ("q", "back"),
         ],
         View::Log { .. } => &[
@@ -676,7 +784,7 @@ fn draw_confirm_delete(
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) {
-    let popup = centered(area, 64, 22);
+    let popup = centered(area, 64, 23);
     frame.render_widget(Clear, popup);
     let key = |k: &str, label: &str| -> Line<'static> {
         Line::from(vec![
@@ -688,10 +796,10 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         key("↑/↓ or j/k", "select worktree"),
         key("Enter", "browse changes per file (diff, stash, revert)"),
         key("n", "new worktree (new or existing branch)"),
-        key("C", "commit (pick files, all selected by default)"),
+        key("⇧C", "commit (pick files, all selected by default)"),
         key("s", "stash manager (stash/pop/apply/drop)"),
         key("p", "pull the worktree (fast-forward only)"),
-        key("P (shift+p)", "push the worktree"),
+        key("⇧P", "push the worktree"),
         key("f", "fetch all remotes"),
         key("b", "branch browser (branch-only create/delete/checkout)"),
         key("l", "commit log of the worktree"),
@@ -700,8 +808,10 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         key("r", "refresh the list"),
         key("q / Ctrl+C", "quit"),
         Line::from(""),
-        Line::from("in the changes view: Space marks a file for commit,".dim()),
-        Line::from("s stashes it, R reverts it, C commits the marked files.".dim()),
+        Line::from("in the changes view: files are grouped into a folder tree.".dim()),
+        Line::from("Space marks a file (or a whole folder) for commit,".dim()),
+        Line::from("s stashes it, ⇧R reverts it, ⇧C commits the marked files,".dim()),
+        Line::from("i adds the file or folder (or a glob) to .gitignore.".dim()),
         Line::from(""),
         Line::from("worktree location and setup steps come from .wtm.toml.".dim()),
     ];

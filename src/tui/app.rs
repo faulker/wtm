@@ -36,15 +36,21 @@ pub enum View {
         files: Vec<StatusEntry>,
         /// Whether each file is selected for commit; defaults to all true.
         marked: Vec<bool>,
-        /// Cursor into `files`.
+        /// Folder-tree rows derived from `files`, rebuilt whenever `files`
+        /// changes. The cursor (`selected`) indexes into this, not `files`.
+        rows: Vec<DiffRow>,
+        /// Cursor into `rows`.
         selected: usize,
-        /// Diff text for `files[selected]`.
+        /// Diff text for the file under the cursor (empty on a folder row).
         content: String,
         scroll: u16,
         /// When the diff was last recomputed, used to throttle auto-refresh.
         last_refresh: Instant,
         /// True while confirming a revert of the highlighted file.
         confirm_revert: bool,
+        /// Present while choosing what to add to `.gitignore` for the
+        /// highlighted file or folder (the exact path vs. a glob pattern).
+        ignore_prompt: Option<IgnorePrompt>,
     },
     /// New-worktree dialog: type a branch name, or pick an existing branch
     /// from the filtered list below the input.
@@ -120,6 +126,83 @@ pub enum View {
         label: String,
         rx: Receiver<Result<String, String>>,
     },
+}
+
+/// Choice shown when adding the highlighted file or folder to `.gitignore`:
+/// the exact path, or a glob pattern that ignores everything like it.
+pub struct IgnorePrompt {
+    /// Exact path of the file or folder, relative to the worktree root.
+    /// Folder paths keep their trailing slash (e.g. `src/tui/`).
+    pub file: String,
+    /// Glob derived from the path (e.g. `*.log`), or the bare name.
+    pub pattern: String,
+    /// 0 = ignore just `file`; 1 = ignore `pattern`.
+    pub selected: usize,
+    /// True when the prompt targets a folder, which changes the wording.
+    pub is_folder: bool,
+}
+
+/// One line in the changed-files folder tree: either a folder that groups the
+/// files beneath it, or a single changed file.
+pub enum DiffRow {
+    /// A folder. `prefix` is the full path from the worktree root ending in
+    /// `/` (used to match the files under it); `label` is the last segment.
+    Folder {
+        prefix: String,
+        label: String,
+        depth: usize,
+    },
+    /// A changed file; `index` points into the Diff view's `files`/`marked`.
+    File {
+        index: usize,
+        label: String,
+        depth: usize,
+    },
+}
+
+/// Builds the folder-tree rows for the changed-file list. Files are sorted by
+/// path so the tree reads top-down, and each folder row is emitted once, just
+/// before the first file it contains.
+pub fn build_diff_rows(files: &[StatusEntry]) -> Vec<DiffRow> {
+    let mut order: Vec<usize> = (0..files.len()).collect();
+    order.sort_by(|&a, &b| files[a].path.cmp(&files[b].path));
+    let mut rows = Vec::new();
+    // Directory segments currently "open" above the last file emitted.
+    let mut stack: Vec<String> = Vec::new();
+    for idx in order {
+        let path = &files[idx].path;
+        let parts: Vec<&str> = path.split('/').collect();
+        let dirs = &parts[..parts.len() - 1];
+        // Keep the shared prefix with the previous file's directories, open
+        // folder rows for the rest.
+        let mut common = 0;
+        while common < stack.len() && common < dirs.len() && stack[common] == dirs[common] {
+            common += 1;
+        }
+        stack.truncate(common);
+        for d in &dirs[common..] {
+            stack.push((*d).to_string());
+            rows.push(DiffRow::Folder {
+                prefix: format!("{}/", stack.join("/")),
+                label: (*d).to_string(),
+                depth: stack.len() - 1,
+            });
+        }
+        rows.push(DiffRow::File {
+            index: idx,
+            label: parts[parts.len() - 1].to_string(),
+            depth: dirs.len(),
+        });
+    }
+    rows
+}
+
+/// The `files` index for the row at `cursor`, or `None` when it is a folder.
+pub fn current_file_index(rows: &[DiffRow], cursor: usize) -> Option<usize> {
+    match rows.get(cursor) {
+        Some(DiffRow::File { index, .. }) => Some(*index),
+        _ => None,
+    }
 }
 
 /// Which part of the commit dialog has keyboard focus.
@@ -536,15 +619,18 @@ impl App {
         match ops::status(&self.ctx, &name) {
             Ok((_, files)) => {
                 let marked = vec![true; files.len()];
+                let rows = build_diff_rows(&files);
                 self.view = View::Diff {
                     name,
                     files,
                     marked,
+                    rows,
                     selected: 0,
                     content: String::new(),
                     scroll: 0,
                     last_refresh: Instant::now(),
                     confirm_revert: false,
+                    ignore_prompt: None,
                 };
                 self.load_diff_content();
             }
@@ -553,17 +639,21 @@ impl App {
     }
 
     /// Loads the diff text for the file under the cursor into the Diff view.
+    /// When the cursor sits on a folder row there is no diff to show, so the
+    /// content is cleared.
     fn load_diff_content(&mut self) {
         let View::Diff {
             name,
             files,
+            rows,
             selected,
             ..
         } = &self.view
         else {
             return;
         };
-        let (name, entry) = (name.clone(), files.get(*selected).cloned());
+        let entry = current_file_index(rows, *selected).and_then(|i| files.get(i).cloned());
+        let name = name.clone();
         let content = match entry {
             Some(e) => {
                 let untracked = e.code.starts_with('?');
@@ -589,8 +679,10 @@ impl App {
         let View::Diff {
             files,
             marked,
+            rows,
             selected,
             confirm_revert,
+            ignore_prompt,
             ..
         } = &mut self.view
         else {
@@ -599,7 +691,8 @@ impl App {
         if *confirm_revert {
             match key.code {
                 KeyCode::Enter | KeyCode::Char('y') => {
-                    let entry = files.get(*selected).cloned();
+                    let entry =
+                        current_file_index(rows, *selected).and_then(|i| files.get(i).cloned());
                     *confirm_revert = false;
                     if let Some(e) = entry {
                         self.revert_file(e);
@@ -610,11 +703,31 @@ impl App {
             }
             return;
         }
+        if ignore_prompt.is_some() {
+            match key.code {
+                KeyCode::Up | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k') => {
+                    if let Some(p) = ignore_prompt {
+                        p.selected ^= 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    let pattern = ignore_prompt
+                        .take()
+                        .map(|p| if p.selected == 0 { p.file } else { p.pattern });
+                    if let Some(pattern) = pattern {
+                        self.add_ignore(&pattern);
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('q') => *ignore_prompt = None,
+                _ => {}
+            }
+            return;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.view = View::List,
             KeyCode::Char('r') => self.refresh_diff(),
             KeyCode::Down | KeyCode::Char('j') => {
-                if *selected + 1 < files.len() {
+                if *selected + 1 < rows.len() {
                     *selected += 1;
                     self.load_diff_content();
                 }
@@ -628,28 +741,87 @@ impl App {
             KeyCode::PageDown => self.scroll_diff(|s| s.saturating_add(20)),
             KeyCode::PageUp => self.scroll_diff(|s| s.saturating_sub(20)),
             KeyCode::Home | KeyCode::Char('g') => self.scroll_diff(|_| 0),
-            KeyCode::Char(' ') => {
-                if let Some(m) = marked.get_mut(*selected) {
-                    *m = !*m;
+            KeyCode::Char(' ') => match rows.get(*selected) {
+                // On a file row, toggle just that file.
+                Some(DiffRow::File { index, .. }) => {
+                    if let Some(m) = marked.get_mut(*index) {
+                        *m = !*m;
+                    }
                 }
-            }
+                // On a folder row, toggle every file under it together: if all
+                // are on, turn them off, otherwise turn them all on.
+                Some(DiffRow::Folder { prefix, .. }) => {
+                    let prefix = prefix.clone();
+                    let under: Vec<usize> = files
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, f)| f.path.starts_with(&prefix))
+                        .map(|(i, _)| i)
+                        .collect();
+                    let all_on = under.iter().all(|&i| marked.get(i).copied().unwrap_or(false));
+                    for i in under {
+                        if let Some(m) = marked.get_mut(i) {
+                            *m = !all_on;
+                        }
+                    }
+                }
+                None => {}
+            },
             KeyCode::Char('a') => {
                 let all_on = marked.iter().all(|m| *m);
                 marked.iter_mut().for_each(|m| *m = !all_on);
             }
             KeyCode::Char('s') => {
-                if let Some(e) = files.get(*selected).cloned() {
+                if let Some(e) =
+                    current_file_index(rows, *selected).and_then(|i| files.get(i).cloned())
+                {
                     self.stash_file(e);
                 }
             }
             KeyCode::Char('R') => {
-                if !files.is_empty() {
+                if current_file_index(rows, *selected).is_some() {
                     *confirm_revert = true;
                 }
             }
+            KeyCode::Char('i') => match rows.get(*selected) {
+                Some(DiffRow::File { index, .. }) => {
+                    if let Some(entry) = files.get(*index) {
+                        *ignore_prompt = Some(IgnorePrompt {
+                            file: entry.path.clone(),
+                            pattern: ops::ignore_pattern(&entry.path),
+                            selected: 0,
+                            is_folder: false,
+                        });
+                    }
+                }
+                Some(DiffRow::Folder { prefix, label, .. }) => {
+                    *ignore_prompt = Some(IgnorePrompt {
+                        file: prefix.clone(),
+                        pattern: format!("{label}/"),
+                        selected: 0,
+                        is_folder: true,
+                    });
+                }
+                None => {}
+            },
             KeyCode::Char('C') => self.commit_from_diff(),
             _ => {}
         }
+    }
+
+    /// Adds `pattern` to the worktree's `.gitignore`, then reloads the view.
+    fn add_ignore(&mut self, pattern: &str) {
+        let View::Diff { name, .. } = &self.view else {
+            return;
+        };
+        let name = name.clone();
+        match ops::add_to_gitignore(&self.ctx, &name, pattern) {
+            Ok(true) => self.message = Some(format!("added '{pattern}' to .gitignore")),
+            Ok(false) => self.message = Some(format!("'{pattern}' is already in .gitignore")),
+            Err(e) => self.message = Some(format!("error: {e:#}")),
+        }
+        self.refresh_diff();
+        self.refresh();
     }
 
     /// Applies `f` to the diff scroll offset, if the diff view is active.
@@ -672,6 +844,7 @@ impl App {
                 if let View::Diff {
                     files,
                     marked,
+                    rows,
                     selected,
                     last_refresh,
                     ..
@@ -687,9 +860,10 @@ impl App {
                         .iter()
                         .map(|f| old.get(f.path.as_str()).copied().unwrap_or(true))
                         .collect();
+                    *rows = build_diff_rows(&new_files);
                     *files = new_files;
                     *marked = new_marked;
-                    *selected = (*selected).min(files.len().saturating_sub(1));
+                    *selected = (*selected).min(rows.len().saturating_sub(1));
                     *last_refresh = Instant::now();
                 }
                 self.load_diff_content();
@@ -1390,18 +1564,23 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
     }
 
-    /// Moves the diff view's cursor onto the file named `path`, panicking if it
-    /// isn't in the list.
+    /// Moves the diff view's cursor onto the row for the file named `path`,
+    /// panicking if it isn't in the list. Skips over folder rows.
     fn select_diff_file(app: &mut App, path: &str) {
         loop {
             match &app.view {
                 View::Diff {
-                    files, selected, ..
+                    files,
+                    rows,
+                    selected,
+                    ..
                 } => {
-                    if files[*selected].path == path {
-                        return;
+                    if let Some(i) = current_file_index(rows, *selected) {
+                        if files[i].path == path {
+                            return;
+                        }
                     }
-                    assert!(*selected + 1 < files.len(), "{path} not in the diff list");
+                    assert!(*selected + 1 < rows.len(), "{path} not in the diff list");
                 }
                 _ => panic!("expected diff view"),
             }
@@ -1566,11 +1745,12 @@ mod tests {
             View::Diff {
                 files,
                 marked,
+                rows,
                 selected,
                 ..
             } => {
                 let i = files.iter().position(|f| f.path == "f.txt").unwrap();
-                assert_eq!(*selected, i);
+                assert_eq!(current_file_index(rows, *selected), Some(i));
                 assert!(!marked[i], "space toggled the mark off");
             }
             _ => panic!("expected diff view"),
@@ -1581,6 +1761,78 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(root.join("f.txt")).unwrap(),
             "one\n"
+        );
+    }
+
+    #[test]
+    fn diff_view_i_adds_pattern_to_gitignore() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("debug.log"), "noise\n").unwrap();
+        app.refresh();
+        app.selected = 0;
+
+        press(&mut app, KeyCode::Enter);
+        select_diff_file(&mut app, "debug.log");
+
+        // `i` opens the ignore prompt with the file and its derived pattern.
+        press(&mut app, KeyCode::Char('i'));
+        match &app.view {
+            View::Diff {
+                ignore_prompt: Some(p),
+                ..
+            } => {
+                assert_eq!(p.file, "debug.log");
+                assert_eq!(p.pattern, "*.log");
+                assert_eq!(p.selected, 0);
+            }
+            _ => panic!("expected the ignore prompt to be open"),
+        }
+
+        // ↓ selects the pattern option; Enter writes it and closes the prompt.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        let gitignore = std::fs::read_to_string(root.join(".gitignore")).unwrap();
+        assert!(
+            gitignore.lines().any(|l| l == "*.log"),
+            "pattern written: {gitignore}"
+        );
+        match &app.view {
+            View::Diff { ignore_prompt, .. } => {
+                assert!(ignore_prompt.is_none(), "prompt closed after confirming")
+            }
+            _ => panic!("expected diff view"),
+        }
+    }
+
+    #[test]
+    fn diff_view_i_can_ignore_single_file_and_esc_cancels() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("secret.log"), "noise\n").unwrap();
+        app.refresh();
+        app.selected = 0;
+
+        press(&mut app, KeyCode::Enter);
+        select_diff_file(&mut app, "secret.log");
+
+        // Esc dismisses the prompt without writing anything.
+        press(&mut app, KeyCode::Char('i'));
+        press(&mut app, KeyCode::Esc);
+        assert!(!root.join(".gitignore").exists(), "esc wrote nothing");
+        match &app.view {
+            View::Diff { ignore_prompt, .. } => assert!(ignore_prompt.is_none()),
+            _ => panic!("expected diff view"),
+        }
+
+        // Default selection (0) ignores just the file itself.
+        select_diff_file(&mut app, "secret.log");
+        press(&mut app, KeyCode::Char('i'));
+        press(&mut app, KeyCode::Enter);
+        let gitignore = std::fs::read_to_string(root.join(".gitignore")).unwrap();
+        assert!(
+            gitignore.lines().any(|l| l == "secret.log"),
+            "exact file written: {gitignore}"
         );
     }
 
@@ -1631,6 +1883,134 @@ mod tests {
             View::Diff { content, .. } => assert!(content.contains("four"), "{content}"),
             _ => panic!("expected diff view"),
         }
+    }
+
+    /// Moves the diff view's cursor onto the folder row whose prefix is
+    /// `prefix`, panicking if it isn't in the list.
+    fn select_diff_folder(app: &mut App, prefix: &str) {
+        loop {
+            match &app.view {
+                View::Diff { rows, selected, .. } => {
+                    if let Some(DiffRow::Folder { prefix: p, .. }) = rows.get(*selected) {
+                        if p == prefix {
+                            return;
+                        }
+                    }
+                    assert!(*selected + 1 < rows.len(), "{prefix} not in the diff list");
+                }
+                _ => panic!("expected diff view"),
+            }
+            press(app, KeyCode::Down);
+        }
+    }
+
+    #[test]
+    fn build_diff_rows_groups_files_into_a_folder_tree() {
+        let files = vec![
+            StatusEntry {
+                code: " M".into(),
+                path: "src/tui/app.rs".into(),
+            },
+            StatusEntry {
+                code: " M".into(),
+                path: "src/tui/ui.rs".into(),
+            },
+            StatusEntry {
+                code: " M".into(),
+                path: "README.md".into(),
+            },
+        ];
+        let rows = build_diff_rows(&files);
+        // Sorted by path: README.md, then the src/ and src/tui/ folders, then
+        // their two files.
+        let shape: Vec<String> = rows
+            .iter()
+            .map(|r| match r {
+                DiffRow::Folder { prefix, depth, .. } => format!("D{depth}:{prefix}"),
+                DiffRow::File { index, depth, .. } => format!("F{depth}:{}", files[*index].path),
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                "F0:README.md",
+                "D0:src/",
+                "D1:src/tui/",
+                "F2:src/tui/app.rs",
+                "F2:src/tui/ui.rs",
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_view_space_toggles_a_whole_folder() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg/a.txt"), "a\n").unwrap();
+        std::fs::write(root.join("pkg/b.txt"), "b\n").unwrap();
+        std::fs::write(root.join("top.txt"), "t\n").unwrap();
+        app.refresh();
+        app.selected = 0;
+        press(&mut app, KeyCode::Enter);
+
+        // Space on the pkg/ folder row clears the marks for both files under it
+        // while leaving top.txt marked.
+        select_diff_folder(&mut app, "pkg/");
+        press(&mut app, KeyCode::Char(' '));
+        match &app.view {
+            View::Diff { files, marked, .. } => {
+                for (f, m) in files.iter().zip(marked.iter()) {
+                    if f.path.starts_with("pkg/") {
+                        assert!(!m, "{} should be unmarked", f.path);
+                    } else {
+                        assert!(m, "{} should stay marked", f.path);
+                    }
+                }
+            }
+            _ => panic!("expected diff view"),
+        }
+
+        // Space again re-marks the whole folder.
+        select_diff_folder(&mut app, "pkg/");
+        press(&mut app, KeyCode::Char(' '));
+        match &app.view {
+            View::Diff { marked, .. } => assert!(marked.iter().all(|m| *m)),
+            _ => panic!("expected diff view"),
+        }
+    }
+
+    #[test]
+    fn diff_view_i_ignores_a_whole_folder() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::create_dir_all(root.join("build/out")).unwrap();
+        std::fs::write(root.join("build/out/x.o"), "o\n").unwrap();
+        app.refresh();
+        app.selected = 0;
+        press(&mut app, KeyCode::Enter);
+
+        select_diff_folder(&mut app, "build/");
+        // The prompt offers the exact folder path or a bare-name glob.
+        press(&mut app, KeyCode::Char('i'));
+        match &app.view {
+            View::Diff {
+                ignore_prompt: Some(p),
+                ..
+            } => {
+                assert!(p.is_folder);
+                assert_eq!(p.file, "build/");
+                assert_eq!(p.pattern, "build/");
+            }
+            _ => panic!("expected the ignore prompt"),
+        }
+        // Enter writes the exact folder path.
+        press(&mut app, KeyCode::Enter);
+        let gitignore = std::fs::read_to_string(root.join(".gitignore")).unwrap();
+        assert!(
+            gitignore.lines().any(|l| l == "build/"),
+            "folder written: {gitignore}"
+        );
     }
 
     #[test]

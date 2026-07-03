@@ -145,13 +145,13 @@ Run `wtm` inside a repo. If the repo isn't initialized yet, the setup wizard ope
 | Key | Action |
 | --- | --- |
 | `↑`/`↓` or `j`/`k` | select worktree |
-| `Enter` | browse changes file by file: pick a file on the left to see its diff on the right. `Space` marks/unmarks a file for commit, `s` stashes just that file, `R` reverts it, `C` commits the marked files. Updates live as files change; `r` refreshes now |
+| `Enter` | browse changes in a folder tree: the left panel groups changed files under their folders (a folder shows `[x]`/`[ ]`/`[~]` for all/none/some of its files marked); pick a file to see its diff on the right. `Space` marks/unmarks the file, or the whole folder when the cursor is on a folder row; `s` stashes just that file, `⇧R` reverts it, `⇧C` commits the marked files, `i` adds the file or folder to `.gitignore` (choose the exact path or a glob that ignores everything like it). Updates live as files change; `r` refreshes now |
 | `n` | new **worktree**: type a name to create a new branch *and* a worktree for it, or pick an existing branch to check out in a worktree (typing filters the list). To make a branch *without* a worktree, use the branch browser (`b`) instead |
 | `d` | delete the selected worktree: choose folder-only (keeps the branch) or folder + branch; `f` to force when dirty |
-| `C` | commit the selected worktree: tick which changed files to include (all selected by default; `Tab` switches between the file list and the message, `Space` toggles a file), type a message, `Enter` commits |
+| `⇧C` | commit the selected worktree: tick which changed files to include (all selected by default; `Tab` switches between the file list and the message, `Space` toggles a file), type a message, `Enter` commits |
 | `s` | stash manager: `s` stash current changes, `p` pop, `a` apply, `x` drop the selected entry |
 | `p` | pull the selected worktree (fast-forward only) |
-| `P` (`shift`+`p`) | push the selected worktree; publishes with `-u` when there's no upstream |
+| `⇧P` | push the selected worktree; publishes with `-u` when there's no upstream |
 | `f` | fetch all remotes and refresh |
 | `b` | branch browser: every local branch with where it's checked out. `n` creates a **branch only** (no worktree, from HEAD), `x` deletes, `Enter` checks the selected branch out in a new worktree |
 | `l` | log of recent commits for the selected worktree |
