@@ -67,7 +67,8 @@ impl SetupWizard {
     pub fn new(repo_root: PathBuf) -> SetupWizard {
         SetupWizard {
             repo_root,
-            step: Step::CloneAsk { yes: true },
+            // Default to "no": most repos are set up fresh, not cloned.
+            step: Step::CloneAsk { yes: false },
             draft: ConfigDraft::default(),
         }
     }
@@ -115,7 +116,7 @@ impl SetupWizard {
             },
 
             Step::ClonePath { mut input } => match key.code {
-                KeyCode::Esc => (Step::CloneAsk { yes: true }, Continue),
+                KeyCode::Esc => (Step::CloneAsk { yes: false }, Continue),
                 KeyCode::Tab => {
                     // Sibling repos are the usual clone source, so start the
                     // browser one level up from this repo.
@@ -447,7 +448,7 @@ impl SetupWizard {
                 selected,
                 editing: None,
             } => match key.code {
-                KeyCode::Esc => (Step::CloneAsk { yes: true }, Continue),
+                KeyCode::Esc => (Step::CloneAsk { yes: false }, Continue),
                 KeyCode::Down | KeyCode::Char('j') => (
                     Step::Review {
                         selected: (selected + 1).min(REVIEW_ROWS - 1),

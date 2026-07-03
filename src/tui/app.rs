@@ -20,17 +20,31 @@ pub enum CreateMsg {
 /// How often the diff view recomputes itself to pick up outside edits.
 const DIFF_REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
 
+/// How long a status/error message stays on screen before auto-clearing.
+const MESSAGE_TIMEOUT: Duration = Duration::from_secs(4);
+
 /// Which screen/overlay is active.
 pub enum View {
     List,
-    /// Scrollable diff of one worktree's uncommitted changes. Re-runs on a
-    /// throttled timer (to catch edits made outside the app) and on `r`.
+    /// Per-file changes browser for one worktree: a list of changed files on
+    /// the left and the selected file's diff on the right. Files can be marked
+    /// for commit, stashed, or reverted from here. Re-runs on a throttled timer
+    /// (to catch edits made outside the app) and on `r`.
     Diff {
         name: String,
+        /// Changed files, parallel with `marked`.
+        files: Vec<StatusEntry>,
+        /// Whether each file is selected for commit; defaults to all true.
+        marked: Vec<bool>,
+        /// Cursor into `files`.
+        selected: usize,
+        /// Diff text for `files[selected]`.
         content: String,
         scroll: u16,
         /// When the diff was last recomputed, used to throttle auto-refresh.
         last_refresh: Instant,
+        /// True while confirming a revert of the highlighted file.
+        confirm_revert: bool,
     },
     /// New-worktree dialog: type a branch name, or pick an existing branch
     /// from the filtered list below the input.
@@ -69,11 +83,17 @@ pub enum View {
     Setup(Box<SetupWizard>),
     /// Editor for the repo's `.wtm.toml` settings.
     Config(Box<ConfigEditor>),
-    /// Commit flow: review the changed files, type a message, commit all.
+    /// Commit flow: pick which changed files to include (all by default) and
+    /// type a message. Focus toggles between the file list and the message.
     Commit {
         name: String,
         files: Vec<StatusEntry>,
+        /// Whether each file is staged for this commit, parallel with `files`.
+        marked: Vec<bool>,
+        /// Cursor into `files` while the file list has focus.
+        cursor: usize,
         input: String,
+        focus: CommitFocus,
     },
     /// Stash manager for one worktree.
     Stash {
@@ -102,6 +122,15 @@ pub enum View {
     },
 }
 
+/// Which part of the commit dialog has keyboard focus.
+#[derive(PartialEq, Eq)]
+pub enum CommitFocus {
+    /// The changed-file list: ↑/↓ move, Space toggles, `a` toggles all.
+    Files,
+    /// The commit message input: typing edits the message.
+    Message,
+}
+
 /// Sub-state of the stash overlay.
 pub enum StashMode {
     List,
@@ -125,8 +154,13 @@ pub struct App {
     pub worktrees: Vec<WorktreeInfo>,
     pub selected: usize,
     pub view: View,
-    /// One-line status or error shown at the bottom.
+    /// One-line status or error shown in the header. Auto-clears after a few
+    /// seconds so it doesn't linger over the key hints.
     pub message: Option<String>,
+    /// When the current `message` first appeared, plus the text it was set for,
+    /// so a replaced message restarts the timer. Managed by `expire_message`.
+    message_at: Option<Instant>,
+    message_shown: Option<String>,
     /// Where new worktrees will be created, shown in the create dialog.
     pub worktree_base: Option<String>,
     pub quit: bool,
@@ -153,6 +187,8 @@ impl App {
             selected: 0,
             view,
             message: None,
+            message_at: None,
+            message_shown: None,
             worktree_base,
             quit: false,
         };
@@ -180,6 +216,7 @@ impl App {
     /// Background work driven by the event loop's poll timeout: auto-refreshes
     /// the diff view and drains progress from an in-flight create.
     pub fn tick(&mut self) {
+        self.expire_message();
         if let View::Busy { rx, .. } = &self.view {
             if let Ok(result) = rx.try_recv() {
                 self.message = Some(match result {
@@ -232,6 +269,27 @@ impl App {
                     lines.push(format!("error: {e}"));
                     lines.push("press Enter to continue".to_string());
                     *done = true;
+                }
+            }
+        }
+    }
+
+    /// Starts (or restarts) the message timer when a new message appears and
+    /// clears the message once it has been on screen past `MESSAGE_TIMEOUT`.
+    fn expire_message(&mut self) {
+        match &self.message {
+            None => {
+                self.message_at = None;
+                self.message_shown = None;
+            }
+            Some(msg) => {
+                if self.message_shown.as_deref() != Some(msg.as_str()) {
+                    self.message_shown = Some(msg.clone());
+                    self.message_at = Some(Instant::now());
+                } else if self.message_at.map(|t| t.elapsed()) >= Some(MESSAGE_TIMEOUT) {
+                    self.message = None;
+                    self.message_at = None;
+                    self.message_shown = None;
                 }
             }
         }
@@ -465,17 +523,7 @@ impl App {
             KeyCode::Enter => {
                 if let Some(wt) = self.selected_worktree() {
                     let name = wt.name.clone();
-                    match ops::diff(&self.ctx, &name) {
-                        Ok((_, content)) => {
-                            self.view = View::Diff {
-                                name,
-                                content,
-                                scroll: 0,
-                                last_refresh: Instant::now(),
-                            };
-                        }
-                        Err(e) => self.message = Some(format!("error: {e:#}")),
-                    }
+                    self.open_diff(name);
                 }
             }
             KeyCode::Char('?') => self.view = View::Help,
@@ -483,15 +531,123 @@ impl App {
         }
     }
 
+    /// Opens the per-file changes view for the worktree named `name`.
+    fn open_diff(&mut self, name: String) {
+        match ops::status(&self.ctx, &name) {
+            Ok((_, files)) => {
+                let marked = vec![true; files.len()];
+                self.view = View::Diff {
+                    name,
+                    files,
+                    marked,
+                    selected: 0,
+                    content: String::new(),
+                    scroll: 0,
+                    last_refresh: Instant::now(),
+                    confirm_revert: false,
+                };
+                self.load_diff_content();
+            }
+            Err(e) => self.message = Some(format!("error: {e:#}")),
+        }
+    }
+
+    /// Loads the diff text for the file under the cursor into the Diff view.
+    fn load_diff_content(&mut self) {
+        let View::Diff {
+            name,
+            files,
+            selected,
+            ..
+        } = &self.view
+        else {
+            return;
+        };
+        let (name, entry) = (name.clone(), files.get(*selected).cloned());
+        let content = match entry {
+            Some(e) => {
+                let untracked = e.code.starts_with('?');
+                match ops::file_diff(&self.ctx, &name, &e.path, untracked) {
+                    Ok(c) => c,
+                    Err(err) => format!("error: {err:#}"),
+                }
+            }
+            None => String::new(),
+        };
+        if let View::Diff {
+            content: slot,
+            scroll,
+            ..
+        } = &mut self.view
+        {
+            *slot = content;
+            *scroll = 0;
+        }
+    }
+
     fn on_diff_key(&mut self, key: KeyEvent) {
+        let View::Diff {
+            files,
+            marked,
+            selected,
+            confirm_revert,
+            ..
+        } = &mut self.view
+        else {
+            return;
+        };
+        if *confirm_revert {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    let entry = files.get(*selected).cloned();
+                    *confirm_revert = false;
+                    if let Some(e) = entry {
+                        self.revert_file(e);
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('n') => *confirm_revert = false,
+                _ => {}
+            }
+            return;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.view = View::List,
             KeyCode::Char('r') => self.refresh_diff(),
-            KeyCode::Down | KeyCode::Char('j') => self.scroll_diff(|s| s.saturating_add(1)),
-            KeyCode::Up | KeyCode::Char('k') => self.scroll_diff(|s| s.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Char('j') => {
+                if *selected + 1 < files.len() {
+                    *selected += 1;
+                    self.load_diff_content();
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if *selected > 0 {
+                    *selected -= 1;
+                    self.load_diff_content();
+                }
+            }
             KeyCode::PageDown => self.scroll_diff(|s| s.saturating_add(20)),
             KeyCode::PageUp => self.scroll_diff(|s| s.saturating_sub(20)),
             KeyCode::Home | KeyCode::Char('g') => self.scroll_diff(|_| 0),
+            KeyCode::Char(' ') => {
+                if let Some(m) = marked.get_mut(*selected) {
+                    *m = !*m;
+                }
+            }
+            KeyCode::Char('a') => {
+                let all_on = marked.iter().all(|m| *m);
+                marked.iter_mut().for_each(|m| *m = !all_on);
+            }
+            KeyCode::Char('s') => {
+                if let Some(e) = files.get(*selected).cloned() {
+                    self.stash_file(e);
+                }
+            }
+            KeyCode::Char('R') => {
+                if !files.is_empty() {
+                    *confirm_revert = true;
+                }
+            }
+            KeyCode::Char('C') => self.commit_from_diff(),
             _ => {}
         }
     }
@@ -503,27 +659,40 @@ impl App {
         }
     }
 
-    /// Recomputes the current diff's content in place, keeping the scroll
-    /// position (clamped to the new length). No-op outside the diff view.
+    /// Rebuilds the changed-file list and the selected file's diff in place,
+    /// preserving commit marks by path and clamping the cursor. No-op outside
+    /// the diff view.
     fn refresh_diff(&mut self) {
         let View::Diff { name, .. } = &self.view else {
             return;
         };
         let name = name.clone();
-        match ops::diff(&self.ctx, &name) {
-            Ok((_, new_content)) => {
-                let max_scroll = new_content.lines().count().saturating_sub(1) as u16;
+        match ops::status(&self.ctx, &name) {
+            Ok((_, new_files)) => {
                 if let View::Diff {
-                    content,
-                    scroll,
+                    files,
+                    marked,
+                    selected,
                     last_refresh,
                     ..
                 } = &mut self.view
                 {
-                    *content = new_content;
-                    *scroll = (*scroll).min(max_scroll);
+                    // Carry commit marks over to files that still exist.
+                    let old: std::collections::HashMap<&str, bool> = files
+                        .iter()
+                        .zip(marked.iter())
+                        .map(|(f, m)| (f.path.as_str(), *m))
+                        .collect();
+                    let new_marked = new_files
+                        .iter()
+                        .map(|f| old.get(f.path.as_str()).copied().unwrap_or(true))
+                        .collect();
+                    *files = new_files;
+                    *marked = new_marked;
+                    *selected = (*selected).min(files.len().saturating_sub(1));
                     *last_refresh = Instant::now();
                 }
+                self.load_diff_content();
             }
             // The worktree may have been removed out from under us; surface it
             // and drop back to the list rather than looping on the error.
@@ -533,6 +702,61 @@ impl App {
                 self.refresh();
             }
         }
+    }
+
+    /// Stashes a single file from the diff view, then reloads it.
+    fn stash_file(&mut self, entry: StatusEntry) {
+        let View::Diff { name, .. } = &self.view else {
+            return;
+        };
+        let name = name.clone();
+        match ops::stash_push_paths(&self.ctx, &name, std::slice::from_ref(&entry.path), None) {
+            Ok(_) => self.message = Some(format!("stashed '{}'", entry.path)),
+            Err(e) => self.message = Some(format!("error: {e:#}")),
+        }
+        self.refresh_diff();
+        self.refresh();
+    }
+
+    /// Reverts a single file from the diff view, then reloads it.
+    fn revert_file(&mut self, entry: StatusEntry) {
+        let View::Diff { name, .. } = &self.view else {
+            return;
+        };
+        let name = name.clone();
+        let untracked = entry.code.starts_with('?');
+        match ops::revert_file(&self.ctx, &name, &entry.path, untracked) {
+            Ok(_) => self.message = Some(format!("reverted '{}'", entry.path)),
+            Err(e) => self.message = Some(format!("error: {e:#}")),
+        }
+        self.refresh_diff();
+        self.refresh();
+    }
+
+    /// Opens the commit dialog from the diff view, carrying the files marked
+    /// there as the initial selection.
+    fn commit_from_diff(&mut self) {
+        let View::Diff {
+            name,
+            files,
+            marked,
+            ..
+        } = &self.view
+        else {
+            return;
+        };
+        if files.is_empty() {
+            self.message = Some("nothing to commit".to_string());
+            return;
+        }
+        self.view = View::Commit {
+            name: name.clone(),
+            files: files.clone(),
+            marked: marked.clone(),
+            cursor: 0,
+            input: String::new(),
+            focus: CommitFocus::Message,
+        };
     }
 
     /// Opens the new-worktree dialog, offering existing local branches that
@@ -607,51 +831,123 @@ impl App {
         let name = wt.name.clone();
         match ops::status(&self.ctx, &name) {
             Ok((_, files)) => {
+                let marked = vec![true; files.len()];
                 self.view = View::Commit {
                     name,
                     files,
+                    marked,
+                    cursor: 0,
                     input: String::new(),
+                    focus: CommitFocus::Message,
                 };
             }
             Err(e) => self.message = Some(format!("error: {e:#}")),
         }
     }
 
-    /// Collects the typed message and, on Enter, commits every change in the
-    /// worktree. Errors keep the dialog open.
+    /// Drives the commit dialog. The file list and message input each own a
+    /// focus; Tab switches between them and Enter commits the marked files.
     fn on_commit_key(&mut self, key: KeyEvent) {
-        let View::Commit { name, input, .. } = &mut self.view else {
+        let View::Commit {
+            files,
+            marked,
+            cursor,
+            input,
+            focus,
+            ..
+        } = &mut self.view
+        else {
             return;
         };
         match key.code {
-            KeyCode::Esc => self.view = View::List,
+            KeyCode::Esc => {
+                self.view = View::List;
+                return;
+            }
+            KeyCode::Tab => {
+                *focus = match focus {
+                    CommitFocus::Files => CommitFocus::Message,
+                    CommitFocus::Message => CommitFocus::Files,
+                };
+                return;
+            }
             KeyCode::Enter => {
-                let name = name.clone();
-                let message = input.trim().to_string();
-                if message.is_empty() {
-                    self.message = Some("commit message must not be empty".to_string());
-                    return;
-                }
-                match ops::commit(&self.ctx, &name, &message, None) {
-                    Ok(r) => {
-                        self.message = Some(format!(
-                            "committed {} · {} ({} file{})",
-                            r.hash,
-                            r.summary,
-                            r.files_changed,
-                            if r.files_changed == 1 { "" } else { "s" }
-                        ));
-                        self.view = View::List;
-                        self.refresh();
-                    }
-                    Err(e) => self.message = Some(format!("error: {e:#}")),
-                }
+                self.do_commit();
+                return;
             }
-            KeyCode::Backspace => {
-                input.pop();
-            }
-            KeyCode::Char(c) => input.push(c),
             _ => {}
+        }
+        match focus {
+            CommitFocus::Files => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if *cursor + 1 < files.len() {
+                        *cursor += 1;
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => *cursor = cursor.saturating_sub(1),
+                KeyCode::Char(' ') => {
+                    if let Some(m) = marked.get_mut(*cursor) {
+                        *m = !*m;
+                    }
+                }
+                KeyCode::Char('a') => {
+                    let all_on = marked.iter().all(|m| *m);
+                    marked.iter_mut().for_each(|m| *m = !all_on);
+                }
+                _ => {}
+            },
+            CommitFocus::Message => match key.code {
+                KeyCode::Backspace => {
+                    input.pop();
+                }
+                KeyCode::Char(c) => input.push(c),
+                _ => {}
+            },
+        }
+    }
+
+    /// Commits the files marked in the commit dialog. Errors and empty
+    /// selections keep the dialog open.
+    fn do_commit(&mut self) {
+        let View::Commit {
+            name,
+            files,
+            marked,
+            input,
+            ..
+        } = &self.view
+        else {
+            return;
+        };
+        let message = input.trim().to_string();
+        if message.is_empty() {
+            self.message = Some("commit message must not be empty".to_string());
+            return;
+        }
+        let paths: Vec<String> = files
+            .iter()
+            .zip(marked.iter())
+            .filter(|(_, m)| **m)
+            .map(|(f, _)| f.path.clone())
+            .collect();
+        if paths.is_empty() {
+            self.message = Some("select at least one file to commit".to_string());
+            return;
+        }
+        let name = name.clone();
+        match ops::commit(&self.ctx, &name, &message, Some(&paths)) {
+            Ok(r) => {
+                self.message = Some(format!(
+                    "committed {} · {} ({} file{})",
+                    r.hash,
+                    r.summary,
+                    r.files_changed,
+                    if r.files_changed == 1 { "" } else { "s" }
+                ));
+                self.view = View::List;
+                self.refresh();
+            }
+            Err(e) => self.message = Some(format!("error: {e:#}")),
         }
     }
 
@@ -1094,6 +1390,25 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
     }
 
+    /// Moves the diff view's cursor onto the file named `path`, panicking if it
+    /// isn't in the list.
+    fn select_diff_file(app: &mut App, path: &str) {
+        loop {
+            match &app.view {
+                View::Diff {
+                    files, selected, ..
+                } => {
+                    if files[*selected].path == path {
+                        return;
+                    }
+                    assert!(*selected + 1 < files.len(), "{path} not in the diff list");
+                }
+                _ => panic!("expected diff view"),
+            }
+            press(app, KeyCode::Down);
+        }
+    }
+
     /// Ticks the app until the Creating view satisfies `pred`, panicking
     /// after 10 seconds.
     fn wait_creating(app: &mut App, pred: impl Fn(&[String], bool) -> bool) {
@@ -1207,15 +1522,66 @@ mod tests {
     fn enter_opens_diff_and_scrolls() {
         let (_tmp, mut app) = test_app();
         press(&mut app, KeyCode::Enter);
-        assert!(matches!(app.view, View::Diff { .. }));
-        press(&mut app, KeyCode::Char('j'));
+        match &app.view {
+            View::Diff { files, .. } => assert!(!files.is_empty(), "the untracked .wtm.toml shows"),
+            _ => panic!("expected diff view"),
+        }
         press(&mut app, KeyCode::PageDown);
         match &app.view {
-            View::Diff { scroll, .. } => assert_eq!(*scroll, 21),
+            View::Diff { scroll, .. } => assert_eq!(*scroll, 20),
             _ => panic!("expected diff view"),
         }
         press(&mut app, KeyCode::Esc);
         assert!(matches!(app.view, View::List));
+    }
+
+    #[test]
+    fn diff_view_marks_and_reverts_a_file() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("f.txt"), "one\n").unwrap();
+        git(&root, &["add", "f.txt"]);
+        git(&root, &["commit", "-m", "add f"]);
+        std::fs::write(root.join("f.txt"), "two\n").unwrap();
+        app.refresh();
+        app.selected = 0;
+
+        press(&mut app, KeyCode::Enter);
+        select_diff_file(&mut app, "f.txt");
+        match &app.view {
+            View::Diff {
+                content, marked, ..
+            } => {
+                assert!(
+                    content.contains("two"),
+                    "shows the file's own diff: {content}"
+                );
+                assert!(marked.iter().all(|m| *m), "everything is marked by default");
+            }
+            _ => panic!("expected diff view"),
+        }
+        // Space unmarks the current file for commit.
+        press(&mut app, KeyCode::Char(' '));
+        match &app.view {
+            View::Diff {
+                files,
+                marked,
+                selected,
+                ..
+            } => {
+                let i = files.iter().position(|f| f.path == "f.txt").unwrap();
+                assert_eq!(*selected, i);
+                assert!(!marked[i], "space toggled the mark off");
+            }
+            _ => panic!("expected diff view"),
+        }
+        // Revert discards the change; f.txt returns to its committed content.
+        press(&mut app, KeyCode::Char('R'));
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "one\n"
+        );
     }
 
     #[test]
@@ -1233,31 +1599,36 @@ mod tests {
             assert!(out.status.success());
         }
 
+        // Edit the tracked file so it shows up as a changed file.
+        std::fs::write(root.join("file.txt"), "two\n").unwrap();
         app.selected = 0; // main worktree
         press(&mut app, KeyCode::Enter);
-        match &app.view {
-            View::Diff { content, .. } => assert!(content.is_empty(), "starts clean: {content}"),
-            _ => panic!("expected diff view"),
-        }
-
-        // An outside edit is picked up when the user presses `r`.
-        std::fs::write(root.join("file.txt"), "two\n").unwrap();
-        press(&mut app, KeyCode::Char('r'));
+        select_diff_file(&mut app, "file.txt");
         match &app.view {
             View::Diff { content, .. } => assert!(content.contains("two"), "{content}"),
             _ => panic!("expected diff view"),
         }
 
-        // A further edit is picked up by tick once the throttle window passes.
+        // A further outside edit is picked up when the user presses `r`.
         std::fs::write(root.join("file.txt"), "three\n").unwrap();
+        press(&mut app, KeyCode::Char('r'));
+        select_diff_file(&mut app, "file.txt");
+        match &app.view {
+            View::Diff { content, .. } => assert!(content.contains("three"), "{content}"),
+            _ => panic!("expected diff view"),
+        }
+
+        // A further edit is picked up by tick once the throttle window passes.
+        std::fs::write(root.join("file.txt"), "four\n").unwrap();
         if let View::Diff { last_refresh, .. } = &mut app.view {
             *last_refresh = Instant::now()
                 .checked_sub(DIFF_REFRESH_INTERVAL * 2)
                 .unwrap();
         }
         app.tick();
+        select_diff_file(&mut app, "file.txt");
         match &app.view {
-            View::Diff { content, .. } => assert!(content.contains("three"), "{content}"),
+            View::Diff { content, .. } => assert!(content.contains("four"), "{content}"),
             _ => panic!("expected diff view"),
         }
     }
@@ -1278,15 +1649,19 @@ mod tests {
         std::fs::write(root.join("file.txt"), "a\nB\nC\nD\n").unwrap();
         app.selected = 0;
         press(&mut app, KeyCode::Enter);
+        select_diff_file(&mut app, "file.txt");
         press(&mut app, KeyCode::PageDown); // scroll to 20
         std::fs::write(root.join("file.txt"), "a\nb\nc\n").unwrap();
         press(&mut app, KeyCode::Char('r'));
+        // file.txt is clean again and drops out of the list; the reload resets
+        // the scroll to the top for whatever file is now selected.
         match &app.view {
-            View::Diff {
-                content, scroll, ..
-            } => {
-                assert!(content.is_empty(), "diff should be clean again: {content}");
-                assert_eq!(*scroll, 0, "scroll must clamp to the shorter content");
+            View::Diff { files, scroll, .. } => {
+                assert!(
+                    !files.iter().any(|f| f.path == "file.txt"),
+                    "clean file leaves the changes list"
+                );
+                assert_eq!(*scroll, 0, "reload resets the scroll");
             }
             _ => panic!("expected diff view"),
         }
@@ -1299,7 +1674,7 @@ mod tests {
             View::Setup(wizard) => {
                 assert!(matches!(
                     wizard.step,
-                    super::setup::Step::CloneAsk { yes: true }
+                    super::setup::Step::CloneAsk { yes: false }
                 ));
             }
             _ => panic!("expected the setup wizard"),
@@ -1351,7 +1726,7 @@ mod tests {
         .unwrap();
 
         // yes -> type the source repo path -> review shows the cloned draft.
-        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('y'));
         type_str(&mut app, source.to_str().unwrap());
         press(&mut app, KeyCode::Enter);
         match &app.view {
@@ -1384,7 +1759,7 @@ mod tests {
     #[test]
     fn setup_bad_clone_path_stays_on_input_with_error() {
         let (_tmp, mut app) = test_app_uninitialized();
-        press(&mut app, KeyCode::Enter); // yes
+        press(&mut app, KeyCode::Char('y')); // yes
         type_str(&mut app, "/definitely/not/there");
         press(&mut app, KeyCode::Enter);
         match &app.view {
@@ -1403,7 +1778,7 @@ mod tests {
         std::fs::create_dir(&source).unwrap();
         std::fs::write(source.join(".wtm.toml"), "worktree_dir = \"home\"\n").unwrap();
 
-        press(&mut app, KeyCode::Enter); // yes -> path input
+        press(&mut app, KeyCode::Char('y')); // yes -> path input
         press(&mut app, KeyCode::Tab); // open the browser at tmp (repo parent)
         // Entries: dirs first alphabetically -> "other" before "proj".
         press(&mut app, KeyCode::Enter); // descend into other/

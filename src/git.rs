@@ -245,6 +245,45 @@ pub fn diff(dir: &Path) -> Result<String> {
     run(dir, &["diff", "HEAD"])
 }
 
+/// Unified diff of a single `path`. Untracked files are diffed against
+/// `/dev/null` so their whole contents show as additions.
+pub fn diff_file(dir: &Path, path: &str, untracked: bool) -> Result<String> {
+    if untracked {
+        // `--no-index` exits non-zero when the files differ, which is the
+        // normal case here, so read stdout directly instead of via `run`.
+        let output = Command::new("git")
+            .args(["diff", "--no-index", "--", "/dev/null", path])
+            .current_dir(dir)
+            .output()?;
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .to_string())
+    } else {
+        run(dir, &["diff", "HEAD", "--", path])
+    }
+}
+
+/// Discards changes to `path`, restoring it to HEAD. Untracked files are
+/// removed outright since they have no HEAD version to restore.
+pub fn revert_file(dir: &Path, path: &str, untracked: bool) -> Result<()> {
+    if untracked {
+        run(dir, &["clean", "-fd", "--", path])?;
+    } else {
+        run(
+            dir,
+            &[
+                "restore",
+                "--source=HEAD",
+                "--staged",
+                "--worktree",
+                "--",
+                path,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 /// One entry from `git stash list`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct StashEntry {
@@ -338,6 +377,19 @@ pub fn stash_push(dir: &Path, message: Option<&str>) -> Result<String> {
         args.push("-m");
         args.push(m);
     }
+    run(dir, &args)
+}
+
+/// Stashes only `paths` (including any untracked ones), leaving the rest of
+/// the working tree in place.
+pub fn stash_push_paths(dir: &Path, paths: &[String], message: Option<&str>) -> Result<String> {
+    let mut args = vec!["stash", "push", "--include-untracked"];
+    if let Some(m) = message {
+        args.push("-m");
+        args.push(m);
+    }
+    args.push("--");
+    args.extend(paths.iter().map(String::as_str));
     run(dir, &args)
 }
 

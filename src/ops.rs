@@ -374,6 +374,20 @@ pub fn diff(ctx: &Ctx, name: &str) -> Result<(WorktreeInfo, String)> {
     Ok((info, diff))
 }
 
+/// Unified diff of a single `path` within the worktree named `name`.
+/// `untracked` should be true for files git doesn't track yet.
+pub fn file_diff(ctx: &Ctx, name: &str, path: &str, untracked: bool) -> Result<String> {
+    let info = find(ctx, name)?.ok_or_else(|| not_found(ctx, name))?;
+    git::diff_file(Path::new(&info.path), path, untracked).map_err(Into::into)
+}
+
+/// Discards uncommitted changes to `path` in the worktree named `name`,
+/// restoring it to HEAD (or removing it if it was untracked).
+pub fn revert_file(ctx: &Ctx, name: &str, path: &str, untracked: bool) -> Result<()> {
+    let info = find(ctx, name)?.ok_or_else(|| not_found(ctx, name))?;
+    git::revert_file(Path::new(&info.path), path, untracked).map_err(Into::into)
+}
+
 /// Absolute path of the worktree named `name`.
 pub fn path(ctx: &Ctx, name: &str) -> Result<String> {
     let info = find(ctx, name)?.ok_or_else(|| not_found(ctx, name))?;
@@ -517,6 +531,23 @@ pub fn commit(
 pub fn stash_push(ctx: &Ctx, name: &str, message: Option<&str>) -> Result<StashResult> {
     let info = find(ctx, name)?.ok_or_else(|| not_found(ctx, name))?;
     let output = git::stash_push(Path::new(&info.path), message)?;
+    Ok(StashResult {
+        name: info.name,
+        action: "push".to_string(),
+        output,
+    })
+}
+
+/// Stashes only `paths` in the worktree named `name`, leaving the rest of the
+/// working tree in place.
+pub fn stash_push_paths(
+    ctx: &Ctx,
+    name: &str,
+    paths: &[String],
+    message: Option<&str>,
+) -> Result<StashResult> {
+    let info = find(ctx, name)?.ok_or_else(|| not_found(ctx, name))?;
+    let output = git::stash_push_paths(Path::new(&info.path), paths, message)?;
     Ok(StashResult {
         name: info.name,
         action: "push".to_string(),

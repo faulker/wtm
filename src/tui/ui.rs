@@ -4,7 +4,7 @@
 //! titles/keys/selection, and a footer that always shows the active keys.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -12,7 +12,7 @@ use ratatui::widgets::{
     ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
 };
 
-use super::app::{App, BranchMode, StashMode, View, filtered_branches};
+use super::app::{App, BranchMode, CommitFocus, StashMode, View, filtered_branches};
 use super::config_editor::{ConfigEditor, FIELD_ROWS, ROWS as CONFIG_ROWS};
 use super::setup::{REVIEW_ROWS, SetupWizard, Step, location_preview};
 use crate::config::{DEFAULT_LOCATION, LOCATION_PRESETS};
@@ -38,10 +38,24 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     match &app.view {
         View::Diff {
             name,
+            files,
+            marked,
+            selected,
             content,
             scroll,
+            confirm_revert,
             ..
-        } => draw_diff(frame, main, name, content, *scroll),
+        } => draw_diff(
+            frame,
+            main,
+            name,
+            files,
+            marked,
+            *selected,
+            content,
+            *scroll,
+            *confirm_revert,
+        ),
         View::Log {
             name,
             entries,
@@ -82,7 +96,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         View::Help => draw_help(frame, main),
         View::Setup(wizard) => draw_setup(frame, main, wizard),
         View::Config(editor) => draw_config(frame, main, editor),
-        View::Commit { name, files, input } => draw_commit(frame, main, name, files, input),
+        View::Commit {
+            name,
+            files,
+            marked,
+            cursor,
+            input,
+            focus,
+        } => draw_commit(frame, main, name, files, marked, *cursor, input, focus),
         View::Stash {
             name,
             entries,
@@ -115,19 +136,33 @@ fn panel(title: impl Into<String>) -> Block<'static> {
         ]))
 }
 
-/// Top bar: app badge, repo path, and worktree count.
+/// Top bar: app badge and repo path on the left; the worktree count on the
+/// right, or the transient status/error message when one is present.
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let count = app.worktrees.len();
-    let line = Line::from(vec![
+    let left = Line::from(vec![
         Span::styled(" wtm ", Style::new().fg(Color::Black).bg(ACCENT).bold()),
         Span::raw("  "),
         Span::styled(app.ctx.repo_root.display().to_string(), Style::new().bold()),
-        Span::styled(
-            format!("  ({count} worktree{})", if count == 1 { "" } else { "s" }),
+    ]);
+    // The right slot is wide enough for the message (or count), and is drawn
+    // right-aligned so it never overlaps the app badge.
+    let right = match &app.message {
+        Some(msg) => {
+            let style = if msg.starts_with("error") {
+                Style::new().fg(Color::Red).bold()
+            } else {
+                Style::new().fg(Color::Yellow).bold()
+            };
+            Line::styled(format!("{msg} "), style)
+        }
+        None => Line::styled(
+            format!("({count} worktree{}) ", if count == 1 { "" } else { "s" }),
             Style::new().dim(),
         ),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+    };
+    frame.render_widget(Paragraph::new(left), area);
+    frame.render_widget(Paragraph::new(right).alignment(Alignment::Right), area);
 }
 
 /// Footer as key hints: the key in accent, its label dimmed.
@@ -214,26 +249,90 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
-fn draw_diff(frame: &mut Frame, area: Rect, name: &str, content: &str, scroll: u16) {
+/// The per-file changes view: a checklist of changed files on the left and the
+/// highlighted file's diff on the right.
+#[allow(clippy::too_many_arguments)]
+fn draw_diff(
+    frame: &mut Frame,
+    area: Rect,
+    name: &str,
+    files: &[StatusEntry],
+    marked: &[bool],
+    selected: usize,
+    content: &str,
+    scroll: u16,
+    confirm_revert: bool,
+) {
+    if files.is_empty() {
+        let para = Paragraph::new(Line::from("no uncommitted changes".dim()))
+            .block(panel(format!("changes · {name}")));
+        frame.render_widget(para, area);
+        return;
+    }
+
+    let [list_area, diff_area] =
+        Layout::horizontal([Constraint::Length(36), Constraint::Min(20)]).areas(area);
+
+    // Left: the changed files with a [x]/[ ] commit checkbox.
+    let items: Vec<ListItem> = files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let checked = marked.get(i).copied().unwrap_or(false);
+            let check = if checked {
+                Span::styled("[x] ", Style::new().fg(Color::Green))
+            } else {
+                Span::styled("[ ] ", Style::new().dim())
+            };
+            ListItem::new(Line::from(vec![
+                check,
+                Span::styled(format!("{:<3}", f.code.trim()), status_style(&f.code)),
+                Span::raw(f.path.clone()),
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(panel(format!("files · {name}")))
+        .highlight_style(Style::new().bg(SELECTION_BG).bold())
+        .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
+    let mut state = ListState::default().with_selected(Some(selected));
+    frame.render_stateful_widget(list, list_area, &mut state);
+
+    // Right: the diff of the highlighted file.
+    let path = files.get(selected).map(|f| f.path.as_str()).unwrap_or("");
     let lines: Vec<Line> = if content.is_empty() {
-        vec![Line::from("no uncommitted changes".dim())]
+        vec![Line::from("no textual diff (binary or empty)".dim())]
     } else {
         content.lines().map(diff_line).collect()
     };
     let total = lines.len();
     let para = Paragraph::new(lines)
-        .block(panel(format!("diff · {name}")))
+        .block(panel(format!("diff · {path}")))
         .scroll((scroll, 0));
-    frame.render_widget(para, area);
-    let mut sb_state =
-        ScrollbarState::new(total.saturating_sub(area.height as usize)).position(scroll as usize);
+    frame.render_widget(para, diff_area);
+    let mut sb_state = ScrollbarState::new(total.saturating_sub(diff_area.height as usize))
+        .position(scroll as usize);
     frame.render_stateful_widget(
         Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .style(Style::new().fg(BORDER))
             .thumb_style(Style::new().fg(ACCENT)),
-        area,
+        diff_area,
         &mut sb_state,
     );
+
+    if confirm_revert {
+        let label = files
+            .get(selected)
+            .map(|f| format!("discard all changes to '{}'?", f.path))
+            .unwrap_or_else(|| "discard changes?".to_string());
+        draw_confirm_popup(
+            frame,
+            area,
+            "revert file",
+            &label,
+            "y to discard · Esc to cancel",
+        );
+    }
 }
 
 /// Colors one diff line by its prefix.
@@ -255,23 +354,17 @@ fn diff_line(line: &str) -> Line<'_> {
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
-    if let Some(msg) = &app.message {
-        let style = if msg.starts_with("error") {
-            Style::new().fg(Color::Red)
-        } else {
-            Style::new().fg(Color::Yellow)
-        };
-        frame.render_widget(Paragraph::new(Line::styled(format!(" {msg}"), style)), area);
-        return;
-    }
+    // The status message lives in the header now, so the key hints below stay
+    // visible at all times.
     let hints: &[(&str, &str)] = match &app.view {
         View::List => &[
             ("↑/↓", "select"),
-            ("Enter", "diff"),
+            ("Enter", "changes"),
             ("n", "new"),
             ("C", "commit"),
             ("s", "stash"),
-            ("p/P", "pull/push"),
+            ("p", "pull"),
+            ("⇧P", "push"),
             ("f", "fetch"),
             ("b", "branch"),
             ("l", "log"),
@@ -279,11 +372,17 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("?", "help"),
             ("q", "quit"),
         ],
+        View::Diff {
+            confirm_revert: true,
+            ..
+        } => &[("y", "discard changes"), ("Esc", "cancel")],
         View::Diff { .. } => &[
-            ("↑/↓", "scroll"),
-            ("PgUp/PgDn", "page"),
-            ("g", "top"),
-            ("r", "refresh"),
+            ("↑/↓", "file"),
+            ("PgUp/PgDn", "scroll diff"),
+            ("Space", "mark for commit"),
+            ("C", "commit"),
+            ("s", "stash file"),
+            ("R", "revert file"),
             ("q", "back"),
         ],
         View::Log { .. } => &[
@@ -292,11 +391,22 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("g", "top"),
             ("q", "back"),
         ],
-        View::Commit { .. } => &[
-            ("type", "commit message"),
-            ("Enter", "commit all"),
-            ("Esc", "cancel"),
-        ],
+        View::Commit { focus, .. } => match focus {
+            CommitFocus::Files => &[
+                ("↑/↓", "file"),
+                ("Space", "toggle"),
+                ("a", "all/none"),
+                ("Tab", "message"),
+                ("Enter", "commit"),
+                ("Esc", "cancel"),
+            ],
+            CommitFocus::Message => &[
+                ("type", "commit message"),
+                ("Tab", "pick files"),
+                ("Enter", "commit"),
+                ("Esc", "cancel"),
+            ],
+        },
         View::Stash { mode, .. } => match mode {
             StashMode::List => &[
                 ("↑/↓", "select"),
@@ -316,8 +426,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         View::Branch { mode, .. } => match mode {
             BranchMode::List => &[
                 ("↑/↓", "select"),
-                ("Enter", "new worktree"),
-                ("n", "new branch"),
+                ("Enter", "check out in a worktree"),
+                ("n", "new branch (no worktree)"),
                 ("x", "delete"),
                 ("Esc", "close"),
             ],
@@ -330,9 +440,9 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         },
         View::Busy { .. } => &[("", "working…")],
         View::Create { .. } => &[
-            ("type", "filter / name a new branch"),
+            ("type", "filter / name a branch"),
             ("↑/↓", "pick"),
-            ("Enter", "create"),
+            ("Enter", "create worktree"),
             ("Esc", "cancel"),
         ],
         View::Creating { done: false, .. } => &[
@@ -424,16 +534,16 @@ fn draw_create_dialog(
     items.push(ListItem::new(Line::from(vec![
         Span::styled("+ ", Style::new().fg(Color::Green).bold()),
         if input.trim().is_empty() {
-            Span::styled("create a new branch (type a name)", Style::new().dim())
+            Span::styled("type a name: new branch + worktree", Style::new().dim())
         } else {
-            Span::raw(format!("create new branch '{}'", input.trim()))
+            Span::raw(format!("new branch + worktree '{}'", input.trim()))
         },
     ])));
     for branch in &filtered {
         items.push(ListItem::new(Line::from(vec![
             Span::styled("⎇ ", Style::new().fg(ACCENT)),
             Span::raw((*branch).clone()),
-            Span::styled("  existing", Style::new().dim()),
+            Span::styled("  existing branch → worktree", Style::new().dim()),
         ])));
     }
     let list = List::new(items)
@@ -576,21 +686,22 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     };
     let text = vec![
         key("↑/↓ or j/k", "select worktree"),
-        key("Enter", "view diff of uncommitted changes"),
+        key("Enter", "browse changes per file (diff, stash, revert)"),
         key("n", "new worktree (new or existing branch)"),
-        key("C", "commit all changes in the worktree"),
+        key("C", "commit (pick files, all selected by default)"),
         key("s", "stash manager (stash/pop/apply/drop)"),
-        key("p / P", "pull (ff-only) / push the worktree"),
+        key("p", "pull the worktree (fast-forward only)"),
+        key("P (shift+p)", "push the worktree"),
         key("f", "fetch all remotes"),
-        key("b", "branch browser (create/delete/checkout)"),
+        key("b", "branch browser (branch-only create/delete/checkout)"),
         key("l", "commit log of the worktree"),
         key("d", "delete worktree (folder, or folder + branch)"),
         key("c", "edit this repo's settings"),
         key("r", "refresh the list"),
         key("q / Ctrl+C", "quit"),
         Line::from(""),
-        Line::from("during setup, type + Enter answers a prompting".dim()),
-        Line::from("command; Ctrl+C twice kills a stuck setup.".dim()),
+        Line::from("in the changes view: Space marks a file for commit,".dim()),
+        Line::from("s stashes it, R reverts it, C commits the marked files.".dim()),
         Line::from(""),
         Line::from("worktree location and setup steps come from .wtm.toml.".dim()),
     ];
@@ -858,36 +969,79 @@ fn draw_config(frame: &mut Frame, area: Rect, editor: &ConfigEditor) {
     frame.render_widget(para, popup);
 }
 
-/// Commit dialog: the changed files above a message prompt.
-fn draw_commit(frame: &mut Frame, area: Rect, name: &str, files: &[StatusEntry], input: &str) {
+/// Commit dialog: a checklist of changed files (all ticked by default) above a
+/// clearly labelled commit-message input. Focus moves between the two panes.
+#[allow(clippy::too_many_arguments)]
+fn draw_commit(
+    frame: &mut Frame,
+    area: Rect,
+    name: &str,
+    files: &[StatusEntry],
+    marked: &[bool],
+    cursor: usize,
+    input: &str,
+    focus: &CommitFocus,
+) {
     let list_rows = (files.len() as u16).clamp(1, 10);
-    let popup = centered(area, 72, list_rows + 7);
+    let popup = centered(area, 72, list_rows + 8);
     frame.render_widget(Clear, popup);
     frame.render_widget(panel(format!("commit · {name}")), popup);
     let inner = popup.inner(ratatui::layout::Margin::new(2, 1));
-    let [files_area, prompt_area, hint_area] = Layout::vertical([
+    let [files_area, label_area, prompt_area, hint_area] = Layout::vertical([
         Constraint::Length(list_rows + 1),
-        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Length(1),
     ])
     .areas(inner);
 
+    let files_focused = *focus == CommitFocus::Files;
     let items: Vec<ListItem> = files
         .iter()
         .take(10)
-        .map(|f| {
+        .enumerate()
+        .map(|(i, f)| {
+            let checked = marked.get(i).copied().unwrap_or(false);
+            let check = if checked {
+                Span::styled("[x] ", Style::new().fg(Color::Green))
+            } else {
+                Span::styled("[ ] ", Style::new().dim())
+            };
             ListItem::new(Line::from(vec![
+                check,
                 Span::styled(format!("{:<3}", f.code.trim()), status_style(&f.code)),
                 Span::raw(f.path.clone()),
             ]))
         })
         .collect();
-    frame.render_widget(List::new(items), files_area);
+    let mut list = List::new(items);
+    if files_focused {
+        list = list
+            .highlight_style(Style::new().bg(SELECTION_BG).bold())
+            .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
+    } else {
+        list = list.highlight_symbol("  ");
+    }
+    let mut state = ListState::default().with_selected(Some(cursor));
+    frame.render_stateful_widget(list, files_area, &mut state);
+
+    // A label makes it obvious the prompt below is the commit message.
+    let label_style = if files_focused {
+        Style::new().dim()
+    } else {
+        Style::new().fg(ACCENT).bold()
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled("Commit message:", label_style)),
+        label_area,
+    );
     frame.render_widget(Paragraph::new(prompt_line(input)), prompt_area);
+
+    let selected_count = marked.iter().filter(|m| **m).count();
     frame.render_widget(
         Paragraph::new(Line::styled(
             format!(
-                "{} file{} · Enter commits all · Esc cancels",
+                "{selected_count}/{} file{} · Tab switches pane · Space toggles · Enter commits",
                 files.len(),
                 if files.len() == 1 { "" } else { "s" }
             ),
@@ -1023,9 +1177,9 @@ fn draw_branch(
         BranchMode::Create(buf) => draw_input_popup(
             frame,
             area,
-            "new branch name",
+            "new branch (no worktree)",
             buf,
-            "created from HEAD; Esc cancels",
+            "branch only, from HEAD · Esc cancels",
         ),
         BranchMode::ConfirmDelete => {
             let label = branches
