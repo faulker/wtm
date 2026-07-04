@@ -3,7 +3,10 @@
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Rect;
 
 use super::config_editor::{ConfigEditor, EditorOutcome};
 use super::setup::{self, SetupWizard, WizardOutcome};
@@ -232,11 +235,46 @@ pub enum BranchMode {
     ConfirmDelete,
 }
 
+/// Geometry of the active view's clickable row list, recorded by the renderer
+/// each frame so a mouse click can be mapped back to a row index. `None` when
+/// the active view has no clickable list (or an overlay covers it).
+#[derive(Clone, Copy)]
+pub struct RowList {
+    /// Content rect where rows are drawn (inside the panel border/padding).
+    pub inner: Rect,
+    /// Rows of chrome inside `inner` above the first data row, e.g. a table
+    /// header. Data row 0 is drawn at `inner.y + header`.
+    pub header: u16,
+    /// Index of the first visible row (the list's scroll offset).
+    pub offset: usize,
+    /// Total number of rows.
+    pub len: usize,
+}
+
+impl RowList {
+    /// Row index at screen position (`col`, `row`), or `None` when the click
+    /// falls outside the list's data rows.
+    fn hit(&self, col: u16, row: u16) -> Option<usize> {
+        let top = self.inner.y + self.header;
+        if col < self.inner.x
+            || col >= self.inner.x + self.inner.width
+            || row < top
+            || row >= self.inner.y + self.inner.height
+        {
+            return None;
+        }
+        let idx = self.offset + (row - top) as usize;
+        (idx < self.len).then_some(idx)
+    }
+}
+
 pub struct App {
     pub ctx: Ctx,
     pub worktrees: Vec<WorktreeInfo>,
     pub selected: usize,
     pub view: View,
+    /// Set by the renderer each frame; read by `on_mouse` to resolve clicks.
+    pub row_list: Option<RowList>,
     /// One-line status or error shown in the header. Auto-clears after a few
     /// seconds so it doesn't linger over the key hints.
     pub message: Option<String>,
@@ -269,6 +307,7 @@ impl App {
             worktrees: Vec::new(),
             selected: 0,
             view,
+            row_list: None,
             message: None,
             message_at: None,
             message_shown: None,
@@ -632,7 +671,7 @@ impl App {
                     confirm_revert: false,
                     ignore_prompt: None,
                 };
-                self.load_diff_content();
+                self.load_diff_content(true);
             }
             Err(e) => self.message = Some(format!("error: {e:#}")),
         }
@@ -640,8 +679,11 @@ impl App {
 
     /// Loads the diff text for the file under the cursor into the Diff view.
     /// When the cursor sits on a folder row there is no diff to show, so the
-    /// content is cleared.
-    fn load_diff_content(&mut self) {
+    /// content is cleared. `reset_scroll` sends the viewport back to the top
+    /// (used when the selected file changes); otherwise the current scroll is
+    /// kept and merely clamped to the new content, so the periodic auto-refresh
+    /// doesn't yank the user back to the top of the file they're reading.
+    fn load_diff_content(&mut self, reset_scroll: bool) {
         let View::Diff {
             name,
             files,
@@ -671,7 +713,74 @@ impl App {
         } = &mut self.view
         {
             *slot = content;
-            *scroll = 0;
+            if reset_scroll {
+                *scroll = 0;
+            } else {
+                // Keep the reader's place, but don't let a shrunken diff leave
+                // the viewport scrolled past the last line.
+                let max = slot.lines().count().saturating_sub(1) as u16;
+                *scroll = (*scroll).min(max);
+            }
+        }
+    }
+
+    /// Handles mouse input. The scroll wheel moves the diff or log viewport;
+    /// other mouse events are ignored.
+    pub fn on_mouse(&mut self, mouse: MouseEvent) {
+        // A left click moves the selection to the clicked row, mirroring the
+        // arrow keys.
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+            self.on_click(mouse.column, mouse.row);
+            return;
+        }
+        // Scroll three lines per wheel notch, matching Shift+Up/Down.
+        let delta = match mouse.kind {
+            MouseEventKind::ScrollDown => |s: u16| s.saturating_add(3),
+            MouseEventKind::ScrollUp => |s: u16| s.saturating_sub(3),
+            _ => return,
+        };
+        match &mut self.view {
+            View::Diff { scroll, .. } | View::Log { scroll, .. } => *scroll = delta(*scroll),
+            _ => {}
+        }
+    }
+
+    /// Selects the list row under a left click, if one landed on the active
+    /// view's clickable list. Loads the diff for a newly selected file so a
+    /// click behaves exactly like arrowing onto the row.
+    fn on_click(&mut self, col: u16, row: u16) {
+        let Some(idx) = self.row_list.and_then(|rl| rl.hit(col, row)) else {
+            return;
+        };
+        match self.view {
+            View::List => {
+                if idx < self.worktrees.len() {
+                    self.selected = idx;
+                }
+            }
+            View::Diff { .. } => {
+                if let View::Diff { selected, rows, .. } = &mut self.view {
+                    if idx >= rows.len() || *selected == idx {
+                        return;
+                    }
+                    *selected = idx;
+                }
+                self.load_diff_content(true);
+            }
+            View::Commit { .. } => {
+                if let View::Commit {
+                    cursor,
+                    focus,
+                    files,
+                    ..
+                } = &mut self.view
+                    && idx < files.len()
+                {
+                    *cursor = idx;
+                    *focus = CommitFocus::Files;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -723,23 +832,37 @@ impl App {
             }
             return;
         }
+        // Scroll the diff content. Shift+Up/Down works on terminals that report
+        // the modifier; Shift+J/Shift+K (which arrive as capital 'J'/'K' on any
+        // terminal) are the always-available fallback. Plain Up/Down still move
+        // the row cursor, so the scroll cases are handled first.
+        let shift_arrow_down =
+            key.code == KeyCode::Down && key.modifiers.contains(KeyModifiers::SHIFT);
+        let shift_arrow_up =
+            key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::SHIFT);
+        if shift_arrow_down || key.code == KeyCode::Char('J') {
+            self.scroll_diff(|s| s.saturating_add(3));
+            return;
+        }
+        if shift_arrow_up || key.code == KeyCode::Char('K') {
+            self.scroll_diff(|s| s.saturating_sub(3));
+            return;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.view = View::List,
             KeyCode::Char('r') => self.refresh_diff(),
             KeyCode::Down | KeyCode::Char('j') => {
                 if *selected + 1 < rows.len() {
                     *selected += 1;
-                    self.load_diff_content();
+                    self.load_diff_content(true);
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 if *selected > 0 {
                     *selected -= 1;
-                    self.load_diff_content();
+                    self.load_diff_content(true);
                 }
             }
-            KeyCode::PageDown => self.scroll_diff(|s| s.saturating_add(20)),
-            KeyCode::PageUp => self.scroll_diff(|s| s.saturating_sub(20)),
             KeyCode::Home | KeyCode::Char('g') => self.scroll_diff(|_| 0),
             KeyCode::Char(' ') => match rows.get(*selected) {
                 // On a file row, toggle just that file.
@@ -839,6 +962,22 @@ impl App {
             return;
         };
         let name = name.clone();
+        // Remember which file is under the cursor so we can tell whether the
+        // refresh lands on the same file (keep scroll) or a different one
+        // because the list shifted (reset scroll).
+        let old_path = if let View::Diff {
+            files,
+            rows,
+            selected,
+            ..
+        } = &self.view
+        {
+            current_file_index(rows, *selected)
+                .and_then(|i| files.get(i))
+                .map(|f| f.path.clone())
+        } else {
+            None
+        };
         match ops::status(&self.ctx, &name) {
             Ok((_, new_files)) => {
                 if let View::Diff {
@@ -866,7 +1005,20 @@ impl App {
                     *selected = (*selected).min(rows.len().saturating_sub(1));
                     *last_refresh = Instant::now();
                 }
-                self.load_diff_content();
+                let new_path = if let View::Diff {
+                    files,
+                    rows,
+                    selected,
+                    ..
+                } = &self.view
+                {
+                    current_file_index(rows, *selected)
+                        .and_then(|i| files.get(i))
+                        .map(|f| f.path.clone())
+                } else {
+                    None
+                };
+                self.load_diff_content(new_path != old_path);
             }
             // The worktree may have been removed out from under us; surface it
             // and drop back to the list rather than looping on the error.
@@ -1560,6 +1712,28 @@ mod tests {
         app.on_key(KeyEvent::from(code));
     }
 
+    fn press_shift(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::SHIFT));
+    }
+
+    fn scroll_wheel(app: &mut App, kind: MouseEventKind) {
+        app.on_mouse(MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        });
+    }
+
+    fn click(app: &mut App, col: u16, row: u16) {
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::empty(),
+        });
+    }
+
     fn ctrl_c(app: &mut App) {
         app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
     }
@@ -1705,9 +1879,25 @@ mod tests {
             View::Diff { files, .. } => assert!(!files.is_empty(), "the untracked .wtm.toml shows"),
             _ => panic!("expected diff view"),
         }
-        press(&mut app, KeyCode::PageDown);
+        // Shift+Down scrolls the diff content; each press moves three lines.
+        press_shift(&mut app, KeyCode::Down);
+        press_shift(&mut app, KeyCode::Down);
         match &app.view {
-            View::Diff { scroll, .. } => assert_eq!(*scroll, 20),
+            View::Diff { scroll, .. } => assert_eq!(*scroll, 6),
+            _ => panic!("expected diff view"),
+        }
+        // Capital J/K scroll on terminals that don't report the Shift modifier
+        // on arrow keys; the mouse wheel scrolls too.
+        press(&mut app, KeyCode::Char('J'));
+        match &app.view {
+            View::Diff { scroll, .. } => assert_eq!(*scroll, 9),
+            _ => panic!("expected diff view"),
+        }
+        scroll_wheel(&mut app, MouseEventKind::ScrollUp);
+        press(&mut app, KeyCode::Char('K'));
+        press_shift(&mut app, KeyCode::Up);
+        match &app.view {
+            View::Diff { scroll, .. } => assert_eq!(*scroll, 0),
             _ => panic!("expected diff view"),
         }
         press(&mut app, KeyCode::Esc);
@@ -1762,6 +1952,123 @@ mod tests {
             std::fs::read_to_string(root.join("f.txt")).unwrap(),
             "one\n"
         );
+    }
+
+    #[test]
+    fn row_list_hit_maps_clicks_to_indices() {
+        // A list with a one-row header, scrolled down by three rows.
+        let rl = RowList {
+            inner: Rect::new(2, 5, 20, 4),
+            header: 1,
+            offset: 3,
+            len: 100,
+        };
+        assert_eq!(rl.hit(3, 5), None, "the header row is not a data row");
+        assert_eq!(rl.hit(3, 6), Some(3), "first data row maps to the offset");
+        assert_eq!(rl.hit(3, 7), Some(4));
+        assert_eq!(rl.hit(3, 8), Some(5), "last visible row");
+        assert_eq!(rl.hit(3, 9), None, "below the list");
+        assert_eq!(rl.hit(1, 6), None, "left of the list");
+        assert_eq!(rl.hit(22, 6), None, "right of the list");
+
+        // A short list: clicks past the last row select nothing.
+        let short = RowList {
+            inner: Rect::new(0, 0, 10, 10),
+            header: 0,
+            offset: 0,
+            len: 2,
+        };
+        assert_eq!(short.hit(0, 0), Some(0));
+        assert_eq!(short.hit(0, 1), Some(1));
+        assert_eq!(short.hit(0, 2), None, "no row there");
+    }
+
+    #[test]
+    fn diff_view_click_selects_file() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("a.txt"), "1\n").unwrap();
+        std::fs::write(root.join("b.txt"), "2\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "add"]);
+        std::fs::write(root.join("a.txt"), "11\n").unwrap();
+        std::fs::write(root.join("b.txt"), "22\n").unwrap();
+        app.refresh();
+        app.selected = 0;
+        press(&mut app, KeyCode::Enter); // open diff, cursor on the first row
+
+        // Both files sit at the repo root, so the rows are two file rows with no
+        // folder headers. Publish the geometry the renderer would set.
+        let len = match &app.view {
+            View::Diff { rows, .. } => rows.len(),
+            _ => panic!("expected diff view"),
+        };
+        assert_eq!(len, 2);
+        app.row_list = Some(RowList {
+            inner: Rect::new(0, 2, 30, 10),
+            header: 0,
+            offset: 0,
+            len,
+        });
+
+        // Click the second row (y = inner.y + 1).
+        click(&mut app, 1, 3);
+        match &app.view {
+            View::Diff {
+                selected,
+                rows,
+                content,
+                ..
+            } => {
+                assert_eq!(*selected, 1, "cursor moved to the clicked row");
+                let i = current_file_index(rows, *selected).unwrap();
+                assert_eq!(i, 1);
+                assert!(content.contains("22"), "clicked file's diff loaded: {content}");
+            }
+            _ => panic!("expected diff view"),
+        }
+
+        // A click outside the list rows leaves the selection untouched.
+        click(&mut app, 1, 99);
+        match &app.view {
+            View::Diff { selected, .. } => assert_eq!(*selected, 1),
+            _ => panic!("expected diff view"),
+        }
+    }
+
+    #[test]
+    fn commit_view_click_focuses_and_selects_file() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        std::fs::write(root.join("b.txt"), "b\n").unwrap();
+        app.refresh();
+        app.selected = 0;
+        press(&mut app, KeyCode::Char('C')); // opens the commit view
+        assert!(matches!(app.view, View::Commit { .. }));
+
+        let len = match &app.view {
+            View::Commit { files, .. } => files.len(),
+            _ => panic!("expected commit view"),
+        };
+        app.row_list = Some(RowList {
+            inner: Rect::new(0, 2, 30, 10),
+            header: 0,
+            offset: 0,
+            len: len.min(10),
+        });
+
+        click(&mut app, 1, 3); // second file row
+        match &app.view {
+            View::Commit { cursor, focus, .. } => {
+                assert_eq!(*cursor, 1, "cursor moved to the clicked file");
+                assert!(
+                    matches!(focus, CommitFocus::Files),
+                    "focus switched to the file list"
+                );
+            }
+            _ => panic!("expected commit view"),
+        }
     }
 
     #[test]
@@ -1881,6 +2188,43 @@ mod tests {
         select_diff_file(&mut app, "file.txt");
         match &app.view {
             View::Diff { content, .. } => assert!(content.contains("four"), "{content}"),
+            _ => panic!("expected diff view"),
+        }
+    }
+
+    #[test]
+    fn auto_refresh_keeps_scroll_on_the_same_file() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        // A tracked file with enough lines to scroll through.
+        let body: String = (0..40).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(root.join("file.txt"), &body).unwrap();
+        git(&root, &["add", "file.txt"]);
+        git(&root, &["commit", "-m", "add"]);
+        std::fs::write(root.join("file.txt"), format!("{body}changed\n")).unwrap();
+        app.refresh();
+        app.selected = 0;
+        press(&mut app, KeyCode::Enter);
+        select_diff_file(&mut app, "file.txt");
+
+        // Scroll down, then force the throttled auto-refresh to fire.
+        press_shift(&mut app, KeyCode::Down);
+        press_shift(&mut app, KeyCode::Down);
+        let before = match &app.view {
+            View::Diff { scroll, .. } => *scroll,
+            _ => panic!("expected diff view"),
+        };
+        assert_eq!(before, 6);
+        if let View::Diff { last_refresh, .. } = &mut app.view {
+            *last_refresh = Instant::now()
+                .checked_sub(DIFF_REFRESH_INTERVAL * 2)
+                .unwrap();
+        }
+        app.tick();
+        match &app.view {
+            View::Diff { scroll, .. } => {
+                assert_eq!(*scroll, before, "auto-refresh must not reset scroll")
+            }
             _ => panic!("expected diff view"),
         }
     }
@@ -2030,7 +2374,7 @@ mod tests {
         app.selected = 0;
         press(&mut app, KeyCode::Enter);
         select_diff_file(&mut app, "file.txt");
-        press(&mut app, KeyCode::PageDown); // scroll to 20
+        press_shift(&mut app, KeyCode::Down); // scroll the diff down
         std::fs::write(root.join("file.txt"), "a\nb\nc\n").unwrap();
         press(&mut app, KeyCode::Char('r'));
         // file.txt is clean again and drops out of the list; the reload resets

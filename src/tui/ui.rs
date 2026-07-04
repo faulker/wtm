@@ -13,7 +13,8 @@ use ratatui::widgets::{
 };
 
 use super::app::{
-    App, BranchMode, CommitFocus, DiffRow, IgnorePrompt, StashMode, View, filtered_branches,
+    App, BranchMode, CommitFocus, DiffRow, IgnorePrompt, RowList, StashMode, View,
+    filtered_branches,
 };
 use super::config_editor::{ConfigEditor, FIELD_ROWS, ROWS as CONFIG_ROWS};
 use super::setup::{REVIEW_ROWS, SetupWizard, Step, location_preview};
@@ -37,7 +38,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     .areas(frame.area());
 
     draw_header(frame, header, app);
-    match &app.view {
+    // The full-screen view's clickable list, if any.
+    let list_hit = match &app.view {
         View::Diff {
             name,
             files,
@@ -66,12 +68,22 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             name,
             entries,
             scroll,
-        } => draw_log(frame, main, name, entries, *scroll),
-        _ => draw_list(frame, main, app),
-    }
+        } => {
+            draw_log(frame, main, name, entries, *scroll);
+            None
+        }
+        _ => None,
+    };
+    let list_hit = if matches!(app.view, View::Diff { .. } | View::Log { .. }) {
+        list_hit
+    } else {
+        draw_list(frame, main, app)
+    };
     draw_footer(frame, footer, app);
 
-    // Overlays on top of the list.
+    // Overlays on top of the list. An overlay with its own selectable list
+    // reports it here so clicks land on the overlay, not the list beneath it.
+    let mut overlay_hit = None;
     match &app.view {
         View::Create {
             input,
@@ -109,7 +121,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             cursor,
             input,
             focus,
-        } => draw_commit(frame, main, name, files, marked, *cursor, input, focus),
+        } => overlay_hit = draw_commit(frame, main, name, files, marked, *cursor, input, focus),
         View::Stash {
             name,
             entries,
@@ -124,6 +136,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         View::Busy { label, .. } => draw_busy(frame, main, label),
         _ => {}
     }
+
+    // Clicks go to the topmost selectable list: an overlay's own list when one
+    // is up, otherwise the full-screen list for views that respond to clicks.
+    // Other overlays cover the list, so clicks are disabled while they're up.
+    app.row_list = match &app.view {
+        View::List | View::Diff { .. } => list_hit,
+        View::Commit { .. } => overlay_hit,
+        _ => None,
+    };
 }
 
 /// A rounded panel with an accent-colored title and inner padding.
@@ -187,7 +208,7 @@ fn hint_line(hints: &[(&str, &str)]) -> Line<'static> {
     Line::from(spans)
 }
 
-fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) {
+fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) -> Option<RowList> {
     let rows: Vec<Row> = app
         .worktrees
         .iter()
@@ -237,6 +258,8 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) {
         .max()
         .unwrap_or(10)
         .max(10) as u16;
+    let block = panel("worktrees");
+    let inner = block.inner(area);
     let table = Table::new(
         rows,
         [
@@ -248,11 +271,19 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) {
         ],
     )
     .header(Row::new(["NAME", "CHANGES", "UPSTREAM", "", "PATH"]).style(Style::new().dim().bold()))
-    .block(panel("worktrees"))
+    .block(block)
     .row_highlight_style(Style::new().bg(SELECTION_BG).bold())
     .highlight_symbol(Span::styled("▌ ", Style::new().fg(ACCENT)));
     let mut state = TableState::default().with_selected(Some(app.selected));
     frame.render_stateful_widget(table, area, &mut state);
+    // The table header occupies the first inner row, so data rows start one
+    // line below it.
+    Some(RowList {
+        inner,
+        header: 1,
+        offset: state.offset(),
+        len: app.worktrees.len(),
+    })
 }
 
 /// Path of the changed file under the cursor row, or "" on a folder row.
@@ -278,12 +309,12 @@ fn draw_diff(
     scroll: u16,
     confirm_revert: bool,
     ignore_prompt: Option<&IgnorePrompt>,
-) {
+) -> Option<RowList> {
     if files.is_empty() {
         let para = Paragraph::new(Line::from("no uncommitted changes".dim()))
             .block(panel(format!("changes · {name}")));
         frame.render_widget(para, area);
-        return;
+        return None;
     }
 
     let [list_area, diff_area] =
@@ -343,12 +374,20 @@ fn draw_diff(
             }
         })
         .collect();
+    let block = panel(format!("files · {name}"));
+    let inner = block.inner(list_area);
     let list = List::new(items)
-        .block(panel(format!("files · {name}")))
+        .block(block)
         .highlight_style(Style::new().bg(SELECTION_BG).bold())
         .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
     let mut state = ListState::default().with_selected(Some(selected));
     frame.render_stateful_widget(list, list_area, &mut state);
+    let list_hit = RowList {
+        inner,
+        header: 0,
+        offset: state.offset(),
+        len: rows.len(),
+    };
 
     // Right: the diff of the highlighted file, or a folder header when the
     // cursor rests on a folder row.
@@ -406,6 +445,13 @@ fn draw_diff(
 
     if let Some(prompt) = ignore_prompt {
         draw_ignore_prompt(frame, area, prompt);
+    }
+
+    // A confirm/ignore popup is modal, so suppress list clicks behind it.
+    if confirm_revert || ignore_prompt.is_some() {
+        None
+    } else {
+        Some(list_hit)
     }
 }
 
@@ -485,7 +531,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         } => &[("y", "discard changes"), ("Esc", "cancel")],
         View::Diff { .. } => &[
             ("↑/↓", "row"),
-            ("PgUp/PgDn", "scroll diff"),
+            ("⇧↑/⇧↓/⇧J/⇧K/wheel", "scroll diff"),
             ("Space", "mark file/folder"),
             ("⇧C", "commit"),
             ("s", "stash file"),
@@ -1091,7 +1137,7 @@ fn draw_commit(
     cursor: usize,
     input: &str,
     focus: &CommitFocus,
-) {
+) -> Option<RowList> {
     let list_rows = (files.len() as u16).clamp(1, 10);
     let popup = centered(area, 72, list_rows + 8);
     frame.render_widget(Clear, popup);
@@ -1134,6 +1180,13 @@ fn draw_commit(
     }
     let mut state = ListState::default().with_selected(Some(cursor));
     frame.render_stateful_widget(list, files_area, &mut state);
+    // Only the first 10 files are rendered, so clicks map onto that window.
+    let list_hit = RowList {
+        inner: files_area,
+        header: 0,
+        offset: 0,
+        len: files.len().min(10),
+    };
 
     // A label makes it obvious the prompt below is the commit message.
     let label_style = if files_focused {
@@ -1159,6 +1212,7 @@ fn draw_commit(
         )),
         hint_area,
     );
+    Some(list_hit)
 }
 
 /// Colors a porcelain status code: green when staged, red when only in the
