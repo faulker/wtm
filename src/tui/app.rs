@@ -123,12 +123,23 @@ pub enum View {
         entries: Vec<LogEntry>,
         scroll: u16,
     },
-    /// A git operation (pull/push/fetch) running on a background thread. Its
-    /// result message is shown and the list refreshed when it finishes.
+    /// A git operation (pull/push/fetch/delete/…) running on a background
+    /// thread. Its result message is shown and the list refreshed when it
+    /// finishes; `then` decides which view to reopen afterwards.
     Busy {
         label: String,
         rx: Receiver<Result<String, String>>,
+        then: BusyThen,
     },
+}
+
+/// Which view to reopen once a `View::Busy` operation completes. Most ops land
+/// back on the worktree list, but stash/branch ops return to their manager so
+/// the user can keep working there.
+pub enum BusyThen {
+    List,
+    Stash(String),
+    Branch,
 }
 
 /// Choice shown when adding the highlighted file or folder to `.gitignore`:
@@ -284,6 +295,8 @@ pub struct App {
     message_shown: Option<String>,
     /// Where new worktrees will be created, shown in the create dialog.
     pub worktree_base: Option<String>,
+    /// Advances once per event-loop tick; drives the busy-overlay spinner.
+    pub tick_count: u64,
     pub quit: bool,
 }
 
@@ -312,6 +325,7 @@ impl App {
             message_at: None,
             message_shown: None,
             worktree_base,
+            tick_count: 0,
             quit: false,
         };
         if initialized {
@@ -338,15 +352,29 @@ impl App {
     /// Background work driven by the event loop's poll timeout: auto-refreshes
     /// the diff view and drains progress from an in-flight create.
     pub fn tick(&mut self) {
+        // Advance the spinner clock every tick so the busy overlay keeps
+        // animating even while a background op holds the screen.
+        self.tick_count = self.tick_count.wrapping_add(1);
         self.expire_message();
         if let View::Busy { rx, .. } = &self.view {
             if let Ok(result) = rx.try_recv() {
-                self.message = Some(match result {
+                let message = match result {
                     Ok(m) => m,
                     Err(e) => format!("error: {e}"),
-                });
-                self.view = View::List;
+                };
+                // Pull the follow-up out of the view so we can mutate self, then
+                // reopen whichever view this op should return to.
+                let then = match std::mem::replace(&mut self.view, View::List) {
+                    View::Busy { then, .. } => then,
+                    _ => BusyThen::List,
+                };
+                self.message = Some(message);
                 self.refresh();
+                match then {
+                    BusyThen::List => {}
+                    BusyThen::Stash(name) => self.load_stash(name, StashMode::List),
+                    BusyThen::Branch => self.load_branches(BranchMode::List, 0),
+                }
             }
             return;
         }
@@ -838,8 +866,7 @@ impl App {
         // the row cursor, so the scroll cases are handled first.
         let shift_arrow_down =
             key.code == KeyCode::Down && key.modifiers.contains(KeyModifiers::SHIFT);
-        let shift_arrow_up =
-            key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::SHIFT);
+        let shift_arrow_up = key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::SHIFT);
         if shift_arrow_down || key.code == KeyCode::Char('J') {
             self.scroll_diff(|s| s.saturating_add(3));
             return;
@@ -881,7 +908,9 @@ impl App {
                         .filter(|(_, f)| f.path.starts_with(&prefix))
                         .map(|(i, _)| i)
                         .collect();
-                    let all_on = under.iter().all(|&i| marked.get(i).copied().unwrap_or(false));
+                    let all_on = under
+                        .iter()
+                        .all(|&i| marked.get(i).copied().unwrap_or(false));
                     for i in under {
                         if let Some(m) = marked.get_mut(i) {
                             *m = !all_on;
@@ -1261,20 +1290,23 @@ impl App {
             return;
         }
         let name = name.clone();
-        match ops::commit(&self.ctx, &name, &message, Some(&paths)) {
-            Ok(r) => {
-                self.message = Some(format!(
-                    "committed {} · {} ({} file{})",
-                    r.hash,
-                    r.summary,
-                    r.files_changed,
-                    if r.files_changed == 1 { "" } else { "s" }
-                ));
-                self.view = View::List;
-                self.refresh();
-            }
-            Err(e) => self.message = Some(format!("error: {e:#}")),
-        }
+        self.start_busy(
+            format!("committing '{name}'…"),
+            BusyThen::List,
+            move |ctx| {
+                ops::commit(ctx, &name, &message, Some(&paths))
+                    .map(|r| {
+                        format!(
+                            "committed {} · {} ({} file{})",
+                            r.hash,
+                            r.summary,
+                            r.files_changed,
+                            if r.files_changed == 1 { "" } else { "s" }
+                        )
+                    })
+                    .map_err(|e| format!("{e:#}"))
+            },
+        );
     }
 
     /// Opens the stash manager for the selected worktree.
@@ -1371,27 +1403,34 @@ impl App {
     /// Runs a pop/apply/drop on `name`, reports the result, and reloads the
     /// overlay (dirty counts and the stash list may both have changed).
     fn stash_action(&mut self, action: &str, name: String, index: Option<u32>) {
-        let result = match action {
-            "pop" => ops::stash_pop(&self.ctx, &name, index),
-            "apply" => ops::stash_apply(&self.ctx, &name, index),
-            _ => ops::stash_drop(&self.ctx, &name, index),
-        };
-        match result {
-            Ok(r) => self.message = Some(format!("stash {} on '{}'", r.action, r.name)),
-            Err(e) => self.message = Some(format!("error: {e:#}")),
-        }
-        self.refresh();
-        self.load_stash(name, StashMode::List);
+        let action = action.to_string();
+        self.start_busy(
+            format!("stash {action}…"),
+            BusyThen::Stash(name.clone()),
+            move |ctx| {
+                let result = match action.as_str() {
+                    "pop" => ops::stash_pop(ctx, &name, index),
+                    "apply" => ops::stash_apply(ctx, &name, index),
+                    _ => ops::stash_drop(ctx, &name, index),
+                };
+                result
+                    .map(|r| format!("stash {} on '{}'", r.action, r.name))
+                    .map_err(|e| format!("{e:#}"))
+            },
+        );
     }
 
     /// Stashes the worktree's current changes with an optional message.
     fn stash_push(&mut self, name: String, message: Option<String>) {
-        match ops::stash_push(&self.ctx, &name, message.as_deref()) {
-            Ok(_) => self.message = Some(format!("stashed changes in '{name}'")),
-            Err(e) => self.message = Some(format!("error: {e:#}")),
-        }
-        self.refresh();
-        self.load_stash(name, StashMode::List);
+        self.start_busy(
+            "stashing…".to_string(),
+            BusyThen::Stash(name.clone()),
+            move |ctx| {
+                ops::stash_push(ctx, &name, message.as_deref())
+                    .map(|_| format!("stashed changes in '{name}'"))
+                    .map_err(|e| format!("{e:#}"))
+            },
+        );
     }
 
     /// Opens the branch browser.
@@ -1490,15 +1529,20 @@ impl App {
 
     /// Creates a branch from HEAD and reloads the browser.
     fn branch_create(&mut self, name: String) {
-        match ops::branch_create(&self.ctx, &name, None) {
-            Ok(_) => self.message = Some(format!("created branch '{name}'")),
-            Err(e) => self.message = Some(format!("error: {e:#}")),
-        }
-        self.load_branches(BranchMode::List, 0);
+        self.start_busy(
+            format!("creating branch '{name}'…"),
+            BusyThen::Branch,
+            move |ctx| {
+                ops::branch_create(ctx, &name, None)
+                    .map(|_| format!("created branch '{name}'"))
+                    .map_err(|e| format!("{e:#}"))
+            },
+        );
     }
 
     /// Deletes a branch. A refused non-force delete keeps the confirm open so
-    /// the user can retry with `f` (force).
+    /// the user can retry with `f` (force). Runs synchronously (a fast local
+    /// op) so that retry flow stays intact.
     fn branch_delete(&mut self, name: String, force: bool) {
         match ops::branch_delete(&self.ctx, &name, force) {
             Ok(r) => {
@@ -1556,10 +1600,12 @@ impl App {
     }
 
     /// Runs `op` on a background thread and shows the Busy overlay until
-    /// tick() drains its result. Keeps long git ops off the UI thread.
+    /// tick() drains its result. Keeps long git ops off the UI thread. `then`
+    /// picks which view is reopened once the op finishes.
     fn start_busy(
         &mut self,
         label: String,
+        then: BusyThen,
         op: impl FnOnce(&Ctx) -> Result<String, String> + Send + 'static,
     ) {
         let (tx, rx) = channel();
@@ -1567,7 +1613,7 @@ impl App {
         std::thread::spawn(move || {
             let _ = tx.send(op(&ctx));
         });
-        self.view = View::Busy { label, rx };
+        self.view = View::Busy { label, rx, then };
     }
 
     /// Pulls the selected worktree (fast-forward only) in the background.
@@ -1576,7 +1622,7 @@ impl App {
             return;
         };
         let name = wt.name.clone();
-        self.start_busy(format!("pulling {name}…"), move |ctx| {
+        self.start_busy(format!("pulling {name}…"), BusyThen::List, move |ctx| {
             ops::pull(ctx, &name, false)
                 .map(|r| {
                     if r.already_up_to_date {
@@ -1595,7 +1641,7 @@ impl App {
             return;
         };
         let name = wt.name.clone();
-        self.start_busy(format!("pushing {name}…"), move |ctx| {
+        self.start_busy(format!("pushing {name}…"), BusyThen::List, move |ctx| {
             ops::push(ctx, &name, false)
                 .map(|r| {
                     if r.set_upstream {
@@ -1615,32 +1661,34 @@ impl App {
 
     /// Fetches all remotes (with prune) in the background.
     fn start_fetch(&mut self) {
-        self.start_busy("fetching all remotes…".to_string(), move |ctx| {
-            ops::fetch(ctx)
-                .map(|r| {
-                    if r.remotes.is_empty() {
-                        "no remotes to fetch".to_string()
-                    } else {
-                        format!("fetched: {}", r.remotes.join(", "))
-                    }
-                })
-                .map_err(|e| format!("{e:#}"))
-        });
+        self.start_busy(
+            "fetching all remotes…".to_string(),
+            BusyThen::List,
+            move |ctx| {
+                ops::fetch(ctx)
+                    .map(|r| {
+                        if r.remotes.is_empty() {
+                            "no remotes to fetch".to_string()
+                        } else {
+                            format!("fetched: {}", r.remotes.join(", "))
+                        }
+                    })
+                    .map_err(|e| format!("{e:#}"))
+            },
+        );
     }
 
     fn remove(&mut self, name: &str, force: bool, delete_branch: bool) {
-        match ops::remove(&self.ctx, name, force, delete_branch) {
-            Ok(info) => {
-                self.message = Some(match (&info.branch, delete_branch) {
+        let name = name.to_string();
+        self.start_busy(format!("removing '{name}'…"), BusyThen::List, move |ctx| {
+            ops::remove(ctx, &name, force, delete_branch)
+                .map(|info| match (&info.branch, delete_branch) {
                     (Some(b), true) => format!("removed '{}' and branch '{b}'", info.name),
                     (Some(_), false) => format!("removed '{}' (branch kept)", info.name),
                     (None, _) => format!("removed '{}'", info.name),
-                });
-            }
-            Err(e) => self.message = Some(format!("error: {e:#}")),
-        }
-        self.view = View::List;
-        self.refresh();
+                })
+                .map_err(|e| format!("{e:#}"))
+        });
     }
 }
 
@@ -1710,6 +1758,17 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode) {
         app.on_key(KeyEvent::from(code));
+    }
+
+    /// Drains an in-flight `View::Busy` op the way the event loop does, so tests
+    /// can assert on the settled state after a backgrounded action.
+    fn settle(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while matches!(app.view, View::Busy { .. }) {
+            app.tick();
+            assert!(std::time::Instant::now() < deadline, "busy op timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     fn press_shift(app: &mut App, code: KeyCode) {
@@ -2023,7 +2082,10 @@ mod tests {
                 assert_eq!(*selected, 1, "cursor moved to the clicked row");
                 let i = current_file_index(rows, *selected).unwrap();
                 assert_eq!(i, 1);
-                assert!(content.contains("22"), "clicked file's diff loaded: {content}");
+                assert!(
+                    content.contains("22"),
+                    "clicked file's diff loaded: {content}"
+                );
             }
             _ => panic!("expected diff view"),
         }
@@ -2557,6 +2619,7 @@ mod tests {
         assert!(matches!(app.view, View::Commit { .. }));
         type_str(&mut app, "add scratch");
         press(&mut app, KeyCode::Enter);
+        settle(&mut app);
         assert!(matches!(app.view, View::List), "message: {:?}", app.message);
         assert!(app.message.as_deref().unwrap().starts_with("committed"));
         app.refresh();
@@ -2606,6 +2669,7 @@ mod tests {
         press(&mut app, KeyCode::Char('s'));
         type_str(&mut app, "wip");
         press(&mut app, KeyCode::Enter);
+        settle(&mut app);
         match &app.view {
             View::Stash { entries, .. } => assert_eq!(entries.len(), 1),
             _ => panic!("expected stash overlay"),
@@ -2615,6 +2679,7 @@ mod tests {
 
         // Pop it back.
         press(&mut app, KeyCode::Char('p'));
+        settle(&mut app);
         match &app.view {
             View::Stash { entries, .. } => assert!(entries.is_empty()),
             _ => panic!("expected stash overlay"),
@@ -2636,6 +2701,7 @@ mod tests {
         press(&mut app, KeyCode::Char('s'));
         press(&mut app, KeyCode::Char('s'));
         press(&mut app, KeyCode::Enter); // stash, no message
+        settle(&mut app);
         press(&mut app, KeyCode::Char('x')); // arm drop
         assert!(matches!(
             app.view,
@@ -2645,6 +2711,7 @@ mod tests {
             }
         ));
         press(&mut app, KeyCode::Char('y'));
+        settle(&mut app);
         match &app.view {
             View::Stash { entries, .. } => assert!(entries.is_empty(), "drop removes the entry"),
             _ => panic!("expected stash overlay"),
@@ -2660,6 +2727,7 @@ mod tests {
         press(&mut app, KeyCode::Char('n'));
         type_str(&mut app, "feature");
         press(&mut app, KeyCode::Enter);
+        settle(&mut app);
         assert!(crate::git::branch_exists(&app.ctx.repo_root, "feature"));
         match &app.view {
             View::Branch { branches, .. } => {
@@ -2776,6 +2844,7 @@ mod tests {
             _ => panic!("expected delete dialog"),
         }
         press(&mut app, KeyCode::Enter);
+        settle(&mut app);
         assert!(matches!(app.view, View::List));
         assert!(!app.worktrees.iter().any(|w| w.name == "keepme"));
         assert!(
@@ -2795,8 +2864,26 @@ mod tests {
             _ => panic!("expected delete dialog"),
         }
         press(&mut app, KeyCode::Char('y'));
+        settle(&mut app);
         assert!(!app.worktrees.iter().any(|w| w.name == "dropme"));
         assert!(!crate::git::branch_exists(&app.ctx.repo_root, "dropme"));
+    }
+
+    #[test]
+    fn delete_runs_through_the_busy_overlay() {
+        let (_tmp, mut app) = test_app();
+        add_and_select_worktree(&mut app, "later");
+        press(&mut app, KeyCode::Char('d'));
+        // Confirming hands the removal to a background thread, so the overlay
+        // shows immediately rather than freezing the UI.
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(app.view, View::Busy { .. }),
+            "delete should be backgrounded"
+        );
+        settle(&mut app);
+        assert!(matches!(app.view, View::List));
+        assert!(!app.worktrees.iter().any(|w| w.name == "later"));
     }
 
     #[test]

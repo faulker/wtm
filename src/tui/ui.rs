@@ -133,7 +133,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             selected,
             mode,
         } => draw_branch(frame, main, branches, *selected, mode),
-        View::Busy { label, .. } => draw_busy(frame, main, label),
+        View::Busy { label, .. } => draw_busy(frame, main, label, app.tick_count),
         _ => {}
     }
 
@@ -364,7 +364,10 @@ fn draw_diff(
                     Span::styled("[ ] ", Style::new().dim())
                 };
                 let code = files.get(*index).map(|f| f.code.trim()).unwrap_or("");
-                let style = files.get(*index).map(|f| status_style(&f.code)).unwrap_or_default();
+                let style = files
+                    .get(*index)
+                    .map(|f| status_style(&f.code))
+                    .unwrap_or_default();
                 ListItem::new(Line::from(vec![
                     check,
                     Span::raw(indent),
@@ -415,7 +418,9 @@ fn draw_diff(
         }
     };
     let total = lines.len();
-    let para = Paragraph::new(lines).block(panel(title)).scroll((scroll, 0));
+    let para = Paragraph::new(lines)
+        .block(panel(title))
+        .scroll((scroll, 0));
     frame.render_widget(para, diff_area);
     let mut sb_state = ScrollbarState::new(total.saturating_sub(diff_area.height as usize))
         .position(scroll as usize);
@@ -1395,12 +1400,20 @@ fn draw_log(frame: &mut Frame, area: Rect, name: &str, entries: &[LogEntry], scr
 }
 
 /// A small centered overlay showing that a background op is running.
-fn draw_busy(frame: &mut Frame, area: Rect, label: &str) {
-    let popup = centered(area, (label.len() as u16 + 6).min(area.width), 3);
+fn draw_busy(frame: &mut Frame, area: Rect, label: &str, tick: u64) {
+    let text = format!("{} {label}", spinner_glyph(tick));
+    let popup = centered(area, (text.chars().count() as u16 + 6).min(area.width), 3);
     frame.render_widget(Clear, popup);
-    let para = Paragraph::new(Line::styled(label, Style::new().fg(ACCENT).bold()))
+    let para = Paragraph::new(Line::styled(text, Style::new().fg(ACCENT).bold()))
         .block(panel("please wait"));
     frame.render_widget(para, popup);
+}
+
+/// Braille throbber frame for the current tick; the event loop redraws often
+/// enough (~10fps) that cycling by `tick` reads as a smooth spinner.
+fn spinner_glyph(tick: u64) -> char {
+    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    FRAMES[(tick % FRAMES.len() as u64) as usize]
 }
 
 /// A generic single-line text input overlay with a dim hint underneath.
@@ -1431,5 +1444,21 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
         y: area.y + (area.height - height) / 2,
         width,
         height,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spinner_glyph;
+
+    #[test]
+    fn spinner_glyph_cycles_through_all_frames() {
+        // Every tick maps to a braille frame and the sequence wraps cleanly.
+        let first = (0..10).map(spinner_glyph).collect::<Vec<_>>();
+        assert_eq!(first.len(), 10);
+        assert_eq!(spinner_glyph(0), spinner_glyph(10), "wraps after 10 frames");
+        assert_eq!(spinner_glyph(3), spinner_glyph(13));
+        // Guard against an out-of-range index panic at the u64 boundary.
+        let _ = spinner_glyph(u64::MAX);
     }
 }
