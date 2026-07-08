@@ -339,6 +339,64 @@ fn resolve_remote_branch(
     Ok(None)
 }
 
+/// A directory already sitting where a new worktree for `branch` would go.
+pub struct ExistingTarget {
+    /// Absolute path of the conflicting directory.
+    pub path: PathBuf,
+    /// The name it is addressed by when it is already a registered worktree,
+    /// so the caller can offer to open it instead of replacing it.
+    pub worktree_name: Option<String>,
+}
+
+/// Absolute target path a worktree for `branch` would be created at (base dir
+/// plus the sanitized branch name). Mirrors the path logic in `create`.
+pub fn target_path(ctx: &Ctx, branch: &str) -> Result<PathBuf> {
+    let base = ctx.config.worktree_base(&ctx.repo_root)?;
+    let base = std::fs::canonicalize(&base).unwrap_or(base);
+    Ok(base.join(sanitize_dir_name(branch)))
+}
+
+/// Checks whether creating a worktree for `branch` would collide with an
+/// existing directory, and whether that directory is already a worktree.
+pub fn existing_target(ctx: &Ctx, branch: &str) -> Result<Option<ExistingTarget>> {
+    let path = target_path(ctx, branch)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+    let worktree_name = list(ctx)?.into_iter().find_map(|w| {
+        let same = std::fs::canonicalize(&w.path)
+            .map(|p| p == canon)
+            .unwrap_or(false);
+        same.then_some(w.name)
+    });
+    Ok(Some(ExistingTarget {
+        path,
+        worktree_name,
+    }))
+}
+
+/// Removes whatever occupies `path` so a fresh worktree can take its place:
+/// unregisters it from git when it is a registered worktree, deletes the
+/// directory, then prunes stale worktree admin entries.
+pub fn remove_target(ctx: &Ctx, path: &Path) -> Result<()> {
+    let canon = std::fs::canonicalize(path).ok();
+    let registered = git::list_worktrees(&ctx.repo_root)?.iter().any(|w| {
+        std::fs::canonicalize(&w.path).ok() == canon && canon.is_some()
+    });
+    if registered {
+        // Best effort: if git can't remove it (already detached, locked) we
+        // still fall back to deleting the directory below.
+        let _ = git::worktree_remove(&ctx.repo_root, path, true);
+    }
+    if path.exists() {
+        std::fs::remove_dir_all(path)
+            .with_context(|| format!("failed to remove {}", path.display()))?;
+    }
+    git::worktree_prune(&ctx.repo_root)?;
+    Ok(())
+}
+
 /// Removes the worktree named `name`. Refuses when dirty unless `force`;
 /// `delete_branch` also deletes its local branch afterwards.
 pub fn remove(ctx: &Ctx, name: &str, force: bool, delete_branch: bool) -> Result<WorktreeInfo> {

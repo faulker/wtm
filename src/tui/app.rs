@@ -1,5 +1,6 @@
 //! TUI application state and key handling.
 
+use std::path::Path;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,81 @@ use super::setup::{self, SetupWizard, WizardOutcome};
 use crate::git::{LogEntry, StashEntry, StatusEntry};
 use crate::ops::{self, BranchListItem, Ctx, SetupControl, WorktreeInfo};
 use crate::settings::ConfigDraft;
+
+/// A single-line text field with a movable insertion cursor. `cursor` is a
+/// character index in `0..=value.chars().count()`, so `←/→`, Home/End, and
+/// mid-string insert/delete all work instead of edit-at-the-end only.
+#[derive(Default, Clone)]
+pub struct TextInput {
+    pub value: String,
+    pub cursor: usize,
+}
+
+impl TextInput {
+    fn len(&self) -> usize {
+        self.value.chars().count()
+    }
+
+    /// Byte offset of character index `idx`, for slicing `value`.
+    fn byte_at(&self, idx: usize) -> usize {
+        self.value
+            .char_indices()
+            .nth(idx)
+            .map(|(b, _)| b)
+            .unwrap_or(self.value.len())
+    }
+
+    fn insert(&mut self, c: char) {
+        let b = self.byte_at(self.cursor);
+        self.value.insert(b, c);
+        self.cursor += 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor > 0 {
+            let start = self.byte_at(self.cursor - 1);
+            let end = self.byte_at(self.cursor);
+            self.value.replace_range(start..end, "");
+            self.cursor -= 1;
+        }
+    }
+
+    fn delete(&mut self) {
+        if self.cursor < self.len() {
+            let start = self.byte_at(self.cursor);
+            let end = self.byte_at(self.cursor + 1);
+            self.value.replace_range(start..end, "");
+        }
+    }
+
+    /// Applies an editing key, returning true when it was consumed as text
+    /// editing (so callers can treat other keys as their own actions).
+    pub fn on_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char(c) => self.insert(c),
+            KeyCode::Backspace => self.backspace(),
+            KeyCode::Delete => self.delete(),
+            KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
+            KeyCode::Right => {
+                if self.cursor < self.len() {
+                    self.cursor += 1;
+                }
+            }
+            KeyCode::Home => self.cursor = 0,
+            KeyCode::End => self.cursor = self.len(),
+            _ => return false,
+        }
+        true
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.value
+    }
+
+    pub fn trimmed(&self) -> String {
+        self.value.trim().to_string()
+    }
+}
 
 /// Message from the background create thread.
 pub enum CreateMsg {
@@ -55,14 +131,35 @@ pub enum View {
         /// highlighted file or folder (the exact path vs. a glob pattern).
         ignore_prompt: Option<IgnorePrompt>,
     },
-    /// New-worktree dialog: type a branch name, or pick an existing branch
-    /// from the filtered list below the input.
+    /// New-worktree dialog. Row 0 creates a new branch (named in `name`) off
+    /// `base`; the rows below check out an existing branch. This keeps the two
+    /// distinct actions clearly separated.
     Create {
-        input: String,
-        /// Local branches not already checked out, newest commit first.
+        /// Name of the new branch (and its worktree folder). Row 0 only.
+        name: TextInput,
+        /// Local branches not checked out anywhere: the checkout options.
         branches: Vec<String>,
-        /// 0 = create the branch typed in `input`; 1..=n = the n-th entry of
-        /// the currently filtered branch list.
+        /// Every local branch, for choosing a base to branch off of.
+        all_branches: Vec<String>,
+        /// Base ref a new branch is created from (defaults to the main branch).
+        base: String,
+        /// 0 = new branch; 1..=branches.len() = check out branches[selected-1].
+        selected: usize,
+        /// Some(idx) while picking the base branch: index into `all_branches`.
+        base_pick: Option<usize>,
+    },
+    /// The target directory for a create already exists; offer to open it (when
+    /// it is a worktree), replace it, or cancel.
+    ConfirmExisting {
+        /// Branch to create or check out once the conflict is resolved.
+        branch: String,
+        /// Base ref for a new branch, or None for an existing-branch checkout.
+        base: Option<String>,
+        /// The conflicting directory.
+        path: String,
+        /// Name the directory is addressed by when it is a registered worktree.
+        existing_name: Option<String>,
+        /// 0 = Open (worktrees only), 1 = Replace, 2 = Cancel.
         selected: usize,
     },
     /// Progress of an in-flight create running on a background thread.
@@ -87,7 +184,13 @@ pub enum View {
         /// Currently selected option: also delete the branch afterwards.
         delete_branch: bool,
     },
-    Help,
+    /// Prompt for a one-off command to run in a worktree's directory, shown by
+    /// the `e` key when no `open_command` is configured.
+    RunCommand {
+        name: String,
+        path: String,
+        input: TextInput,
+    },
     /// First-run setup wizard, shown until `.wtm.toml` exists.
     Setup(Box<SetupWizard>),
     /// Editor for the repo's `.wtm.toml` settings.
@@ -297,6 +400,9 @@ pub struct App {
     pub worktree_base: Option<String>,
     /// Advances once per event-loop tick; drives the busy-overlay spinner.
     pub tick_count: u64,
+    /// When true, the help overlay is drawn on top of the active view; the next
+    /// key press dismisses it and returns to that view.
+    pub show_help: bool,
     pub quit: bool,
 }
 
@@ -326,6 +432,7 @@ impl App {
             message_shown: None,
             worktree_base,
             tick_count: 0,
+            show_help: false,
             quit: false,
         };
         if initialized {
@@ -471,41 +578,32 @@ impl App {
             }
             return;
         }
+        // The help overlay swallows the next key press, returning to the view
+        // underneath it.
+        if self.show_help {
+            self.show_help = false;
+            return;
+        }
         match &mut self.view {
             View::List => self.on_list_key(key),
             View::Diff { .. } => self.on_diff_key(key),
-            View::Create {
-                input,
-                branches,
-                selected,
-            } => match key.code {
+            View::Create { .. } => self.on_create_key(key),
+            View::ConfirmExisting { .. } => self.on_confirm_existing_key(key),
+            View::RunCommand { input, .. } => match key.code {
                 KeyCode::Esc => self.view = View::List,
-                KeyCode::Down => {
-                    let max = filtered_branches(branches, input).len();
-                    if *selected < max {
-                        *selected += 1;
-                    }
-                }
-                KeyCode::Up => *selected = selected.saturating_sub(1),
                 KeyCode::Enter => {
-                    let branch = if *selected == 0 {
-                        input.trim().to_string()
-                    } else {
-                        filtered_branches(branches, input)[*selected - 1].clone()
-                    };
-                    if !branch.is_empty() {
-                        self.start_create(branch);
+                    if let View::RunCommand { name, path, input } =
+                        std::mem::replace(&mut self.view, View::List)
+                    {
+                        let cmd = input.trimmed();
+                        if !cmd.is_empty() {
+                            self.spawn_in_dir(&cmd, &path, &name);
+                        }
                     }
                 }
-                KeyCode::Backspace => {
-                    input.pop();
-                    *selected = 0;
+                _ => {
+                    input.on_key(key);
                 }
-                KeyCode::Char(c) => {
-                    input.push(c);
-                    *selected = 0;
-                }
-                _ => {}
             },
             View::Creating {
                 done,
@@ -563,7 +661,6 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => self.view = View::List,
                 _ => {}
             },
-            View::Help => self.view = View::List,
             View::Setup(wizard) => match wizard.on_key(key, &mut self.message) {
                 WizardOutcome::Quit => self.quit = true,
                 WizardOutcome::Done => {
@@ -645,11 +742,12 @@ impl App {
                 self.message = Some("refreshed".to_string());
             }
             KeyCode::Char('n') => self.open_create(),
-            KeyCode::Char('c') => match ConfigEditor::load(self.ctx.repo_root.clone()) {
+            KeyCode::Char('c') => self.open_commit(),
+            KeyCode::Char('o') => match ConfigEditor::load(self.ctx.repo_root.clone()) {
                 Ok(editor) => self.view = View::Config(Box::new(editor)),
                 Err(e) => self.message = Some(format!("error: {e:#}")),
             },
-            KeyCode::Char('C') => self.open_commit(),
+            KeyCode::Char('e') => self.run_open_command(),
             KeyCode::Char('s') => self.open_stash(),
             KeyCode::Char('p') => self.start_pull(),
             KeyCode::Char('P') => self.start_push(),
@@ -676,7 +774,7 @@ impl App {
                     self.open_diff(name);
                 }
             }
-            KeyCode::Char('?') => self.view = View::Help,
+            KeyCode::Char('?') => self.show_help = true,
             _ => {}
         }
     }
@@ -930,6 +1028,7 @@ impl App {
                     self.stash_file(e);
                 }
             }
+            KeyCode::Char('S') => self.stash_marked(),
             KeyCode::Char('R') => {
                 if current_file_index(rows, *selected).is_some() {
                     *confirm_revert = true;
@@ -956,7 +1055,8 @@ impl App {
                 }
                 None => {}
             },
-            KeyCode::Char('C') => self.commit_from_diff(),
+            KeyCode::Char('c') => self.commit_from_diff(),
+            KeyCode::Char('?') => self.show_help = true,
             _ => {}
         }
     }
@@ -1073,6 +1173,37 @@ impl App {
         self.refresh();
     }
 
+    /// Stashes every marked (`[x]`) file from the diff view, then reloads it.
+    /// Reports when nothing is marked rather than stashing the whole worktree.
+    fn stash_marked(&mut self) {
+        let View::Diff {
+            name,
+            files,
+            marked,
+            ..
+        } = &self.view
+        else {
+            return;
+        };
+        let name = name.clone();
+        let paths: Vec<String> = files
+            .iter()
+            .zip(marked.iter())
+            .filter(|(_, m)| **m)
+            .map(|(f, _)| f.path.clone())
+            .collect();
+        if paths.is_empty() {
+            self.message = Some("no files marked; press Space to mark files first".to_string());
+            return;
+        }
+        match ops::stash_push_paths(&self.ctx, &name, &paths, None) {
+            Ok(_) => self.message = Some(format!("stashed {} marked file(s)", paths.len())),
+            Err(e) => self.message = Some(format!("error: {e:#}")),
+        }
+        self.refresh_diff();
+        self.refresh();
+    }
+
     /// Reverts a single file from the diff view, then reloads it.
     fn revert_file(&mut self, entry: StatusEntry) {
         let View::Diff { name, .. } = &self.view else {
@@ -1114,34 +1245,206 @@ impl App {
         };
     }
 
-    /// Opens the new-worktree dialog, offering existing local branches that
-    /// aren't already checked out somewhere.
+    /// Opens the new-worktree dialog. Row 0 creates a new branch off a base
+    /// branch; the rows below check out an existing branch that isn't already
+    /// in a worktree. The base defaults to the repo's main branch.
     fn open_create(&mut self) {
         let checked_out: Vec<&str> = self
             .worktrees
             .iter()
             .filter_map(|w| w.branch.as_deref())
             .collect();
-        let branches = match crate::git::local_branches(&self.ctx.repo_root) {
-            Ok(all) => all
-                .into_iter()
-                .filter(|b| !checked_out.contains(&b.as_str()))
-                .collect(),
+        let all_branches = match crate::git::local_branches(&self.ctx.repo_root) {
+            Ok(all) => all,
             Err(e) => {
                 self.message = Some(format!("error: {e:#}"));
                 return;
             }
         };
+        let branches: Vec<String> = all_branches
+            .iter()
+            .filter(|b| !checked_out.contains(&b.as_str()))
+            .cloned()
+            .collect();
+        let base = self.default_base(&all_branches);
         self.view = View::Create {
-            input: String::new(),
+            name: TextInput::default(),
             branches,
+            all_branches,
+            base,
             selected: 0,
+            base_pick: None,
         };
     }
 
+    /// The base branch a new branch should default to: the main worktree's
+    /// branch when it is a known local branch, else the first local branch,
+    /// else `HEAD`.
+    fn default_base(&self, all_branches: &[String]) -> String {
+        self.worktrees
+            .iter()
+            .find(|w| w.is_main)
+            .and_then(|w| w.branch.clone())
+            .filter(|b| all_branches.iter().any(|x| x == b))
+            .or_else(|| all_branches.first().cloned())
+            .unwrap_or_else(|| "HEAD".to_string())
+    }
+
+    /// Drives the new-worktree dialog: edit the new-branch name, move over the
+    /// checkout list, or pick the base branch to branch off of.
+    fn on_create_key(&mut self, key: KeyEvent) {
+        let View::Create {
+            name,
+            branches,
+            all_branches,
+            base,
+            selected,
+            base_pick,
+        } = &mut self.view
+        else {
+            return;
+        };
+        // Base-branch picker: a small overlay list of every local branch.
+        if let Some(idx) = base_pick {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => *idx = idx.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if *idx + 1 < all_branches.len() {
+                        *idx += 1;
+                    }
+                }
+                KeyCode::Enter | KeyCode::Tab => {
+                    if let Some(b) = all_branches.get(*idx) {
+                        *base = b.clone();
+                    }
+                    *base_pick = None;
+                }
+                KeyCode::Esc => *base_pick = None,
+                _ => {}
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => self.view = View::List,
+            KeyCode::Down => {
+                if *selected < branches.len() {
+                    *selected += 1;
+                }
+            }
+            KeyCode::Up => *selected = selected.saturating_sub(1),
+            // Tab opens the base picker, but only for the new-branch row.
+            KeyCode::Tab if *selected == 0 && !all_branches.is_empty() => {
+                let start = all_branches.iter().position(|b| b == base).unwrap_or(0);
+                *base_pick = Some(start);
+            }
+            KeyCode::Enter => {
+                if *selected == 0 {
+                    let branch = name.trimmed();
+                    let base = base.clone();
+                    if branch.is_empty() {
+                        self.message = Some("type a name for the new branch".to_string());
+                        return;
+                    }
+                    self.request_create(branch, Some(base));
+                } else {
+                    let branch = branches[*selected - 1].clone();
+                    self.request_create(branch, None);
+                }
+            }
+            // Any other key edits the new-branch name (and implies row 0).
+            _ => {
+                if name.on_key(key) {
+                    *selected = 0;
+                }
+            }
+        }
+    }
+
+    /// Starts a create for `branch` (new branch when `base` is `Some`), first
+    /// checking whether the target directory already exists and, if so, asking
+    /// the user what to do about it.
+    fn request_create(&mut self, branch: String, base: Option<String>) {
+        match ops::existing_target(&self.ctx, &branch) {
+            Ok(Some(target)) => {
+                self.view = View::ConfirmExisting {
+                    branch,
+                    base,
+                    path: target.path.to_string_lossy().to_string(),
+                    existing_name: target.worktree_name,
+                    // Default to Open when it's a worktree, else Replace.
+                    selected: 0,
+                };
+            }
+            Ok(None) => self.start_create(branch, base),
+            Err(e) => self.message = Some(format!("error: {e:#}")),
+        }
+    }
+
+    /// Drives the "directory already exists" prompt: Open an existing worktree,
+    /// Replace the directory, or Cancel.
+    fn on_confirm_existing_key(&mut self, key: KeyEvent) {
+        let View::ConfirmExisting {
+            existing_name,
+            selected,
+            ..
+        } = &mut self.view
+        else {
+            return;
+        };
+        // Without a worktree to open, only Replace (1) and Cancel (2) apply.
+        let first = if existing_name.is_some() { 0 } else { 1 };
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                *selected = (*selected).saturating_sub(1).max(first);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if *selected < 2 {
+                    *selected += 1;
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q') => self.view = View::List,
+            KeyCode::Enter => {
+                if *selected < first {
+                    *selected = first;
+                }
+                self.apply_confirm_existing();
+            }
+            _ => {}
+        }
+    }
+
+    /// Carries out the choice made in the "directory already exists" prompt.
+    fn apply_confirm_existing(&mut self) {
+        let View::ConfirmExisting {
+            branch,
+            base,
+            path,
+            existing_name,
+            selected,
+        } = std::mem::replace(&mut self.view, View::List)
+        else {
+            return;
+        };
+        match selected {
+            // Open the existing worktree.
+            0 => match existing_name {
+                Some(name) => self.open_diff(name),
+                None => self.message = Some("that directory is not a worktree".to_string()),
+            },
+            // Replace: remove the directory, then create fresh.
+            1 => match ops::remove_target(&self.ctx, Path::new(&path)) {
+                Ok(()) => self.start_create(branch, base),
+                Err(e) => self.message = Some(format!("error: {e:#}")),
+            },
+            // Cancel.
+            _ => {}
+        }
+    }
+
     /// Kicks off `ops::create` on a background thread so setup commands
-    /// (npm install etc.) don't freeze the UI.
-    fn start_create(&mut self, branch: String) {
+    /// (npm install etc.) don't freeze the UI. `base` is the ref a new branch
+    /// is created from; `None` checks out an existing branch.
+    fn start_create(&mut self, branch: String, base: Option<String>) {
         let (tx, rx) = channel();
         let control = SetupControl::default();
         let ctx = self.ctx.clone();
@@ -1152,7 +1455,7 @@ impl App {
             let result = ops::create(
                 &ctx,
                 &thread_branch,
-                None,
+                base.as_deref(),
                 ops::RunMode::Controlled(thread_control),
                 move |line| {
                     let _ = progress_tx.send(CreateMsg::Progress(line.to_string()));
@@ -1169,6 +1472,44 @@ impl App {
             input: String::new(),
             kill_armed: false,
         };
+    }
+
+    /// Runs the configured `open_command` in the selected worktree's directory,
+    /// or opens a prompt for a one-off command when none is configured.
+    fn run_open_command(&mut self) {
+        let Some(wt) = self.selected_worktree() else {
+            return;
+        };
+        let path = wt.path.clone();
+        let name = wt.name.clone();
+        match self.ctx.config.open_command.clone() {
+            Some(cmd) if !cmd.trim().is_empty() => self.spawn_in_dir(cmd.trim(), &path, &name),
+            _ => {
+                self.view = View::RunCommand {
+                    name,
+                    path,
+                    input: TextInput::default(),
+                }
+            }
+        }
+    }
+
+    /// Spawns `cmd` through the shell, detached, in `dir`. Stdio is detached so
+    /// GUI tools like `cursor .` open without disturbing the TUI. Intended for
+    /// background/GUI commands, not terminal programs that need this terminal.
+    fn spawn_in_dir(&mut self, cmd: &str, dir: &str, name: &str) {
+        let result = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .current_dir(dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match result {
+            Ok(_) => self.message = Some(format!("ran '{cmd}' in '{name}'")),
+            Err(e) => self.message = Some(format!("error: {e:#}")),
+        }
     }
 
     /// Opens the commit flow for the selected worktree, or reports it clean.
@@ -1561,8 +1902,14 @@ impl App {
     /// branch browser targets a branch that isn't checked out anywhere.
     fn open_create_prefilled(&mut self, branch: String) {
         self.open_create();
-        if let View::Create { input, .. } = &mut self.view {
-            *input = branch;
+        // The branch browser picks an existing branch to check out, so select
+        // it in the checkout list rather than the new-branch row.
+        if let View::Create {
+            branches, selected, ..
+        } = &mut self.view
+            && let Some(pos) = branches.iter().position(|b| *b == branch)
+        {
+            *selected = pos + 1;
         }
     }
 
@@ -1595,6 +1942,7 @@ impl App {
             KeyCode::PageDown => *scroll = scroll.saturating_add(20),
             KeyCode::PageUp => *scroll = scroll.saturating_sub(20),
             KeyCode::Home | KeyCode::Char('g') => *scroll = 0,
+            KeyCode::Char('?') => self.show_help = true,
             _ => {}
         }
     }
@@ -1690,16 +2038,6 @@ impl App {
                 .map_err(|e| format!("{e:#}"))
         });
     }
-}
-
-/// Branches matching the typed filter (case-insensitive substring),
-/// preserving their recency order.
-pub fn filtered_branches<'a>(branches: &'a [String], filter: &str) -> Vec<&'a String> {
-    let needle = filter.to_lowercase();
-    branches
-        .iter()
-        .filter(|b| b.to_lowercase().contains(&needle))
-        .collect()
 }
 
 #[cfg(test)]
@@ -1854,22 +2192,28 @@ mod tests {
     fn q_quits_and_question_mark_opens_help() {
         let (_tmp, mut app) = test_app();
         press(&mut app, KeyCode::Char('?'));
-        assert!(matches!(app.view, View::Help));
+        assert!(app.show_help);
+        // Any key closes the overlay, returning to the underlying view.
         press(&mut app, KeyCode::Char('x'));
+        assert!(!app.show_help);
         assert!(matches!(app.view, View::List));
         press(&mut app, KeyCode::Char('q'));
         assert!(app.quit);
     }
 
     #[test]
-    fn create_dialog_collects_input_and_cancels() {
+    fn create_dialog_name_input_moves_cursor() {
         let (_tmp, mut app) = test_app();
         press(&mut app, KeyCode::Char('n'));
-        press(&mut app, KeyCode::Char('a'));
-        press(&mut app, KeyCode::Char('b'));
-        press(&mut app, KeyCode::Backspace);
+        type_str(&mut app, "abc");
+        // Move the cursor left and insert in the middle.
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Char('X'));
         match &app.view {
-            View::Create { input, .. } => assert_eq!(input, "a"),
+            View::Create { name, .. } => {
+                assert_eq!(name.as_str(), "abXc");
+                assert_eq!(name.cursor, 3);
+            }
             _ => panic!("expected create dialog"),
         }
         press(&mut app, KeyCode::Esc);
@@ -1901,25 +2245,37 @@ mod tests {
             }
             _ => panic!("expected create dialog"),
         }
-        // Typing filters the list; ↓ selects the surviving branch.
-        type_str(&mut app, "spa");
+        // ↓ into the checkout list, then pick the highlighted existing branch.
         press(&mut app, KeyCode::Down);
+        let expected = match &app.view {
+            View::Create {
+                branches, selected, ..
+            } => branches[*selected - 1].clone(),
+            _ => panic!("expected create dialog"),
+        };
         press(&mut app, KeyCode::Enter);
         match &app.view {
-            View::Creating { branch, .. } => assert_eq!(branch, "spare"),
+            View::Creating { branch, .. } => assert_eq!(*branch, expected),
             _ => panic!("expected creating view"),
         }
         wait_creating(&mut app, |_, done| done);
         press(&mut app, KeyCode::Enter);
-        assert!(app.worktrees.iter().any(|w| w.name == "spare"));
+        assert!(app.worktrees.iter().any(|w| w.name == expected));
     }
 
     #[test]
-    fn filtered_branches_matches_case_insensitively() {
-        let branches = vec!["Feature/Login".to_string(), "bugfix".to_string()];
-        assert_eq!(filtered_branches(&branches, "log").len(), 1);
-        assert_eq!(filtered_branches(&branches, "").len(), 2);
-        assert!(filtered_branches(&branches, "zzz").is_empty());
+    fn create_dialog_new_branch_uses_typed_name() {
+        let (_tmp, mut app) = test_app();
+        press(&mut app, KeyCode::Char('n'));
+        type_str(&mut app, "feature");
+        press(&mut app, KeyCode::Enter);
+        match &app.view {
+            View::Creating { branch, .. } => assert_eq!(branch, "feature"),
+            _ => panic!("expected creating view"),
+        }
+        wait_creating(&mut app, |_, done| done);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.worktrees.iter().any(|w| w.name == "feature"));
     }
 
     #[test]
@@ -2011,6 +2367,96 @@ mod tests {
             std::fs::read_to_string(root.join("f.txt")).unwrap(),
             "one\n"
         );
+    }
+
+    #[test]
+    fn diff_view_shift_s_stashes_marked_files() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        // Two committed files, then edit both so they show as changes.
+        for (name, body) in [("a.txt", "a1\n"), ("b.txt", "b1\n")] {
+            std::fs::write(root.join(name), body).unwrap();
+            git(&root, &["add", name]);
+        }
+        git(&root, &["commit", "-m", "add ab"]);
+        std::fs::write(root.join("a.txt"), "a2\n").unwrap();
+        std::fs::write(root.join("b.txt"), "b2\n").unwrap();
+        app.refresh();
+        app.selected = 0;
+
+        press(&mut app, KeyCode::Enter);
+        // Unmark b.txt so only a.txt stays marked.
+        select_diff_file(&mut app, "b.txt");
+        press(&mut app, KeyCode::Char(' '));
+        // Shift+S stashes just the marked file (a.txt).
+        press(&mut app, KeyCode::Char('S'));
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "a1\n",
+            "a.txt was marked, so it was stashed back to committed content"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.txt")).unwrap(),
+            "b2\n",
+            "b.txt was unmarked, so its change is untouched"
+        );
+    }
+
+    #[test]
+    fn diff_view_shift_s_reports_when_nothing_marked() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("c.txt"), "c\n").unwrap();
+        git(&root, &["add", "c.txt"]);
+        git(&root, &["commit", "-m", "add c"]);
+        std::fs::write(root.join("c.txt"), "cc\n").unwrap();
+        app.refresh();
+        app.selected = 0;
+
+        press(&mut app, KeyCode::Enter);
+        // Unmark all, then Shift+S should refuse rather than stash everything.
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('S'));
+        assert!(
+            app.message.as_deref().unwrap().contains("no files marked"),
+            "message: {:?}",
+            app.message
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("c.txt")).unwrap(),
+            "cc\n",
+            "nothing marked, so nothing was stashed"
+        );
+    }
+
+    #[test]
+    fn create_into_existing_worktree_dir_offers_open() {
+        let (_tmp, mut app) = test_app();
+        // A worktree named "spare" now occupies its target directory.
+        add_and_select_worktree(&mut app, "spare");
+        app.selected = 0;
+
+        // Typing "spare" as a new branch collides with that directory.
+        press(&mut app, KeyCode::Char('n'));
+        type_str(&mut app, "spare");
+        press(&mut app, KeyCode::Enter);
+        match &app.view {
+            View::ConfirmExisting {
+                existing_name,
+                selected,
+                ..
+            } => {
+                assert_eq!(existing_name.as_deref(), Some("spare"));
+                assert_eq!(*selected, 0, "defaults to Open for a real worktree");
+            }
+            _ => panic!("expected the existing-directory prompt"),
+        }
+        // Enter opens the existing worktree's diff.
+        press(&mut app, KeyCode::Enter);
+        match &app.view {
+            View::Diff { name, .. } => assert_eq!(name, "spare"),
+            _ => panic!("expected the diff view for the existing worktree"),
+        }
     }
 
     #[test]
@@ -2106,7 +2552,7 @@ mod tests {
         std::fs::write(root.join("b.txt"), "b\n").unwrap();
         app.refresh();
         app.selected = 0;
-        press(&mut app, KeyCode::Char('C')); // opens the commit view
+        press(&mut app, KeyCode::Char('c')); // opens the commit view
         assert!(matches!(app.view, View::Commit { .. }));
 
         let len = match &app.view {
@@ -2615,7 +3061,7 @@ mod tests {
         let (_tmp, mut app) = test_app();
         dirty_main(&mut app);
         assert!(app.worktrees[0].dirty > 0);
-        press(&mut app, KeyCode::Char('C'));
+        press(&mut app, KeyCode::Char('c'));
         assert!(matches!(app.view, View::Commit { .. }));
         type_str(&mut app, "add scratch");
         press(&mut app, KeyCode::Enter);
@@ -2633,7 +3079,7 @@ mod tests {
         let (_tmp, mut app) = test_app();
         add_and_select_worktree(&mut app, "clean");
         assert_eq!(app.worktrees[app.selected].dirty, 0);
-        press(&mut app, KeyCode::Char('C'));
+        press(&mut app, KeyCode::Char('c'));
         assert!(matches!(app.view, View::List));
         assert!(app.message.as_deref().unwrap().contains("clean"));
     }
@@ -2642,7 +3088,7 @@ mod tests {
     fn commit_empty_message_is_rejected() {
         let (_tmp, mut app) = test_app();
         dirty_main(&mut app);
-        press(&mut app, KeyCode::Char('C'));
+        press(&mut app, KeyCode::Char('c'));
         press(&mut app, KeyCode::Enter); // empty message
         assert!(matches!(app.view, View::Commit { .. }), "stays open");
         assert!(
@@ -2765,8 +3211,15 @@ mod tests {
             *selected = idx;
         }
         press(&mut app, KeyCode::Enter);
+        // The branch browser checks out an existing branch, so the create
+        // dialog opens with that branch selected in the checkout list.
         match &app.view {
-            View::Create { input, .. } => assert_eq!(input, "spare"),
+            View::Create {
+                branches, selected, ..
+            } => {
+                assert!(*selected >= 1);
+                assert_eq!(branches[*selected - 1], "spare");
+            }
             _ => panic!("expected the create dialog prefilled with the branch"),
         }
     }
@@ -2889,19 +3342,20 @@ mod tests {
     #[test]
     fn config_editor_edits_and_saves_settings() {
         let (_tmp, mut app) = test_app();
-        press(&mut app, KeyCode::Char('c'));
+        press(&mut app, KeyCode::Char('o'));
         assert!(matches!(app.view, View::Config(_)));
 
         // Edit worktree_dir (row 0): clear, type "inside".
         press(&mut app, KeyCode::Enter);
         type_str(&mut app, "inside");
         press(&mut app, KeyCode::Enter);
-        // Move to setup.copy (row 1) and set it.
+        // Move past open_command (row 1) to setup.copy (row 2) and set it.
+        press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Enter);
         type_str(&mut app, ".env, config/.env.local");
         press(&mut app, KeyCode::Enter);
-        // Down to setup.run (2) then to save row (3) and save.
+        // Down to setup.run (3) then to save row (4) and save.
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Enter);
@@ -2925,7 +3379,7 @@ mod tests {
         )
         .unwrap();
 
-        press(&mut app, KeyCode::Char('c'));
+        press(&mut app, KeyCode::Char('o'));
         // Row 0 (worktree_dir) should load the existing "home".
         match &app.view {
             View::Config(editor) => assert_eq!(editor.worktree_dir, "home"),
@@ -2937,8 +3391,8 @@ mod tests {
             press(&mut app, KeyCode::Backspace);
         }
         press(&mut app, KeyCode::Enter);
-        // Save.
-        for _ in 0..3 {
+        // Save (down past open_command, setup.copy, setup.run to the save row).
+        for _ in 0..4 {
             press(&mut app, KeyCode::Down);
         }
         press(&mut app, KeyCode::Enter);
@@ -2953,7 +3407,7 @@ mod tests {
     fn config_editor_cancel_leaves_file_untouched() {
         let (_tmp, mut app) = test_app();
         let before = std::fs::read_to_string(app.ctx.repo_root.join(".wtm.toml")).unwrap();
-        press(&mut app, KeyCode::Char('c'));
+        press(&mut app, KeyCode::Char('o'));
         press(&mut app, KeyCode::Enter);
         type_str(&mut app, "home");
         press(&mut app, KeyCode::Enter);
@@ -3055,8 +3509,25 @@ mod tests {
             press(&mut app, KeyCode::Esc);
             press(&mut app, KeyCode::Char('n'));
             type_str(&mut app, "rend");
-            draw(&mut app); // create dialog with a filtered branch list
+            draw(&mut app); // create dialog: new-branch row plus checkout list
+            press(&mut app, KeyCode::Tab);
+            draw(&mut app); // base-branch picker floating over the dialog
+            press(&mut app, KeyCode::Esc); // close picker
+            press(&mut app, KeyCode::Esc); // close create dialog
+
+            // Run-command prompt (no open_command configured).
+            press(&mut app, KeyCode::Char('e'));
+            type_str(&mut app, "echo hi");
+            draw(&mut app); // run-command prompt
             press(&mut app, KeyCode::Esc);
+
+            // Existing-directory prompt: creating a name that already exists.
+            press(&mut app, KeyCode::Char('n'));
+            type_str(&mut app, "rendered");
+            press(&mut app, KeyCode::Enter);
+            draw(&mut app); // directory-exists prompt (open/replace/cancel)
+            press(&mut app, KeyCode::Esc);
+
             press(&mut app, KeyCode::Char('d'));
             draw(&mut app); // delete dialog
             press(&mut app, KeyCode::Down);
@@ -3064,7 +3535,7 @@ mod tests {
             press(&mut app, KeyCode::Esc);
 
             // Config editor: navigating and mid-edit.
-            press(&mut app, KeyCode::Char('c'));
+            press(&mut app, KeyCode::Char('o'));
             draw(&mut app);
             press(&mut app, KeyCode::Enter); // edit worktree_dir
             type_str(&mut app, "inside");
@@ -3092,7 +3563,7 @@ mod tests {
             std::fs::write(app.ctx.repo_root.join("scratch.txt"), "work\n").unwrap();
             app.refresh();
             app.selected = 0;
-            press(&mut app, KeyCode::Char('C'));
+            press(&mut app, KeyCode::Char('c'));
             type_str(&mut app, "wip");
             draw(&mut app); // commit dialog
             press(&mut app, KeyCode::Esc);

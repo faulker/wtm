@@ -35,6 +35,7 @@ To view or change settings later, no TOML editing required:
 wtm config                       # show every setting, its value, and where it came from
 wtm config get worktree_dir
 wtm config set worktree_dir inside
+wtm config set open_command "cursor ."
 wtm config set setup.copy ".env, .env.local"
 wtm config unset setup.copy      # back to the default (or the global value)
 wtm config path                  # where the config files live
@@ -67,6 +68,8 @@ Settings resolve per field: repo, then global, then built-in default.
 ```toml
 # "sibling", "inside", "home", or a path ({repo} = repo folder name)
 worktree_dir = "sibling"
+# Command the TUI's `e` key runs in a worktree's directory (e.g. open an editor).
+open_command = "cursor ."
 
 [setup]
 # Files copied from the main worktree into the new one (if they exist).
@@ -145,22 +148,25 @@ Run `wtm` inside a repo. If the repo isn't initialized yet, the setup wizard ope
 | Key | Action |
 | --- | --- |
 | `↑`/`↓` or `j`/`k` | select worktree |
-| `Enter` | browse changes in a folder tree: the left panel groups changed files under their folders (a folder shows `[x]`/`[ ]`/`[~]` for all/none/some of its files marked); pick a file to see its diff on the right. `Space` marks/unmarks the file, or the whole folder when the cursor is on a folder row; `s` stashes just that file, `⇧R` reverts it, `⇧C` commits the marked files, `i` adds the file or folder to `.gitignore` (choose the exact path or a glob that ignores everything like it). Updates live as files change; `r` refreshes now |
-| `n` | new **worktree**: type a name to create a new branch *and* a worktree for it, or pick an existing branch to check out in a worktree (typing filters the list). To make a branch *without* a worktree, use the branch browser (`b`) instead |
+| `Enter` | browse changes in a folder tree: the left panel groups changed files under their folders (a folder shows `[x]`/`[ ]`/`[~]` for all/none/some of its files marked); pick a file to see its diff on the right. `Space` marks/unmarks the file, or the whole folder when the cursor is on a folder row; `s` stashes just the highlighted file, `⇧S` stashes every marked (`[x]`) file, `⇧R` reverts the highlighted file, `c` commits the marked files, `i` adds the file or folder to `.gitignore` (choose the exact path or a glob that ignores everything like it), `?` shows help. New files inside brand-new folders are listed too, so you can view their contents. Updates live as files change; `r` refreshes now |
+| `n` | new **worktree**. The top row creates a **new branch** (named as you type) branched off a base branch — press `Tab` to choose the base (defaults to the main branch). The rows below **check out an existing branch** in a worktree. To make a branch *without* a worktree, use the branch browser (`b`) instead. If the target folder already exists you're asked to open it (when it's already a worktree), replace it, or cancel |
 | `d` | delete the selected worktree: choose folder-only (keeps the branch) or folder + branch; `f` to force when dirty |
-| `⇧C` | commit the selected worktree: tick which changed files to include (all selected by default; `Tab` switches between the file list and the message, `Space` toggles a file), type a message, `Enter` commits |
+| `c` | commit the selected worktree: tick which changed files to include (all selected by default; `Tab` switches between the file list and the message, `Space` toggles a file), type a message, `Enter` commits |
+| `o` | options: edit this repo's settings (`worktree_dir`, `open_command`, `setup.copy`, `setup.run`) without touching the file |
+| `e` | run the `open_command` in the selected worktree's directory (e.g. `cursor .`); prompts for a command when `open_command` isn't set |
 | `s` | stash manager: `s` stash current changes, `p` pop, `a` apply, `x` drop the selected entry |
 | `p` | pull the selected worktree (fast-forward only) |
 | `⇧P` | push the selected worktree; publishes with `-u` when there's no upstream |
 | `f` | fetch all remotes and refresh |
 | `b` | branch browser: every local branch with where it's checked out. `n` creates a **branch only** (no worktree, from HEAD), `x` deletes, `Enter` checks the selected branch out in a new worktree |
 | `l` | log of recent commits for the selected worktree |
-| `c` | edit this repo's settings (`worktree_dir`, `setup.copy`, `setup.run`) without touching the file |
 | `r` | refresh |
-| `?` | help |
+| `?` | help (works here and in the changes view; any key closes it) |
 | `q` / `Ctrl+C` | quit |
 
-Pressing `c` opens an editor for the repo's `.wtm.toml`: pick a row with `↑`/`↓`, press `Enter` to edit it, and select the save row to write. It shows a live preview of where worktrees will land, preserves any comments in the file, and clearing a field unsets it so the default (or global value) applies again.
+Text fields (like the new-branch name) support cursor editing: `←`/`→` move, `Home`/`End` jump, and `Backspace`/`Delete` remove characters mid-string.
+
+Pressing `o` opens an editor for the repo's `.wtm.toml`: pick a row with `↑`/`↓`, press `Enter` to edit it, and select the save row to write. It shows a live preview of where worktrees will land, preserves any comments in the file, and clearing a field unsets it so the default (or global value) applies again.
 
 While setup runs, its output streams into the progress window. Type a line and press `Enter` to answer a prompting command; press `Ctrl+C` twice to kill a stuck setup.
 

@@ -147,6 +147,34 @@ fn create_list_status_diff_remove_roundtrip() {
 }
 
 #[test]
+fn status_lists_files_inside_new_untracked_folders() {
+    let (_tmp, repo) = setup_repo();
+    let created = stdout_json(&wtm(&repo, &["create", "feature-x", "--json"]));
+    let wt_path = PathBuf::from(created["path"].as_str().unwrap());
+
+    // A brand-new folder with files: `git status` collapses this to `newdir/`
+    // by default, hiding the files. With --untracked-files=all each file is
+    // listed individually so the diff view can show them.
+    std::fs::create_dir_all(wt_path.join("newdir/sub")).unwrap();
+    std::fs::write(wt_path.join("newdir/a.txt"), "a\n").unwrap();
+    std::fs::write(wt_path.join("newdir/sub/b.txt"), "b\n").unwrap();
+
+    let status = stdout_json(&wtm(&repo, &["status", "feature-x", "--json"]));
+    let paths: Vec<&str> = status["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["path"].as_str().unwrap())
+        .collect();
+    assert!(paths.contains(&"newdir/a.txt"), "got {paths:?}");
+    assert!(paths.contains(&"newdir/sub/b.txt"), "got {paths:?}");
+    assert!(
+        !paths.iter().any(|p| p.ends_with('/')),
+        "no collapsed folder entries: {paths:?}"
+    );
+}
+
+#[test]
 fn create_checks_out_existing_branch_and_rejects_duplicates() {
     let (_tmp, repo) = setup_repo();
     git(&repo, &["branch", "existing"]);

@@ -52,6 +52,9 @@ impl fmt::Display for Source {
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
     pub worktree_dir: Option<String>,
+    /// Command run in a worktree's directory by the TUI's "open" key (e.g.
+    /// `cursor .` to open an editor there).
+    pub open_command: Option<String>,
     pub setup: Option<FileSetup>,
 }
 
@@ -84,6 +87,9 @@ pub struct Config {
     /// Raw `worktree_dir` setting; `None` means the `sibling` preset.
     pub worktree_dir: Option<String>,
     pub worktree_dir_source: Source,
+    /// Command the TUI runs in a worktree's directory on the "open" key.
+    pub open_command: Option<String>,
+    pub open_command_source: Source,
     pub setup: Setup,
     pub copy_source: Source,
     pub run_source: Source,
@@ -103,6 +109,8 @@ impl Default for Config {
         Config {
             worktree_dir: None,
             worktree_dir_source: Source::Default,
+            open_command: None,
+            open_command_source: Source::Default,
             setup: Setup::default(),
             copy_source: Source::Default,
             run_source: Source::Default,
@@ -131,6 +139,7 @@ impl Config {
             }
         }
         let (worktree_dir, worktree_dir_source) = pick(global.worktree_dir, repo.worktree_dir);
+        let (open_command, open_command_source) = pick(global.open_command, repo.open_command);
         let global_setup = global.setup.unwrap_or_default();
         let repo_setup = repo.setup.unwrap_or_default();
         let (copy, copy_source) = pick(global_setup.copy, repo_setup.copy);
@@ -138,6 +147,8 @@ impl Config {
         Config {
             worktree_dir,
             worktree_dir_source,
+            open_command,
+            open_command_source,
             setup: Setup {
                 copy: copy.unwrap_or_default(),
                 run: run.unwrap_or_default(),

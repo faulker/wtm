@@ -12,10 +12,7 @@ use ratatui::widgets::{
     ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
 };
 
-use super::app::{
-    App, BranchMode, CommitFocus, DiffRow, IgnorePrompt, RowList, StashMode, View,
-    filtered_branches,
-};
+use super::app::{App, BranchMode, CommitFocus, DiffRow, IgnorePrompt, RowList, StashMode, View};
 use super::config_editor::{ConfigEditor, FIELD_ROWS, ROWS as CONFIG_ROWS};
 use super::setup::{REVIEW_ROWS, SetupWizard, Step, location_preview};
 use crate::config::{DEFAULT_LOCATION, LOCATION_PRESETS};
@@ -86,17 +83,29 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let mut overlay_hit = None;
     match &app.view {
         View::Create {
-            input,
+            name,
             branches,
+            all_branches,
+            base,
             selected,
+            base_pick,
         } => draw_create_dialog(
             frame,
             main,
-            input,
+            name,
             branches,
+            all_branches,
+            base,
             *selected,
+            *base_pick,
             app.worktree_base.as_deref(),
         ),
+        View::ConfirmExisting {
+            path,
+            existing_name,
+            selected,
+            ..
+        } => draw_confirm_existing(frame, main, path, existing_name.as_deref(), *selected),
         View::Creating {
             branch,
             lines,
@@ -111,7 +120,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             branch,
             delete_branch,
         } => draw_confirm_delete(frame, main, name, *dirty, branch.as_deref(), *delete_branch),
-        View::Help => draw_help(frame, main),
         View::Setup(wizard) => draw_setup(frame, main, wizard),
         View::Config(editor) => draw_config(frame, main, editor),
         View::Commit {
@@ -134,7 +142,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             mode,
         } => draw_branch(frame, main, branches, *selected, mode),
         View::Busy { label, .. } => draw_busy(frame, main, label, app.tick_count),
+        View::RunCommand { name, input, .. } => draw_run_command(frame, main, name, input),
         _ => {}
+    }
+
+    // The help overlay sits on top of whatever view is active, so `?` works
+    // everywhere and returns to where it was opened.
+    if app.show_help {
+        draw_help(frame, main);
     }
 
     // Clicks go to the topmost selectable list: an overlay's own list when one
@@ -514,12 +529,17 @@ fn diff_line(line: &str) -> Line<'_> {
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     // The status message lives in the header now, so the key hints below stay
     // visible at all times.
+    if app.show_help {
+        frame.render_widget(Paragraph::new(hint_line(&[("any key", "close help")])), area);
+        return;
+    }
     let hints: &[(&str, &str)] = match &app.view {
         View::List => &[
-            ("↑/↓", "select"),
             ("Enter", "changes"),
             ("n", "new"),
-            ("⇧C", "commit"),
+            ("c", "commit"),
+            ("o", "options"),
+            ("e", "open"),
             ("s", "stash"),
             ("p", "pull"),
             ("⇧P", "push"),
@@ -535,13 +555,13 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ..
         } => &[("y", "discard changes"), ("Esc", "cancel")],
         View::Diff { .. } => &[
-            ("↑/↓", "row"),
-            ("⇧↑/⇧↓/⇧J/⇧K/wheel", "scroll diff"),
-            ("Space", "mark file/folder"),
-            ("⇧C", "commit"),
+            ("Space", "mark"),
+            ("c", "commit"),
             ("s", "stash file"),
-            ("⇧R", "revert file"),
-            ("i", "ignore file/folder"),
+            ("⇧S", "stash marked"),
+            ("⇧R", "revert"),
+            ("i", "ignore"),
+            ("?", "help"),
             ("q", "back"),
         ],
         View::Log { .. } => &[
@@ -598,10 +618,30 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             BranchMode::ConfirmDelete => &[("y", "delete"), ("f", "force"), ("Esc", "cancel")],
         },
         View::Busy { .. } => &[("", "working…")],
+        View::Create {
+            base_pick: Some(_),
+            ..
+        } => &[("↑/↓", "pick base branch"), ("Enter", "use"), ("Esc", "back")],
+        View::Create { selected: 0, .. } => &[
+            ("type", "new branch name"),
+            ("Tab", "base branch"),
+            ("↓", "check out existing"),
+            ("Enter", "create"),
+            ("Esc", "cancel"),
+        ],
         View::Create { .. } => &[
-            ("type", "filter / name a branch"),
-            ("↑/↓", "pick"),
-            ("Enter", "create worktree"),
+            ("↑/↓", "pick branch"),
+            ("Enter", "check out"),
+            ("Esc", "cancel"),
+        ],
+        View::ConfirmExisting { .. } => &[
+            ("↑/↓", "choose"),
+            ("Enter", "confirm"),
+            ("Esc", "cancel"),
+        ],
+        View::RunCommand { .. } => &[
+            ("type", "command to run in the worktree"),
+            ("Enter", "run"),
             ("Esc", "cancel"),
         ],
         View::Creating { done: false, .. } => &[
@@ -615,7 +655,6 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("f", "force"),
             ("Esc", "cancel"),
         ],
-        View::Help => &[("any key", "close")],
         View::Config(editor) if editor.editing.is_some() => {
             &[("Enter", "save value"), ("Esc", "cancel edit")]
         }
@@ -656,70 +695,186 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(hint_line(hints)), area);
 }
 
-/// The typed input with a block cursor, styled as a prompt line.
-fn prompt_line(input: &str) -> Line<'_> {
-    Line::from(vec![
-        Span::styled("❯ ", Style::new().fg(ACCENT).bold()),
-        Span::raw(input),
-        Span::styled("▏", Style::new().fg(ACCENT)),
-    ])
+/// The typed input with a block cursor at the end, styled as a prompt line.
+fn prompt_line(input: &str) -> Line<'static> {
+    prompt_line_at(input, input.chars().count())
 }
 
+/// Like `prompt_line`, but draws the block cursor at character index `cursor`
+/// so a field with a movable cursor shows where edits will land.
+fn prompt_line_at(input: &str, cursor: usize) -> Line<'static> {
+    let byte = input
+        .char_indices()
+        .nth(cursor)
+        .map(|(b, _)| b)
+        .unwrap_or(input.len());
+    let (before, after) = input.split_at(byte);
+    let mut spans = vec![Span::styled("❯ ", Style::new().fg(ACCENT).bold())];
+    spans.push(Span::raw(before.to_string()));
+    let mut rest = after.chars();
+    match rest.next() {
+        // Draw the character under the cursor as a reverse-video block.
+        Some(under) => {
+            spans.push(Span::styled(
+                under.to_string(),
+                Style::new().bg(ACCENT).fg(Color::Black),
+            ));
+            spans.push(Span::raw(rest.collect::<String>()));
+        }
+        // Cursor at end: a thin bar after the text.
+        None => spans.push(Span::styled("▏", Style::new().fg(ACCENT))),
+    }
+    Line::from(spans)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn draw_create_dialog(
     frame: &mut Frame,
     area: Rect,
-    input: &str,
+    name: &super::app::TextInput,
     branches: &[String],
+    all_branches: &[String],
+    base: &str,
     selected: usize,
-    base: Option<&str>,
+    base_pick: Option<usize>,
+    location: Option<&str>,
 ) {
-    let filtered = filtered_branches(branches, input);
-    let list_rows = filtered.len().min(8) as u16;
-    let popup = centered(area, 64, 6 + list_rows);
+    // Rows: the "new branch" action, a section header (only when there are
+    // branches to check out), then one row per existing branch.
+    let header_rows = usize::from(!branches.is_empty());
+    let list_rows = (1 + header_rows + branches.len()).min(10) as u16;
+    let popup = centered(area, 66, 6 + list_rows);
     frame.render_widget(Clear, popup);
     frame.render_widget(panel("new worktree"), popup);
     let inner = popup.inner(ratatui::layout::Margin::new(2, 1));
-    let [input_area, list_area, hint_area] = Layout::vertical([
+    let [name_area, list_area, hint_area] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Length(list_rows + 1),
         Constraint::Length(1),
     ])
     .areas(inner);
 
-    frame.render_widget(Paragraph::new(prompt_line(input)), input_area);
+    frame.render_widget(
+        Paragraph::new(prompt_line_at(name.as_str(), name.cursor)),
+        name_area,
+    );
 
-    // Row 0: create a new branch from the input; then matching existing ones.
+    // Row 0: create a new branch off `base`; the section below checks out an
+    // existing branch.
     let mut items: Vec<ListItem> = Vec::new();
-    items.push(ListItem::new(Line::from(vec![
-        Span::styled("+ ", Style::new().fg(Color::Green).bold()),
-        if input.trim().is_empty() {
-            Span::styled("type a name: new branch + worktree", Style::new().dim())
-        } else {
-            Span::raw(format!("new branch + worktree '{}'", input.trim()))
-        },
-    ])));
-    for branch in &filtered {
+    let typed = name.as_str().trim();
+    let row0 = if typed.is_empty() {
+        Line::from(vec![
+            Span::styled("+ ", Style::new().fg(Color::Green).bold()),
+            Span::styled("type a name above → new branch", Style::new().dim()),
+            Span::styled(format!("  (off {base})"), Style::new().dim()),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("+ ", Style::new().fg(Color::Green).bold()),
+            Span::raw(format!("new branch '{typed}'")),
+            Span::styled(format!("  off {base}  ·  Tab to change", ), Style::new().dim()),
+        ])
+    };
+    items.push(ListItem::new(row0));
+    if !branches.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "  or check out an existing branch:",
+            Style::new().dim(),
+        )));
+    }
+    for branch in branches {
         items.push(ListItem::new(Line::from(vec![
             Span::styled("⎇ ", Style::new().fg(ACCENT)),
-            Span::raw((*branch).clone()),
-            Span::styled("  existing branch → worktree", Style::new().dim()),
+            Span::raw(branch.clone()),
         ])));
     }
+    // The section header is a non-selectable row, so shift the highlight past
+    // it for any existing-branch selection.
+    let highlight_row = if selected == 0 { 0 } else { selected + 1 };
     let list = List::new(items)
         .highlight_style(Style::new().bg(SELECTION_BG).bold())
         .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
-    let mut state = ListState::default().with_selected(Some(selected));
+    let mut state = ListState::default().with_selected(Some(highlight_row));
     frame.render_stateful_widget(list, list_area, &mut state);
 
-    if let Some(base) = base {
+    if let Some(location) = location {
         frame.render_widget(
             Paragraph::new(Line::styled(
-                format!("location: {base}"),
+                format!("location: {location}"),
                 Style::new().dim(),
             )),
             hint_area,
         );
     }
+
+    // The base-branch picker floats over the dialog when active.
+    if let Some(idx) = base_pick {
+        draw_base_picker(frame, area, all_branches, idx);
+    }
+}
+
+/// Floating list for choosing the base branch a new branch is created from.
+fn draw_base_picker(frame: &mut Frame, area: Rect, all_branches: &[String], selected: usize) {
+    let rows = all_branches.len().min(10) as u16;
+    let popup = centered(area, 44, rows + 2);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(panel("branch off of"), popup);
+    let inner = popup.inner(ratatui::layout::Margin::new(1, 1));
+    let items: Vec<ListItem> = all_branches
+        .iter()
+        .map(|b| ListItem::new(Line::from(Span::raw(b.clone()))))
+        .collect();
+    let list = List::new(items)
+        .highlight_style(Style::new().bg(SELECTION_BG).bold())
+        .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
+    let mut state = ListState::default().with_selected(Some(selected));
+    frame.render_stateful_widget(list, inner, &mut state);
+}
+
+/// Prompt shown when a create would land on an existing directory.
+fn draw_confirm_existing(
+    frame: &mut Frame,
+    area: Rect,
+    path: &str,
+    existing_name: Option<&str>,
+    selected: usize,
+) {
+    let popup = centered(area, 70, 8);
+    frame.render_widget(Clear, popup);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::raw("a directory already exists at "),
+            Span::styled(path.to_string(), Style::new().bold()),
+        ]),
+        Line::from(""),
+    ];
+    let option = |on: bool, label: String, enabled: bool| -> Line<'static> {
+        let marker = if on { "▌ ● " } else { "  ○ " };
+        let base = if enabled {
+            Style::new()
+        } else {
+            Style::new().dim()
+        };
+        let style = if on { base.bg(SELECTION_BG).bold() } else { base };
+        Line::from(vec![
+            Span::styled(marker.to_string(), style.fg(ACCENT)),
+            Span::styled(label, style),
+        ])
+    };
+    let is_wt = existing_name.is_some();
+    lines.push(option(
+        selected == 0,
+        match existing_name {
+            Some(n) => format!("open the existing worktree '{n}'"),
+            None => "open (only if it is a worktree)".to_string(),
+        },
+        is_wt,
+    ));
+    lines.push(option(selected == 1, "replace it (delete, then create)".to_string(), true));
+    lines.push(option(selected == 2, "cancel".to_string(), true));
+    let para = Paragraph::new(lines).block(panel("directory exists"));
+    frame.render_widget(para, popup);
 }
 
 fn draw_creating(
@@ -759,6 +914,27 @@ fn draw_creating(
         .block(panel(title))
         .wrap(Wrap { trim: false });
     frame.render_widget(para, popup);
+}
+
+/// Prompt for a one-off command to run in a worktree's directory.
+fn draw_run_command(frame: &mut Frame, area: Rect, name: &str, input: &super::app::TextInput) {
+    let popup = centered(area, 64, 5);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(panel(format!("run in '{name}'")), popup);
+    let inner = popup.inner(ratatui::layout::Margin::new(2, 1));
+    let [prompt_area, hint_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+    frame.render_widget(
+        Paragraph::new(prompt_line_at(input.as_str(), input.cursor)),
+        prompt_area,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "e.g. cursor .  ·  set open_command in options to skip this prompt",
+            Style::new().dim(),
+        )),
+        hint_area,
+    );
 }
 
 /// Styles one line of setup output: step results and errors stand out,
@@ -835,38 +1011,49 @@ fn draw_confirm_delete(
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) {
-    let popup = centered(area, 64, 23);
+    let popup = centered(area, 66, 32);
     frame.render_widget(Clear, popup);
     let key = |k: &str, label: &str| -> Line<'static> {
         Line::from(vec![
-            Span::styled(format!("{k:<12}"), Style::new().fg(ACCENT).bold()),
+            Span::styled(format!("  {k:<12}"), Style::new().fg(ACCENT).bold()),
             Span::raw(label.to_string()),
         ])
     };
+    let heading = |t: &str| -> Line<'static> { Line::from(Span::styled(t.to_string(), Style::new().bold())) };
     let text = vec![
+        heading("worktree list"),
         key("↑/↓ or j/k", "select worktree"),
         key("Enter", "browse changes per file (diff, stash, revert)"),
-        key("n", "new worktree (new or existing branch)"),
-        key("⇧C", "commit (pick files, all selected by default)"),
+        key("n", "new worktree (new branch or existing branch)"),
+        key("c", "commit (pick files, all selected by default)"),
+        key("o", "options: edit this repo's settings"),
+        key("e", "run the open command in the worktree dir"),
         key("s", "stash manager (stash/pop/apply/drop)"),
-        key("p", "pull the worktree (fast-forward only)"),
-        key("⇧P", "push the worktree"),
+        key("p / ⇧P", "pull (fast-forward) / push the worktree"),
         key("f", "fetch all remotes"),
-        key("b", "branch browser (branch-only create/delete/checkout)"),
+        key("b", "branch browser (create/delete/checkout a branch)"),
         key("l", "commit log of the worktree"),
         key("d", "delete worktree (folder, or folder + branch)"),
-        key("c", "edit this repo's settings"),
         key("r", "refresh the list"),
         key("q / Ctrl+C", "quit"),
         Line::from(""),
-        Line::from("in the changes view: files are grouped into a folder tree.".dim()),
-        Line::from("Space marks a file (or a whole folder) for commit,".dim()),
-        Line::from("s stashes it, ⇧R reverts it, ⇧C commits the marked files,".dim()),
-        Line::from("i adds the file or folder (or a glob) to .gitignore.".dim()),
+        heading("changes (diff) view"),
+        key("↑/↓ or j/k", "move the file cursor"),
+        key("⇧↑/⇧↓/⇧J/⇧K", "scroll the diff (or mouse wheel)"),
+        key("Space", "mark a file (or a whole folder) for commit"),
+        key("a", "mark / unmark all"),
+        key("c", "commit the marked files"),
+        key("s", "stash the highlighted file"),
+        key("⇧S", "stash every marked ([x]) file"),
+        key("⇧R", "revert the highlighted file"),
+        key("i", "add file/folder (or a glob) to .gitignore"),
         Line::from(""),
-        Line::from("worktree location and setup steps come from .wtm.toml.".dim()),
+        heading("new branch vs existing branch vs branch-only"),
+        Line::from("  n → type a name: new branch + worktree, off a base branch.".dim()),
+        Line::from("  n → pick a branch: check that existing branch out here.".dim()),
+        Line::from("  b → n: create a branch only, without a worktree.".dim()),
     ];
-    let para = Paragraph::new(text).block(panel("help"));
+    let para = Paragraph::new(text).block(panel("help  ·  ? or any key to close"));
     frame.render_widget(para, popup);
 }
 
@@ -1068,11 +1255,17 @@ fn draw_review(
 /// The repo settings editor: editable rows for worktree_dir, setup.copy, and
 /// setup.run, a live resolved-location preview, and a save row.
 fn draw_config(frame: &mut Frame, area: Rect, editor: &ConfigEditor) {
-    let popup = centered(area, 76, 11);
+    let popup = centered(area, 76, 13);
     frame.render_widget(Clear, popup);
-    let labels = ["worktree_dir", "setup.copy  ", "setup.run   "];
+    let labels = [
+        "worktree_dir",
+        "open_command",
+        "setup.copy  ",
+        "setup.run   ",
+    ];
     let hints = [
         "sibling · inside · home · or a path ({repo} = repo name)",
+        "command the open key (e) runs in a worktree, e.g. cursor .",
         "files copied into each new worktree, comma separated",
         "commands run in each new worktree, comma separated",
     ];

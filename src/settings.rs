@@ -25,6 +25,10 @@ const KEYS: &[(&str, &str)] = &[
         "where new worktrees go: sibling, inside, home, or a path",
     ),
     (
+        "open_command",
+        "command the TUI's open key runs in a worktree (e.g. `cursor .`)",
+    ),
+    (
         "setup.copy",
         "files copied into each new worktree, comma separated",
     ),
@@ -109,7 +113,7 @@ pub fn write_draft(repo_root: &Path, draft: &ConfigDraft) -> Result<PathBuf> {
 /// The values the repo's own `.wtm.toml` sets (ignoring the global layer), as
 /// strings for the TUI config editor. Unset keys come back empty; `copy` and
 /// `run` are comma-joined.
-pub fn repo_config_fields(repo_root: &Path) -> Result<(String, String, String)> {
+pub fn repo_config_fields(repo_root: &Path) -> Result<RepoConfigFields> {
     let cfg = FileConfig::load(&repo_root.join(CONFIG_FILE))?;
     let setup = cfg.setup.unwrap_or_default();
     let copy = setup
@@ -120,7 +124,20 @@ pub fn repo_config_fields(repo_root: &Path) -> Result<(String, String, String)> 
         .collect::<Vec<_>>()
         .join(", ");
     let run = setup.run.unwrap_or_default().join(", ");
-    Ok((cfg.worktree_dir.unwrap_or_default(), copy, run))
+    Ok(RepoConfigFields {
+        worktree_dir: cfg.worktree_dir.unwrap_or_default(),
+        open_command: cfg.open_command.unwrap_or_default(),
+        copy,
+        run,
+    })
+}
+
+/// The repo-level settings the TUI config editor shows, each empty when unset.
+pub struct RepoConfigFields {
+    pub worktree_dir: String,
+    pub open_command: String,
+    pub copy: String,
+    pub run: String,
 }
 
 /// Applies edits from the TUI config editor to the repo's `.wtm.toml`,
@@ -129,12 +146,14 @@ pub fn repo_config_fields(repo_root: &Path) -> Result<(String, String, String)> 
 pub fn save_config_edits(
     repo_root: &Path,
     worktree_dir: &str,
+    open_command: &str,
     copy: &str,
     run: &str,
 ) -> Result<PathBuf> {
     let file = repo_root.join(CONFIG_FILE);
     let mut doc = load_doc(&file)?;
     set_or_unset(&mut doc, "worktree_dir", worktree_dir)?;
+    set_or_unset(&mut doc, "open_command", open_command)?;
     set_or_unset(&mut doc, "setup.copy", copy)?;
     set_or_unset(&mut doc, "setup.run", run)?;
     save_doc(&file, &doc)?;
@@ -181,6 +200,10 @@ fn show(cwd: &Path, json: bool) -> Result<()> {
                 "resolved": resolved,
                 "source": cfg.worktree_dir_source,
             },
+            "open_command": {
+                "value": cfg.open_command,
+                "source": cfg.open_command_source,
+            },
             "setup": {
                 "copy": { "value": cfg.setup.copy, "source": cfg.copy_source },
                 "run": { "value": cfg.setup.run, "source": cfg.run_source },
@@ -199,6 +222,11 @@ fn show(cwd: &Path, json: bool) -> Result<()> {
         cfg.worktree_dir_source
     );
     println!("      new worktrees go in {}", resolved.display());
+    println!(
+        "  open_command = {:?}   ({})",
+        cfg.open_command.clone().unwrap_or_default(),
+        cfg.open_command_source
+    );
     println!(
         "  setup.copy   = {:?}   ({})",
         cfg.setup.copy, cfg.copy_source
@@ -231,6 +259,7 @@ fn get(cwd: &Path, key: &str, json: bool) -> Result<()> {
                 .clone()
                 .unwrap_or_else(|| DEFAULT_LOCATION.to_string())
         ),
+        "open_command" => json!(cfg.open_command.clone().unwrap_or_default()),
         "setup.copy" => json!(cfg.setup.copy),
         "setup.run" => json!(cfg.setup.run),
         _ => unreachable!("known_key checked"),
@@ -536,6 +565,9 @@ fn apply_set(doc: &mut DocumentMut, key: &str, raw: &str) -> Result<()> {
         "worktree_dir" => {
             doc["worktree_dir"] = toml_value(raw);
         }
+        "open_command" => {
+            doc["open_command"] = toml_value(raw);
+        }
         "setup.copy" | "setup.run" => {
             let sub = key.strip_prefix("setup.").unwrap();
             let setup = doc
@@ -554,6 +586,7 @@ fn apply_set(doc: &mut DocumentMut, key: &str, raw: &str) -> Result<()> {
 fn apply_unset(doc: &mut DocumentMut, key: &str) -> Result<bool> {
     let removed = match key {
         "worktree_dir" => doc.remove("worktree_dir").is_some(),
+        "open_command" => doc.remove("open_command").is_some(),
         "setup.copy" | "setup.run" => {
             let sub = key.strip_prefix("setup.").unwrap();
             let removed = doc
@@ -826,10 +859,24 @@ mod tests {
             "worktree_dir = \"home\"\n[setup]\ncopy = [\".env\", \"config/.env\"]\n",
         )
         .unwrap();
-        let (worktree_dir, copy, run) = repo_config_fields(dir.path()).unwrap();
-        assert_eq!(worktree_dir, "home");
-        assert_eq!(copy, ".env, config/.env");
-        assert_eq!(run, "");
+        let fields = repo_config_fields(dir.path()).unwrap();
+        assert_eq!(fields.worktree_dir, "home");
+        assert_eq!(fields.open_command, "");
+        assert_eq!(fields.copy, ".env, config/.env");
+        assert_eq!(fields.run, "");
+    }
+
+    #[test]
+    fn save_and_read_open_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(CONFIG_FILE);
+        save_config_edits(dir.path(), "", "cursor .", "", "").unwrap();
+        let cfg = FileConfig::load(&file).unwrap();
+        assert_eq!(cfg.open_command.as_deref(), Some("cursor ."));
+        // Clearing it unsets the key again.
+        save_config_edits(dir.path(), "", "", "", "").unwrap();
+        let cfg = FileConfig::load(&file).unwrap();
+        assert_eq!(cfg.open_command, None);
     }
 
     #[test]
@@ -843,7 +890,7 @@ mod tests {
         .unwrap();
 
         // Change worktree_dir, add a run command, and clear copy (unset it).
-        save_config_edits(dir.path(), "inside", "", "npm install").unwrap();
+        save_config_edits(dir.path(), "inside", "", "", "npm install").unwrap();
         let text = std::fs::read_to_string(&file).unwrap();
         assert!(text.contains("# keep me"), "comment lost: {text}");
         let cfg = FileConfig::load(&file).unwrap();

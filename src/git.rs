@@ -205,9 +205,18 @@ pub fn branch_delete(dir: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
+/// Prunes worktree admin entries whose directories are gone, so a path can be
+/// reused after its directory was removed by hand or via `worktree_remove`.
+pub fn worktree_prune(dir: &Path) -> Result<()> {
+    run(dir, &["worktree", "prune"])?;
+    Ok(())
+}
+
 /// Changed files in the worktree at `dir` (staged, unstaged, and untracked).
+/// `--untracked-files=all` expands new directories into their individual files
+/// so each one is listed (and viewable) instead of a single collapsed `dir/`.
 pub fn status(dir: &Path) -> Result<Vec<StatusEntry>> {
-    let out = run(dir, &["status", "--porcelain"])?;
+    let out = run(dir, &["status", "--porcelain", "--untracked-files=all"])?;
     Ok(parse_status_porcelain(&out))
 }
 
