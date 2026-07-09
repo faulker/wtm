@@ -145,6 +145,10 @@ pub enum View {
         base: String,
         /// 0 = new branch; 1..=branches.len() = check out branches[selected-1].
         selected: usize,
+        /// True when the `[ Base: … ⌄ ]` button is focused (via Tab from the
+        /// new-branch row), so Enter/Space opens the base picker instead of
+        /// creating. Only meaningful while `selected == 0`.
+        base_focus: bool,
         /// Some(idx) while picking the base branch: index into `all_branches`.
         base_pick: Option<usize>,
     },
@@ -160,6 +164,19 @@ pub enum View {
         /// Name the directory is addressed by when it is a registered worktree.
         existing_name: Option<String>,
         /// 0 = Open (worktrees only), 1 = Replace, 2 = Cancel.
+        selected: usize,
+    },
+    /// Replacing the existing directory would discard real work (uncommitted
+    /// changes, or commits on its branch not yet in the default branch). Confirm
+    /// the force delete before recreating.
+    ConfirmReplaceChanges {
+        /// Branch to create or check out once the directory is replaced.
+        branch: String,
+        /// Base ref for a new branch, or None for an existing-branch checkout.
+        base: Option<String>,
+        /// The conflicting directory, force-deleted on confirm.
+        path: String,
+        /// 0 = Force delete (lose all changes), 1 = Cancel.
         selected: usize,
     },
     /// Progress of an in-flight create running on a background thread.
@@ -183,6 +200,23 @@ pub enum View {
         branch: Option<String>,
         /// Currently selected option: also delete the branch afterwards.
         delete_branch: bool,
+    },
+    /// The worktree being deleted has uncommitted changes: keep the work with a
+    /// stash, discard it (force-remove), or cancel.
+    ConfirmDeleteDirty {
+        name: String,
+        /// Branch checked out there, carried through to the branch-delete step.
+        branch: Option<String>,
+        /// Whether to also delete the branch after the folder is removed.
+        delete_branch: bool,
+        /// 0 = Stash, 1 = Discard, 2 = Cancel.
+        selected: usize,
+    },
+    /// The folder is gone but its branch could not be safely deleted; offer to
+    /// force. `reason` explains why git refused so the wording can match.
+    ConfirmForceBranch {
+        branch: String,
+        reason: ForceBranchReason,
     },
     /// Prompt for a one-off command to run in a worktree's directory, shown by
     /// the `e` key when no `open_command` is configured.
@@ -214,11 +248,18 @@ pub enum View {
         selected: usize,
         mode: StashMode,
     },
-    /// Branch browser across the whole repo.
-    Branch {
-        branches: Vec<BranchListItem>,
+    /// Picker for switching the selected worktree onto a different existing
+    /// local branch (one that isn't checked out anywhere else).
+    Switch {
+        /// Worktree being switched.
+        name: String,
+        /// Branches available to switch to (not checked out in any worktree).
+        branches: Vec<String>,
+        /// Live type-to-filter text; narrows `branches` by case-insensitive
+        /// substring match.
+        filter: TextInput,
+        /// Cursor into the FILTERED branch list, not `branches` directly.
         selected: usize,
-        mode: BranchMode,
     },
     /// Scrollable commit log for one worktree.
     Log {
@@ -322,6 +363,18 @@ pub fn current_file_index(rows: &[DiffRow], cursor: usize) -> Option<usize> {
     }
 }
 
+/// Branches from `branches` whose name contains `filter`, matched case
+/// insensitively. An empty filter matches everything. Used by both the
+/// switch-picker key handling and its renderer, so the two stay in sync.
+pub fn filtered_branches<'a>(branches: &'a [String], filter: &str) -> Vec<&'a str> {
+    let filter = filter.to_lowercase();
+    branches
+        .iter()
+        .map(|b| b.as_str())
+        .filter(|b| filter.is_empty() || b.to_lowercase().contains(&filter))
+        .collect()
+}
+
 /// Which part of the commit dialog has keyboard focus.
 #[derive(PartialEq, Eq)]
 pub enum CommitFocus {
@@ -340,13 +393,32 @@ pub enum StashMode {
     ConfirmDrop,
 }
 
-/// Sub-state of the branch overlay.
+/// Why a branch could not be safely deleted after its worktree was removed,
+/// used to word the force-delete prompt.
+pub enum ForceBranchReason {
+    /// The branch has commits not merged anywhere (`git branch -d` refused).
+    NotMerged,
+    /// The branch is still checked out in another worktree (its name); forcing
+    /// switches that worktree to the default branch first.
+    CheckedOutElsewhere(String),
+}
+
+/// Sub-state of the branch tab.
 pub enum BranchMode {
     List,
     /// Typing a name for a new branch.
     Create(String),
     /// Confirming deletion of the selected branch (`f` forces on refusal).
     ConfirmDelete,
+}
+
+/// The two top-level tabs of the main window. `View::List` renders whichever
+/// tab is active; overlays (create, diff, switch, …) draw on top of it and
+/// leave the active tab intact when they close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Worktrees,
+    Branches,
 }
 
 /// Geometry of the active view's clickable row list, recorded by the renderer
@@ -386,16 +458,28 @@ pub struct App {
     pub ctx: Ctx,
     pub worktrees: Vec<WorktreeInfo>,
     pub selected: usize,
+    /// Active top-level tab. Only meaningful while `view` is `View::List`.
+    pub tab: Tab,
+    /// Branches shown on the Branches tab, loaded by `load_branches`.
+    pub branches: Vec<BranchListItem>,
+    /// Cursor into `branches` on the Branches tab.
+    pub branch_selected: usize,
+    /// Inline sub-state of the Branches tab (list, create-input, confirm-delete).
+    pub branch_mode: BranchMode,
     pub view: View,
     /// Set by the renderer each frame; read by `on_mouse` to resolve clicks.
     pub row_list: Option<RowList>,
-    /// One-line status or error shown in the header. Auto-clears after a few
-    /// seconds so it doesn't linger over the key hints.
+    /// One-line status shown in the header. Auto-clears after a few seconds
+    /// so it doesn't linger over the key hints.
     pub message: Option<String>,
     /// When the current `message` first appeared, plus the text it was set for,
     /// so a replaced message restarts the timer. Managed by `expire_message`.
     message_at: Option<Instant>,
     message_shown: Option<String>,
+    /// A modal error, shown as a centered popup over everything else. Unlike
+    /// `message`, it does not auto-expire; any key press dismisses it (see
+    /// `on_key`).
+    pub error: Option<String>,
     /// Where new worktrees will be created, shown in the create dialog.
     pub worktree_base: Option<String>,
     /// Advances once per event-loop tick; drives the busy-overlay spinner.
@@ -425,11 +509,16 @@ impl App {
             ctx,
             worktrees: Vec::new(),
             selected: 0,
+            tab: Tab::Worktrees,
+            branches: Vec::new(),
+            branch_selected: 0,
+            branch_mode: BranchMode::List,
             view,
             row_list: None,
             message: None,
             message_at: None,
             message_shown: None,
+            error: None,
             worktree_base,
             tick_count: 0,
             show_help: false,
@@ -448,8 +537,13 @@ impl App {
                 self.worktrees = wts;
                 self.selected = self.selected.min(self.worktrees.len().saturating_sub(1));
             }
-            Err(e) => self.message = Some(format!("error: {e:#}")),
+            Err(e) => self.set_error(format!("{e:#}")),
         }
+    }
+
+    /// Shows `msg` as a modal error popup (see `App::error`).
+    fn set_error(&mut self, msg: impl Into<String>) {
+        self.error = Some(msg.into());
     }
 
     fn selected_worktree(&self) -> Option<&WorktreeInfo> {
@@ -465,22 +559,27 @@ impl App {
         self.expire_message();
         if let View::Busy { rx, .. } = &self.view {
             if let Ok(result) = rx.try_recv() {
-                let message = match result {
-                    Ok(m) => m,
-                    Err(e) => format!("error: {e}"),
-                };
                 // Pull the follow-up out of the view so we can mutate self, then
                 // reopen whichever view this op should return to.
                 let then = match std::mem::replace(&mut self.view, View::List) {
                     View::Busy { then, .. } => then,
                     _ => BusyThen::List,
                 };
-                self.message = Some(message);
+                // A success lands in the header's status line; a failure pops up
+                // the modal error box instead, since git errors are often
+                // multi-line and unreadable truncated to one line.
+                match result {
+                    Ok(m) => self.message = Some(m),
+                    Err(e) => self.set_error(e),
+                }
                 self.refresh();
                 match then {
                     BusyThen::List => {}
                     BusyThen::Stash(name) => self.load_stash(name, StashMode::List),
-                    BusyThen::Branch => self.load_branches(BranchMode::List, 0),
+                    BusyThen::Branch => {
+                        self.branch_mode = BranchMode::List;
+                        self.load_branches(self.branch_selected);
+                    }
                 }
             }
             return;
@@ -554,6 +653,12 @@ impl App {
 
     pub fn on_key(&mut self, key: KeyEvent) {
         self.message = None;
+        // A modal error popup swallows the very next key press, dismissing
+        // itself rather than reaching Ctrl+C handling or the view underneath.
+        if self.error.is_some() {
+            self.error = None;
+            return;
+        }
         // Ctrl+C: while setup runs it must be pressed twice to kill the
         // command; everywhere else it quits like q.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -589,6 +694,17 @@ impl App {
             View::Diff { .. } => self.on_diff_key(key),
             View::Create { .. } => self.on_create_key(key),
             View::ConfirmExisting { .. } => self.on_confirm_existing_key(key),
+            View::ConfirmReplaceChanges { selected, .. } => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if *selected < 1 {
+                        *selected += 1;
+                    }
+                }
+                KeyCode::Enter => self.apply_confirm_replace_changes(),
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') => self.view = View::List,
+                _ => {}
+            },
             View::RunCommand { input, .. } => match key.code {
                 KeyCode::Esc => self.view = View::List,
                 KeyCode::Enter => {
@@ -638,27 +754,45 @@ impl App {
                     _ => {}
                 }
             }
-            View::ConfirmDelete {
-                name,
-                dirty,
-                branch,
-                delete_branch,
-            } => match key.code {
+            View::ConfirmDelete { branch, delete_branch, .. } => match key.code {
                 KeyCode::Up | KeyCode::Down | KeyCode::Tab => {
                     // Detached worktrees have no branch to offer deleting.
                     if branch.is_some() {
                         *delete_branch = !*delete_branch;
                     }
                 }
-                KeyCode::Enter | KeyCode::Char('y') if *dirty == 0 => {
-                    let (name, del) = (name.clone(), *delete_branch);
-                    self.remove(&name, false, del);
-                }
-                KeyCode::Char('f') => {
-                    let (name, del) = (name.clone(), *delete_branch);
-                    self.remove(&name, true, del);
-                }
+                KeyCode::Enter | KeyCode::Char('y') => self.begin_delete(),
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => self.view = View::List,
+                _ => {}
+            },
+            View::ConfirmDeleteDirty { selected, .. } => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if *selected < 2 {
+                        *selected += 1;
+                    }
+                }
+                KeyCode::Enter => self.apply_delete_dirty(),
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') => self.view = View::List,
+                _ => {}
+            },
+            View::ConfirmForceBranch { branch, .. } => match key.code {
+                KeyCode::Enter | KeyCode::Char('f') | KeyCode::Char('y') => {
+                    let branch = branch.clone();
+                    match ops::force_delete_branch(&self.ctx, &branch) {
+                        Ok(()) => {
+                            self.message = Some(format!("deleted branch '{branch}' (forced)"));
+                        }
+                        Err(e) => self.set_error(format!("{e:#}")),
+                    }
+                    self.view = View::List;
+                    self.refresh();
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
+                    self.message = Some(format!("kept branch '{branch}'"));
+                    self.view = View::List;
+                    self.refresh();
+                }
                 _ => {}
             },
             View::Setup(wizard) => match wizard.on_key(key, &mut self.message) {
@@ -682,7 +816,7 @@ impl App {
             },
             View::Commit { .. } => self.on_commit_key(key),
             View::Stash { .. } => self.on_stash_key(key),
-            View::Branch { .. } => self.on_branch_key(key),
+            View::Switch { .. } => self.on_switch_key(key),
             View::Log { .. } => self.on_log_key(key),
             // A background op owns the screen until tick() drains its result.
             View::Busy { .. } => {}
@@ -702,7 +836,7 @@ impl App {
                     .ok()
                     .map(|p| p.display().to_string());
             }
-            Err(e) => self.message = Some(format!("error: {e:#}")),
+            Err(e) => self.set_error(format!("{e:#}")),
         }
     }
 
@@ -724,11 +858,35 @@ impl App {
                 self.refresh();
                 self.message = Some(format!("wrote {}", crate::config::CONFIG_FILE));
             }
-            Err(e) => self.message = Some(format!("error: {e:#}")),
+            Err(e) => self.set_error(format!("{e:#}")),
         }
     }
 
+    /// Home-view key handling: cycle tabs, then dispatch to the active tab.
     fn on_list_key(&mut self, key: KeyEvent) {
+        // Tab / Shift+Tab cycle the top-level tabs, except while the Branches
+        // tab is capturing text for a new branch name.
+        let typing_branch =
+            self.tab == Tab::Branches && matches!(self.branch_mode, BranchMode::Create(_));
+        if !typing_branch && matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.toggle_tab();
+            return;
+        }
+        match self.tab {
+            Tab::Worktrees => self.on_worktrees_tab_key(key),
+            Tab::Branches => self.on_branches_tab_key(key),
+        }
+    }
+
+    /// Switches to the other top-level tab.
+    fn toggle_tab(&mut self) {
+        match self.tab {
+            Tab::Worktrees => self.open_branches_tab(),
+            Tab::Branches => self.tab = Tab::Worktrees,
+        }
+    }
+
+    fn on_worktrees_tab_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Down | KeyCode::Char('j') => {
@@ -745,14 +903,14 @@ impl App {
             KeyCode::Char('c') => self.open_commit(),
             KeyCode::Char('o') => match ConfigEditor::load(self.ctx.repo_root.clone()) {
                 Ok(editor) => self.view = View::Config(Box::new(editor)),
-                Err(e) => self.message = Some(format!("error: {e:#}")),
+                Err(e) => self.set_error(format!("{e:#}")),
             },
             KeyCode::Char('e') => self.run_open_command(),
             KeyCode::Char('s') => self.open_stash(),
             KeyCode::Char('p') => self.start_pull(),
             KeyCode::Char('P') => self.start_push(),
             KeyCode::Char('f') => self.start_fetch(),
-            KeyCode::Char('b') => self.open_branch(),
+            KeyCode::Char('b') => self.open_switch(),
             KeyCode::Char('l') => self.open_log(),
             KeyCode::Char('d') => {
                 if let Some(wt) = self.selected_worktree() {
@@ -799,7 +957,7 @@ impl App {
                 };
                 self.load_diff_content(true);
             }
-            Err(e) => self.message = Some(format!("error: {e:#}")),
+            Err(e) => self.set_error(format!("{e:#}")),
         }
     }
 
@@ -879,11 +1037,18 @@ impl App {
             return;
         };
         match self.view {
-            View::List => {
-                if idx < self.worktrees.len() {
-                    self.selected = idx;
+            View::List => match self.tab {
+                Tab::Worktrees => {
+                    if idx < self.worktrees.len() {
+                        self.selected = idx;
+                    }
                 }
-            }
+                Tab::Branches => {
+                    if idx < self.branches.len() {
+                        self.branch_selected = idx;
+                    }
+                }
+            },
             View::Diff { .. } => {
                 if let View::Diff { selected, rows, .. } = &mut self.view {
                     if idx >= rows.len() || *selected == idx {
@@ -1070,7 +1235,7 @@ impl App {
         match ops::add_to_gitignore(&self.ctx, &name, pattern) {
             Ok(true) => self.message = Some(format!("added '{pattern}' to .gitignore")),
             Ok(false) => self.message = Some(format!("'{pattern}' is already in .gitignore")),
-            Err(e) => self.message = Some(format!("error: {e:#}")),
+            Err(e) => self.set_error(format!("{e:#}")),
         }
         self.refresh_diff();
         self.refresh();
@@ -1152,7 +1317,7 @@ impl App {
             // The worktree may have been removed out from under us; surface it
             // and drop back to the list rather than looping on the error.
             Err(e) => {
-                self.message = Some(format!("error: {e:#}"));
+                self.set_error(format!("{e:#}"));
                 self.view = View::List;
                 self.refresh();
             }
@@ -1167,7 +1332,7 @@ impl App {
         let name = name.clone();
         match ops::stash_push_paths(&self.ctx, &name, std::slice::from_ref(&entry.path), None) {
             Ok(_) => self.message = Some(format!("stashed '{}'", entry.path)),
-            Err(e) => self.message = Some(format!("error: {e:#}")),
+            Err(e) => self.set_error(format!("{e:#}")),
         }
         self.refresh_diff();
         self.refresh();
@@ -1198,7 +1363,7 @@ impl App {
         }
         match ops::stash_push_paths(&self.ctx, &name, &paths, None) {
             Ok(_) => self.message = Some(format!("stashed {} marked file(s)", paths.len())),
-            Err(e) => self.message = Some(format!("error: {e:#}")),
+            Err(e) => self.set_error(format!("{e:#}")),
         }
         self.refresh_diff();
         self.refresh();
@@ -1213,7 +1378,7 @@ impl App {
         let untracked = entry.code.starts_with('?');
         match ops::revert_file(&self.ctx, &name, &entry.path, untracked) {
             Ok(_) => self.message = Some(format!("reverted '{}'", entry.path)),
-            Err(e) => self.message = Some(format!("error: {e:#}")),
+            Err(e) => self.set_error(format!("{e:#}")),
         }
         self.refresh_diff();
         self.refresh();
@@ -1257,7 +1422,7 @@ impl App {
         let all_branches = match crate::git::local_branches(&self.ctx.repo_root) {
             Ok(all) => all,
             Err(e) => {
-                self.message = Some(format!("error: {e:#}"));
+                self.set_error(format!("{e:#}"));
                 return;
             }
         };
@@ -1273,6 +1438,7 @@ impl App {
             all_branches,
             base,
             selected: 0,
+            base_focus: false,
             base_pick: None,
         };
     }
@@ -1299,6 +1465,7 @@ impl App {
             all_branches,
             base,
             selected,
+            base_focus,
             base_pick,
         } = &mut self.view
         else {
@@ -1324,18 +1491,41 @@ impl App {
             }
             return;
         }
+        // Opens the base picker starting on the currently selected base.
+        let open_base_pick = |base: &str, all_branches: &[String], base_pick: &mut Option<usize>| {
+            let start = all_branches.iter().position(|b| b == base).unwrap_or(0);
+            *base_pick = Some(start);
+        };
         match key.code {
-            KeyCode::Esc => self.view = View::List,
+            // Esc backs out of the focused base button first, then the dialog.
+            KeyCode::Esc => {
+                if *base_focus {
+                    *base_focus = false;
+                } else {
+                    self.view = View::List;
+                }
+            }
+            // Tab focuses the base button on the new-branch row; a second Tab (or
+            // Enter/Space while focused) opens the picker.
+            KeyCode::Tab if *selected == 0 && !all_branches.is_empty() => {
+                if *base_focus {
+                    open_base_pick(base, all_branches, base_pick);
+                } else {
+                    *base_focus = true;
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') if *base_focus => {
+                open_base_pick(base, all_branches, base_pick);
+            }
             KeyCode::Down => {
+                *base_focus = false;
                 if *selected < branches.len() {
                     *selected += 1;
                 }
             }
-            KeyCode::Up => *selected = selected.saturating_sub(1),
-            // Tab opens the base picker, but only for the new-branch row.
-            KeyCode::Tab if *selected == 0 && !all_branches.is_empty() => {
-                let start = all_branches.iter().position(|b| b == base).unwrap_or(0);
-                *base_pick = Some(start);
+            KeyCode::Up => {
+                *base_focus = false;
+                *selected = selected.saturating_sub(1);
             }
             KeyCode::Enter => {
                 if *selected == 0 {
@@ -1351,8 +1541,9 @@ impl App {
                     self.request_create(branch, None);
                 }
             }
-            // Any other key edits the new-branch name (and implies row 0).
+            // Any other key returns focus to the new-branch name and edits it.
             _ => {
+                *base_focus = false;
                 if name.on_key(key) {
                     *selected = 0;
                 }
@@ -1376,7 +1567,7 @@ impl App {
                 };
             }
             Ok(None) => self.start_create(branch, base),
-            Err(e) => self.message = Some(format!("error: {e:#}")),
+            Err(e) => self.set_error(format!("{e:#}")),
         }
     }
 
@@ -1431,13 +1622,50 @@ impl App {
                 Some(name) => self.open_diff(name),
                 None => self.message = Some("that directory is not a worktree".to_string()),
             },
-            // Replace: remove the directory, then create fresh.
-            1 => match ops::remove_target(&self.ctx, Path::new(&path)) {
-                Ok(()) => self.start_create(branch, base),
-                Err(e) => self.message = Some(format!("error: {e:#}")),
+            // Replace: remove the directory, then create fresh. Only stop to
+            // confirm when the occupying worktree holds work that would be lost.
+            1 => match ops::target_has_changes(&self.ctx, Path::new(&path)) {
+                Ok(true) => {
+                    self.view = View::ConfirmReplaceChanges {
+                        branch,
+                        base,
+                        path,
+                        selected: 1,
+                    };
+                }
+                Ok(false) => self.replace_target(branch, base, &path),
+                Err(e) => self.set_error(format!("{e:#}")),
             },
             // Cancel.
             _ => {}
+        }
+    }
+
+    /// Carries out the force-delete confirmation shown when replacing a
+    /// directory that holds real work: Force delete removes it and recreates,
+    /// Cancel returns to the list.
+    fn apply_confirm_replace_changes(&mut self) {
+        let View::ConfirmReplaceChanges {
+            branch,
+            base,
+            path,
+            selected,
+        } = std::mem::replace(&mut self.view, View::List)
+        else {
+            return;
+        };
+        // 0 = Force delete; anything else cancels back to the list.
+        if selected == 0 {
+            self.replace_target(branch, base, &path);
+        }
+    }
+
+    /// Force-removes the directory at `path` (even when non-empty) and, on
+    /// success, starts creating the worktree for `branch` in its place.
+    fn replace_target(&mut self, branch: String, base: Option<String>, path: &str) {
+        match ops::remove_target(&self.ctx, Path::new(path)) {
+            Ok(()) => self.start_create(branch, base),
+            Err(e) => self.set_error(format!("{e:#}")),
         }
     }
 
@@ -1508,7 +1736,7 @@ impl App {
             .spawn();
         match result {
             Ok(_) => self.message = Some(format!("ran '{cmd}' in '{name}'")),
-            Err(e) => self.message = Some(format!("error: {e:#}")),
+            Err(e) => self.set_error(format!("{e:#}")),
         }
     }
 
@@ -1537,7 +1765,7 @@ impl App {
                     focus: CommitFocus::Message,
                 };
             }
-            Err(e) => self.message = Some(format!("error: {e:#}")),
+            Err(e) => self.set_error(format!("{e:#}")),
         }
     }
 
@@ -1672,7 +1900,7 @@ impl App {
                 };
             }
             Err(e) => {
-                self.message = Some(format!("error: {e:#}"));
+                self.set_error(format!("{e:#}"));
                 self.view = View::List;
             }
         }
@@ -1774,69 +2002,133 @@ impl App {
         );
     }
 
-    /// Opens the branch browser.
-    fn open_branch(&mut self) {
-        self.load_branches(BranchMode::List, 0);
-    }
-
-    /// (Re)loads all local branches into the branch overlay, clamping the
-    /// selection. Falls back to the list view on error.
-    fn load_branches(&mut self, mode: BranchMode, selected: usize) {
-        match ops::branch_list(&self.ctx) {
-            Ok(r) => {
-                let selected = selected.min(r.branches.len().saturating_sub(1));
-                self.view = View::Branch {
-                    branches: r.branches,
-                    selected,
-                    mode,
-                };
-            }
+    /// Opens the switch-branch picker for the selected worktree: local branches
+    /// not checked out in any worktree (so git will let us switch onto them).
+    fn open_switch(&mut self) {
+        let Some(wt) = self.selected_worktree() else {
+            return;
+        };
+        let name = wt.name.clone();
+        // Every branch currently checked out somewhere (includes this worktree's
+        // own current branch), which git forbids switching onto.
+        let checked_out: Vec<String> = self
+            .worktrees
+            .iter()
+            .filter_map(|w| w.branch.clone())
+            .collect();
+        let branches: Vec<String> = match crate::git::local_branches(&self.ctx.repo_root) {
+            Ok(all) => all
+                .into_iter()
+                .filter(|b| !checked_out.contains(b))
+                .collect(),
             Err(e) => {
-                self.message = Some(format!("error: {e:#}"));
-                self.view = View::List;
+                self.set_error(format!("{e:#}"));
+                return;
             }
+        };
+        if branches.is_empty() {
+            self.message = Some("no other branches available to switch to".to_string());
+            return;
         }
+        self.view = View::Switch {
+            name,
+            branches,
+            filter: TextInput::default(),
+            selected: 0,
+        };
     }
 
-    fn on_branch_key(&mut self, key: KeyEvent) {
-        let View::Branch {
+    /// Drives the switch-branch picker: type to filter the branch list, move
+    /// the cursor within the filtered results, or switch on Enter. Esc clears
+    /// an active filter first, then closes the view on a second press.
+    fn on_switch_key(&mut self, key: KeyEvent) {
+        let View::Switch {
+            name,
             branches,
+            filter,
             selected,
-            mode,
         } = &mut self.view
         else {
             return;
         };
-        match mode {
-            BranchMode::List => match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => self.view = View::List,
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if *selected + 1 < branches.len() {
-                        *selected += 1;
-                    }
+        match key.code {
+            KeyCode::Esc => {
+                if !filter.as_str().is_empty() {
+                    *filter = TextInput::default();
+                    *selected = 0;
+                } else {
+                    self.view = View::List;
                 }
-                KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
-                KeyCode::Char('n') => *mode = BranchMode::Create(String::new()),
-                KeyCode::Char('x') => {
-                    if !branches.is_empty() {
-                        *mode = BranchMode::ConfirmDelete;
-                    }
+            }
+            KeyCode::Down => {
+                let count = filtered_branches(branches, filter.as_str()).len();
+                if *selected + 1 < count {
+                    *selected += 1;
                 }
-                KeyCode::Enter => {
-                    if let Some(b) = branches.get(*selected) {
-                        if b.checked_out_path.is_some() {
-                            self.message =
-                                Some(format!("branch '{}' is already checked out", b.name));
-                        } else {
-                            let branch = b.name.clone();
-                            self.open_create_prefilled(branch);
-                        }
-                    }
+            }
+            KeyCode::Up => *selected = selected.saturating_sub(1),
+            KeyCode::Enter => {
+                let branch = filtered_branches(branches, filter.as_str())
+                    .get(*selected)
+                    .map(|b| (*b).to_string());
+                if let Some(branch) = branch {
+                    let name = name.clone();
+                    self.request_switch(name, branch);
                 }
-                _ => {}
+            }
+            _ => {
+                if filter.on_key(key) {
+                    // The filtered set just changed; keep the cursor in bounds
+                    // rather than pointing past the new (likely shorter) list.
+                    let count = filtered_branches(branches, filter.as_str()).len();
+                    *selected = (*selected).min(count.saturating_sub(1));
+                }
+            }
+        }
+    }
+
+    /// Switches the worktree named `name` onto `branch` in the background.
+    fn request_switch(&mut self, name: String, branch: String) {
+        self.start_busy(
+            format!("switching {name} to {branch}…"),
+            BusyThen::List,
+            move |ctx| {
+                ops::switch_branch(ctx, &name, &branch)
+                    .map(|r| format!("switched '{}' to '{}'", r.name, r.branch))
+                    .map_err(|e| format!("{e:#}"))
             },
-            BranchMode::Create(buf) => match key.code {
-                KeyCode::Esc => *mode = BranchMode::List,
+        );
+    }
+
+    /// Switches to the Branches tab, loading the branch list fresh.
+    fn open_branches_tab(&mut self) {
+        self.tab = Tab::Branches;
+        self.branch_mode = BranchMode::List;
+        self.load_branches(0);
+    }
+
+    /// (Re)loads all local branches for the Branches tab, clamping the cursor.
+    /// Bounces back to the Worktrees tab on error.
+    fn load_branches(&mut self, selected: usize) {
+        match ops::branch_list(&self.ctx) {
+            Ok(r) => {
+                self.branch_selected = selected.min(r.branches.len().saturating_sub(1));
+                self.branches = r.branches;
+            }
+            Err(e) => {
+                self.set_error(format!("{e:#}"));
+                self.tab = Tab::Worktrees;
+            }
+        }
+    }
+
+    /// Key handling for the Branches tab (active when `view` is `List` and
+    /// `tab` is `Branches`).
+    fn on_branches_tab_key(&mut self, key: KeyEvent) {
+        // Text-entry mode owns keystrokes while naming a new branch.
+        if let BranchMode::Create(buf) = &mut self.branch_mode {
+            match key.code {
+                KeyCode::Esc => self.branch_mode = BranchMode::List,
                 KeyCode::Enter => {
                     let name = buf.trim().to_string();
                     if name.is_empty() {
@@ -1850,25 +2142,72 @@ impl App {
                 }
                 KeyCode::Char(c) => buf.push(c),
                 _ => {}
-            },
-            BranchMode::ConfirmDelete => match key.code {
+            }
+            return;
+        }
+        if matches!(self.branch_mode, BranchMode::ConfirmDelete) {
+            match key.code {
                 KeyCode::Enter | KeyCode::Char('y') => {
-                    if let Some(name) = branches.get(*selected).map(|b| b.name.clone()) {
+                    if let Some(name) = self
+                        .branches
+                        .get(self.branch_selected)
+                        .map(|b| b.name.clone())
+                    {
                         self.branch_delete(name, false);
                     }
                 }
                 KeyCode::Char('f') => {
-                    if let Some(name) = branches.get(*selected).map(|b| b.name.clone()) {
+                    if let Some(name) = self
+                        .branches
+                        .get(self.branch_selected)
+                        .map(|b| b.name.clone())
+                    {
                         self.branch_delete(name, true);
                     }
                 }
-                KeyCode::Esc | KeyCode::Char('n') => *mode = BranchMode::List,
+                KeyCode::Esc | KeyCode::Char('n') => self.branch_mode = BranchMode::List,
                 _ => {}
-            },
+            }
+            return;
+        }
+        // BranchMode::List
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.branch_selected + 1 < self.branches.len() {
+                    self.branch_selected += 1;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.branch_selected = self.branch_selected.saturating_sub(1)
+            }
+            KeyCode::Char('r') => {
+                self.load_branches(self.branch_selected);
+                self.message = Some("refreshed".to_string());
+            }
+            KeyCode::Char('n') => self.branch_mode = BranchMode::Create(String::new()),
+            KeyCode::Char('d') => {
+                if !self.branches.is_empty() {
+                    self.branch_mode = BranchMode::ConfirmDelete;
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(b) = self.branches.get(self.branch_selected) {
+                    if b.checked_out_path.is_some() {
+                        let msg = format!("branch '{}' is already checked out", b.name);
+                        self.message = Some(msg);
+                    } else {
+                        let branch = b.name.clone();
+                        self.open_create_prefilled(branch);
+                    }
+                }
+            }
+            KeyCode::Char('?') => self.show_help = true,
+            _ => {}
         }
     }
 
-    /// Creates a branch from HEAD and reloads the browser.
+    /// Creates a branch from HEAD and reloads the Branches tab.
     fn branch_create(&mut self, name: String) {
         self.start_busy(
             format!("creating branch '{name}'…"),
@@ -1892,14 +2231,15 @@ impl App {
                     r.name,
                     if r.forced { " (forced)" } else { "" }
                 ));
-                self.load_branches(BranchMode::List, 0);
+                self.branch_mode = BranchMode::List;
+                self.load_branches(self.branch_selected);
             }
-            Err(e) => self.message = Some(format!("error: {e:#} — press f to force")),
+            Err(e) => self.set_error(format!("{e:#} — press f to force")),
         }
     }
 
     /// Opens the new-worktree dialog prefilled with `branch`, used when the
-    /// branch browser targets a branch that isn't checked out anywhere.
+    /// Branches tab targets a branch that isn't checked out anywhere.
     fn open_create_prefilled(&mut self, branch: String) {
         self.open_create();
         // The branch browser picks an existing branch to check out, so select
@@ -1927,7 +2267,7 @@ impl App {
                     scroll: 0,
                 }
             }
-            Err(e) => self.message = Some(format!("error: {e:#}")),
+            Err(e) => self.set_error(format!("{e:#}")),
         }
     }
 
@@ -2026,17 +2366,132 @@ impl App {
         );
     }
 
-    fn remove(&mut self, name: &str, force: bool, delete_branch: bool) {
-        let name = name.to_string();
-        self.start_busy(format!("removing '{name}'…"), BusyThen::List, move |ctx| {
-            ops::remove(ctx, &name, force, delete_branch)
-                .map(|info| match (&info.branch, delete_branch) {
-                    (Some(b), true) => format!("removed '{}' and branch '{b}'", info.name),
-                    (Some(_), false) => format!("removed '{}' (branch kept)", info.name),
-                    (None, _) => format!("removed '{}'", info.name),
-                })
-                .map_err(|e| format!("{e:#}"))
-        });
+    /// Starts the delete flow from the `ConfirmDelete` prompt. A dirty worktree
+    /// first routes through the Stash / Discard prompt; a clean one proceeds
+    /// straight to removal.
+    fn begin_delete(&mut self) {
+        let View::ConfirmDelete {
+            name,
+            dirty,
+            branch,
+            delete_branch,
+        } = &self.view
+        else {
+            return;
+        };
+        let (name, cached_dirty, branch, delete_branch) =
+            (name.clone(), *dirty, branch.clone(), *delete_branch);
+        // Re-check dirtiness live rather than trusting the count captured when
+        // the list was loaded, since the worktree may have changed since then.
+        let dirty = ops::worktree_is_dirty(&self.ctx, &name).unwrap_or(cached_dirty > 0);
+        if dirty {
+            self.view = View::ConfirmDeleteDirty {
+                name,
+                branch,
+                delete_branch,
+                selected: 0,
+            };
+        } else {
+            self.do_delete(name, branch, delete_branch, false);
+        }
+    }
+
+    /// Carries out the Stash / Discard / Cancel choice for a dirty worktree.
+    fn apply_delete_dirty(&mut self) {
+        let View::ConfirmDeleteDirty {
+            name,
+            branch,
+            delete_branch,
+            selected,
+        } = &self.view
+        else {
+            return;
+        };
+        let (name, branch, delete_branch, selected) =
+            (name.clone(), branch.clone(), *delete_branch, *selected);
+        match selected {
+            // Stash: keep the work, then remove the now-clean folder.
+            0 => match ops::stash_worktree(&self.ctx, &name) {
+                Ok(()) => self.do_delete(name, branch, delete_branch, false),
+                Err(e) => {
+                    self.set_error(format!("{e:#}"));
+                    self.view = View::List;
+                    self.refresh();
+                }
+            },
+            // Discard: force-remove the folder, throwing the changes away.
+            1 => self.do_delete(name, branch, delete_branch, true),
+            // Cancel.
+            _ => self.view = View::List,
+        }
+    }
+
+    /// Removes the worktree folder and, when requested, deletes its branch. A
+    /// folder-only removal is backgrounded through the Busy overlay; a branch
+    /// delete runs synchronously so an unmerged or checked-out-elsewhere
+    /// refusal can open the force prompt instead of failing silently.
+    fn do_delete(&mut self, name: String, branch: Option<String>, delete_branch: bool, force: bool) {
+        match (delete_branch, branch) {
+            (true, Some(branch)) => match ops::remove_worktree_only(&self.ctx, &name, force) {
+                // The folder is gone, so the branch is no longer checked out
+                // here; now try to delete it.
+                Ok(_) => self.delete_branch_step(name, branch),
+                Err(e) => {
+                    self.set_error(format!("{e:#}"));
+                    self.view = View::List;
+                    self.refresh();
+                }
+            },
+            // Folder-only removal (branch kept, or a detached worktree).
+            _ => {
+                let thread_name = name.clone();
+                self.start_busy(
+                    format!("removing '{name}'…"),
+                    BusyThen::List,
+                    move |ctx| {
+                        ops::remove_worktree_only(ctx, &thread_name, force)
+                            .map(|info| match &info.branch {
+                                Some(_) => format!("removed '{}' (branch kept)", info.name),
+                                None => format!("removed '{}'", info.name),
+                            })
+                            .map_err(|e| format!("{e:#}"))
+                    },
+                );
+            }
+        }
+    }
+
+    /// After the folder is removed, attempts a safe branch delete and routes to
+    /// the matching force prompt when git refuses.
+    fn delete_branch_step(&mut self, name: String, branch: String) {
+        match ops::try_delete_branch(&self.ctx, &branch) {
+            Ok(ops::DeleteBranchOutcome::Deleted) => {
+                self.message = Some(format!("removed '{name}' and branch '{branch}'"));
+                self.view = View::List;
+                self.refresh();
+            }
+            Ok(ops::DeleteBranchOutcome::NotMerged) => {
+                // Refresh so the now-removed folder drops from the list behind
+                // the popup.
+                self.refresh();
+                self.view = View::ConfirmForceBranch {
+                    branch,
+                    reason: ForceBranchReason::NotMerged,
+                };
+            }
+            Ok(ops::DeleteBranchOutcome::CheckedOutElsewhere(other)) => {
+                self.refresh();
+                self.view = View::ConfirmForceBranch {
+                    branch,
+                    reason: ForceBranchReason::CheckedOutElsewhere(other),
+                };
+            }
+            Err(e) => {
+                self.set_error(format!("{e:#}"));
+                self.view = View::List;
+                self.refresh();
+            }
+        }
     }
 }
 
@@ -2202,6 +2657,16 @@ mod tests {
     }
 
     #[test]
+    fn any_key_dismisses_the_error_popup() {
+        let (_tmp, mut app) = test_app();
+        app.set_error("boom");
+        assert!(app.error.is_some());
+        // Any key closes the popup instead of reaching the view underneath.
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.error.is_none());
+    }
+
+    #[test]
     fn create_dialog_name_input_moves_cursor() {
         let (_tmp, mut app) = test_app();
         press(&mut app, KeyCode::Char('n'));
@@ -2276,6 +2741,81 @@ mod tests {
         wait_creating(&mut app, |_, done| done);
         press(&mut app, KeyCode::Enter);
         assert!(app.worktrees.iter().any(|w| w.name == "feature"));
+    }
+
+    #[test]
+    fn create_dialog_base_button_focus_and_pick() {
+        let (_tmp, mut app) = test_app();
+        git(&app.ctx.repo_root, &["branch", "release"]);
+        press(&mut app, KeyCode::Char('n'));
+        type_str(&mut app, "feature");
+        // Tab focuses the base button; a second Tab opens the base picker.
+        press(&mut app, KeyCode::Tab);
+        match &app.view {
+            View::Create {
+                base_focus,
+                base_pick,
+                ..
+            } => {
+                assert!(*base_focus);
+                assert!(base_pick.is_none());
+            }
+            _ => panic!("expected create dialog"),
+        }
+        press(&mut app, KeyCode::Tab);
+        assert!(matches!(
+            app.view,
+            View::Create {
+                base_pick: Some(_),
+                ..
+            }
+        ));
+        // Point the picker at "release" and confirm it as the base.
+        if let View::Create {
+            all_branches,
+            base_pick,
+            ..
+        } = &mut app.view
+        {
+            *base_pick = Some(all_branches.iter().position(|b| b == "release").unwrap());
+        }
+        press(&mut app, KeyCode::Enter);
+        match &app.view {
+            View::Create {
+                base, base_pick, ..
+            } => {
+                assert_eq!(base, "release");
+                assert!(base_pick.is_none());
+            }
+            _ => panic!("expected create dialog"),
+        }
+    }
+
+    #[test]
+    fn tab_key_cycles_top_level_tabs() {
+        let (_tmp, mut app) = test_app();
+        assert_eq!(app.tab, Tab::Worktrees);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.tab, Tab::Branches);
+        // Entering the Branches tab loads the branch list.
+        assert!(!app.branches.is_empty());
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.tab, Tab::Worktrees);
+    }
+
+    #[test]
+    fn switch_with_no_other_branches_reports_message() {
+        let (_tmp, mut app) = test_app();
+        // Only the main branch exists and it is checked out, so there is nothing
+        // to switch onto: the picker doesn't open and a message explains why.
+        press(&mut app, KeyCode::Char('b'));
+        assert!(matches!(app.view, View::List));
+        assert!(
+            app.message
+                .as_deref()
+                .unwrap()
+                .contains("no other branches")
+        );
     }
 
     #[test]
@@ -3165,54 +3705,51 @@ mod tests {
     }
 
     #[test]
-    fn branch_browser_creates_and_deletes_branches() {
+    fn branches_tab_creates_and_deletes_branches() {
         let (_tmp, mut app) = test_app();
-        press(&mut app, KeyCode::Char('b'));
-        assert!(matches!(app.view, View::Branch { .. }));
+        // Tab switches from the Worktrees tab to the Branches tab.
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.tab, Tab::Branches);
         // Create a new branch "feature".
         press(&mut app, KeyCode::Char('n'));
         type_str(&mut app, "feature");
         press(&mut app, KeyCode::Enter);
         settle(&mut app);
         assert!(crate::git::branch_exists(&app.ctx.repo_root, "feature"));
-        match &app.view {
-            View::Branch { branches, .. } => {
-                assert!(branches.iter().any(|b| b.name == "feature"));
-            }
-            _ => panic!("expected branch overlay"),
-        }
+        assert!(app.branches.iter().any(|b| b.name == "feature"));
         // Select "feature" and delete it (main is not deletable while checked out).
-        let idx = match &app.view {
-            View::Branch { branches, .. } => {
-                branches.iter().position(|b| b.name == "feature").unwrap()
-            }
-            _ => unreachable!(),
-        };
-        if let View::Branch { selected, .. } = &mut app.view {
-            *selected = idx;
-        }
-        press(&mut app, KeyCode::Char('x'));
+        app.branch_selected = app
+            .branches
+            .iter()
+            .position(|b| b.name == "feature")
+            .unwrap();
+        press(&mut app, KeyCode::Char('d'));
         press(&mut app, KeyCode::Char('y'));
         assert!(!crate::git::branch_exists(&app.ctx.repo_root, "feature"));
     }
 
     #[test]
-    fn branch_enter_opens_prefilled_create() {
+    fn branches_tab_d_key_opens_confirm_delete() {
+        let (_tmp, mut app) = test_app();
+        // Tab switches from the Worktrees tab to the Branches tab.
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.tab, Tab::Branches);
+        // The main branch is listed by default, so `d` has something to target.
+        assert!(!app.branches.is_empty());
+        press(&mut app, KeyCode::Char('d'));
+        assert!(matches!(app.branch_mode, BranchMode::ConfirmDelete));
+    }
+
+    #[test]
+    fn branches_tab_enter_opens_prefilled_create() {
         let (_tmp, mut app) = test_app();
         git(&app.ctx.repo_root, &["branch", "spare"]);
-        press(&mut app, KeyCode::Char('b'));
-        let idx = match &app.view {
-            View::Branch { branches, .. } => {
-                branches.iter().position(|b| b.name == "spare").unwrap()
-            }
-            _ => panic!("expected branch overlay"),
-        };
-        if let View::Branch { selected, .. } = &mut app.view {
-            *selected = idx;
-        }
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.tab, Tab::Branches);
+        app.branch_selected = app.branches.iter().position(|b| b.name == "spare").unwrap();
         press(&mut app, KeyCode::Enter);
-        // The branch browser checks out an existing branch, so the create
-        // dialog opens with that branch selected in the checkout list.
+        // The Branches tab checks out an existing branch, so the create dialog
+        // opens with that branch selected in the checkout list.
         match &app.view {
             View::Create {
                 branches, selected, ..
@@ -3221,6 +3758,124 @@ mod tests {
                 assert_eq!(branches[*selected - 1], "spare");
             }
             _ => panic!("expected the create dialog prefilled with the branch"),
+        }
+    }
+
+    #[test]
+    fn switch_picker_lists_available_branches_and_switches() {
+        let (_tmp, mut app) = test_app();
+        git(&app.ctx.repo_root, &["branch", "spare"]);
+        app.refresh();
+        app.selected = 0;
+        // `b` on the Worktrees tab opens the switch picker for the selected
+        // worktree, listing branches not checked out anywhere.
+        press(&mut app, KeyCode::Char('b'));
+        match &app.view {
+            View::Switch { branches, .. } => {
+                assert!(branches.iter().any(|b| b == "spare"));
+                // The worktree's own current branch is not offered.
+                assert!(!branches.iter().any(|b| b == "main" || b == "master"));
+            }
+            _ => panic!("expected the switch picker"),
+        }
+        // Select "spare" and switch onto it.
+        if let View::Switch {
+            branches, selected, ..
+        } = &mut app.view
+        {
+            *selected = branches.iter().position(|b| b == "spare").unwrap();
+        }
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        assert!(app.worktrees.iter().any(|w| w.branch.as_deref() == Some("spare")));
+    }
+
+    #[test]
+    fn switch_filter_narrows_branch_list_and_enter_targets_match() {
+        let (_tmp, mut app) = test_app();
+        for name in ["feature-auth", "feature-billing", "hotfix-1"] {
+            git(&app.ctx.repo_root, &["branch", name]);
+        }
+        app.refresh();
+        app.selected = 0;
+        press(&mut app, KeyCode::Char('b'));
+        match &app.view {
+            View::Switch { branches, .. } => assert_eq!(branches.len(), 3),
+            _ => panic!("expected the switch picker"),
+        }
+        // Typing narrows the filtered set (case-insensitive substring match).
+        type_str(&mut app, "FEATURE");
+        match &app.view {
+            View::Switch {
+                branches, filter, ..
+            } => {
+                assert_eq!(
+                    filtered_branches(branches, filter.as_str()),
+                    vec!["feature-auth", "feature-billing"]
+                );
+            }
+            _ => panic!("expected the switch picker"),
+        }
+        // Narrowing further to a single match, Enter switches to that match
+        // (not to an index into the full, unfiltered branch list).
+        type_str(&mut app, "-billing");
+        match &app.view {
+            View::Switch {
+                branches, filter, ..
+            } => {
+                assert_eq!(
+                    filtered_branches(branches, filter.as_str()),
+                    vec!["feature-billing"]
+                );
+            }
+            _ => panic!("expected the switch picker"),
+        }
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        assert!(
+            app.worktrees
+                .iter()
+                .any(|w| w.branch.as_deref() == Some("feature-billing"))
+        );
+    }
+
+    #[test]
+    fn switch_esc_clears_filter_before_closing() {
+        let (_tmp, mut app) = test_app();
+        git(&app.ctx.repo_root, &["branch", "spare"]);
+        app.refresh();
+        app.selected = 0;
+        press(&mut app, KeyCode::Char('b'));
+        type_str(&mut app, "sp");
+        press(&mut app, KeyCode::Esc);
+        match &app.view {
+            View::Switch { filter, .. } => {
+                assert!(filter.as_str().is_empty(), "first Esc clears the filter");
+            }
+            _ => panic!("expected the switch picker to stay open"),
+        }
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.view, View::List), "second Esc closes the picker");
+    }
+
+    #[test]
+    fn switch_j_and_k_type_into_filter_instead_of_navigating() {
+        // j/k are printable characters a branch name could contain, so unlike
+        // most lists in this app they must feed the filter, not move the
+        // cursor; only the arrow keys navigate here.
+        let (_tmp, mut app) = test_app();
+        git(&app.ctx.repo_root, &["branch", "jkbranch"]);
+        app.refresh();
+        app.selected = 0;
+        press(&mut app, KeyCode::Char('b'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('k'));
+        match &app.view {
+            View::Switch { filter, selected, .. } => {
+                assert_eq!(filter.as_str(), "jk");
+                assert_eq!(*selected, 0);
+            }
+            _ => panic!("expected the switch picker"),
         }
     }
 
@@ -3259,7 +3914,8 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "busy op timed out");
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert!(app.message.as_deref().unwrap().contains("no upstream"));
+        // Busy failures pop up the modal error box, not the header message.
+        assert!(app.error.as_deref().unwrap().contains("no upstream"));
     }
 
     #[test]
@@ -3337,6 +3993,64 @@ mod tests {
         settle(&mut app);
         assert!(matches!(app.view, View::List));
         assert!(!app.worktrees.iter().any(|w| w.name == "later"));
+    }
+
+    #[test]
+    fn deleting_a_dirty_worktree_prompts_then_discards() {
+        let (_tmp, mut app) = test_app();
+        add_and_select_worktree(&mut app, "messy");
+        // Leave an untracked file so the worktree reads as dirty.
+        let path = app.worktrees[app.selected].path.clone();
+        std::fs::write(Path::new(&path).join("scratch.txt"), "work\n").unwrap();
+        app.refresh();
+        app.selected = app
+            .worktrees
+            .iter()
+            .position(|w| w.name == "messy")
+            .unwrap();
+
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(app.view, View::ConfirmDeleteDirty { .. }),
+            "a dirty worktree should open the stash/discard prompt"
+        );
+        // Move to "discard" (index 1) and confirm.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        assert!(matches!(app.view, View::List));
+        assert!(!app.worktrees.iter().any(|w| w.name == "messy"));
+    }
+
+    #[test]
+    fn deleting_an_unmerged_branch_prompts_to_force() {
+        let (_tmp, mut app) = test_app();
+        add_and_select_worktree(&mut app, "feature");
+        // Commit on the worktree so its branch is not merged into main.
+        let path = app.worktrees[app.selected].path.clone();
+        std::fs::write(Path::new(&path).join("f.txt"), "x\n").unwrap();
+        git(Path::new(&path), &["add", "."]);
+        git(Path::new(&path), &["commit", "-m", "unmerged work"]);
+
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Down); // toggle "also delete branch"
+        press(&mut app, KeyCode::Char('y'));
+        settle(&mut app);
+        // Folder removed synchronously, branch delete refused -> force prompt.
+        match &app.view {
+            View::ConfirmForceBranch { branch, reason } => {
+                assert_eq!(branch, "feature");
+                assert!(matches!(reason, ForceBranchReason::NotMerged));
+            }
+            _ => panic!("expected the force-branch prompt after an unmerged branch delete"),
+        }
+        assert!(!app.worktrees.iter().any(|w| w.name == "feature"));
+        assert!(crate::git::branch_exists(&app.ctx.repo_root, "feature"));
+        // Force the delete.
+        press(&mut app, KeyCode::Char('f'));
+        assert!(matches!(app.view, View::List));
+        assert!(!crate::git::branch_exists(&app.ctx.repo_root, "feature"));
     }
 
     #[test]
@@ -3580,17 +4294,30 @@ mod tests {
             press(&mut app, KeyCode::Esc);
             press(&mut app, KeyCode::Esc);
 
-            // Branch overlay and its sub-modes.
-            press(&mut app, KeyCode::Char('b'));
-            draw(&mut app); // branch list
+            // Branches tab and its sub-modes.
+            press(&mut app, KeyCode::Tab);
+            draw(&mut app); // branch table
             press(&mut app, KeyCode::Char('n'));
             type_str(&mut app, "feat2");
             draw(&mut app); // create-branch input
-            press(&mut app, KeyCode::Esc);
-            press(&mut app, KeyCode::Char('x'));
+            press(&mut app, KeyCode::Enter);
+            settle(&mut app); // feat2 created
+            draw(&mut app);
+            press(&mut app, KeyCode::Char('d'));
             draw(&mut app); // delete confirm
-            press(&mut app, KeyCode::Esc);
-            press(&mut app, KeyCode::Esc);
+            press(&mut app, KeyCode::Esc); // cancel delete
+            press(&mut app, KeyCode::Tab); // back to Worktrees tab
+            draw(&mut app);
+
+            // Switch-branch picker (feat2 is available to switch onto).
+            press(&mut app, KeyCode::Char('b'));
+            draw(&mut app); // switch picker
+            type_str(&mut app, "feat2");
+            draw(&mut app); // filtered down to a match
+            type_str(&mut app, "zzz");
+            draw(&mut app); // filter with no matches
+            press(&mut app, KeyCode::Esc); // clears the filter
+            press(&mut app, KeyCode::Esc); // closes the picker
 
             // Log overlay.
             press(&mut app, KeyCode::Char('l'));

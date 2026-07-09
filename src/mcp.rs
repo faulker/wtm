@@ -86,6 +86,14 @@ struct PushRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SwitchRequest {
+    #[schemars(description = "worktree name (branch name, or directory name when detached)")]
+    name: String,
+    #[schemars(description = "existing local branch to check out in the worktree")]
+    branch: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct BranchCreateRequest {
     #[schemars(description = "branch name")]
     name: String,
@@ -311,6 +319,17 @@ impl WtmServer {
     )]
     fn fetch_remotes(&self) -> Result<CallToolResult, ErrorData> {
         json_result(&ops::fetch(&self.ctx()?).map_err(internal)?)
+    }
+
+    #[tool(
+        description = "Switch a worktree to check out a different existing local branch. Refuses if the branch is already checked out in another worktree"
+    )]
+    fn switch_branch(
+        &self,
+        Parameters(req): Parameters<SwitchRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let result = ops::switch_branch(&self.ctx()?, &req.name, &req.branch).map_err(internal)?;
+        json_result(&result)
     }
 
     #[tool(

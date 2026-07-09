@@ -4,7 +4,7 @@ A friendly top-level interface for git, built for working with AI agents on mult
 
 Three ways to use it:
 
-- **TUI**: run `wtm` with no arguments inside a repo
+- **TUI**: run `wtm` with no arguments inside a repo. It has two tabs (press `Tab` to switch): a **Worktrees** tab (where `b` switches the selected worktree to another branch and `n` opens the new-worktree dialog) and a **Branches** tab for creating, deleting, and checking out branches. Press `?` for the full key list.
 - **CLI**: scriptable subcommands, all with `--json` output for agents
 - **MCP**: `wtm mcp` serves worktree operations as MCP tools over stdio
 
@@ -105,6 +105,7 @@ wtm stash push <name> [-m <msg>]           # stash changes, untracked files incl
 wtm stash list|pop|apply|drop <name> [--index N]
 wtm pull <name> [--rebase]                 # fast-forward only unless --rebase
 wtm push <name> [--force-with-lease]       # publishes with -u origin when no upstream yet
+wtm switch <name> <branch>                 # check a different existing branch out in the worktree
 wtm fetch                                  # fetch all remotes, prune deleted branches
 wtm branch list                            # branches with checkout, tracking, last commit
 wtm branch create <name> [--from <ref>]    # branch without a worktree
@@ -150,7 +151,7 @@ Run `wtm` inside a repo. If the repo isn't initialized yet, the setup wizard ope
 | `↑`/`↓` or `j`/`k` | select worktree |
 | `Enter` | browse changes in a folder tree: the left panel groups changed files under their folders (a folder shows `[x]`/`[ ]`/`[~]` for all/none/some of its files marked); pick a file to see its diff on the right. `Space` marks/unmarks the file, or the whole folder when the cursor is on a folder row; `s` stashes just the highlighted file, `⇧S` stashes every marked (`[x]`) file, `⇧R` reverts the highlighted file, `c` commits the marked files, `i` adds the file or folder to `.gitignore` (choose the exact path or a glob that ignores everything like it), `?` shows help. New files inside brand-new folders are listed too, so you can view their contents. Updates live as files change; `r` refreshes now |
 | `n` | new **worktree**. The top row creates a **new branch** (named as you type) branched off a base branch — press `Tab` to choose the base (defaults to the main branch). The rows below **check out an existing branch** in a worktree. To make a branch *without* a worktree, use the branch browser (`b`) instead. If the target folder already exists you're asked to open it (when it's already a worktree), replace it, or cancel |
-| `d` | delete the selected worktree: choose folder-only (keeps the branch) or folder + branch; `f` to force when dirty |
+| `d` | delete the selected worktree: choose folder-only (keeps the branch) or folder + branch. If the worktree has uncommitted changes you're asked to stash them (keeping the work) or discard them. If the branch can't be safely deleted (not fully merged, or checked out in another worktree) you're offered a force delete; forcing a branch that's checked out elsewhere first switches that worktree to the repo's default branch |
 | `c` | commit the selected worktree: tick which changed files to include (all selected by default; `Tab` switches between the file list and the message, `Space` toggles a file), type a message, `Enter` commits |
 | `o` | options: edit this repo's settings (`worktree_dir`, `open_command`, `setup.copy`, `setup.run`) without touching the file |
 | `e` | run the `open_command` in the selected worktree's directory (e.g. `cursor .`); prompts for a command when `open_command` isn't set |
@@ -158,7 +159,8 @@ Run `wtm` inside a repo. If the repo isn't initialized yet, the setup wizard ope
 | `p` | pull the selected worktree (fast-forward only) |
 | `⇧P` | push the selected worktree; publishes with `-u` when there's no upstream |
 | `f` | fetch all remotes and refresh |
-| `b` | branch browser: every local branch with where it's checked out. `n` creates a **branch only** (no worktree, from HEAD), `x` deletes, `Enter` checks the selected branch out in a new worktree |
+| `b` | switch the selected worktree to another local branch: a picker of branches not checked out anywhere. Type to filter the list, `↑`/`↓` select, `Enter` switches, `Esc` clears the filter then closes |
+| `Tab` | branch browser (Branches tab): every local branch with where it's checked out. `n` creates a **branch only** (no worktree, from HEAD), `d` deletes (`f` forces), `Enter` checks the selected branch out in a new worktree |
 | `l` | log of recent commits for the selected worktree |
 | `r` | refresh |
 | `?` | help (works here and in the changes view; any key closes it) |

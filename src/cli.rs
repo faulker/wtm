@@ -89,6 +89,13 @@ pub enum Command {
     },
     /// Fetch all remotes and prune deleted remote branches.
     Fetch,
+    /// Switch a worktree to check out a different existing local branch.
+    Switch {
+        /// Worktree name.
+        name: String,
+        /// Existing local branch to check out.
+        branch: String,
+    },
     /// Manage branches across the repo (list, create, delete, rename).
     Branch {
         #[command(subcommand)]

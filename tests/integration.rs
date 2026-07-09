@@ -1113,6 +1113,40 @@ fn branch_create_list_delete_rename() {
 }
 
 #[test]
+fn switch_changes_a_worktrees_branch() {
+    let (_tmp, repo) = setup_repo();
+    let created = stdout_json(&wtm(&repo, &["create", "feat", "--json"]));
+    let wt_path = PathBuf::from(created["path"].as_str().unwrap());
+    // A spare local branch that isn't checked out anywhere.
+    git(&repo, &["branch", "spare"]);
+
+    // Switching the worktree onto the spare branch reports the new branch.
+    let switched = stdout_json(&wtm(&repo, &["switch", "feat", "spare", "--json"]));
+    assert_eq!(switched["branch"], "spare");
+    assert_eq!(switched["name"], "spare");
+    let list = stdout_json(&wtm(&repo, &["list", "--json"]));
+    let wt = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["path"] == wt_path.to_string_lossy().to_string())
+        .unwrap();
+    assert_eq!(wt["branch"], "spare");
+
+    // Switching onto a branch already checked out elsewhere (main) fails cleanly.
+    let out = wtm(&repo, &["switch", "spare", "main", "--json"]);
+    assert!(!out.status.success());
+    let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert!(err["error"].as_str().unwrap().contains("already checked out"));
+
+    // Human output confirms the switch.
+    git(&repo, &["branch", "spare2"]);
+    let out = wtm(&repo, &["switch", "spare", "spare2"]);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("spare2"));
+}
+
+#[test]
 fn log_shows_recent_commits_with_limit() {
     let (_tmp, repo) = setup_repo();
     let created = stdout_json(&wtm(&repo, &["create", "feat", "--json"]));

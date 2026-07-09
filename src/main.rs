@@ -196,6 +196,15 @@ fn run(cli: Cli) -> Result<()> {
                 output::print_fetch(&result);
             }
         }
+        Command::Switch { name, branch } => {
+            let ctx = Ctx::discover_initialized(&cwd)?;
+            let result = ops::switch_branch(&ctx, &name, &branch)?;
+            if cli.json {
+                output::print_json(&result)?;
+            } else {
+                output::print_switch(&result);
+            }
+        }
         Command::Branch { action } => {
             let ctx = Ctx::discover_initialized(&cwd)?;
             match action {

@@ -187,6 +187,14 @@ pub fn worktree_add(
     Ok(())
 }
 
+/// Switches the worktree at `dir` to `branch` (an existing local branch).
+/// Lets git's own error surface for a dirty tree that would conflict or a
+/// branch already checked out in another worktree.
+pub fn switch(dir: &Path, branch: &str) -> Result<()> {
+    run(dir, &["switch", branch])?;
+    Ok(())
+}
+
 /// Removes the worktree at `path`. `force` discards uncommitted changes.
 pub fn worktree_remove(dir: &Path, path: &Path, force: bool) -> Result<()> {
     let path_str = path.to_string_lossy();
@@ -205,11 +213,30 @@ pub fn branch_delete(dir: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
+/// Unlocks the worktree at `path`. A locked worktree is refused by both
+/// `worktree remove --force` (single force) and `worktree prune`, so unlocking
+/// first lets those reclaim it. Returns git's error when it is not locked;
+/// callers use this best-effort.
+pub fn worktree_unlock(dir: &Path, path: &Path) -> Result<()> {
+    let path_str = path.to_string_lossy();
+    run(dir, &["worktree", "unlock", &path_str])?;
+    Ok(())
+}
+
 /// Prunes worktree admin entries whose directories are gone, so a path can be
 /// reused after its directory was removed by hand or via `worktree_remove`.
 pub fn worktree_prune(dir: &Path) -> Result<()> {
     run(dir, &["worktree", "prune"])?;
     Ok(())
+}
+
+/// Counts commits reachable from `branch` but not from `base`
+/// (`git rev-list --count base..branch`). Zero when `branch` has no unique
+/// work, e.g. when it equals or is fully merged into `base`.
+pub fn commits_ahead_of(dir: &Path, base: &str, branch: &str) -> Result<u32> {
+    let range = format!("{base}..{branch}");
+    let out = run(dir, &["rev-list", "--count", &range])?;
+    Ok(out.trim().parse().unwrap_or(0))
 }
 
 /// Changed files in the worktree at `dir` (staged, unstaged, and untracked).
@@ -513,6 +540,42 @@ pub fn branch_delete_flag(dir: &Path, name: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// True when `err` is git's "not fully merged" refusal from a safe (`-d`)
+/// branch delete, as opposed to any other failure. Lets callers offer a force
+/// (`-D`) retry only for that specific, recoverable case.
+pub fn is_not_merged_error(err: &GitError) -> bool {
+    matches!(err, GitError::Command { stderr, .. } if stderr.contains("not fully merged"))
+}
+
+/// Best-effort name of the repository's default branch, used when a worktree
+/// must be moved off a branch that is about to be deleted. Prefers what
+/// `origin/HEAD` points at, then a local `main`, then `master`, then the first
+/// local branch. Errors only when the repo has no local branches at all.
+pub fn default_branch(dir: &Path) -> Result<String> {
+    if let Ok(head) = run(
+        dir,
+        &["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+    ) {
+        let name = head.strip_prefix("origin/").unwrap_or(&head).to_string();
+        if !name.is_empty() {
+            return Ok(name);
+        }
+    }
+    if branch_exists(dir, "main") {
+        return Ok("main".to_string());
+    }
+    if branch_exists(dir, "master") {
+        return Ok("master".to_string());
+    }
+    local_branches(dir)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| GitError::Command {
+            args: "for-each-ref refs/heads".to_string(),
+            stderr: "repository has no local branches".to_string(),
+        })
+}
+
 /// Renames branch `old` to `new` (`git branch -m`).
 pub fn branch_rename(dir: &Path, old: &str, new: &str) -> Result<()> {
     run(dir, &["branch", "-m", old, new])?;
@@ -655,6 +718,50 @@ pub fn parse_log(out: &str) -> Vec<LogEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+
+    /// Builds a throwaway git repo with a single commit on `main` and no
+    /// remotes, returning its temp dir and path.
+    fn temp_repo() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir(&repo).unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "t@e.st"],
+            vec!["config", "user.name", "t"],
+            vec!["commit", "--allow-empty", "-m", "init"],
+        ] {
+            let out = Command::new("git")
+                .args(&args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+        (tmp, repo)
+    }
+
+    #[test]
+    fn default_branch_falls_back_to_initial_branch_without_origin() {
+        let (_tmp, repo) = temp_repo();
+        // No origin remote, but a local `main`, so it should report "main".
+        assert_eq!(default_branch(&repo).unwrap(), "main");
+    }
+
+    #[test]
+    fn is_not_merged_error_matches_only_the_merge_refusal() {
+        let merge = GitError::Command {
+            args: "branch -d x".to_string(),
+            stderr: "error: the branch 'x' is not fully merged".to_string(),
+        };
+        let other = GitError::Command {
+            args: "branch -d x".to_string(),
+            stderr: "error: branch 'x' not found".to_string(),
+        };
+        assert!(is_not_merged_error(&merge));
+        assert!(!is_not_merged_error(&other));
+    }
 
     #[test]
     fn parses_worktree_porcelain_multiple_entries() {

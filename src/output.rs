@@ -8,7 +8,7 @@ use crate::git::StatusEntry;
 use crate::ops::{
     BranchCreateResult, BranchDeleteResult, BranchListResult, BranchRenameResult, CommitResult,
     CreateResult, FetchResult, LogResult, PullResult, PushResult, StashListResult, StashResult,
-    WorktreeInfo,
+    SwitchResult, WorktreeInfo,
 };
 
 /// Serializes `value` as pretty JSON to stdout.
@@ -173,6 +173,11 @@ pub fn print_fetch(result: &FetchResult) {
     } else {
         println!("fetched remotes: {}", result.remotes.join(", "));
     }
+}
+
+/// Human-readable switch confirmation.
+pub fn print_switch(result: &SwitchResult) {
+    println!("switched '{}' to '{}'", result.name, result.branch);
 }
 
 /// Human-readable branch listing.

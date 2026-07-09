@@ -376,18 +376,29 @@ pub fn existing_target(ctx: &Ctx, branch: &str) -> Result<Option<ExistingTarget>
     }))
 }
 
-/// Removes whatever occupies `path` so a fresh worktree can take its place:
-/// unregisters it from git when it is a registered worktree, deletes the
-/// directory, then prunes stale worktree admin entries.
+/// Removes whatever occupies `path` so a fresh worktree can take its place,
+/// even when the directory is non-empty. Unregisters it from git when it is a
+/// registered worktree (unlocking first, since a locked worktree is refused by
+/// both `worktree remove` and `prune`), deletes the directory, then prunes
+/// stale admin entries so a follow-up `worktree add` at this path succeeds.
+///
+/// A non-empty directory is never a reason to fail: `remove_dir_all` clears it,
+/// and the git steps are best-effort with `prune` as the backstop.
 pub fn remove_target(ctx: &Ctx, path: &Path) -> Result<()> {
     let canon = std::fs::canonicalize(path).ok();
-    let registered = git::list_worktrees(&ctx.repo_root)?.iter().any(|w| {
-        std::fs::canonicalize(&w.path).ok() == canon && canon.is_some()
-    });
-    if registered {
-        // Best effort: if git can't remove it (already detached, locked) we
-        // still fall back to deleting the directory below.
-        let _ = git::worktree_remove(&ctx.repo_root, path, true);
+    // Match against the path git actually recorded so removal/unlock target the
+    // registration even when `path` is spelled differently (symlinks, etc.).
+    let registered_path = git::list_worktrees(&ctx.repo_root)?
+        .into_iter()
+        .find(|w| std::fs::canonicalize(&w.path).ok() == canon && canon.is_some())
+        .map(|w| w.path);
+    if let Some(reg) = &registered_path {
+        // Unlock first so the subsequent remove/prune can reclaim a locked
+        // worktree; harmless (and ignored) when it was not locked.
+        let _ = git::worktree_unlock(&ctx.repo_root, reg);
+        // Best effort: if git still refuses we fall back to deleting the
+        // directory and pruning below.
+        let _ = git::worktree_remove(&ctx.repo_root, reg, true);
     }
     if path.exists() {
         std::fs::remove_dir_all(path)
@@ -395,6 +406,34 @@ pub fn remove_target(ctx: &Ctx, path: &Path) -> Result<()> {
     }
     git::worktree_prune(&ctx.repo_root)?;
     Ok(())
+}
+
+/// Whether the worktree occupying `path` holds work that replacing it would
+/// lose: uncommitted changes, or commits on its branch that are not yet in the
+/// repo's default branch. A plain directory that is not a registered worktree
+/// (or a detached, clean one) is treated as having nothing to lose.
+pub fn target_has_changes(ctx: &Ctx, path: &Path) -> Result<bool> {
+    let canon = std::fs::canonicalize(path).ok();
+    let Some(info) = list(ctx)?
+        .into_iter()
+        .find(|w| std::fs::canonicalize(&w.path).ok() == canon && canon.is_some())
+    else {
+        // Not a worktree, just a leftover directory: nothing to preserve.
+        return Ok(false);
+    };
+    if info.dirty > 0 {
+        return Ok(true);
+    }
+    // Only a branch can carry commits we can compare; a detached, clean
+    // worktree has no branch tip to check against the default branch.
+    let Some(branch) = info.branch.as_deref() else {
+        return Ok(false);
+    };
+    let default = git::default_branch(&ctx.repo_root)?;
+    if default == branch {
+        return Ok(false);
+    }
+    Ok(git::commits_ahead_of(&ctx.repo_root, &default, branch)? > 0)
 }
 
 /// Removes the worktree named `name`. Refuses when dirty unless `force`;
@@ -416,6 +455,115 @@ pub fn remove(ctx: &Ctx, name: &str, force: bool, delete_branch: bool) -> Result
         git::branch_delete(&ctx.repo_root, branch)?;
     }
     Ok(info)
+}
+
+/// True when the worktree named `name` has uncommitted changes.
+pub fn worktree_is_dirty(ctx: &Ctx, name: &str) -> Result<bool> {
+    let info = find(ctx, name)?.ok_or_else(|| not_found(ctx, name))?;
+    Ok(info.dirty > 0)
+}
+
+/// Stashes all changes (including untracked files) in the worktree named
+/// `name`, so a subsequent removal can proceed without discarding the work.
+pub fn stash_worktree(ctx: &Ctx, name: &str) -> Result<()> {
+    stash_push(ctx, name, None).map(|_| ())
+}
+
+/// Removes just the worktree folder for `name`, never touching its branch.
+/// Refuses on a dirty tree unless `force` (mirroring the guard in `remove`).
+/// Returns the worktree info (including its branch name) so the caller can act
+/// on the branch afterwards.
+pub fn remove_worktree_only(ctx: &Ctx, name: &str, force: bool) -> Result<WorktreeInfo> {
+    let info = find(ctx, name)?.ok_or_else(|| not_found(ctx, name))?;
+    if info.is_main {
+        bail!("refusing to remove the main worktree");
+    }
+    if info.dirty > 0 && !force {
+        bail!(
+            "worktree '{}' has {} uncommitted change(s); use --force to discard them",
+            info.name,
+            info.dirty
+        );
+    }
+    git::worktree_remove(&ctx.repo_root, Path::new(&info.path), force)?;
+    Ok(info)
+}
+
+/// Why a safe (`-d`) branch delete was refused, so a caller can offer the
+/// matching recovery. `Deleted` means it actually succeeded.
+pub enum DeleteBranchOutcome {
+    /// The branch was deleted.
+    Deleted,
+    /// Refused: the branch is still checked out in another worktree (its name).
+    CheckedOutElsewhere(String),
+    /// Refused: the branch has commits not merged anywhere; `-D` would force it.
+    NotMerged,
+}
+
+/// Attempts a safe (`-d`) delete of `branch`, reporting why git refused rather
+/// than failing outright, so the interactive flow can offer a force retry.
+/// Assumes the branch's own worktree has already been removed, so a checkout
+/// means a genuinely different worktree, not the one being deleted.
+pub fn try_delete_branch(ctx: &Ctx, branch: &str) -> Result<DeleteBranchOutcome> {
+    if let Some(wt) = git::list_worktrees(&ctx.repo_root)?
+        .into_iter()
+        .find(|w| w.branch.as_deref() == Some(branch))
+    {
+        return Ok(DeleteBranchOutcome::CheckedOutElsewhere(worktree_name(
+            &wt.branch, &wt.path,
+        )));
+    }
+    match git::branch_delete_flag(&ctx.repo_root, branch, false) {
+        Ok(()) => Ok(DeleteBranchOutcome::Deleted),
+        Err(e) if git::is_not_merged_error(&e) => Ok(DeleteBranchOutcome::NotMerged),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Deletes the local branch `branch`, handling the two obstacles left once its
+/// own worktree is gone:
+///  - checked out in ANOTHER worktree: errors (non-force), or when `force`
+///    switches that worktree to the repo's default branch first, then deletes.
+///  - not fully merged: a non-force delete returns a clear "not fully merged"
+///    error so the caller can offer to force; `force` uses `-D`.
+pub fn delete_branch_maybe_force(ctx: &Ctx, branch: &str, force: bool) -> Result<()> {
+    if let Some(wt) = git::list_worktrees(&ctx.repo_root)?
+        .into_iter()
+        .find(|w| w.branch.as_deref() == Some(branch))
+    {
+        if !force {
+            bail!(
+                "branch '{branch}' is checked out at {}; remove that worktree first \
+                 or force to move it to the default branch",
+                wt.path.display()
+            );
+        }
+        let default = git::default_branch(&ctx.repo_root)?;
+        if default == branch {
+            bail!(
+                "branch '{branch}' is the repository's default branch and cannot be \
+                 moved off its own worktree"
+            );
+        }
+        // Move the other worktree onto the default branch so the branch is no
+        // longer checked out anywhere and can be deleted.
+        git::switch(&wt.path, &default)?;
+    }
+    match git::branch_delete_flag(&ctx.repo_root, branch, force) {
+        Ok(()) => Ok(()),
+        // Turn git's raw refusal into a message the interactive flow can act on.
+        Err(e) if git::is_not_merged_error(&e) => Err(anyhow!(
+            "branch '{branch}' is not fully merged; force to delete it anyway"
+        )),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Force-deletes `branch` (`-D`), first moving any other worktree that still
+/// has it checked out onto the repository's default branch. Used by the TUI's
+/// "Force" delete choice.
+pub fn force_delete_branch(ctx: &Ctx, branch: &str) -> Result<()> {
+    delete_branch_maybe_force(ctx, branch, true)
 }
 
 /// Changed files for the worktree named `name`.
@@ -587,6 +735,17 @@ pub struct BranchRenameResult {
 pub struct LogResult {
     pub name: String,
     pub entries: Vec<git::LogEntry>,
+}
+
+/// Result of `switch`.
+#[derive(Debug, Clone, Serialize)]
+pub struct SwitchResult {
+    /// The worktree that switched (addressed by its new branch name).
+    pub name: String,
+    /// The branch now checked out.
+    pub branch: String,
+    /// Absolute path of the worktree.
+    pub path: String,
 }
 
 /// Stages and commits changes in the worktree named `name`. Stages everything
@@ -822,6 +981,34 @@ pub fn log(ctx: &Ctx, name: &str, count: u32) -> Result<LogResult> {
     Ok(LogResult {
         name: info.name,
         entries,
+    })
+}
+
+/// Switches the worktree named `name` to check out the existing local branch
+/// `branch`. Refuses when the branch is already checked out in another worktree
+/// (git forbids this) or is already the worktree's current branch.
+pub fn switch_branch(ctx: &Ctx, name: &str, branch: &str) -> Result<SwitchResult> {
+    let info = find(ctx, name)?.ok_or_else(|| not_found(ctx, name))?;
+    if info.branch.as_deref() == Some(branch) {
+        bail!("worktree '{}' already has '{branch}' checked out", info.name);
+    }
+    if !git::branch_exists(&ctx.repo_root, branch) {
+        bail!("no local branch named '{branch}'");
+    }
+    if let Some(other) = list(ctx)?
+        .into_iter()
+        .find(|i| i.path != info.path && i.branch.as_deref() == Some(branch))
+    {
+        bail!(
+            "branch '{branch}' is already checked out in worktree '{}'",
+            other.name
+        );
+    }
+    git::switch(Path::new(&info.path), branch)?;
+    Ok(SwitchResult {
+        name: branch.to_string(),
+        branch: branch.to_string(),
+        path: info.path,
     })
 }
 
@@ -1095,6 +1282,181 @@ fn run_step_controlled(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds a throwaway initialized repo with one commit on `main` and a
+    /// hand-made Ctx (default config), so the developer's global config can't
+    /// leak in. Returns the temp dir plus the Ctx.
+    fn temp_ctx() -> (tempfile::TempDir, Ctx) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir(&repo).unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "t@e.st"],
+            vec!["config", "user.name", "t"],
+            vec!["commit", "--allow-empty", "-m", "init"],
+        ] {
+            git(&repo, &args);
+        }
+        std::fs::write(repo.join(".wtm.toml"), "").unwrap();
+        let ctx = Ctx {
+            repo_root: git::repo_root(&repo).unwrap(),
+            config: Config::default(),
+        };
+        (tmp, ctx)
+    }
+
+    /// Runs a git command in `dir`, asserting it succeeds.
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Creates a worktree for `branch` with no setup steps, returning its path.
+    fn make_worktree(ctx: &Ctx, branch: &str) -> PathBuf {
+        let r = create(ctx, branch, None, RunMode::Capture, |_| {}).unwrap();
+        PathBuf::from(r.path)
+    }
+
+    #[test]
+    fn removes_worktree_and_merged_branch() {
+        let (_tmp, ctx) = temp_ctx();
+        make_worktree(&ctx, "feature");
+        // Merged branch (no new commits): folder removal then a safe delete
+        // should take out both.
+        let info = remove_worktree_only(&ctx, "feature", false).unwrap();
+        assert_eq!(info.branch.as_deref(), Some("feature"));
+        assert!(matches!(
+            try_delete_branch(&ctx, "feature").unwrap(),
+            DeleteBranchOutcome::Deleted
+        ));
+        assert!(!git::branch_exists(&ctx.repo_root, "feature"));
+    }
+
+    #[test]
+    fn unmerged_branch_is_refused_then_force_deleted() {
+        let (_tmp, ctx) = temp_ctx();
+        let path = make_worktree(&ctx, "wip");
+        // Add a commit that lives only on `wip`, so a safe delete is refused.
+        std::fs::write(path.join("f.txt"), "x\n").unwrap();
+        git(&path, &["add", "."]);
+        git(&path, &["commit", "-m", "wip work"]);
+
+        let _ = remove_worktree_only(&ctx, "wip", false).unwrap();
+        assert!(matches!(
+            try_delete_branch(&ctx, "wip").unwrap(),
+            DeleteBranchOutcome::NotMerged
+        ));
+        assert!(git::branch_exists(&ctx.repo_root, "wip"));
+        // Forcing (-D) takes it out.
+        force_delete_branch(&ctx, "wip").unwrap();
+        assert!(!git::branch_exists(&ctx.repo_root, "wip"));
+    }
+
+    #[test]
+    fn force_delete_switches_worktree_checked_out_elsewhere() {
+        let (_tmp, ctx) = temp_ctx();
+        // Free up `main` so it can be switched onto: move the main worktree to a
+        // separate `trunk` branch. `default_branch` still resolves to `main`.
+        git(&ctx.repo_root, &["switch", "-c", "trunk"]);
+        let path = make_worktree(&ctx, "feat");
+
+        // `feat` is checked out in its worktree; a non-force delete is refused.
+        assert!(matches!(
+            try_delete_branch(&ctx, "feat").unwrap(),
+            DeleteBranchOutcome::CheckedOutElsewhere(_)
+        ));
+        // Forcing moves that worktree to the default branch, then deletes.
+        force_delete_branch(&ctx, "feat").unwrap();
+        assert!(!git::branch_exists(&ctx.repo_root, "feat"));
+        let wts = git::list_worktrees(&ctx.repo_root).unwrap();
+        let moved = wts.iter().find(|w| w.path == path).unwrap();
+        assert_eq!(moved.branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn remove_target_clears_non_empty_worktree_and_reuses_path() {
+        let (_tmp, ctx) = temp_ctx();
+        let path = make_worktree(&ctx, "feature");
+        // Populate the worktree with untracked files so the directory is not
+        // empty; a naive rmdir would fail here.
+        std::fs::write(path.join("a.txt"), "x\n").unwrap();
+        std::fs::create_dir(path.join("sub")).unwrap();
+        std::fs::write(path.join("sub/b.txt"), "y\n").unwrap();
+
+        remove_target(&ctx, &path).unwrap();
+        assert!(!path.exists(), "directory should be gone");
+        // No worktree should remain registered at that path.
+        let still_registered = git::list_worktrees(&ctx.repo_root)
+            .unwrap()
+            .iter()
+            .any(|w| w.path == path);
+        assert!(!still_registered, "path should be unregistered");
+        // The path is reusable: a fresh worktree can be created there.
+        let r = create(&ctx, "feature2", None, RunMode::Capture, |_| {}).unwrap();
+        assert_eq!(PathBuf::from(&r.path).file_name().unwrap(), "feature2");
+    }
+
+    #[test]
+    fn remove_target_reclaims_locked_worktree() {
+        let (_tmp, ctx) = temp_ctx();
+        let path = make_worktree(&ctx, "feature");
+        std::fs::write(path.join("dirty.txt"), "x\n").unwrap();
+        // A locked worktree is refused by `worktree remove --force` (single
+        // force) and skipped by `prune`; remove_target must still reclaim it.
+        git(&ctx.repo_root, &["worktree", "lock", path.to_str().unwrap()]);
+
+        remove_target(&ctx, &path).unwrap();
+        assert!(!path.exists());
+        // The path is reusable afterwards.
+        let path2 = make_worktree(&ctx, "feature3");
+        assert!(path2.exists());
+    }
+
+    #[test]
+    fn target_has_changes_false_when_clean_and_merged() {
+        let (_tmp, ctx) = temp_ctx();
+        // A fresh worktree off HEAD: clean and fully merged into main.
+        let path = make_worktree(&ctx, "feature");
+        assert!(!target_has_changes(&ctx, &path).unwrap());
+    }
+
+    #[test]
+    fn target_has_changes_true_when_dirty() {
+        let (_tmp, ctx) = temp_ctx();
+        let path = make_worktree(&ctx, "feature");
+        std::fs::write(path.join("f.txt"), "x\n").unwrap();
+        assert!(target_has_changes(&ctx, &path).unwrap());
+    }
+
+    #[test]
+    fn target_has_changes_true_with_unmerged_commit() {
+        let (_tmp, ctx) = temp_ctx();
+        let path = make_worktree(&ctx, "feature");
+        // A commit only on `feature`, not yet in `main`: replacing loses it.
+        std::fs::write(path.join("f.txt"), "x\n").unwrap();
+        git(&path, &["add", "."]);
+        git(&path, &["commit", "-m", "unique work"]);
+        assert!(target_has_changes(&ctx, &path).unwrap());
+    }
+
+    #[test]
+    fn target_has_changes_false_for_plain_directory() {
+        let (_tmp, ctx) = temp_ctx();
+        // A directory that is not a registered worktree: nothing to preserve.
+        let dir = ctx.repo_root.join("..").join("just-a-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("file.txt"), "x\n").unwrap();
+        assert!(!target_has_changes(&ctx, &dir).unwrap());
+    }
 
     #[test]
     fn sanitizes_branch_dir_names() {
