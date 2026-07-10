@@ -109,6 +109,18 @@ pub enum Command {
         #[arg(long, short = 'n', default_value_t = 20)]
         count: u32,
     },
+    /// Cherry-pick one or more commits from any branch into a worktree.
+    CherryPick {
+        /// Worktree to apply the commits into.
+        #[arg(long)]
+        into: String,
+        /// Commits to apply, oldest-first (the order git applies them).
+        #[arg(required = true)]
+        commits: Vec<String>,
+        /// Load the changes into the working tree without committing (git -n).
+        #[arg(long)]
+        no_commit: bool,
+    },
     /// Set up .wtm.toml for this repo with a few guided questions (where
     /// worktrees go, files to copy, commands to run).
     Init {
@@ -192,6 +204,14 @@ pub enum BranchAction {
         old: String,
         /// New branch name.
         new: String,
+    },
+    /// Show a branch's commit history (without checking it out).
+    Log {
+        /// Branch name.
+        name: String,
+        /// Number of commits to show.
+        #[arg(long, short = 'n', default_value_t = 20)]
+        count: u32,
     },
 }
 

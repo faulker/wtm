@@ -1206,3 +1206,53 @@ fn create_tracks_a_branch_that_exists_only_on_origin() {
         "origin/remote-only"
     );
 }
+
+#[test]
+fn cherry_pick_commits_from_a_branch_into_a_worktree() {
+    let (_tmp, repo) = setup_repo();
+
+    // A feature branch (in its own worktree) with a commit adding feat.txt.
+    let feat = stdout_json(&wtm(&repo, &["create", "feature", "--json"]));
+    let feat_path = PathBuf::from(feat["path"].as_str().unwrap());
+    std::fs::write(feat_path.join("feat.txt"), "feature work\n").unwrap();
+    git(&feat_path, &["add", "feat.txt"]);
+    git(&feat_path, &["commit", "-m", "add feat.txt"]);
+
+    // The commit shows up via `branch log` without checking the branch out,
+    // and its hash is what we cherry-pick.
+    let log = stdout_json(&wtm(&repo, &["branch", "log", "feature", "--json"]));
+    assert_eq!(log["entries"][0]["subject"], "add feat.txt");
+    let hash = log["entries"][0]["hash"].as_str().unwrap().to_string();
+
+    // A separate target worktree (branched off main) to receive the commit.
+    let target = stdout_json(&wtm(&repo, &["create", "target", "--json"]));
+    let target_path = PathBuf::from(target["path"].as_str().unwrap());
+
+    // Cherry-pick and commit: the file lands and the target's HEAD advances.
+    let picked = stdout_json(&wtm(
+        &repo,
+        &["cherry-pick", "--into", "target", &hash, "--json"],
+    ));
+    assert_eq!(picked["committed"], true);
+    assert_eq!(picked["count"], 1);
+    assert!(target_path.join("feat.txt").exists());
+    let target_log = stdout_json(&wtm(&repo, &["log", "target", "--json"]));
+    assert_eq!(target_log["entries"][0]["subject"], "add feat.txt");
+
+    // A second feature commit, this time loaded without committing.
+    std::fs::write(feat_path.join("feat2.txt"), "more work\n").unwrap();
+    git(&feat_path, &["add", "feat2.txt"]);
+    git(&feat_path, &["commit", "-m", "add feat2.txt"]);
+    let log2 = stdout_json(&wtm(&repo, &["branch", "log", "feature", "--json"]));
+    let hash2 = log2["entries"][0]["hash"].as_str().unwrap().to_string();
+
+    let loaded = stdout_json(&wtm(
+        &repo,
+        &["cherry-pick", "--into", "target", "--no-commit", &hash2, "--json"],
+    ));
+    assert_eq!(loaded["committed"], false);
+    // The change is in the working tree but not committed: HEAD is unchanged.
+    assert!(target_path.join("feat2.txt").exists());
+    let target_log2 = stdout_json(&wtm(&repo, &["log", "target", "--json"]));
+    assert_eq!(target_log2["entries"][0]["subject"], "add feat.txt");
+}

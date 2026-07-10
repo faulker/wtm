@@ -13,8 +13,8 @@ use ratatui::widgets::{
 };
 
 use super::app::{
-    App, BranchMode, CommitFocus, DiffRow, ForceBranchReason, IgnorePrompt, RowList, StashMode,
-    Tab, TextInput, View, filtered_branches,
+    App, BranchMode, CherryTarget, CommitFocus, DiffRow, ForceBranchReason, IgnorePrompt, RowList,
+    StashMode, Tab, TextInput, View, filtered_branches,
 };
 use super::config_editor::{ConfigEditor, FIELD_ROWS, ROWS as CONFIG_ROWS};
 use super::setup::{REVIEW_ROWS, SetupWizard, Step, location_preview};
@@ -69,6 +69,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             scroll,
         } => {
             draw_log(frame, main, name, entries, *scroll);
+            None
+        }
+        View::BranchCommits {
+            branch,
+            entries,
+            marked,
+            selected,
+        } => {
+            draw_branch_commits(frame, main, branch, entries, marked, *selected);
             None
         }
         // The first-run setup wizard takes over the whole main area (there is no
@@ -168,6 +177,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         } => draw_switch(frame, main, name, branches, filter, *selected),
         View::Busy { label, .. } => draw_busy(frame, main, label, app.tick_count),
         View::RunCommand { name, input, .. } => draw_run_command(frame, main, name, input),
+        View::CherryPick {
+            source_branch,
+            summaries,
+            targets,
+            selected,
+            mode,
+            ..
+        } => draw_cherry_pick(frame, main, source_branch, summaries, targets, *selected, *mode),
         _ => {}
     }
 
@@ -590,10 +607,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             Tab::Branches => match &app.branch_mode {
                 BranchMode::List => &[
                     ("⇥", "worktrees"),
-                    ("↑/↓", "select"),
-                    ("Enter", "check out in a worktree"),
+                    ("Enter", "commits / cherry-pick"),
+                    ("c", "check out in a worktree"),
                     ("n", "new branch (no worktree)"),
                     ("d", "delete"),
+                    ("?", "help"),
                     ("q", "quit"),
                 ],
                 BranchMode::Create(_) => &[
@@ -625,6 +643,22 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("PgUp/PgDn", "page"),
             ("g", "top"),
             ("q", "back"),
+        ],
+        View::BranchCommits { .. } => &[
+            ("↑/↓", "select"),
+            ("Space", "mark commit"),
+            ("a", "all/none"),
+            ("Enter", "cherry-pick"),
+            ("?", "help"),
+            ("q", "back"),
+        ],
+        View::CherryPick { mode: Some(_), .. } => {
+            &[("↑/↓", "mode"), ("Enter", "confirm"), ("Esc", "back")]
+        }
+        View::CherryPick { .. } => &[
+            ("↑/↓", "pick worktree"),
+            ("Enter", "choose mode"),
+            ("Esc", "cancel"),
         ],
         View::Commit { focus, .. } => match focus {
             CommitFocus::Files => &[
@@ -1222,7 +1256,7 @@ fn draw_confirm_force_branch(
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) {
-    let popup = centered(area, 70, 40);
+    let popup = centered(area, 74, 48);
     frame.render_widget(Clear, popup);
     let key = |k: &str, label: &str| -> Line<'static> {
         Line::from(vec![
@@ -1241,37 +1275,39 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         key("n", "new worktree (new branch or existing branch)"),
         key("b", "switch the selected worktree to another branch"),
         key("c", "commit (pick files, all selected by default)"),
-        key("o", "options: edit this repo's settings"),
-        key("e", "run the open command in the worktree dir"),
+        key("o / e", "edit repo settings / run the open command"),
         key("s", "stash manager (stash/pop/apply/drop)"),
         key("p / ⇧P", "pull (fast-forward) / push the worktree"),
-        key("f", "fetch all remotes"),
-        key("l", "commit log of the worktree"),
+        key("f / l", "fetch all remotes / commit log"),
         key("d", "delete worktree (folder, or folder + branch)"),
-        key("r", "refresh the list"),
-        key("q / Ctrl+C", "quit"),
+        key("r / q", "refresh the list / quit"),
         Line::from(""),
         heading("branches tab"),
         key("↑/↓ or j/k", "select branch"),
-        key("Enter", "check the branch out in a new worktree"),
+        key("Enter", "view the branch's commits (then cherry-pick)"),
+        key("c", "check the branch out in a new worktree"),
         key("n", "create a branch only (no worktree)"),
         key("d", "delete the selected branch (f to force)"),
         Line::from(""),
+        heading("commits view (Branches tab → Enter)"),
+        key("↑/↓", "move the commit cursor"),
+        key("Space / a", "mark a commit / mark all for cherry-pick"),
+        key("Enter", "cherry-pick marked commits into a worktree"),
+        Line::from("  then pick a target worktree, and choose to commit".dim()),
+        Line::from("  directly (keep messages) or just load the changes.".dim()),
+        Line::from(""),
         heading("changes (diff) view"),
         key("↑/↓ or j/k", "move the file cursor"),
-        key("⇧↑/⇧↓/⇧J/⇧K", "scroll the diff (or mouse wheel)"),
-        key("Space", "mark a file (or a whole folder) for commit"),
-        key("a", "mark / unmark all"),
+        key("⇧↑/⇧↓", "scroll the diff (or mouse wheel)"),
+        key("Space / a", "mark a file (or folder) / mark all for commit"),
         key("c", "commit the marked files"),
-        key("s", "stash the highlighted file"),
-        key("⇧S", "stash every marked ([x]) file"),
-        key("⇧R", "revert the highlighted file"),
-        key("i", "add file/folder (or a glob) to .gitignore"),
+        key("s / ⇧S", "stash the highlighted / every marked file"),
+        key("⇧R / i", "revert file / add file or glob to .gitignore"),
         Line::from(""),
-        heading("new branch vs existing branch vs branch-only"),
-        Line::from("  n → type a name, ⇥ to pick a base: new branch + worktree.".dim()),
-        Line::from("  n → pick a branch: check that existing branch out here.".dim()),
-        Line::from("  Branches tab → n: create a branch only, no worktree.".dim()),
+        heading("changes view status codes  (col 1 = staged · col 2 = working tree)"),
+        Line::from("  M modified · A added · D deleted · R renamed · C copied".dim()),
+        Line::from("  ?? untracked · UU conflict (both sides changed)".dim()),
+        Line::from("  e.g.  ' M' edited, unstaged · 'M ' staged · 'MM' staged + more edits · 'A ' new file staged".dim()),
     ];
     let para = Paragraph::new(text).block(panel("help  ·  ? or any key to close"));
     frame.render_widget(para, popup);
@@ -1938,6 +1974,138 @@ fn draw_log(frame: &mut Frame, area: Rect, name: &str, entries: &[LogEntry], scr
         area,
         &mut sb_state,
     );
+}
+
+/// A branch's commit history with a commit checkbox on each row. Marked commits
+/// (or the one under the cursor) are cherry-picked into a worktree via Enter.
+fn draw_branch_commits(
+    frame: &mut Frame,
+    area: Rect,
+    branch: &str,
+    entries: &[LogEntry],
+    marked: &[bool],
+    selected: usize,
+) {
+    let block = panel(format!("commits · {branch}"));
+    if entries.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from("no commits".dim())).block(block),
+            area,
+        );
+        return;
+    }
+    let items: Vec<ListItem> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let checked = marked.get(i).copied().unwrap_or(false);
+            let check = if checked {
+                Span::styled("[x] ", Style::new().fg(Color::Green))
+            } else {
+                Span::styled("[ ] ", Style::new().dim())
+            };
+            // Full hashes are stored for cherry-pick; show an abbreviated form.
+            let short = &e.hash[..e.hash.len().min(9)];
+            ListItem::new(Line::from(vec![
+                check,
+                Span::styled(format!("{short} "), Style::new().fg(Color::Yellow)),
+                Span::raw(format!("{}  ", e.subject)),
+                Span::styled(format!("{} · {}", e.author, e.date), Style::new().dim()),
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::new().bg(SELECTION_BG).bold())
+        .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
+    let mut state = ListState::default().with_selected(Some(selected.min(entries.len() - 1)));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// The cherry-pick flow overlay: first a worktree picker (`mode` is None), then
+/// a commit-vs-load-only choice (`mode` is Some).
+fn draw_cherry_pick(
+    frame: &mut Frame,
+    area: Rect,
+    source_branch: &str,
+    summaries: &[String],
+    targets: &[CherryTarget],
+    selected: usize,
+    mode: Option<usize>,
+) {
+    let n = summaries.len();
+    let plural = if n == 1 { "commit" } else { "commits" };
+    match mode {
+        // Commit vs load-only.
+        Some(m) => {
+            let popup = centered(area, 60, 7);
+            frame.render_widget(Clear, popup);
+            let option = |sel: bool, label: &str| -> Line<'static> {
+                let marker = if sel { "▌ ● " } else { "  ○ " };
+                let style = if sel {
+                    Style::new().bg(SELECTION_BG).bold()
+                } else {
+                    Style::new()
+                };
+                Line::from(vec![
+                    Span::styled(marker.to_string(), style.fg(ACCENT)),
+                    Span::styled(label.to_string(), style),
+                ])
+            };
+            let lines = vec![
+                Line::from(format!("apply {n} {plural} into the worktree:").dim()),
+                Line::from(""),
+                option(m == 0, "Commit directly (keep original messages)"),
+                option(m == 1, "Load changes only (review, then commit)"),
+                Line::from(""),
+                Line::from("↑/↓ choose · Enter confirm · Esc back".dim()),
+            ];
+            frame.render_widget(Paragraph::new(lines).block(panel("cherry-pick mode")), popup);
+        }
+        // Worktree picker.
+        None => {
+            let rows = targets.len().clamp(1, 12) as u16;
+            let popup = centered(area, 60, rows + 5);
+            frame.render_widget(Clear, popup);
+            let block = panel(format!("cherry-pick {n} {plural} from '{source_branch}'"));
+            frame.render_widget(&block, popup);
+            let inner = block.inner(popup);
+            let [head_area, list_area, hint_area] = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .areas(inner);
+            frame.render_widget(
+                Paragraph::new(Line::from("into which worktree?".dim())),
+                head_area,
+            );
+            let items: Vec<ListItem> = targets
+                .iter()
+                .map(|t| {
+                    let branch = match &t.branch {
+                        Some(b) => format!(" ({b})"),
+                        None => " (detached)".to_string(),
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled("● ", Style::new().fg(Color::Green)),
+                        Span::raw(t.name.clone()),
+                        Span::styled(branch, Style::new().dim()),
+                    ]))
+                })
+                .collect();
+            let list = List::new(items)
+                .highlight_style(Style::new().bg(SELECTION_BG).bold())
+                .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
+            let mut state =
+                ListState::default().with_selected(Some(selected.min(targets.len().max(1) - 1)));
+            frame.render_stateful_widget(list, list_area, &mut state);
+            frame.render_widget(
+                Paragraph::new(Line::from("↑/↓ pick · Enter choose mode · Esc cancel".dim())),
+                hint_area,
+            );
+        }
+    }
 }
 
 /// A small centered overlay showing that a background op is running.

@@ -111,7 +111,9 @@ wtm branch list                            # branches with checkout, tracking, l
 wtm branch create <name> [--from <ref>]    # branch without a worktree
 wtm branch delete <name> [--force]         # refuses if checked out in a worktree
 wtm branch rename <old> <new>
+wtm branch log <name> [-n <count>]         # a branch's commits without checking it out
 wtm log <name> [-n <count>]                # recent commits (default 20)
+wtm cherry-pick --into <name> <commit>...  # apply commits into a worktree (--no-commit to load only)
 ```
 
 `wtm create` also pulls down remote branches: when the branch only exists on a remote, it creates a local tracking branch from it instead of branching off HEAD.
@@ -136,6 +138,8 @@ wtm branch list                            # local branches: checkout, tracking,
 wtm branch create <name> [--from <ref>]    # create a branch without a worktree
 wtm branch delete <name> [--force]         # delete; refuses if checked out in a worktree
 wtm branch rename <old> <new>
+wtm branch log <name> [-n <count>]         # a branch's commit history without checking it out
+wtm cherry-pick --into <name> <commit>...  # cherry-pick commits into a worktree; --no-commit stages only
 ```
 
 When `wtm create <branch>` is given a branch that only exists on a remote (e.g. `origin/<branch>`), it fetches if needed and checks out a local tracking branch from the remote instead of branching from HEAD.
@@ -160,7 +164,7 @@ Run `wtm` inside a repo. If the repo isn't initialized yet, the setup wizard ope
 | `⇧P` | push the selected worktree; publishes with `-u` when there's no upstream |
 | `f` | fetch all remotes and refresh |
 | `b` | switch the selected worktree to another local branch: a picker of branches not checked out anywhere. Type to filter the list, `↑`/`↓` select, `Enter` switches, `Esc` clears the filter then closes |
-| `Tab` | branch browser (Branches tab): every local branch with where it's checked out. `n` creates a **branch only** (no worktree, from HEAD), `d` deletes (`f` forces), `Enter` checks the selected branch out in a new worktree |
+| `Tab` | branch browser (Branches tab): every local branch with where it's checked out. `Enter` opens the branch's **commit history**, where `Space` marks commits (`a` all/none) and `Enter` **cherry-picks** the marked commits into a worktree you pick — choosing to commit them directly (keeping the original messages) or just load the changes for review. `c` checks the branch out in a new worktree, `n` creates a **branch only** (no worktree, from HEAD), `d` deletes (`f` forces) |
 | `l` | log of recent commits for the selected worktree |
 | `r` | refresh |
 | `?` | help (works here and in the changes view; any key closes it) |
@@ -179,10 +183,10 @@ While setup runs, its output streams into the progress window. Type a line and p
 | Area | Tools |
 | --- | --- |
 | Worktrees | `list_worktrees`, `create_worktree`, `remove_worktree`, `worktree_status`, `worktree_diff` |
-| Commits | `commit_changes`, `worktree_log` |
+| Commits | `commit_changes`, `worktree_log`, `cherry_pick` |
 | Stashes | `stash_push`, `stash_list`, `stash_pop`, `stash_apply`, `stash_drop` |
 | Remotes | `pull_worktree`, `push_worktree`, `fetch_remotes` |
-| Branches | `list_branches`, `create_branch`, `delete_branch`, `rename_branch` |
+| Branches | `list_branches`, `create_branch`, `delete_branch`, `rename_branch`, `branch_log` |
 
 Register with [Claude Code](https://claude.com/claude-code) from inside your repo:
 

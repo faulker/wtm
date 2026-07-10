@@ -267,6 +267,34 @@ pub enum View {
         entries: Vec<LogEntry>,
         scroll: u16,
     },
+    /// Commit history of a branch on the Branches tab, with multi-select for
+    /// cherry-picking. `marked` is parallel with `entries`; Enter opens the
+    /// worktree picker (`CherryPick`) for the marked commits (or the one under
+    /// the cursor when none are marked).
+    BranchCommits {
+        branch: String,
+        entries: Vec<LogEntry>,
+        marked: Vec<bool>,
+        selected: usize,
+    },
+    /// Cherry-pick flow: choose which worktree to apply the picked commits into,
+    /// then whether to commit them or just load the changes. Reached from
+    /// `BranchCommits`.
+    CherryPick {
+        /// Branch the commits came from (for labelling).
+        source_branch: String,
+        /// Commit hashes to apply, ordered oldest-first (git's apply order).
+        commits: Vec<String>,
+        /// Short subjects of `commits`, oldest-first, for display.
+        summaries: Vec<String>,
+        /// Worktrees the commits can be applied into.
+        targets: Vec<CherryTarget>,
+        /// Cursor into `targets`.
+        selected: usize,
+        /// None while picking the target; Some(0) = "commit", Some(1) = "load
+        /// changes only" while the mode prompt is open.
+        mode: Option<usize>,
+    },
     /// A git operation (pull/push/fetch/delete/…) running on a background
     /// thread. Its result message is shown and the list refreshed when it
     /// finishes; `then` decides which view to reopen afterwards.
@@ -284,6 +312,19 @@ pub enum BusyThen {
     List,
     Stash(String),
     Branch,
+    /// After a backgrounded worktree removal succeeds, delete its branch on the
+    /// main thread (so a refused delete can open the force prompt). Carries the
+    /// worktree name and the branch to delete.
+    DeleteBranch { name: String, branch: String },
+}
+
+/// A worktree the picked commits can be cherry-picked into. Cherry-pick needs a
+/// working directory, so targets are always existing worktrees.
+pub struct CherryTarget {
+    /// Worktree name (how it's addressed in ops).
+    pub name: String,
+    /// Branch checked out there, or None when detached.
+    pub branch: Option<String>,
 }
 
 /// Choice shown when adding the highlighted file or folder to `.gitignore`:
@@ -567,18 +608,30 @@ impl App {
                 };
                 // A success lands in the header's status line; a failure pops up
                 // the modal error box instead, since git errors are often
-                // multi-line and unreadable truncated to one line.
-                match result {
-                    Ok(m) => self.message = Some(m),
-                    Err(e) => self.set_error(e),
-                }
-                self.refresh();
-                match then {
-                    BusyThen::List => {}
-                    BusyThen::Stash(name) => self.load_stash(name, StashMode::List),
-                    BusyThen::Branch => {
-                        self.branch_mode = BranchMode::List;
-                        self.load_branches(self.branch_selected);
+                // multi-line and unreadable truncated to one line. The
+                // DeleteBranch follow-up is special: on success it proceeds to
+                // the (possibly force-prompting) branch delete rather than
+                // showing a message here.
+                match (result, then) {
+                    (Ok(_), BusyThen::DeleteBranch { name, branch }) => {
+                        self.refresh();
+                        self.delete_branch_step(name, branch);
+                    }
+                    (Ok(m), then) => {
+                        self.message = Some(m);
+                        self.refresh();
+                        match then {
+                            BusyThen::List | BusyThen::DeleteBranch { .. } => {}
+                            BusyThen::Stash(name) => self.load_stash(name, StashMode::List),
+                            BusyThen::Branch => {
+                                self.branch_mode = BranchMode::List;
+                                self.load_branches(self.branch_selected);
+                            }
+                        }
+                    }
+                    (Err(e), _) => {
+                        self.set_error(e);
+                        self.refresh();
                     }
                 }
             }
@@ -818,6 +871,8 @@ impl App {
             View::Stash { .. } => self.on_stash_key(key),
             View::Switch { .. } => self.on_switch_key(key),
             View::Log { .. } => self.on_log_key(key),
+            View::BranchCommits { .. } => self.on_branch_commits_key(key),
+            View::CherryPick { .. } => self.on_cherry_pick_key(key),
             // A background op owns the screen until tick() drains its result.
             View::Busy { .. } => {}
         }
@@ -2191,7 +2246,11 @@ impl App {
                     self.branch_mode = BranchMode::ConfirmDelete;
                 }
             }
-            KeyCode::Enter => {
+            // Enter drills into the branch's commit history, the entry point
+            // for cherry-picking commits into a worktree.
+            KeyCode::Enter => self.open_branch_commits(),
+            // `c` checks the branch out in a new worktree (the old Enter action).
+            KeyCode::Char('c') => {
                 if let Some(b) = self.branches.get(self.branch_selected) {
                     if b.checked_out_path.is_some() {
                         let msg = format!("branch '{}' is already checked out", b.name);
@@ -2205,6 +2264,204 @@ impl App {
             KeyCode::Char('?') => self.show_help = true,
             _ => {}
         }
+    }
+
+    /// Opens the commit history of the selected branch (Branches tab → Enter),
+    /// from which commits can be marked and cherry-picked into a worktree.
+    fn open_branch_commits(&mut self) {
+        let Some(branch) = self
+            .branches
+            .get(self.branch_selected)
+            .map(|b| b.name.clone())
+        else {
+            return;
+        };
+        match ops::branch_log(&self.ctx, &branch, 200) {
+            Ok(r) => {
+                let marked = vec![false; r.entries.len()];
+                self.view = View::BranchCommits {
+                    branch,
+                    entries: r.entries,
+                    marked,
+                    selected: 0,
+                };
+            }
+            Err(e) => self.set_error(format!("{e:#}")),
+        }
+    }
+
+    /// Key handling for the branch commit-history view: move the cursor, toggle
+    /// commits for cherry-picking, and open the worktree picker.
+    fn on_branch_commits_key(&mut self, key: KeyEvent) {
+        let View::BranchCommits {
+            entries,
+            marked,
+            selected,
+            ..
+        } = &mut self.view
+        else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                // Back to the Branches tab, keeping the branch highlighted.
+                self.view = View::List;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if *selected + 1 < entries.len() {
+                    *selected += 1;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+            KeyCode::Char(' ') => {
+                if let Some(m) = marked.get_mut(*selected) {
+                    *m = !*m;
+                }
+            }
+            KeyCode::Char('a') => {
+                let all = marked.iter().all(|m| *m);
+                for m in marked.iter_mut() {
+                    *m = !all;
+                }
+            }
+            KeyCode::Enter => self.open_cherry_pick(),
+            KeyCode::Char('?') => self.show_help = true,
+            _ => {}
+        }
+    }
+
+    /// Builds the cherry-pick worktree picker from the marked commits (or the
+    /// one under the cursor when none are marked). Commits are ordered
+    /// oldest-first, the order git applies them.
+    fn open_cherry_pick(&mut self) {
+        let View::BranchCommits {
+            branch,
+            entries,
+            marked,
+            selected,
+        } = &self.view
+        else {
+            return;
+        };
+        // Gather chosen commits newest-first as they appear, then reverse to
+        // oldest-first for git.
+        let chosen: Vec<usize> = if marked.iter().any(|m| *m) {
+            (0..entries.len()).filter(|i| marked[*i]).collect()
+        } else {
+            vec![*selected]
+        };
+        if chosen.is_empty() {
+            return;
+        }
+        let mut commits: Vec<String> = Vec::new();
+        let mut summaries: Vec<String> = Vec::new();
+        for &i in chosen.iter().rev() {
+            if let Some(e) = entries.get(i) {
+                commits.push(e.hash.clone());
+                summaries.push(e.subject.clone());
+            }
+        }
+        let source_branch = branch.clone();
+        // Every existing worktree is a possible destination; cherry-pick needs a
+        // working directory to apply into.
+        let targets: Vec<CherryTarget> = self
+            .worktrees
+            .iter()
+            .map(|w| CherryTarget {
+                name: w.name.clone(),
+                branch: w.branch.clone(),
+            })
+            .collect();
+        if targets.is_empty() {
+            self.message = Some("no worktrees to cherry-pick into".to_string());
+            return;
+        }
+        self.view = View::CherryPick {
+            source_branch,
+            commits,
+            summaries,
+            targets,
+            selected: 0,
+            mode: None,
+        };
+    }
+
+    /// Key handling for the cherry-pick flow: pick a target worktree, then
+    /// choose whether to commit or just load the changes, then run it.
+    fn on_cherry_pick_key(&mut self, key: KeyEvent) {
+        let View::CherryPick {
+            targets,
+            selected,
+            mode,
+            ..
+        } = &mut self.view
+        else {
+            return;
+        };
+        match mode {
+            // Mode prompt: commit vs load-only.
+            Some(m) => match key.code {
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j') => {
+                    *m = 1 - *m;
+                }
+                KeyCode::Enter => self.run_cherry_pick(),
+                KeyCode::Esc | KeyCode::Char('q') => *mode = None,
+                _ => {}
+            },
+            // Worktree picker.
+            None => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if *selected + 1 < targets.len() {
+                        *selected += 1;
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+                KeyCode::Enter => *mode = Some(0),
+                KeyCode::Esc | KeyCode::Char('q') => self.view = View::List,
+                _ => {}
+            },
+        }
+    }
+
+    /// Runs the chosen cherry-pick in the background, returning to the Branches
+    /// tab with a result message.
+    fn run_cherry_pick(&mut self) {
+        let View::CherryPick {
+            commits,
+            targets,
+            selected,
+            mode,
+            ..
+        } = &self.view
+        else {
+            return;
+        };
+        let Some(target) = targets.get(*selected) else {
+            return;
+        };
+        let no_commit = *mode == Some(1);
+        let target_name = target.name.clone();
+        let commits = commits.clone();
+        let count = commits.len();
+        let verb = if no_commit { "loading" } else { "cherry-picking" };
+        self.start_busy(
+            format!("{verb} {count} commit(s) into '{target_name}'…"),
+            BusyThen::List,
+            move |ctx| {
+                ops::cherry_pick(ctx, &target_name, &commits, no_commit)
+                    .map(|r| {
+                        if r.committed {
+                            format!("cherry-picked {} commit(s) into '{}'", r.count, r.target)
+                        } else {
+                            format!(
+                                "loaded {} commit(s) into '{}' (review, then commit)",
+                                r.count, r.target
+                            )
+                        }
+                    })
+                    .map_err(|e| format!("{e:#}"))
+            },
+        );
     }
 
     /// Creates a branch from HEAD and reloads the Branches tab.
@@ -2432,16 +2689,26 @@ impl App {
     /// refusal can open the force prompt instead of failing silently.
     fn do_delete(&mut self, name: String, branch: Option<String>, delete_branch: bool, force: bool) {
         match (delete_branch, branch) {
-            (true, Some(branch)) => match ops::remove_worktree_only(&self.ctx, &name, force) {
-                // The folder is gone, so the branch is no longer checked out
-                // here; now try to delete it.
-                Ok(_) => self.delete_branch_step(name, branch),
-                Err(e) => {
-                    self.set_error(format!("{e:#}"));
-                    self.view = View::List;
-                    self.refresh();
-                }
-            },
+            // Remove the folder in the background (the slow part), then delete
+            // the branch on the main thread once it lands (see the DeleteBranch
+            // follow-up in tick), so an unmerged or checked-out-elsewhere
+            // refusal can still open the force prompt. Backgrounding keeps the
+            // spinner moving instead of freezing the UI while git works.
+            (true, Some(branch)) => {
+                let thread_name = name.clone();
+                self.start_busy(
+                    format!("removing '{name}' and branch '{branch}'…"),
+                    BusyThen::DeleteBranch {
+                        name: name.clone(),
+                        branch,
+                    },
+                    move |ctx| {
+                        ops::remove_worktree_only(ctx, &thread_name, force)
+                            .map(|_| String::new())
+                            .map_err(|e| format!("{e:#}"))
+                    },
+                );
+            }
             // Folder-only removal (branch kept, or a detached worktree).
             _ => {
                 let thread_name = name.clone();
@@ -2601,10 +2868,10 @@ mod tests {
                     selected,
                     ..
                 } => {
-                    if let Some(i) = current_file_index(rows, *selected) {
-                        if files[i].path == path {
-                            return;
-                        }
+                    if let Some(i) = current_file_index(rows, *selected)
+                        && files[i].path == path
+                    {
+                        return;
                     }
                     assert!(*selected + 1 < rows.len(), "{path} not in the diff list");
                 }
@@ -3283,10 +3550,10 @@ mod tests {
         loop {
             match &app.view {
                 View::Diff { rows, selected, .. } => {
-                    if let Some(DiffRow::Folder { prefix: p, .. }) = rows.get(*selected) {
-                        if p == prefix {
-                            return;
-                        }
+                    if let Some(DiffRow::Folder { prefix: p, .. }) = rows.get(*selected)
+                        && p == prefix
+                    {
+                        return;
                     }
                     assert!(*selected + 1 < rows.len(), "{prefix} not in the diff list");
                 }
@@ -3741,15 +4008,15 @@ mod tests {
     }
 
     #[test]
-    fn branches_tab_enter_opens_prefilled_create() {
+    fn branches_tab_c_opens_prefilled_create() {
         let (_tmp, mut app) = test_app();
         git(&app.ctx.repo_root, &["branch", "spare"]);
         press(&mut app, KeyCode::Tab);
         assert_eq!(app.tab, Tab::Branches);
         app.branch_selected = app.branches.iter().position(|b| b.name == "spare").unwrap();
-        press(&mut app, KeyCode::Enter);
-        // The Branches tab checks out an existing branch, so the create dialog
-        // opens with that branch selected in the checkout list.
+        // `c` checks out an existing branch, so the create dialog opens with
+        // that branch selected in the checkout list.
+        press(&mut app, KeyCode::Char('c'));
         match &app.view {
             View::Create {
                 branches, selected, ..
@@ -3758,6 +4025,32 @@ mod tests {
                 assert_eq!(branches[*selected - 1], "spare");
             }
             _ => panic!("expected the create dialog prefilled with the branch"),
+        }
+    }
+
+    #[test]
+    fn branches_tab_enter_opens_commits_and_marks_for_cherry_pick() {
+        let (_tmp, mut app) = test_app();
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.tab, Tab::Branches);
+        // Enter on a branch drills into its commit history.
+        press(&mut app, KeyCode::Enter);
+        match &app.view {
+            View::BranchCommits { entries, .. } => assert!(!entries.is_empty()),
+            _ => panic!("expected the branch commits view"),
+        }
+        // Space marks the commit under the cursor, and Enter opens the
+        // cherry-pick worktree picker with it selected.
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Enter);
+        match &app.view {
+            View::CherryPick {
+                commits, targets, ..
+            } => {
+                assert_eq!(commits.len(), 1);
+                assert!(!targets.is_empty());
+            }
+            _ => panic!("expected the cherry-pick picker"),
         }
     }
 

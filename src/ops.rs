@@ -737,6 +737,18 @@ pub struct LogResult {
     pub entries: Vec<git::LogEntry>,
 }
 
+/// Result of `cherry_pick`.
+#[derive(Debug, Clone, Serialize)]
+pub struct CherryPickResult {
+    /// Worktree the commits were applied into.
+    pub target: String,
+    /// How many commits were cherry-picked.
+    pub count: usize,
+    /// True when the commits were committed; false when loaded into the working
+    /// tree only (`no_commit`).
+    pub committed: bool,
+}
+
 /// Result of `switch`.
 #[derive(Debug, Clone, Serialize)]
 pub struct SwitchResult {
@@ -981,6 +993,45 @@ pub fn log(ctx: &Ctx, name: &str, count: u32) -> Result<LogResult> {
     Ok(LogResult {
         name: info.name,
         entries,
+    })
+}
+
+/// Recent commits reachable from a local branch (newest first), without
+/// checking it out. Used by the Branches tab to show a branch's history for
+/// cherry-picking. Commit hashes are full so they can be passed to
+/// [`cherry_pick`].
+pub fn branch_log(ctx: &Ctx, branch: &str, count: u32) -> Result<LogResult> {
+    if !git::branch_exists(&ctx.repo_root, branch) {
+        bail!("no local branch named '{branch}'");
+    }
+    let entries = git::log_ref(&ctx.repo_root, branch, count)?;
+    Ok(LogResult {
+        name: branch.to_string(),
+        entries,
+    })
+}
+
+/// Cherry-picks `commits` into the worktree named `target`. `commits` are taken
+/// oldest-first (the order git applies them). With `no_commit` the changes are
+/// staged in the target worktree without a commit so they can be reviewed or
+/// edited; otherwise each commit is recorded with its original message. A
+/// conflict aborts the cherry-pick and surfaces git's error, leaving the target
+/// worktree clean.
+pub fn cherry_pick(
+    ctx: &Ctx,
+    target: &str,
+    commits: &[String],
+    no_commit: bool,
+) -> Result<CherryPickResult> {
+    if commits.is_empty() {
+        bail!("no commits to cherry-pick");
+    }
+    let info = find(ctx, target)?.ok_or_else(|| not_found(ctx, target))?;
+    git::cherry_pick(Path::new(&info.path), commits, no_commit)?;
+    Ok(CherryPickResult {
+        target: info.name,
+        count: commits.len(),
+        committed: !no_commit,
     })
 }
 

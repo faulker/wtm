@@ -616,6 +616,49 @@ pub fn log(dir: &Path, count: u32) -> Result<Vec<LogEntry>> {
     Ok(parse_log(&out))
 }
 
+/// Recent commits reachable from an arbitrary ref (branch, tag, hash), newest
+/// first. Runs in `dir` (typically the repo root) so any local branch can be
+/// inspected without checking it out. Full (`%H`) hashes are used so the
+/// results can be passed straight to `cherry_pick`.
+pub fn log_ref(dir: &Path, refname: &str, count: u32) -> Result<Vec<LogEntry>> {
+    let count = count.to_string();
+    let out = run(
+        dir,
+        &[
+            "log",
+            refname,
+            "-n",
+            &count,
+            "--date=relative",
+            "--format=%H\u{1f}%s\u{1f}%an\u{1f}%ad",
+        ],
+    )?;
+    Ok(parse_log(&out))
+}
+
+/// Cherry-picks `commits` onto the branch checked out in `dir`. `commits` must
+/// be ordered oldest-first, the order git applies them. When `no_commit` is
+/// true (`-x -n`) the changes land staged in the working tree without a commit,
+/// so the caller can review or edit before committing; otherwise each commit is
+/// recorded with its original message. On failure the in-progress cherry-pick
+/// is aborted so the worktree is left clean rather than mid-sequence.
+pub fn cherry_pick(dir: &Path, commits: &[String], no_commit: bool) -> Result<()> {
+    let mut args: Vec<&str> = vec!["cherry-pick"];
+    if no_commit {
+        args.push("-n");
+    }
+    args.extend(commits.iter().map(String::as_str));
+    match run(dir, &args) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            // Best-effort cleanup: leave no half-applied sequence or -n changes
+            // behind, so the target worktree stays usable after a conflict.
+            let _ = run(dir, &["cherry-pick", "--abort"]);
+            Err(e)
+        }
+    }
+}
+
 /// Finds a remote-tracking ref matching `branch` (e.g. "origin/feature"),
 /// searching each configured remote. Returns the short `<remote>/<branch>`
 /// form for use as a branch base.

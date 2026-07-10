@@ -6,9 +6,9 @@ use serde_json::json;
 
 use crate::git::StatusEntry;
 use crate::ops::{
-    BranchCreateResult, BranchDeleteResult, BranchListResult, BranchRenameResult, CommitResult,
-    CreateResult, FetchResult, LogResult, PullResult, PushResult, StashListResult, StashResult,
-    SwitchResult, WorktreeInfo,
+    BranchCreateResult, BranchDeleteResult, BranchListResult, BranchRenameResult, CherryPickResult,
+    CommitResult, CreateResult, FetchResult, LogResult, PullResult, PushResult, StashListResult,
+    StashResult, SwitchResult, WorktreeInfo,
 };
 
 /// Serializes `value` as pretty JSON to stdout.
@@ -229,6 +229,21 @@ pub fn print_branch_delete(result: &BranchDeleteResult) {
 /// Human-readable branch-rename confirmation.
 pub fn print_branch_rename(result: &BranchRenameResult) {
     println!("renamed branch '{}' to '{}'", result.old, result.new);
+}
+
+/// Human-readable cherry-pick confirmation.
+pub fn print_cherry_pick(result: &CherryPickResult) {
+    if result.committed {
+        println!(
+            "cherry-picked {} commit(s) into '{}'",
+            result.count, result.target
+        );
+    } else {
+        println!(
+            "loaded {} commit(s) into '{}' (review, then commit)",
+            result.count, result.target
+        );
+    }
 }
 
 /// Human-readable commit log.

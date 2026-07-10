@@ -240,6 +240,27 @@ fn run(cli: Cli) -> Result<()> {
                         output::print_branch_rename(&result);
                     }
                 }
+                BranchAction::Log { name, count } => {
+                    let result = ops::branch_log(&ctx, &name, count)?;
+                    if cli.json {
+                        output::print_json(&result)?;
+                    } else {
+                        output::print_log(&result);
+                    }
+                }
+            }
+        }
+        Command::CherryPick {
+            into,
+            commits,
+            no_commit,
+        } => {
+            let ctx = Ctx::discover_initialized(&cwd)?;
+            let result = ops::cherry_pick(&ctx, &into, &commits, no_commit)?;
+            if cli.json {
+                output::print_json(&result)?;
+            } else {
+                output::print_cherry_pick(&result);
             }
         }
         Command::Log { name, count } => {
