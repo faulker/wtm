@@ -849,7 +849,7 @@ fn stash_push_list_apply_pop_drop_roundtrip() {
     std::fs::remove_file(wt_path.join("scratch.txt")).unwrap();
 
     let popped = stdout_json(&wtm(&repo, &["stash", "pop", "feat", "--json"]));
-    assert_eq!(popped["action"], "pop");
+    assert_eq!(popped["status"], "applied");
     assert!(wt_path.join("scratch.txt").exists());
     let list = stdout_json(&wtm(&repo, &["stash", "list", "feat", "--json"]));
     assert_eq!(
@@ -1137,7 +1137,12 @@ fn switch_changes_a_worktrees_branch() {
     let out = wtm(&repo, &["switch", "spare", "main", "--json"]);
     assert!(!out.status.success());
     let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
-    assert!(err["error"].as_str().unwrap().contains("already checked out"));
+    assert!(
+        err["error"]
+            .as_str()
+            .unwrap()
+            .contains("already checked out")
+    );
 
     // Human output confirms the switch.
     git(&repo, &["branch", "spare2"]);
@@ -1248,11 +1253,167 @@ fn cherry_pick_commits_from_a_branch_into_a_worktree() {
 
     let loaded = stdout_json(&wtm(
         &repo,
-        &["cherry-pick", "--into", "target", "--no-commit", &hash2, "--json"],
+        &[
+            "cherry-pick",
+            "--into",
+            "target",
+            "--no-commit",
+            &hash2,
+            "--json",
+        ],
     ));
     assert_eq!(loaded["committed"], false);
     // The change is in the working tree but not committed: HEAD is unchanged.
     assert!(target_path.join("feat2.txt").exists());
     let target_log2 = stdout_json(&wtm(&repo, &["log", "target", "--json"]));
     assert_eq!(target_log2["entries"][0]["subject"], "add feat.txt");
+}
+
+#[test]
+fn merge_merges_a_branch_cleanly() {
+    let (_tmp, repo) = setup_repo();
+
+    // A feature branch with a new file, and a separate target worktree
+    // branched off the same commit, so the merge is a clean fast-forward.
+    let feat = stdout_json(&wtm(&repo, &["create", "feature", "--json"]));
+    let feat_path = PathBuf::from(feat["path"].as_str().unwrap());
+    std::fs::write(feat_path.join("feat.txt"), "feature work\n").unwrap();
+    git(&feat_path, &["add", "feat.txt"]);
+    git(&feat_path, &["commit", "-m", "add feat.txt"]);
+
+    let target = stdout_json(&wtm(&repo, &["create", "target", "--json"]));
+    let target_path = PathBuf::from(target["path"].as_str().unwrap());
+
+    let merged = stdout_json(&wtm(
+        &repo,
+        &["merge", "feature", "--into", "target", "--json"],
+    ));
+    assert_eq!(merged["status"], "clean");
+    assert!(!merged["commit"].as_str().unwrap().is_empty());
+    assert!(target_path.join("feat.txt").exists());
+
+    // Merging the same branch again reports up to date.
+    let again = stdout_json(&wtm(
+        &repo,
+        &["merge", "feature", "--into", "target", "--json"],
+    ));
+    assert_eq!(again["status"], "up_to_date");
+}
+
+#[test]
+fn merge_conflict_lists_files_then_resolve_and_continue() {
+    let (_tmp, repo) = setup_repo();
+
+    // Two branches that both edit README.md differently from the same base.
+    let feat = stdout_json(&wtm(&repo, &["create", "feature", "--json"]));
+    let feat_path = PathBuf::from(feat["path"].as_str().unwrap());
+    std::fs::write(feat_path.join("README.md"), "from feature\n").unwrap();
+    git(&feat_path, &["commit", "-am", "feature edit"]);
+
+    let target = stdout_json(&wtm(&repo, &["create", "target", "--json"]));
+    let target_path = PathBuf::from(target["path"].as_str().unwrap());
+    std::fs::write(target_path.join("README.md"), "from target\n").unwrap();
+    git(&target_path, &["commit", "-am", "target edit"]);
+
+    // The merge stops on the conflicting file.
+    let merged = stdout_json(&wtm(
+        &repo,
+        &["merge", "feature", "--into", "target", "--json"],
+    ));
+    assert_eq!(merged["status"], "conflicted");
+    let files: Vec<&str> = merged["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f.as_str().unwrap())
+        .collect();
+    assert_eq!(files, vec!["README.md"]);
+
+    // `conflicts` confirms it, and reading the file returns parsed hunks.
+    let conflicts = stdout_json(&wtm(&repo, &["conflicts", "target", "--json"]));
+    assert_eq!(conflicts["files"].as_array().unwrap().len(), 1);
+    let read = stdout_json(&wtm(&repo, &["conflicts", "target", "README.md", "--json"]));
+    assert_eq!(read["path"], "README.md");
+    assert!(!read["segments"].as_array().unwrap().is_empty());
+
+    // Resolve by keeping "ours" (the target's edit), then finish the merge.
+    let resolved = stdout_json(&wtm(
+        &repo,
+        &["resolve", "target", "README.md", "--ours", "--json"],
+    ));
+    assert_eq!(resolved["action"], "ours");
+    assert_eq!(
+        std::fs::read_to_string(target_path.join("README.md")).unwrap(),
+        "from target\n"
+    );
+
+    let completed = stdout_json(&wtm(
+        &repo,
+        &["merge", "--into", "target", "--continue", "--json"],
+    ));
+    assert_eq!(completed["target"], "target");
+    assert!(!completed["commit"].as_str().unwrap().is_empty());
+
+    // No conflicts remain.
+    let conflicts_after = stdout_json(&wtm(&repo, &["conflicts", "target", "--json"]));
+    assert!(conflicts_after["files"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn cherry_pick_conflict_lists_files_then_resolve_and_continue() {
+    let (_tmp, repo) = setup_repo();
+
+    // A feature branch with a commit editing README.md (the one we cherry-pick).
+    let feat = stdout_json(&wtm(&repo, &["create", "feature", "--json"]));
+    let feat_path = PathBuf::from(feat["path"].as_str().unwrap());
+    std::fs::write(feat_path.join("README.md"), "from feature\n").unwrap();
+    git(&feat_path, &["commit", "-am", "feature edit"]);
+    let log = stdout_json(&wtm(&repo, &["branch", "log", "feature", "--json"]));
+    let hash = log["entries"][0]["hash"].as_str().unwrap().to_string();
+
+    // A target worktree that edits the same line differently, so the pick
+    // conflicts.
+    let target = stdout_json(&wtm(&repo, &["create", "target", "--json"]));
+    let target_path = PathBuf::from(target["path"].as_str().unwrap());
+    std::fs::write(target_path.join("README.md"), "from target\n").unwrap();
+    git(&target_path, &["commit", "-am", "target edit"]);
+
+    // The cherry-pick stops on the conflicting file and leaves it mid-pick.
+    let picked = stdout_json(&wtm(
+        &repo,
+        &["cherry-pick", "--into", "target", &hash, "--json"],
+    ));
+    assert_eq!(picked["status"], "conflicted");
+    let files: Vec<&str> = picked["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f.as_str().unwrap())
+        .collect();
+    assert_eq!(files, vec!["README.md"]);
+
+    // Resolve by keeping "theirs" (the cherry-picked commit's edit), then finish
+    // the cherry-pick via the shared `merge --continue`, which auto-detects it.
+    let resolved = stdout_json(&wtm(
+        &repo,
+        &["resolve", "target", "README.md", "--theirs", "--json"],
+    ));
+    assert_eq!(resolved["action"], "theirs");
+    assert_eq!(
+        std::fs::read_to_string(target_path.join("README.md")).unwrap(),
+        "from feature\n"
+    );
+
+    let completed = stdout_json(&wtm(
+        &repo,
+        &["merge", "--into", "target", "--continue", "--json"],
+    ));
+    assert_eq!(completed["target"], "target");
+    assert!(!completed["commit"].as_str().unwrap().is_empty());
+
+    // No conflicts remain and the cherry-picked commit's message is recorded.
+    let conflicts_after = stdout_json(&wtm(&repo, &["conflicts", "target", "--json"]));
+    assert!(conflicts_after["files"].as_array().unwrap().is_empty());
+    let target_log = stdout_json(&wtm(&repo, &["log", "target", "--json"]));
+    assert_eq!(target_log["entries"][0]["subject"], "feature edit");
 }

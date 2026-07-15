@@ -156,6 +156,31 @@ pub fn local_branches(dir: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
+/// Lists remote-tracking branches as `(short_name, remote_ref)` pairs, e.g.
+/// `("feature", "origin/feature")`, most recently committed first. Skips each
+/// remote's symbolic `HEAD` pointer (`origin/HEAD`), which is not a real branch.
+pub fn remote_branches(dir: &Path) -> Result<Vec<(String, String)>> {
+    let out = run(
+        dir,
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname:short)",
+            "refs/remotes",
+        ],
+    )?;
+    Ok(out
+        .lines()
+        .filter(|l| !l.is_empty() && !l.ends_with("/HEAD"))
+        // `refname:short` is `<remote>/<branch>`; split on the first slash so a
+        // branch name that itself contains slashes stays intact.
+        .filter_map(|full| {
+            full.split_once('/')
+                .map(|(_, branch)| (branch.to_string(), full.to_string()))
+        })
+        .collect())
+}
+
 /// True if `branch` exists as a local branch.
 pub fn branch_exists(dir: &Path, branch: &str) -> bool {
     run(
@@ -351,6 +376,19 @@ pub struct LogEntry {
     pub author: String,
     /// Relative author date, e.g. "3 hours ago".
     pub date: String,
+    /// Refs pointing at this commit, e.g. `["HEAD -> main", "origin/main"]`.
+    /// Empty for the vast majority of commits.
+    pub refs: Vec<String>,
+}
+
+/// One line of `git log --graph` output: the ASCII graph drawn to the left,
+/// plus the commit on that line. `entry` is `None` for the connector-only lines
+/// git emits between commits (`|\`, `|/`, …), which carry art but no commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphLine {
+    /// The graph art prefix, e.g. `"* "` or `"|\\  "`.
+    pub graph: String,
+    pub entry: Option<LogEntry>,
 }
 
 /// Stages every change in `dir` (`git add -A`).
@@ -446,9 +484,34 @@ fn stash_op(dir: &Path, verb: &str, index: Option<u32>) -> Result<String> {
     run(dir, &args)
 }
 
-/// Applies and drops a stash entry (`git stash pop`).
-pub fn stash_pop(dir: &Path, index: Option<u32>) -> Result<String> {
-    stash_op(dir, "pop", index)
+/// Outcome of a `git stash pop`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StashPopStatus {
+    /// The stash applied cleanly and was dropped; carries git's output.
+    Applied(String),
+    /// Applying the stash produced conflicts. The stash was NOT dropped and the
+    /// listed files are left with conflict markers to resolve.
+    Conflicted(Vec<String>),
+}
+
+/// Applies and (on success) drops a stash entry (`git stash pop`). A conflicting
+/// pop writes conflict markers, exits non-zero, and deliberately keeps the stash
+/// entry; that case is reported as [`StashPopStatus::Conflicted`] rather than an
+/// error so a resolver can take over. Any other failure is surfaced as an error.
+pub fn stash_pop(dir: &Path, index: Option<u32>) -> Result<StashPopStatus> {
+    match stash_op(dir, "pop", index) {
+        Ok(out) => Ok(StashPopStatus::Applied(out)),
+        Err(e) => {
+            // A conflict leaves unmerged index entries behind (and keeps the
+            // stash); anything else is a real failure.
+            let files = conflicted_files(dir).unwrap_or_default();
+            if !files.is_empty() {
+                Ok(StashPopStatus::Conflicted(files))
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 /// Applies a stash entry without dropping it (`git stash apply`).
@@ -473,6 +536,44 @@ pub fn has_upstream(dir: &Path) -> bool {
         ],
     )
     .unwrap_or(false)
+}
+
+/// The remote and remote-side branch `branch` tracks, e.g. `("origin",
+/// "main")` for a branch tracking `origin/main`. `None` when `branch` has no
+/// upstream configured.
+///
+/// Read from `branch.<name>.remote`/`.merge` rather than `@{upstream}` so it
+/// works for any branch, not just the one HEAD is on.
+pub fn branch_upstream(dir: &Path, branch: &str) -> Result<Option<(String, String)>> {
+    let remote_key = format!("branch.{branch}.remote");
+    let merge_key = format!("branch.{branch}.merge");
+    let (Ok(remote), Ok(merge)) = (
+        run(dir, &["config", "--get", &remote_key]),
+        run(dir, &["config", "--get", &merge_key]),
+    ) else {
+        return Ok(None);
+    };
+    let remote = remote.trim();
+    // `merge` is a full ref (refs/heads/main); the fetch refspec wants the
+    // branch name.
+    let merge = merge
+        .trim()
+        .strip_prefix("refs/heads/")
+        .unwrap_or(merge.trim());
+    if remote.is_empty() || merge.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((remote.to_string(), merge.to_string())))
+}
+
+/// Fast-forwards the local `branch` to `remote`'s `src` branch without checking
+/// it out, by fetching straight into the local ref. git refuses the update when
+/// it would not be a fast-forward, which is exactly the guarantee we want, and
+/// also refuses when `branch` is checked out anywhere (callers pull there
+/// instead).
+pub fn fetch_into_branch(dir: &Path, remote: &str, src: &str, branch: &str) -> Result<String> {
+    let refspec = format!("{src}:{branch}");
+    run(dir, &["fetch", remote, &refspec])
 }
 
 /// Pulls the current branch. Fast-forward only by default; `rebase` rebases
@@ -554,7 +655,12 @@ pub fn is_not_merged_error(err: &GitError) -> bool {
 pub fn default_branch(dir: &Path) -> Result<String> {
     if let Ok(head) = run(
         dir,
-        &["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+        &[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
     ) {
         let name = head.strip_prefix("origin/").unwrap_or(&head).to_string();
         if !name.is_empty() {
@@ -600,19 +706,21 @@ pub fn branch_details(dir: &Path) -> Result<Vec<BranchDetail>> {
     Ok(parse_branch_details(&out))
 }
 
+/// `git log` pretty format for [`parse_log_line`], with `%h` (abbreviated) or
+/// `%H` (full) substituted in for the hash.
+fn log_format(full_hash: bool) -> &'static str {
+    if full_hash {
+        "%H\u{1f}%s\u{1f}%an\u{1f}%ad\u{1f}%D"
+    } else {
+        "%h\u{1f}%s\u{1f}%an\u{1f}%ad\u{1f}%D"
+    }
+}
+
 /// Recent commits reachable from HEAD in `dir` (newest first).
 pub fn log(dir: &Path, count: u32) -> Result<Vec<LogEntry>> {
     let count = count.to_string();
-    let out = run(
-        dir,
-        &[
-            "log",
-            "-n",
-            &count,
-            "--date=relative",
-            "--format=%h\u{1f}%s\u{1f}%an\u{1f}%ad",
-        ],
-    )?;
+    let format = format!("--format={}", log_format(false));
+    let out = run(dir, &["log", "-n", &count, "--date=relative", &format])?;
     Ok(parse_log(&out))
 }
 
@@ -622,41 +730,193 @@ pub fn log(dir: &Path, count: u32) -> Result<Vec<LogEntry>> {
 /// results can be passed straight to `cherry_pick`.
 pub fn log_ref(dir: &Path, refname: &str, count: u32) -> Result<Vec<LogEntry>> {
     let count = count.to_string();
+    let format = format!("--format={}", log_format(true));
     let out = run(
         dir,
-        &[
-            "log",
-            refname,
-            "-n",
-            &count,
-            "--date=relative",
-            "--format=%H\u{1f}%s\u{1f}%an\u{1f}%ad",
-        ],
+        &["log", refname, "-n", &count, "--date=relative", &format],
     )?;
     Ok(parse_log(&out))
 }
 
+/// The same history as [`log_ref`], but rendered by `git log --graph` so the
+/// branch/merge topology comes back drawn. `refname` of `None` graphs HEAD.
+///
+/// Letting git draw the art (rather than assigning lanes ourselves) keeps the
+/// topology exactly right; a NUL byte leads the pretty format so each line
+/// splits cleanly into "graph art" and "commit fields".
+pub fn log_graph(
+    dir: &Path,
+    refname: Option<&str>,
+    count: u32,
+    full_hash: bool,
+) -> Result<Vec<GraphLine>> {
+    let count = count.to_string();
+    let format = format!("--format=%x00{}", log_format(full_hash));
+    let mut args = vec!["log", "--graph", "-n", &count, "--date=relative", &format];
+    if let Some(refname) = refname {
+        args.push(refname);
+    }
+    let out = run(dir, &args)?;
+    Ok(parse_log_graph(&out))
+}
+
+/// Outcome of a `git cherry-pick` sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CherryPickStatus {
+    /// Every commit applied (committed, or staged under `no_commit`).
+    Applied,
+    /// A commit conflicted; the cherry-pick is left in progress with the listed
+    /// files in conflict, so a resolver can finish it.
+    Conflicted(Vec<String>),
+}
+
 /// Cherry-picks `commits` onto the branch checked out in `dir`. `commits` must
 /// be ordered oldest-first, the order git applies them. When `no_commit` is
-/// true (`-x -n`) the changes land staged in the working tree without a commit,
-/// so the caller can review or edit before committing; otherwise each commit is
-/// recorded with its original message. On failure the in-progress cherry-pick
-/// is aborted so the worktree is left clean rather than mid-sequence.
-pub fn cherry_pick(dir: &Path, commits: &[String], no_commit: bool) -> Result<()> {
+/// true (`-n`) the changes land staged in the working tree without a commit, so
+/// the caller can review or edit before committing; otherwise each commit is
+/// recorded with its original message. A conflict is reported as
+/// [`CherryPickStatus::Conflicted`] and deliberately leaves the sequence in
+/// progress (conflict markers in the files) so a resolver can take over; use
+/// `cherry_pick_abort` or `cherry_pick_continue` to finish. Any other failure
+/// is surfaced as an error after cleaning up the half-applied sequence.
+pub fn cherry_pick(dir: &Path, commits: &[String], no_commit: bool) -> Result<CherryPickStatus> {
     let mut args: Vec<&str> = vec!["cherry-pick"];
     if no_commit {
         args.push("-n");
     }
     args.extend(commits.iter().map(String::as_str));
     match run(dir, &args) {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(CherryPickStatus::Applied),
         Err(e) => {
-            // Best-effort cleanup: leave no half-applied sequence or -n changes
-            // behind, so the target worktree stays usable after a conflict.
-            let _ = run(dir, &["cherry-pick", "--abort"]);
-            Err(e)
+            // A genuine conflict leaves unmerged index entries behind; report it
+            // and leave the sequence in progress for the resolver. Anything else
+            // is a real failure, so clean up rather than leaving a mess.
+            let files = conflicted_files(dir).unwrap_or_default();
+            if !files.is_empty() {
+                Ok(CherryPickStatus::Conflicted(files))
+            } else {
+                let _ = run(dir, &["cherry-pick", "--abort"]);
+                Err(e)
+            }
         }
     }
+}
+
+/// True while a cherry-pick is in progress in `dir` (CHERRY_PICK_HEAD exists).
+pub fn is_cherry_picking(dir: &Path) -> bool {
+    run_predicate(
+        dir,
+        &["rev-parse", "--verify", "--quiet", "CHERRY_PICK_HEAD"],
+    )
+    .unwrap_or(false)
+}
+
+/// Continues an in-progress cherry-pick once its conflicts are resolved and
+/// staged, recording the commit with git's prepared message. `core.editor=true`
+/// suppresses the editor so the message is accepted non-interactively.
+pub fn cherry_pick_continue(dir: &Path) -> Result<()> {
+    run(
+        dir,
+        &["-c", "core.editor=true", "cherry-pick", "--continue"],
+    )?;
+    Ok(())
+}
+
+/// Aborts an in-progress cherry-pick, restoring the pre-cherry-pick state.
+pub fn cherry_pick_abort(dir: &Path) -> Result<()> {
+    run(dir, &["cherry-pick", "--abort"])?;
+    Ok(())
+}
+
+/// Discards all tracked changes in the working tree and index, resetting to
+/// HEAD. Used to undo a conflicting stash pop's application while leaving the
+/// (still-present) stash entry intact.
+pub fn reset_hard(dir: &Path) -> Result<()> {
+    run(dir, &["reset", "--hard", "HEAD"])?;
+    Ok(())
+}
+
+/// Outcome of a `git merge` invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeStatus {
+    /// The current branch already contained the source; nothing changed.
+    AlreadyUpToDate,
+    /// The merge completed, either by fast-forward or a new merge commit.
+    Merged,
+    /// The merge stopped on conflicts; the paths of the conflicted files.
+    Conflicted(Vec<String>),
+}
+
+/// Merges `source_ref` into the branch checked out in `dir`. `no_ff` forces a
+/// merge commit even when a fast-forward would do. On a conflict the merge is
+/// deliberately left in progress (MERGE_HEAD present, conflict markers in the
+/// files) so a resolver can take over; use `merge_abort` or `merge_continue`
+/// to finish. Any other failure (dirty tree, unknown ref) is surfaced as an
+/// error.
+pub fn merge(dir: &Path, source_ref: &str, no_ff: bool) -> Result<MergeStatus> {
+    let mut args = vec!["merge"];
+    if no_ff {
+        args.push("--no-ff");
+    }
+    args.push(source_ref);
+    match run(dir, &args) {
+        Ok(out) => {
+            if out.contains("Already up to date") {
+                Ok(MergeStatus::AlreadyUpToDate)
+            } else {
+                Ok(MergeStatus::Merged)
+            }
+        }
+        Err(e) => {
+            // A genuine conflict exits non-zero but leaves MERGE_HEAD and
+            // unmerged index entries behind; anything else is a real failure.
+            let files = conflicted_files(dir).unwrap_or_default();
+            if is_merging(dir) && !files.is_empty() {
+                Ok(MergeStatus::Conflicted(files))
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Paths currently in an unmerged (conflict) state, i.e. porcelain codes
+/// UU, AA, DD, AU, UA, DU, or UD.
+pub fn conflicted_files(dir: &Path) -> Result<Vec<String>> {
+    const CONFLICT_CODES: [&str; 7] = ["UU", "AA", "DD", "AU", "UA", "DU", "UD"];
+    let out = run(dir, &["status", "--porcelain"])?;
+    Ok(parse_status_porcelain(&out)
+        .into_iter()
+        .filter(|e| CONFLICT_CODES.contains(&e.code.as_str()))
+        .map(|e| e.path)
+        .collect())
+}
+
+/// True while a merge is in progress in `dir` (MERGE_HEAD exists).
+pub fn is_merging(dir: &Path) -> bool {
+    run_predicate(dir, &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]).unwrap_or(false)
+}
+
+/// Aborts an in-progress merge, restoring the pre-merge state.
+pub fn merge_abort(dir: &Path) -> Result<()> {
+    run(dir, &["merge", "--abort"])?;
+    Ok(())
+}
+
+/// Commits an in-progress merge once its conflicts are resolved and staged,
+/// keeping the merge message git prepared (`--no-edit`).
+pub fn merge_continue(dir: &Path) -> Result<()> {
+    run(dir, &["commit", "--no-edit"])?;
+    Ok(())
+}
+
+/// Resolves a conflicted path by taking one whole side: `ours` selects
+/// `--ours`, otherwise `--theirs`. Leaves the result unstaged; pair with
+/// `stage_paths` to mark it resolved.
+pub fn checkout_conflict_side(dir: &Path, path: &str, ours: bool) -> Result<()> {
+    let flag = if ours { "--ours" } else { "--theirs" };
+    run(dir, &["checkout", flag, "--", path])?;
+    Ok(())
 }
 
 /// Finds a remote-tracking ref matching `branch` (e.g. "origin/feature"),
@@ -743,17 +1003,59 @@ fn parse_track(track: &str) -> (u32, u32) {
     (ahead, behind)
 }
 
-/// Parses `git log` output formatted as `<hash>\x1f<subject>\x1f<author>\x1f<date>`.
+/// Parses one `<hash>\x1f<subject>\x1f<author>\x1f<date>\x1f<refs>` record.
+/// Returns `None` for a line with no hash.
+fn parse_log_line(line: &str) -> Option<LogEntry> {
+    let mut fields = line.split('\u{1f}');
+    let hash = fields.next()?.to_string();
+    if hash.is_empty() {
+        return None;
+    }
+    let subject = fields.next().unwrap_or("").to_string();
+    let author = fields.next().unwrap_or("").to_string();
+    let date = fields.next().unwrap_or("").to_string();
+    // `%D` is a comma-separated list ("HEAD -> main, origin/main"), empty for
+    // commits no ref points at.
+    let refs = fields
+        .next()
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map(str::to_string)
+        .collect();
+    Some(LogEntry {
+        hash,
+        subject,
+        author,
+        date,
+        refs,
+    })
+}
+
+/// Parses `git log` output formatted by [`log_format`].
 pub fn parse_log(out: &str) -> Vec<LogEntry> {
+    out.lines().filter_map(parse_log_line).collect()
+}
+
+/// Parses `git log --graph` output whose pretty format starts with a NUL.
+/// Lines containing a NUL are commits (art before it, fields after); the rest
+/// are connector-only art. Blank lines are dropped, but art-only lines are kept
+/// since they carry the branch/merge structure.
+pub fn parse_log_graph(out: &str) -> Vec<GraphLine> {
     out.lines()
-        .filter_map(|line| {
-            let mut fields = line.split('\u{1f}');
-            Some(LogEntry {
-                hash: fields.next()?.to_string(),
-                subject: fields.next().unwrap_or("").to_string(),
-                author: fields.next().unwrap_or("").to_string(),
-                date: fields.next().unwrap_or("").to_string(),
-            })
+        .filter_map(|line| match line.split_once('\u{0}') {
+            Some((graph, data)) => Some(GraphLine {
+                graph: graph.to_string(),
+                entry: parse_log_line(data),
+            }),
+            None => {
+                let graph = line.trim_end();
+                (!graph.trim().is_empty()).then(|| GraphLine {
+                    graph: graph.to_string(),
+                    entry: None,
+                })
+            }
         })
         .collect()
 }
@@ -790,6 +1092,39 @@ mod tests {
         let (_tmp, repo) = temp_repo();
         // No origin remote, but a local `main`, so it should report "main".
         assert_eq!(default_branch(&repo).unwrap(), "main");
+    }
+
+    #[test]
+    fn remote_branches_lists_short_names_and_skips_head() {
+        let (_tmp, repo) = temp_repo();
+        let sha = run(&repo, &["rev-parse", "HEAD"]).unwrap();
+        let sha = sha.trim();
+        // Simulate fetched remote-tracking refs, including a slashed name and
+        // the symbolic HEAD that must be filtered out.
+        for refname in [
+            "refs/remotes/origin/teammate",
+            "refs/remotes/origin/feature/x",
+        ] {
+            run(&repo, &["update-ref", refname, sha]).unwrap();
+        }
+        run(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/teammate",
+            ],
+        )
+        .unwrap();
+        let mut got = remote_branches(&repo).unwrap();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("feature/x".to_string(), "origin/feature/x".to_string()),
+                ("teammate".to_string(), "origin/teammate".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -914,5 +1249,113 @@ mod tests {
         assert_eq!(entries[0].author, "Ada");
         assert_eq!(entries[0].date, "3 hours ago");
         assert_eq!(entries[1].hash, "5d6e7f8");
+    }
+
+    #[test]
+    fn parses_log_ref_decorations() {
+        let out = "1a2b3c4\u{1f}fix parser\u{1f}Ada\u{1f}3 hours ago\u{1f}HEAD -> main, origin/main\n\
+                   5d6e7f8\u{1f}add tests\u{1f}Grace\u{1f}yesterday\u{1f}\n";
+        let entries = parse_log(out);
+        assert_eq!(entries[0].refs, vec!["HEAD -> main", "origin/main"]);
+        // A commit no ref points at decorates to nothing, not to one empty ref.
+        assert!(entries[1].refs.is_empty());
+    }
+
+    #[test]
+    fn parses_graph_art_and_commit_lines() {
+        let out = "* \u{0}1a2b3c4\u{1f}merge feature\u{1f}Ada\u{1f}1 hour ago\u{1f}HEAD -> main\n\
+                   |\\  \n\
+                   | * \u{0}5d6e7f8\u{1f}add tests\u{1f}Grace\u{1f}2 hours ago\u{1f}\n\
+                   |/  \n\
+                   * \u{0}9a8b7c6\u{1f}init\u{1f}Ada\u{1f}3 hours ago\u{1f}\n";
+        let lines = parse_log_graph(out);
+        assert_eq!(lines.len(), 5);
+        // Commit rows keep their art and their fields.
+        assert_eq!(lines[0].graph, "* ");
+        assert_eq!(lines[0].entry.as_ref().unwrap().subject, "merge feature");
+        assert_eq!(lines[0].entry.as_ref().unwrap().refs, vec!["HEAD -> main"]);
+        // Art-only rows carry structure but no commit.
+        assert_eq!(lines[1].graph, "|\\");
+        assert!(lines[1].entry.is_none());
+        assert_eq!(lines[2].entry.as_ref().unwrap().hash, "5d6e7f8");
+        assert!(lines[3].entry.is_none());
+        assert_eq!(lines[4].entry.as_ref().unwrap().subject, "init");
+    }
+
+    #[test]
+    fn parses_empty_graph_output() {
+        assert!(parse_log_graph("").is_empty());
+        // Blank lines are dropped rather than becoming empty art rows.
+        assert!(parse_log_graph("\n  \n").is_empty());
+    }
+
+    /// The real `git log --graph` on a merge: the art must come back drawn, and
+    /// every commit must still be readable off it.
+    #[test]
+    fn log_graph_draws_a_merge() {
+        let (_tmp, repo) = temp_repo();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&["checkout", "-b", "feature"]);
+        git(&["commit", "--allow-empty", "-m", "feature work"]);
+        git(&["checkout", "main"]);
+        git(&["commit", "--allow-empty", "-m", "main work"]);
+        git(&["merge", "--no-ff", "feature", "-m", "merge feature"]);
+
+        let lines = log_graph(&repo, Some("main"), 20, false).unwrap();
+        let subjects: Vec<&str> = lines
+            .iter()
+            .filter_map(|l| l.entry.as_ref())
+            .map(|e| e.subject.as_str())
+            .collect();
+        // `--graph` implies `--topo-order`, so the merged-in branch is drawn as
+        // one unbroken run rather than interleaved by date with `main work`.
+        assert_eq!(
+            subjects,
+            ["merge feature", "feature work", "main work", "init"]
+        );
+        // A merge forces git to draw connector rows; without them the art would
+        // be meaningless.
+        assert!(
+            lines.iter().any(|l| l.entry.is_none()),
+            "expected art-only connector rows, got {lines:#?}"
+        );
+        // The merge commit sits on a lane, and a second lane exists beside it.
+        assert!(lines.iter().any(|l| l.graph.contains('*')));
+        assert!(lines.iter().any(|l| l.graph.contains('|')));
+    }
+
+    #[test]
+    fn branch_upstream_is_none_without_tracking() {
+        let (_tmp, repo) = temp_repo();
+        assert_eq!(branch_upstream(&repo, "main").unwrap(), None);
+    }
+
+    /// A branch tracking a remote reports the remote and the remote-side branch
+    /// name, with `refs/heads/` stripped so it can go straight into a refspec.
+    #[test]
+    fn branch_upstream_reads_tracking_config() {
+        let (_tmp, repo) = temp_repo();
+        for args in [
+            vec!["config", "branch.main.remote", "origin"],
+            vec!["config", "branch.main.merge", "refs/heads/trunk"],
+        ] {
+            let out = Command::new("git")
+                .args(&args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        }
+        assert_eq!(
+            branch_upstream(&repo, "main").unwrap(),
+            Some(("origin".to_string(), "trunk".to_string()))
+        );
     }
 }

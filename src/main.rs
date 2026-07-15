@@ -5,6 +5,7 @@
 
 mod cli;
 mod config;
+mod conflict;
 mod git;
 mod mcp;
 mod ops;
@@ -12,7 +13,7 @@ mod output;
 mod settings;
 mod tui;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow, bail};
 use clap::Parser;
 
 use cli::{BranchAction, Cli, Command, StashAction};
@@ -145,7 +146,7 @@ fn run(cli: Cli) -> Result<()> {
                     if cli.json {
                         output::print_json(&result)?;
                     } else {
-                        output::print_stash(&result);
+                        output::print_stash_pop(&result);
                     }
                 }
                 StashAction::Apply { name, index } => {
@@ -248,6 +249,126 @@ fn run(cli: Cli) -> Result<()> {
                         output::print_log(&result);
                     }
                 }
+            }
+        }
+        Command::Merge {
+            source,
+            into,
+            no_ff,
+            r#continue,
+            abort,
+            message,
+        } => {
+            let ctx = Ctx::discover_initialized(&cwd)?;
+            if r#continue && abort {
+                bail!("--continue and --abort cannot be used together");
+            }
+            if r#continue {
+                // Auto-detect merge vs cherry-pick from the repo markers so the
+                // same flag finishes either. A stash pop leaves no marker; finish
+                // one with `wtm stash drop` after resolving.
+                let kind = ops::detect_resolve_kind(&ctx, &into)?.ok_or_else(|| {
+                    anyhow!(
+                        "no merge or cherry-pick in progress in '{into}' \
+                         (finish a resolved stash pop with `wtm stash drop {into}`)"
+                    )
+                })?;
+                let result = ops::complete_resolution(&ctx, &into, kind, message.as_deref())?;
+                if cli.json {
+                    output::print_json(&result)?;
+                } else {
+                    output::print_complete_resolution(&result);
+                }
+            } else if abort {
+                let kind = ops::detect_resolve_kind(&ctx, &into)?
+                    .ok_or_else(|| anyhow!("no merge or cherry-pick in progress in '{into}'"))?;
+                ops::abort_resolution(&ctx, &into, kind)?;
+                if cli.json {
+                    output::print_json(&serde_json::json!({ "target": into, "aborted": true }))?;
+                } else {
+                    println!("{into}: resolution aborted");
+                }
+            } else {
+                let Some(source) = source else {
+                    bail!("a source branch is required (or use --continue/--abort)");
+                };
+                let result = ops::merge(&ctx, &into, &source, no_ff)?;
+                if cli.json {
+                    output::print_json(&result)?;
+                } else {
+                    output::print_merge_outcome(&into, &result);
+                }
+            }
+        }
+        Command::Update { name } => {
+            let ctx = Ctx::discover_initialized(&cwd)?;
+            let result = ops::update(&ctx, &name)?;
+            if cli.json {
+                output::print_json(&result)?;
+            } else {
+                output::print_merge_outcome(&name, &result);
+            }
+        }
+        Command::Conflicts { name, file } => {
+            let ctx = Ctx::discover_initialized(&cwd)?;
+            match file {
+                Some(file) => {
+                    let result = ops::read_conflict(&ctx, &name, &file)?;
+                    if cli.json {
+                        output::print_json(&result)?;
+                    } else {
+                        output::print_conflict_file(&result);
+                    }
+                }
+                None => {
+                    let files = ops::list_conflicts(&ctx, &name)?;
+                    if cli.json {
+                        output::print_json(&output::conflicts_json(&name, &files))?;
+                    } else {
+                        output::print_conflicts(&name, &files);
+                    }
+                }
+            }
+        }
+        Command::Resolve {
+            name,
+            file,
+            ours,
+            theirs,
+            both,
+            both_reversed,
+        } => {
+            let ctx = Ctx::discover_initialized(&cwd)?;
+            let action = match (ours, theirs, both, both_reversed) {
+                (true, false, false, false) => "ours",
+                (false, true, false, false) => "theirs",
+                (false, false, true, false) => "both",
+                (false, false, false, true) => "both-reversed",
+                _ => bail!("choose exactly one of --ours, --theirs, --both, --both-reversed"),
+            };
+            match action {
+                "ours" => ops::checkout_ours(&ctx, &name, &file)?,
+                "theirs" => ops::checkout_theirs(&ctx, &name, &file)?,
+                _ => {
+                    let conflict_file = ops::read_conflict(&ctx, &name, &file)?;
+                    let resolution = if action == "both" {
+                        conflict::ResolutionAction::KeepBoth
+                    } else {
+                        conflict::ResolutionAction::KeepBothReversed
+                    };
+                    let hunks = conflict_file
+                        .segments
+                        .iter()
+                        .filter(|s| matches!(s, conflict::ConflictSegment::Hunk { .. }))
+                        .count();
+                    let text = conflict::render(&conflict_file.segments, &vec![resolution; hunks]);
+                    ops::write_resolution(&ctx, &name, &file, &text)?;
+                }
+            }
+            if cli.json {
+                output::print_json(&output::resolve_json(&name, &file, action))?;
+            } else {
+                output::print_resolve(&name, &file, action);
             }
         }
         Command::CherryPick {

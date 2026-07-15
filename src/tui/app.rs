@@ -11,8 +11,9 @@ use ratatui::layout::Rect;
 
 use super::config_editor::{ConfigEditor, EditorOutcome};
 use super::setup::{self, SetupWizard, WizardOutcome};
-use crate::git::{LogEntry, StashEntry, StatusEntry};
-use crate::ops::{self, BranchListItem, Ctx, SetupControl, WorktreeInfo};
+use crate::conflict::{self, ConflictSegment, ResolutionAction};
+use crate::git::{GraphLine, LogEntry, StashEntry, StatusEntry};
+use crate::ops::{self, BranchListItem, ConflictFile, Ctx, SetupControl, WorktreeInfo};
 use crate::settings::ConfigDraft;
 
 /// A single-line text field with a movable insertion cursor. `cursor` is a
@@ -99,8 +100,102 @@ pub enum CreateMsg {
 /// How often the diff view recomputes itself to pick up outside edits.
 const DIFF_REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
 
+/// How often the worktree/branch lists reload themselves so work done outside
+/// the app (an agent committing, a teammate's branch landing) shows up without
+/// pressing `r`. Only fires while the plain list is on screen; see
+/// `auto_refresh`.
+const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
 /// How long a status/error message stays on screen before auto-clearing.
 const MESSAGE_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// How commit history is drawn in the log and branch-commit views. `Tree` runs
+/// the log through `git log --graph` so branch and merge topology is visible;
+/// `Flat` is a plain newest-first list. Toggled with `t`, and remembered on the
+/// `App` so the choice sticks across views.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogMode {
+    Tree,
+    Flat,
+}
+
+impl LogMode {
+    fn toggled(self) -> LogMode {
+        match self {
+            LogMode::Tree => LogMode::Flat,
+            LogMode::Flat => LogMode::Tree,
+        }
+    }
+
+    /// Label for the header/help, naming the current mode.
+    pub fn label(self) -> &'static str {
+        match self {
+            LogMode::Tree => "tree",
+            LogMode::Flat => "flat",
+        }
+    }
+}
+
+/// Index of the first row holding a commit, skipping any leading art-only rows.
+/// 0 when there are none (an empty list has nothing to select anyway).
+fn first_commit_row(lines: &[GraphLine]) -> usize {
+    lines.iter().position(|l| l.entry.is_some()).unwrap_or(0)
+}
+
+/// The next row at or after `from` (searching in `dir`'s direction) that holds a
+/// commit, so the cursor steps between commits rather than stopping on the
+/// connector rows the graph draws between them. `None` when there is no further
+/// commit that way, leaving the cursor put.
+fn seek_commit_row(lines: &[GraphLine], from: usize, forward: bool) -> Option<usize> {
+    let mut i = from;
+    loop {
+        i = if forward {
+            i.checked_add(1).filter(|i| *i < lines.len())?
+        } else {
+            i.checked_sub(1)?
+        };
+        if lines[i].entry.is_some() {
+            return Some(i);
+        }
+    }
+}
+
+/// Presents flat log entries as graph lines carrying no art, so the tree and
+/// flat views share a single row type and rendering path.
+fn flat_lines(entries: Vec<LogEntry>) -> Vec<GraphLine> {
+    entries
+        .into_iter()
+        .map(|e| GraphLine {
+            graph: String::new(),
+            entry: Some(e),
+        })
+        .collect()
+}
+
+/// A branch offered for checkout in the new-worktree dialog. Local branches
+/// carry `remote: None` and are checked out directly. Remote-only branches (a
+/// teammate's branch that has no local copy yet) carry their remote ref (e.g.
+/// `origin/feature`), so selecting one creates a local tracking branch from it.
+#[derive(Debug, Clone)]
+pub struct CheckoutCandidate {
+    /// Local branch name to check out or create.
+    pub branch: String,
+    /// Remote ref to base a new tracking branch on; `None` for a local branch.
+    pub remote: Option<String>,
+}
+
+/// Indices into `branches` whose name matches `filter` (case-insensitive
+/// substring); an empty filter matches everything. Used by both the create
+/// dialog's key handling and its rendering so they stay in lockstep.
+pub fn create_filtered(branches: &[CheckoutCandidate], filter: &str) -> Vec<usize> {
+    let needle = filter.trim().to_lowercase();
+    branches
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| needle.is_empty() || c.branch.to_lowercase().contains(&needle))
+        .map(|(i, _)| i)
+        .collect()
+}
 
 /// Which screen/overlay is active.
 pub enum View {
@@ -132,18 +227,21 @@ pub enum View {
         ignore_prompt: Option<IgnorePrompt>,
     },
     /// New-worktree dialog. Row 0 creates a new branch (named in `name`) off
-    /// `base`; the rows below check out an existing branch. This keeps the two
-    /// distinct actions clearly separated.
+    /// `base`; the rows below check out an existing branch. The `name` field
+    /// doubles as a live filter over the checkout list, so typing narrows the
+    /// existing branches while also naming the would-be new branch.
     Create {
-        /// Name of the new branch (and its worktree folder). Row 0 only.
+        /// Name of the new branch (row 0) and the live filter over `branches`.
         name: TextInput,
-        /// Local branches not checked out anywhere: the checkout options.
-        branches: Vec<String>,
+        /// Checkout options: local branches not checked out anywhere, plus
+        /// remote-only branches (someone else's work) that have no local branch.
+        branches: Vec<CheckoutCandidate>,
         /// Every local branch, for choosing a base to branch off of.
         all_branches: Vec<String>,
         /// Base ref a new branch is created from (defaults to the main branch).
         base: String,
-        /// 0 = new branch; 1..=branches.len() = check out branches[selected-1].
+        /// 0 = new branch; 1..=filtered.len() = check out the Nth *filtered*
+        /// candidate (see `create_filtered`), not `branches` directly.
         selected: usize,
         /// True when the `[ Base: … ⌄ ]` button is focused (via Tab from the
         /// new-branch row), so Enter/Space opens the base picker instead of
@@ -261,19 +359,22 @@ pub enum View {
         /// Cursor into the FILTERED branch list, not `branches` directly.
         selected: usize,
     },
-    /// Scrollable commit log for one worktree.
+    /// Scrollable commit log for one worktree. Rows are graph lines: in
+    /// `LogMode::Tree` some carry only art (no commit), in `LogMode::Flat`
+    /// every row is a commit with no art.
     Log {
         name: String,
-        entries: Vec<LogEntry>,
+        lines: Vec<GraphLine>,
         scroll: u16,
     },
     /// Commit history of a branch on the Branches tab, with multi-select for
-    /// cherry-picking. `marked` is parallel with `entries`; Enter opens the
-    /// worktree picker (`CherryPick`) for the marked commits (or the one under
-    /// the cursor when none are marked).
+    /// cherry-picking. `marked` is parallel with `lines`; art-only rows are
+    /// never marked and the cursor skips over them. Enter opens the worktree
+    /// picker (`CherryPick`) for the marked commits (or the one under the
+    /// cursor when none are marked).
     BranchCommits {
         branch: String,
-        entries: Vec<LogEntry>,
+        lines: Vec<GraphLine>,
         marked: Vec<bool>,
         selected: usize,
     },
@@ -295,6 +396,41 @@ pub enum View {
         /// changes only" while the mode prompt is open.
         mode: Option<usize>,
     },
+    /// Merge picker: choose which worktree (the target) to merge the branch
+    /// selected on the Branches tab into. Reached from the Branches tab; runs
+    /// the merge in the background and routes conflicts into the resolver.
+    MergePick {
+        /// Branch being merged in (the source).
+        source_branch: String,
+        /// Worktrees the branch can be merged into.
+        targets: Vec<CherryTarget>,
+        /// Cursor into `targets`.
+        selected: usize,
+    },
+    /// Friendly conflict resolver for a worktree left mid-merge. Lists the
+    /// conflicted files, and for the selected file shows each hunk's OURS vs
+    /// THEIRS sides so a resolution can be picked per hunk (or the whole file
+    /// taken from one side), then staged. Reached when a merge/update conflicts.
+    ConflictResolver {
+        /// Worktree being resolved (addressed by name in ops).
+        target: String,
+        /// What is being merged in, for the header (e.g. the source branch).
+        source_label: String,
+        /// The in-progress operation this resolver finishes (merge, cherry-pick,
+        /// or stash pop), so complete/abort dispatch correctly.
+        kind: ops::ResolveKind,
+        /// Conflicted file paths, parallel with `resolved`.
+        files: Vec<String>,
+        /// Whether each file has been staged as resolved.
+        resolved: Vec<bool>,
+        /// Cursor into `files`.
+        file: usize,
+        /// Parsed state of the file under the cursor, when it loaded and still
+        /// has conflicts. `None` on an already-resolved file or a load error.
+        current: Option<ResolverFile>,
+        /// True while confirming an abort of the whole merge.
+        confirm_abort: bool,
+    },
     /// A git operation (pull/push/fetch/delete/…) running on a background
     /// thread. Its result message is shown and the list refreshed when it
     /// finishes; `then` decides which view to reopen afterwards.
@@ -303,6 +439,157 @@ pub enum View {
         rx: Receiver<Result<String, String>>,
         then: BusyThen,
     },
+}
+
+/// A conflicted file loaded into the resolver: its parsed contents plus the
+/// resolution the user has chosen for each hunk.
+pub struct ResolverFile {
+    /// Parsed conflicted file (path, segments, ours/theirs labels).
+    pub file: ConflictFile,
+    /// Chosen action per conflict hunk, parallel with the file's `Hunk`
+    /// segments; `None` until the user picks a side, so a file can't be staged
+    /// with hunks left undecided.
+    pub actions: Vec<Option<ResolutionAction>>,
+    /// Cursor into the hunks (index over `Hunk` segments only). The detail
+    /// pane auto-scrolls to keep this hunk in view.
+    pub hunk: usize,
+    /// Present while hand-editing the current hunk's resolved text. Saving it
+    /// records a `ResolutionAction::Manual` for that hunk.
+    pub edit: Option<HunkEditor>,
+}
+
+/// A minimal multi-line text editor for hand-editing one conflict hunk's
+/// resolved text. Lines are stored without their trailing newline; the seed's
+/// trailing newline is remembered and restored on save so line-based hunks
+/// round-trip exactly.
+pub struct HunkEditor {
+    /// The edited text, one entry per line, without line endings.
+    pub lines: Vec<String>,
+    /// Cursor row into `lines`.
+    pub row: usize,
+    /// Cursor column as a character index into the current line.
+    pub col: usize,
+    /// Whether the seed text ended in a newline, reapplied by `text`.
+    trailing_newline: bool,
+}
+
+/// Byte offset of character index `col` within `line`, or the line's byte
+/// length when `col` is past the end. Keeps edits on char boundaries.
+fn char_byte_index(line: &str, col: usize) -> usize {
+    line.char_indices()
+        .nth(col)
+        .map(|(b, _)| b)
+        .unwrap_or(line.len())
+}
+
+impl HunkEditor {
+    /// Seeds the editor from `text`, splitting it into editable lines.
+    pub fn new(text: &str) -> Self {
+        let trailing_newline = text.ends_with('\n');
+        let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+        // A trailing newline leaves a final empty element; drop it so the cursor
+        // does not sit on a phantom blank line below the content.
+        if trailing_newline {
+            lines.pop();
+        }
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        Self {
+            lines,
+            row: 0,
+            col: 0,
+            trailing_newline,
+        }
+    }
+
+    /// Reconstructs the edited text, restoring the seed's trailing newline.
+    pub fn text(&self) -> String {
+        let mut s = self.lines.join("\n");
+        if self.trailing_newline {
+            s.push('\n');
+        }
+        s
+    }
+
+    /// Number of characters on the current line.
+    fn cur_len(&self) -> usize {
+        self.lines[self.row].chars().count()
+    }
+
+    /// Applies one key of editing (insert, delete, newline, or cursor move).
+    pub fn on_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char(c) => {
+                let b = char_byte_index(&self.lines[self.row], self.col);
+                self.lines[self.row].insert(b, c);
+                self.col += 1;
+            }
+            KeyCode::Enter => {
+                let b = char_byte_index(&self.lines[self.row], self.col);
+                let rest = self.lines[self.row].split_off(b);
+                self.lines.insert(self.row + 1, rest);
+                self.row += 1;
+                self.col = 0;
+            }
+            KeyCode::Backspace => {
+                if self.col > 0 {
+                    let start = char_byte_index(&self.lines[self.row], self.col - 1);
+                    let end = char_byte_index(&self.lines[self.row], self.col);
+                    self.lines[self.row].replace_range(start..end, "");
+                    self.col -= 1;
+                } else if self.row > 0 {
+                    // Join this line onto the end of the previous one.
+                    let cur = self.lines.remove(self.row);
+                    self.row -= 1;
+                    self.col = self.cur_len();
+                    self.lines[self.row].push_str(&cur);
+                }
+            }
+            KeyCode::Delete => {
+                let len = self.cur_len();
+                if self.col < len {
+                    let start = char_byte_index(&self.lines[self.row], self.col);
+                    let end = char_byte_index(&self.lines[self.row], self.col + 1);
+                    self.lines[self.row].replace_range(start..end, "");
+                } else if self.row + 1 < self.lines.len() {
+                    let next = self.lines.remove(self.row + 1);
+                    self.lines[self.row].push_str(&next);
+                }
+            }
+            KeyCode::Left => {
+                if self.col > 0 {
+                    self.col -= 1;
+                } else if self.row > 0 {
+                    self.row -= 1;
+                    self.col = self.cur_len();
+                }
+            }
+            KeyCode::Right => {
+                if self.col < self.cur_len() {
+                    self.col += 1;
+                } else if self.row + 1 < self.lines.len() {
+                    self.row += 1;
+                    self.col = 0;
+                }
+            }
+            KeyCode::Up => {
+                if self.row > 0 {
+                    self.row -= 1;
+                    self.col = self.col.min(self.cur_len());
+                }
+            }
+            KeyCode::Down => {
+                if self.row + 1 < self.lines.len() {
+                    self.row += 1;
+                    self.col = self.col.min(self.cur_len());
+                }
+            }
+            KeyCode::Home => self.col = 0,
+            KeyCode::End => self.col = self.cur_len(),
+            _ => {}
+        }
+    }
 }
 
 /// Which view to reopen once a `View::Busy` operation completes. Most ops land
@@ -315,7 +602,19 @@ pub enum BusyThen {
     /// After a backgrounded worktree removal succeeds, delete its branch on the
     /// main thread (so a refused delete can open the force prompt). Carries the
     /// worktree name and the branch to delete.
-    DeleteBranch { name: String, branch: String },
+    DeleteBranch {
+        name: String,
+        branch: String,
+    },
+    /// After a merge/update/cherry-pick/stash-pop finishes, check the target for
+    /// conflicts: open the resolver when any remain, otherwise report the clean
+    /// result. Carries the worktree name, a label for what was applied, and the
+    /// kind of operation so the resolver can finish it correctly.
+    Resolve {
+        target: String,
+        source_label: String,
+        kind: ops::ResolveKind,
+    },
 }
 
 /// A worktree the picked commits can be cherry-picked into. Cherry-pick needs a
@@ -525,6 +824,12 @@ pub struct App {
     pub worktree_base: Option<String>,
     /// Advances once per event-loop tick; drives the busy-overlay spinner.
     pub tick_count: u64,
+    /// Whether commit history is drawn as a graph or a flat list, shared by the
+    /// log and branch-commit views. Toggled with `t`.
+    pub log_mode: LogMode,
+    /// When the list last reloaded itself (by timer or by `r`), used to pace
+    /// `auto_refresh`.
+    last_auto_refresh: Instant,
     /// When true, the help overlay is drawn on top of the active view; the next
     /// key press dismisses it and returns to that view.
     pub show_help: bool,
@@ -562,6 +867,8 @@ impl App {
             error: None,
             worktree_base,
             tick_count: 0,
+            log_mode: LogMode::Tree,
+            last_auto_refresh: Instant::now(),
             show_help: false,
             quit: false,
         };
@@ -573,12 +880,58 @@ impl App {
 
     /// Reloads the worktree list, keeping the selection in bounds.
     pub fn refresh(&mut self) {
+        self.last_auto_refresh = Instant::now();
         match ops::list(&self.ctx) {
             Ok(wts) => {
                 self.worktrees = wts;
                 self.selected = self.selected.min(self.worktrees.len().saturating_sub(1));
             }
             Err(e) => self.set_error(format!("{e:#}")),
+        }
+    }
+
+    /// Reloads the visible lists on a timer, so work done outside the app (an
+    /// agent committing in a worktree, a branch landing upstream) shows up on
+    /// its own.
+    ///
+    /// Deliberately conservative: it only runs on the plain list, never while an
+    /// overlay, prompt, or modal error owns the screen, and it keeps the cursor
+    /// on whatever it was on by name rather than by index. A failed reload is
+    /// swallowed rather than raised, since an unattended background refresh
+    /// should never interrupt with a popup; `r` still reports errors.
+    fn auto_refresh(&mut self) {
+        if !matches!(self.view, View::List)
+            || self.error.is_some()
+            || self.last_auto_refresh.elapsed() < AUTO_REFRESH_INTERVAL
+        {
+            return;
+        }
+        // Naming a branch or confirming a delete reads the list under the
+        // cursor; leave it alone until the user is done.
+        if self.tab == Tab::Branches && !matches!(self.branch_mode, BranchMode::List) {
+            return;
+        }
+        self.last_auto_refresh = Instant::now();
+        if let Ok(wts) = ops::list(&self.ctx) {
+            let current = self.selected_worktree().map(|w| w.name.clone());
+            self.worktrees = wts;
+            self.selected = current
+                .and_then(|name| self.worktrees.iter().position(|w| w.name == name))
+                .unwrap_or(self.selected)
+                .min(self.worktrees.len().saturating_sub(1));
+        }
+        if self.tab == Tab::Branches
+            && let Ok(r) = ops::branch_list(&self.ctx)
+        {
+            let current = self
+                .branches
+                .get(self.branch_selected)
+                .map(|b| b.name.clone());
+            self.branches = r.branches;
+            self.branch_selected = current
+                .and_then(|name| self.branches.iter().position(|b| b.name == name))
+                .unwrap_or(self.branch_selected)
+                .min(self.branches.len().saturating_sub(1));
         }
     }
 
@@ -598,6 +951,7 @@ impl App {
         // animating even while a background op holds the screen.
         self.tick_count = self.tick_count.wrapping_add(1);
         self.expire_message();
+        self.auto_refresh();
         if let View::Busy { rx, .. } = &self.view {
             if let Ok(result) = rx.try_recv() {
                 // Pull the follow-up out of the view so we can mutate self, then
@@ -617,11 +971,26 @@ impl App {
                         self.refresh();
                         self.delete_branch_step(name, branch);
                     }
+                    // A merge/update landed: open the resolver if it left
+                    // conflicts, otherwise show its clean-result message.
+                    (
+                        Ok(m),
+                        BusyThen::Resolve {
+                            target,
+                            source_label,
+                            kind,
+                        },
+                    ) => {
+                        self.refresh();
+                        self.finish_merge_op(target, source_label, kind, m);
+                    }
                     (Ok(m), then) => {
                         self.message = Some(m);
                         self.refresh();
                         match then {
-                            BusyThen::List | BusyThen::DeleteBranch { .. } => {}
+                            BusyThen::List
+                            | BusyThen::DeleteBranch { .. }
+                            | BusyThen::Resolve { .. } => {}
                             BusyThen::Stash(name) => self.load_stash(name, StashMode::List),
                             BusyThen::Branch => {
                                 self.branch_mode = BranchMode::List;
@@ -807,7 +1176,11 @@ impl App {
                     _ => {}
                 }
             }
-            View::ConfirmDelete { branch, delete_branch, .. } => match key.code {
+            View::ConfirmDelete {
+                branch,
+                delete_branch,
+                ..
+            } => match key.code {
                 KeyCode::Up | KeyCode::Down | KeyCode::Tab => {
                     // Detached worktrees have no branch to offer deleting.
                     if branch.is_some() {
@@ -873,6 +1246,8 @@ impl App {
             View::Log { .. } => self.on_log_key(key),
             View::BranchCommits { .. } => self.on_branch_commits_key(key),
             View::CherryPick { .. } => self.on_cherry_pick_key(key),
+            View::MergePick { .. } => self.on_merge_pick_key(key),
+            View::ConflictResolver { .. } => self.on_resolver_key(key),
             // A background op owns the screen until tick() drains its result.
             View::Busy { .. } => {}
         }
@@ -966,6 +1341,7 @@ impl App {
             KeyCode::Char('P') => self.start_push(),
             KeyCode::Char('f') => self.start_fetch(),
             KeyCode::Char('b') => self.open_switch(),
+            KeyCode::Char('u') => self.start_update(),
             KeyCode::Char('l') => self.open_log(),
             KeyCode::Char('d') => {
                 if let Some(wt) = self.selected_worktree() {
@@ -1481,11 +1857,31 @@ impl App {
                 return;
             }
         };
-        let branches: Vec<String> = all_branches
+        // Local branches not already in a worktree come first, then remote-only
+        // branches (a teammate's work with no local copy) so they are
+        // discoverable and can be checked out into a tracking branch. Remotes
+        // are best-effort: a repo without them just yields the local list.
+        let mut branches: Vec<CheckoutCandidate> = all_branches
             .iter()
             .filter(|b| !checked_out.contains(&b.as_str()))
-            .cloned()
+            .map(|b| CheckoutCandidate {
+                branch: b.clone(),
+                remote: None,
+            })
             .collect();
+        if let Ok(remotes) = crate::git::remote_branches(&self.ctx.repo_root) {
+            let mut seen: Vec<String> = all_branches.clone();
+            for (short, remote_ref) in remotes {
+                if seen.contains(&short) {
+                    continue;
+                }
+                seen.push(short.clone());
+                branches.push(CheckoutCandidate {
+                    branch: short,
+                    remote: Some(remote_ref),
+                });
+            }
+        }
         let base = self.default_base(&all_branches);
         self.view = View::Create {
             name: TextInput::default(),
@@ -1547,10 +1943,11 @@ impl App {
             return;
         }
         // Opens the base picker starting on the currently selected base.
-        let open_base_pick = |base: &str, all_branches: &[String], base_pick: &mut Option<usize>| {
-            let start = all_branches.iter().position(|b| b == base).unwrap_or(0);
-            *base_pick = Some(start);
-        };
+        let open_base_pick =
+            |base: &str, all_branches: &[String], base_pick: &mut Option<usize>| {
+                let start = all_branches.iter().position(|b| b == base).unwrap_or(0);
+                *base_pick = Some(start);
+            };
         match key.code {
             // Esc backs out of the focused base button first, then the dialog.
             KeyCode::Esc => {
@@ -1574,7 +1971,9 @@ impl App {
             }
             KeyCode::Down => {
                 *base_focus = false;
-                if *selected < branches.len() {
+                // Navigation is over the filtered checkout list, not `branches`.
+                let filtered = create_filtered(branches, name.as_str());
+                if *selected < filtered.len() {
                     *selected += 1;
                 }
             }
@@ -1592,8 +1991,15 @@ impl App {
                     }
                     self.request_create(branch, Some(base));
                 } else {
-                    let branch = branches[*selected - 1].clone();
-                    self.request_create(branch, None);
+                    // Map the filtered cursor back to the real candidate. A
+                    // remote-only branch is created as a local tracking branch
+                    // off its remote ref; a local branch is checked out directly.
+                    let filtered = create_filtered(branches, name.as_str());
+                    let Some(&idx) = filtered.get(*selected - 1) else {
+                        return;
+                    };
+                    let candidate = branches[idx].clone();
+                    self.request_create(candidate.branch, candidate.remote);
                 }
             }
             // Any other key returns focus to the new-branch name and edits it.
@@ -1984,7 +2390,7 @@ impl App {
                 KeyCode::Char('p') => {
                     let name = name.clone();
                     let index = entries.get(*selected).map(|e| e.index);
-                    self.stash_action("pop", name, index);
+                    self.stash_pop(name, index);
                 }
                 KeyCode::Char('a') => {
                     let name = name.clone();
@@ -2024,8 +2430,9 @@ impl App {
         }
     }
 
-    /// Runs a pop/apply/drop on `name`, reports the result, and reloads the
-    /// overlay (dirty counts and the stash list may both have changed).
+    /// Runs an apply/drop on `name`, reports the result, and reloads the overlay
+    /// (dirty counts and the stash list may both have changed). Pop is handled
+    /// separately by `stash_pop`, since it can leave conflicts to resolve.
     fn stash_action(&mut self, action: &str, name: String, index: Option<u32>) {
         let action = action.to_string();
         self.start_busy(
@@ -2033,12 +2440,39 @@ impl App {
             BusyThen::Stash(name.clone()),
             move |ctx| {
                 let result = match action.as_str() {
-                    "pop" => ops::stash_pop(ctx, &name, index),
                     "apply" => ops::stash_apply(ctx, &name, index),
                     _ => ops::stash_drop(ctx, &name, index),
                 };
                 result
                     .map(|r| format!("stash {} on '{}'", r.action, r.name))
+                    .map_err(|e| format!("{e:#}"))
+            },
+        );
+    }
+
+    /// Pops a stash on `name` in the background. A clean pop returns to the stash
+    /// overlay; a conflicting pop routes into the resolver (kind `StashPop`),
+    /// which finishes by dropping the stash once every file is resolved.
+    fn stash_pop(&mut self, name: String, index: Option<u32>) {
+        let n = name.clone();
+        self.start_busy(
+            "stash pop…".to_string(),
+            BusyThen::Resolve {
+                target: name,
+                source_label: "the stashed changes".to_string(),
+                kind: ops::ResolveKind::StashPop { index },
+            },
+            move |ctx| {
+                ops::stash_pop(ctx, &n, index)
+                    .map(|outcome| match outcome {
+                        ops::StashPopOutcome::Applied { name, .. } => {
+                            format!("popped stash on '{name}'")
+                        }
+                        // The message is unused on conflict; the resolver opens.
+                        ops::StashPopOutcome::Conflicted { .. } => {
+                            "conflicts to resolve".to_string()
+                        }
+                    })
                     .map_err(|e| format!("{e:#}"))
             },
         );
@@ -2240,6 +2674,10 @@ impl App {
                 self.load_branches(self.branch_selected);
                 self.message = Some("refreshed".to_string());
             }
+            // `f` refreshes every branch's ahead/behind against the remotes;
+            // `p` then fast-forwards the selected one onto its upstream.
+            KeyCode::Char('f') => self.start_fetch(),
+            KeyCode::Char('p') => self.start_branch_pull(),
             KeyCode::Char('n') => self.branch_mode = BranchMode::Create(String::new()),
             KeyCode::Char('d') => {
                 if !self.branches.is_empty() {
@@ -2249,6 +2687,9 @@ impl App {
             // Enter drills into the branch's commit history, the entry point
             // for cherry-picking commits into a worktree.
             KeyCode::Enter => self.open_branch_commits(),
+            // `m` merges the selected branch into a worktree of the user's
+            // choosing, routing any conflicts into the resolver.
+            KeyCode::Char('m') => self.open_merge_pick(),
             // `c` checks the branch out in a new worktree (the old Enter action).
             KeyCode::Char('c') => {
                 if let Some(b) = self.branches.get(self.branch_selected) {
@@ -2276,17 +2717,29 @@ impl App {
         else {
             return;
         };
-        match ops::branch_log(&self.ctx, &branch, 200) {
-            Ok(r) => {
-                let marked = vec![false; r.entries.len()];
+        match self.branch_log_lines(&branch) {
+            Ok(lines) => {
+                let selected = first_commit_row(&lines);
                 self.view = View::BranchCommits {
                     branch,
-                    entries: r.entries,
-                    marked,
-                    selected: 0,
+                    marked: vec![false; lines.len()],
+                    lines,
+                    selected,
                 };
             }
-            Err(e) => self.set_error(format!("{e:#}")),
+            Err(e) => self.set_error(e),
+        }
+    }
+
+    /// Commit history of a branch as graph rows, honouring `log_mode`.
+    fn branch_log_lines(&self, branch: &str) -> Result<Vec<GraphLine>, String> {
+        match self.log_mode {
+            LogMode::Tree => {
+                ops::branch_log_graph(&self.ctx, branch, 200).map_err(|e| format!("{e:#}"))
+            }
+            LogMode::Flat => ops::branch_log(&self.ctx, branch, 200)
+                .map(|r| flat_lines(r.entries))
+                .map_err(|e| format!("{e:#}")),
         }
     }
 
@@ -2294,7 +2747,7 @@ impl App {
     /// commits for cherry-picking, and open the worktree picker.
     fn on_branch_commits_key(&mut self, key: KeyEvent) {
         let View::BranchCommits {
-            entries,
+            lines,
             marked,
             selected,
             ..
@@ -2308,23 +2761,35 @@ impl App {
                 self.view = View::List;
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if *selected + 1 < entries.len() {
-                    *selected += 1;
+                if let Some(i) = seek_commit_row(lines, *selected, true) {
+                    *selected = i;
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(i) = seek_commit_row(lines, *selected, false) {
+                    *selected = i;
+                }
+            }
             KeyCode::Char(' ') => {
-                if let Some(m) = marked.get_mut(*selected) {
+                // Only commits can be picked; art-only rows ignore the toggle.
+                if lines.get(*selected).is_some_and(|l| l.entry.is_some())
+                    && let Some(m) = marked.get_mut(*selected)
+                {
                     *m = !*m;
                 }
             }
             KeyCode::Char('a') => {
-                let all = marked.iter().all(|m| *m);
-                for m in marked.iter_mut() {
-                    *m = !all;
+                let all = lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| l.entry.is_some())
+                    .all(|(i, _)| marked[i]);
+                for (i, line) in lines.iter().enumerate() {
+                    marked[i] = !all && line.entry.is_some();
                 }
             }
             KeyCode::Enter => self.open_cherry_pick(),
+            KeyCode::Char('t') => self.toggle_log_mode(),
             KeyCode::Char('?') => self.show_help = true,
             _ => {}
         }
@@ -2336,7 +2801,7 @@ impl App {
     fn open_cherry_pick(&mut self) {
         let View::BranchCommits {
             branch,
-            entries,
+            lines,
             marked,
             selected,
         } = &self.view
@@ -2344,22 +2809,22 @@ impl App {
             return;
         };
         // Gather chosen commits newest-first as they appear, then reverse to
-        // oldest-first for git.
+        // oldest-first for git. Art-only rows carry no commit and drop out.
         let chosen: Vec<usize> = if marked.iter().any(|m| *m) {
-            (0..entries.len()).filter(|i| marked[*i]).collect()
+            (0..lines.len()).filter(|i| marked[*i]).collect()
         } else {
             vec![*selected]
         };
-        if chosen.is_empty() {
-            return;
-        }
         let mut commits: Vec<String> = Vec::new();
         let mut summaries: Vec<String> = Vec::new();
         for &i in chosen.iter().rev() {
-            if let Some(e) = entries.get(i) {
+            if let Some(e) = lines.get(i).and_then(|l| l.entry.as_ref()) {
                 commits.push(e.hash.clone());
                 summaries.push(e.subject.clone());
             }
+        }
+        if commits.is_empty() {
+            return;
         }
         let source_branch = branch.clone();
         // Every existing worktree is a possible destination; cherry-pick needs a
@@ -2443,25 +2908,564 @@ impl App {
         let target_name = target.name.clone();
         let commits = commits.clone();
         let count = commits.len();
-        let verb = if no_commit { "loading" } else { "cherry-picking" };
+        let verb = if no_commit {
+            "loading"
+        } else {
+            "cherry-picking"
+        };
+        let label = if count == 1 {
+            "the cherry-picked commit".to_string()
+        } else {
+            format!("{count} cherry-picked commits")
+        };
         self.start_busy(
             format!("{verb} {count} commit(s) into '{target_name}'…"),
-            BusyThen::List,
+            BusyThen::Resolve {
+                target: target_name.clone(),
+                source_label: label,
+                kind: ops::ResolveKind::CherryPick,
+            },
             move |ctx| {
                 ops::cherry_pick(ctx, &target_name, &commits, no_commit)
-                    .map(|r| {
-                        if r.committed {
-                            format!("cherry-picked {} commit(s) into '{}'", r.count, r.target)
-                        } else {
-                            format!(
-                                "loaded {} commit(s) into '{}' (review, then commit)",
-                                r.count, r.target
-                            )
+                    .map(|outcome| match outcome {
+                        ops::CherryPickOutcome::Applied {
+                            target,
+                            count,
+                            committed,
+                        } => {
+                            if committed {
+                                format!("cherry-picked {count} commit(s) into '{target}'")
+                            } else {
+                                format!(
+                                    "loaded {count} commit(s) into '{target}' (review, then commit)"
+                                )
+                            }
+                        }
+                        // The message is unused on conflict; the resolver opens.
+                        ops::CherryPickOutcome::Conflicted { .. } => {
+                            "conflicts to resolve".to_string()
                         }
                     })
                     .map_err(|e| format!("{e:#}"))
             },
         );
+    }
+
+    /// Opens the merge picker for the branch selected on the Branches tab,
+    /// listing every worktree the branch can be merged into.
+    fn open_merge_pick(&mut self) {
+        let Some(source_branch) = self
+            .branches
+            .get(self.branch_selected)
+            .map(|b| b.name.clone())
+        else {
+            return;
+        };
+        let targets: Vec<CherryTarget> = self
+            .worktrees
+            .iter()
+            .map(|w| CherryTarget {
+                name: w.name.clone(),
+                branch: w.branch.clone(),
+            })
+            .collect();
+        if targets.is_empty() {
+            self.message = Some("no worktrees to merge into".to_string());
+            return;
+        }
+        self.view = View::MergePick {
+            source_branch,
+            targets,
+            selected: 0,
+        };
+    }
+
+    /// Key handling for the merge picker: pick a target worktree, then run the
+    /// merge in the background.
+    fn on_merge_pick_key(&mut self, key: KeyEvent) {
+        let View::MergePick {
+            targets, selected, ..
+        } = &mut self.view
+        else {
+            return;
+        };
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                if *selected + 1 < targets.len() {
+                    *selected += 1;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+            KeyCode::Enter => self.run_merge(),
+            KeyCode::Esc | KeyCode::Char('q') => self.view = View::List,
+            KeyCode::Char('?') => self.show_help = true,
+            _ => {}
+        }
+    }
+
+    /// Merges the picked branch into the chosen worktree on a background
+    /// thread. Conflicts route into the resolver via `BusyThen::Resolve`.
+    fn run_merge(&mut self) {
+        let picked = match &self.view {
+            View::MergePick {
+                source_branch,
+                targets,
+                selected,
+            } => targets
+                .get(*selected)
+                .map(|t| (source_branch.clone(), t.name.clone(), t.branch.clone())),
+            _ => None,
+        };
+        let Some((source, target_name, target_branch)) = picked else {
+            return;
+        };
+        // Merging a branch into the worktree that already has it checked out is
+        // a no-op git would refuse; guard so the user gets a clear message.
+        if target_branch.as_deref() == Some(source.as_str()) {
+            self.message = Some(format!("'{target_name}' is already on '{source}'"));
+            return;
+        }
+        // Owned copies for the background closure (which outlives this frame).
+        let tn = target_name.clone();
+        let src = source.clone();
+        self.start_busy(
+            format!("merging '{source}' into '{target_name}'…"),
+            BusyThen::Resolve {
+                target: target_name,
+                source_label: source,
+                kind: ops::ResolveKind::Merge,
+            },
+            move |ctx| {
+                ops::merge(ctx, &tn, &src, false)
+                    .map(|outcome| match outcome {
+                        ops::MergeOutcome::UpToDate => format!("'{tn}' already up to date"),
+                        ops::MergeOutcome::Clean { commit } => {
+                            format!("merged '{src}' into '{tn}' ({commit})")
+                        }
+                        // The message is unused on conflict; the resolver opens.
+                        ops::MergeOutcome::Conflicted { .. } => "conflicts to resolve".to_string(),
+                    })
+                    .map_err(|e| format!("{e:#}"))
+            },
+        );
+    }
+
+    /// Merges the repo's default branch into the selected worktree ("update
+    /// from main") on a background thread, routing conflicts into the resolver.
+    fn start_update(&mut self) {
+        let Some(wt) = self.selected_worktree() else {
+            return;
+        };
+        if wt.is_main {
+            self.message = Some("the main worktree is already on the default branch".to_string());
+            return;
+        }
+        let name = wt.name.clone();
+        let n = name.clone();
+        self.start_busy(
+            format!("updating '{name}' from the default branch…"),
+            BusyThen::Resolve {
+                target: name,
+                source_label: "the default branch".to_string(),
+                kind: ops::ResolveKind::Merge,
+            },
+            move |ctx| {
+                ops::update(ctx, &n)
+                    .map(|outcome| match outcome {
+                        ops::MergeOutcome::UpToDate => format!("'{n}' already up to date"),
+                        ops::MergeOutcome::Clean { commit } => format!("updated '{n}' ({commit})"),
+                        ops::MergeOutcome::Conflicted { .. } => "conflicts to resolve".to_string(),
+                    })
+                    .map_err(|e| format!("{e:#}"))
+            },
+        );
+    }
+
+    /// After a merge/update/cherry-pick/stash-pop op settles, opens the resolver
+    /// when the target still has conflicts, otherwise shows the op's clean-result
+    /// `msg`. A clean stash pop returns to the stash overlay so the user can keep
+    /// working there.
+    fn finish_merge_op(
+        &mut self,
+        target: String,
+        source_label: String,
+        kind: ops::ResolveKind,
+        msg: String,
+    ) {
+        match ops::list_conflicts(&self.ctx, &target) {
+            Ok(files) if !files.is_empty() => self.open_resolver(target, source_label, kind, files),
+            Ok(_) => {
+                self.message = Some(msg);
+                if matches!(kind, ops::ResolveKind::StashPop { .. }) {
+                    self.load_stash(target, StashMode::List);
+                }
+            }
+            Err(e) => self.set_error(format!("{e:#}")),
+        }
+    }
+
+    /// Opens the conflict resolver on `target` for the given conflicted
+    /// `files`, loading the first file's contents. `kind` records which
+    /// operation the resolver will finish.
+    fn open_resolver(
+        &mut self,
+        target: String,
+        source_label: String,
+        kind: ops::ResolveKind,
+        files: Vec<String>,
+    ) {
+        let resolved = vec![false; files.len()];
+        self.view = View::ConflictResolver {
+            target,
+            source_label,
+            kind,
+            files,
+            resolved,
+            file: 0,
+            current: None,
+            confirm_abort: false,
+        };
+        self.load_resolver_file();
+    }
+
+    /// Loads (or reloads) the currently selected conflicted file into the
+    /// resolver, parsing it into hunks with every hunk left unresolved. A file
+    /// with no remaining conflict markers (already resolved) or a read error
+    /// leaves `current` empty, which the renderer shows as "resolved".
+    fn load_resolver_file(&mut self) {
+        let target_path = match &self.view {
+            View::ConflictResolver {
+                target,
+                files,
+                file,
+                ..
+            } => files.get(*file).map(|p| (target.clone(), p.clone())),
+            _ => None,
+        };
+        let Some((target, path)) = target_path else {
+            return;
+        };
+        let loaded = ops::read_conflict(&self.ctx, &target, &path)
+            .ok()
+            .and_then(|cf| {
+                let hunks = cf
+                    .segments
+                    .iter()
+                    .filter(|s| matches!(s, ConflictSegment::Hunk { .. }))
+                    .count();
+                // A file with no hunks left is fully resolved; show nothing.
+                (hunks > 0).then(|| ResolverFile {
+                    file: cf,
+                    actions: vec![None; hunks],
+                    hunk: 0,
+                    edit: None,
+                })
+            });
+        if let View::ConflictResolver { current, .. } = &mut self.view {
+            *current = loaded;
+        }
+    }
+
+    /// Key handling for the conflict resolver.
+    fn on_resolver_key(&mut self, key: KeyEvent) {
+        // A manual hunk edit captures every key until saved or cancelled.
+        let editing = matches!(
+            &self.view,
+            View::ConflictResolver { current: Some(rf), .. } if rf.edit.is_some()
+        );
+        if editing {
+            self.on_hunk_editor_key(key);
+            return;
+        }
+        // The abort confirmation captures keys until dismissed.
+        if matches!(
+            self.view,
+            View::ConflictResolver {
+                confirm_abort: true,
+                ..
+            }
+        ) {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => self.abort_resolver(),
+                KeyCode::Esc | KeyCode::Char('n') => {
+                    if let View::ConflictResolver { confirm_abort, .. } = &mut self.view {
+                        *confirm_abort = false;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        match key.code {
+            // Leaving keeps the merge in progress so it can be resumed later.
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.view = View::List;
+                self.refresh();
+            }
+            KeyCode::Left | KeyCode::Char('[') | KeyCode::Char('h') => self.resolver_move_file(-1),
+            KeyCode::Right | KeyCode::Char(']') | KeyCode::Char('l') => self.resolver_move_file(1),
+            KeyCode::Down | KeyCode::Char('j') => self.resolver_move_hunk(1),
+            KeyCode::Up | KeyCode::Char('k') => self.resolver_move_hunk(-1),
+            KeyCode::Char('o') => self.resolver_set_action(ResolutionAction::KeepOurs),
+            KeyCode::Char('t') => self.resolver_set_action(ResolutionAction::KeepTheirs),
+            KeyCode::Char('b') => self.resolver_set_action(ResolutionAction::KeepBoth),
+            KeyCode::Char('B') => self.resolver_set_action(ResolutionAction::KeepBothReversed),
+            KeyCode::Char('O') => self.resolver_whole_file(true),
+            KeyCode::Char('T') => self.resolver_whole_file(false),
+            KeyCode::Char('e') => self.resolver_edit_hunk(),
+            KeyCode::Char('w') | KeyCode::Enter => self.resolver_write_file(),
+            KeyCode::Char('c') => self.resolver_complete(),
+            KeyCode::Char('x') => {
+                if let View::ConflictResolver { confirm_abort, .. } = &mut self.view {
+                    *confirm_abort = true;
+                }
+            }
+            KeyCode::Char('?') => self.show_help = true,
+            _ => {}
+        }
+    }
+
+    /// Moves the file cursor by `delta`, clamped, and reloads the new file.
+    fn resolver_move_file(&mut self, delta: isize) {
+        let moved = if let View::ConflictResolver { files, file, .. } = &mut self.view {
+            let n = files.len();
+            if n == 0 {
+                false
+            } else {
+                let new = (*file as isize + delta).clamp(0, n as isize - 1) as usize;
+                let moved = new != *file;
+                *file = new;
+                moved
+            }
+        } else {
+            false
+        };
+        if moved {
+            self.load_resolver_file();
+        }
+    }
+
+    /// Moves the hunk cursor within the current file by `delta`, clamped.
+    fn resolver_move_hunk(&mut self, delta: isize) {
+        if let View::ConflictResolver {
+            current: Some(rf), ..
+        } = &mut self.view
+        {
+            let n = rf.actions.len();
+            if n > 0 {
+                rf.hunk = (rf.hunk as isize + delta).clamp(0, n as isize - 1) as usize;
+            }
+        }
+    }
+
+    /// Records `action` for the current hunk of the current file.
+    fn resolver_set_action(&mut self, action: ResolutionAction) {
+        if let View::ConflictResolver {
+            current: Some(rf), ..
+        } = &mut self.view
+            && let Some(slot) = rf.actions.get_mut(rf.hunk)
+        {
+            *slot = Some(action);
+        }
+    }
+
+    /// Opens the manual editor for the current hunk. It is seeded from the
+    /// side already chosen (if any), else from both sides so nothing is lost;
+    /// the user then trims or rewrites it into the final result.
+    fn resolver_edit_hunk(&mut self) {
+        if let View::ConflictResolver {
+            current: Some(rf), ..
+        } = &mut self.view
+        {
+            let seed = rf
+                .file
+                .segments
+                .iter()
+                .filter_map(|s| match s {
+                    ConflictSegment::Hunk { ours, theirs, .. } => Some((ours, theirs)),
+                    _ => None,
+                })
+                .nth(rf.hunk)
+                .map(
+                    |(ours, theirs)| match rf.actions.get(rf.hunk).and_then(|a| a.clone()) {
+                        Some(ResolutionAction::KeepOurs) => ours.clone(),
+                        Some(ResolutionAction::KeepTheirs) => theirs.clone(),
+                        Some(ResolutionAction::KeepBothReversed) => format!("{theirs}{ours}"),
+                        Some(ResolutionAction::Manual(t)) => t,
+                        // No side picked, or "keep both": start with both, ours first.
+                        _ => format!("{ours}{theirs}"),
+                    },
+                );
+            if let Some(text) = seed {
+                rf.edit = Some(HunkEditor::new(&text));
+            }
+        }
+    }
+
+    /// Key handling while the manual hunk editor is open: Ctrl+S saves the edit
+    /// as a `Manual` resolution, Esc discards it, everything else edits.
+    fn on_hunk_editor_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            self.resolver_save_manual_edit();
+            return;
+        }
+        if key.code == KeyCode::Esc {
+            if let View::ConflictResolver {
+                current: Some(rf), ..
+            } = &mut self.view
+            {
+                rf.edit = None;
+            }
+            return;
+        }
+        if let View::ConflictResolver {
+            current: Some(rf), ..
+        } = &mut self.view
+            && let Some(ed) = &mut rf.edit
+        {
+            ed.on_key(key);
+        }
+    }
+
+    /// Saves the open manual edit as the current hunk's resolution and closes
+    /// the editor.
+    fn resolver_save_manual_edit(&mut self) {
+        if let View::ConflictResolver {
+            current: Some(rf), ..
+        } = &mut self.view
+            && let Some(ed) = rf.edit.take()
+        {
+            let text = ed.text();
+            if let Some(slot) = rf.actions.get_mut(rf.hunk) {
+                *slot = Some(ResolutionAction::Manual(text));
+            }
+        }
+    }
+
+    /// Renders the current file from its chosen per-hunk actions and stages it,
+    /// then advances to the next unresolved file. Refuses until every hunk has
+    /// a chosen side, so nothing is staged with a hunk left undecided.
+    fn resolver_write_file(&mut self) {
+        let prepared = if let View::ConflictResolver {
+            target,
+            files,
+            file,
+            current,
+            ..
+        } = &self.view
+        {
+            current.as_ref().map(|rf| {
+                let text = rf
+                    .actions
+                    .iter()
+                    .cloned()
+                    .collect::<Option<Vec<_>>>()
+                    .map(|actions| conflict::render(&rf.file.segments, &actions));
+                (target.clone(), files[*file].clone(), text)
+            })
+        } else {
+            None
+        };
+        let Some((target, path, text)) = prepared else {
+            self.message = Some("no conflicts to stage in this file".to_string());
+            return;
+        };
+        let Some(text) = text else {
+            self.message = Some("pick a side for every hunk (o/t/b) before staging".to_string());
+            return;
+        };
+        match ops::write_resolution(&self.ctx, &target, &path, &text) {
+            Ok(()) => {
+                self.message = Some(format!("staged '{path}'"));
+                self.resolver_mark_resolved_and_advance();
+            }
+            Err(e) => self.set_error(format!("{e:#}")),
+        }
+    }
+
+    /// Takes the whole current file from one side (ours or theirs) and stages
+    /// it, then advances to the next unresolved file.
+    fn resolver_whole_file(&mut self, ours: bool) {
+        let target_path = match &self.view {
+            View::ConflictResolver {
+                target,
+                files,
+                file,
+                ..
+            } => files.get(*file).map(|p| (target.clone(), p.clone())),
+            _ => None,
+        };
+        let Some((target, path)) = target_path else {
+            return;
+        };
+        let res = if ours {
+            ops::checkout_ours(&self.ctx, &target, &path)
+        } else {
+            ops::checkout_theirs(&self.ctx, &target, &path)
+        };
+        match res {
+            Ok(()) => {
+                let side = if ours { "ours" } else { "theirs" };
+                self.message = Some(format!("took {side} for '{path}'"));
+                self.resolver_mark_resolved_and_advance();
+            }
+            Err(e) => self.set_error(format!("{e:#}")),
+        }
+    }
+
+    /// Marks the current file resolved, then jumps to the next still-unresolved
+    /// file (wrapping around), reloading its contents.
+    fn resolver_mark_resolved_and_advance(&mut self) {
+        let next = if let View::ConflictResolver { resolved, file, .. } = &mut self.view {
+            if let Some(r) = resolved.get_mut(*file) {
+                *r = true;
+            }
+            let n = resolved.len();
+            (1..=n).map(|off| (*file + off) % n).find(|&i| !resolved[i])
+        } else {
+            None
+        };
+        if let (Some(i), View::ConflictResolver { file, .. }) = (next, &mut self.view) {
+            *file = i;
+        }
+        self.load_resolver_file();
+    }
+
+    /// Finishes the resolved operation (commit the merge, continue the
+    /// cherry-pick, or drop the popped stash) and returns to the worktree list.
+    /// Errors (e.g. conflicts still unresolved) surface in the modal error popup.
+    fn resolver_complete(&mut self) {
+        let (target, kind) = match &self.view {
+            View::ConflictResolver { target, kind, .. } => (target.clone(), *kind),
+            _ => return,
+        };
+        match ops::complete_resolution(&self.ctx, &target, kind, None) {
+            Ok(r) => {
+                self.view = View::List;
+                self.refresh();
+                self.message = Some(match r.commit {
+                    Some(commit) => format!("resolved '{}' ({commit})", r.target),
+                    None => format!("resolved '{}'", r.target),
+                });
+            }
+            Err(e) => self.set_error(format!("{e:#}")),
+        }
+    }
+
+    /// Aborts the in-progress operation and returns to the worktree list.
+    fn abort_resolver(&mut self) {
+        let (target, kind) = match &self.view {
+            View::ConflictResolver { target, kind, .. } => (target.clone(), *kind),
+            _ => return,
+        };
+        match ops::abort_resolution(&self.ctx, &target, kind) {
+            Ok(()) => {
+                self.view = View::List;
+                self.refresh();
+                self.message = Some(format!("aborted resolution in '{target}'"));
+            }
+            Err(e) => self.set_error(format!("{e:#}")),
+        }
     }
 
     /// Creates a branch from HEAD and reloads the Branches tab.
@@ -2501,30 +3505,43 @@ impl App {
         self.open_create();
         // The branch browser picks an existing branch to check out, so select
         // it in the checkout list rather than the new-branch row.
+        // No filter text is typed yet, so the filtered list equals `branches`
+        // and the position maps straight to the checkout selection.
         if let View::Create {
             branches, selected, ..
         } = &mut self.view
-            && let Some(pos) = branches.iter().position(|b| *b == branch)
+            && let Some(pos) = branches.iter().position(|b| b.branch == branch)
         {
             *selected = pos + 1;
         }
     }
 
-    /// Opens the scrollable commit log for the selected worktree.
+    /// Opens the scrollable commit log for the selected worktree, drawn in the
+    /// current `log_mode`.
     fn open_log(&mut self) {
         let Some(wt) = self.selected_worktree() else {
             return;
         };
         let name = wt.name.clone();
-        match ops::log(&self.ctx, &name, 100) {
-            Ok(r) => {
+        match self.worktree_log_lines(&name) {
+            Ok(lines) => {
                 self.view = View::Log {
                     name,
-                    entries: r.entries,
+                    lines,
                     scroll: 0,
                 }
             }
-            Err(e) => self.set_error(format!("{e:#}")),
+            Err(e) => self.set_error(e),
+        }
+    }
+
+    /// Commit history of a worktree as graph rows, honouring `log_mode`.
+    fn worktree_log_lines(&self, name: &str) -> Result<Vec<GraphLine>, String> {
+        match self.log_mode {
+            LogMode::Tree => ops::log_graph(&self.ctx, name, 100).map_err(|e| format!("{e:#}")),
+            LogMode::Flat => ops::log(&self.ctx, name, 100)
+                .map(|r| flat_lines(r.entries))
+                .map_err(|e| format!("{e:#}")),
         }
     }
 
@@ -2539,9 +3556,51 @@ impl App {
             KeyCode::PageDown => *scroll = scroll.saturating_add(20),
             KeyCode::PageUp => *scroll = scroll.saturating_sub(20),
             KeyCode::Home | KeyCode::Char('g') => *scroll = 0,
+            // Swap between the commit graph and the plain list, reloading in
+            // place and returning to the top since the rows no longer line up.
+            KeyCode::Char('t') => self.toggle_log_mode(),
             KeyCode::Char('?') => self.show_help = true,
             _ => {}
         }
+    }
+
+    /// Flips `log_mode` and reloads whichever commit view is open.
+    fn toggle_log_mode(&mut self) {
+        self.log_mode = self.log_mode.toggled();
+        match &self.view {
+            View::Log { name, .. } => {
+                let name = name.clone();
+                match self.worktree_log_lines(&name) {
+                    Ok(lines) => {
+                        self.view = View::Log {
+                            name,
+                            lines,
+                            scroll: 0,
+                        }
+                    }
+                    Err(e) => self.set_error(e),
+                }
+            }
+            // Any cherry-pick marks are dropped: the rows are re-derived and no
+            // longer line up with the old ones.
+            View::BranchCommits { branch, .. } => {
+                let branch = branch.clone();
+                match self.branch_log_lines(&branch) {
+                    Ok(lines) => {
+                        let selected = first_commit_row(&lines);
+                        self.view = View::BranchCommits {
+                            branch,
+                            marked: vec![false; lines.len()],
+                            lines,
+                            selected,
+                        };
+                    }
+                    Err(e) => self.set_error(e),
+                }
+            }
+            _ => return,
+        }
+        self.message = Some(format!("{} view", self.log_mode.label()));
     }
 
     /// Runs `op` on a background thread and shows the Busy overlay until
@@ -2604,23 +3663,49 @@ impl App {
         });
     }
 
-    /// Fetches all remotes (with prune) in the background.
-    fn start_fetch(&mut self) {
+    /// Fast-forwards the branch selected on the Branches tab to its upstream.
+    /// Reports the worktree it happened in when the branch is checked out.
+    fn start_branch_pull(&mut self) {
+        let Some(branch) = self
+            .branches
+            .get(self.branch_selected)
+            .map(|b| b.name.clone())
+        else {
+            return;
+        };
         self.start_busy(
-            "fetching all remotes…".to_string(),
-            BusyThen::List,
+            format!("pulling {branch}…"),
+            BusyThen::Branch,
             move |ctx| {
-                ops::fetch(ctx)
-                    .map(|r| {
-                        if r.remotes.is_empty() {
-                            "no remotes to fetch".to_string()
-                        } else {
-                            format!("fetched: {}", r.remotes.join(", "))
-                        }
+                ops::branch_pull(ctx, &branch)
+                    .map(|r| match (r.already_up_to_date, r.worktree) {
+                        (true, _) => format!("'{}' already up to date", r.branch),
+                        (false, Some(wt)) => format!("fast-forwarded '{}' in {wt}", r.branch),
+                        (false, None) => format!("fast-forwarded '{}'", r.branch),
                     })
                     .map_err(|e| format!("{e:#}"))
             },
         );
+    }
+
+    /// Fetches all remotes (with prune) in the background, reopening whichever
+    /// tab asked so its ahead/behind counts reload.
+    fn start_fetch(&mut self) {
+        let then = match self.tab {
+            Tab::Worktrees => BusyThen::List,
+            Tab::Branches => BusyThen::Branch,
+        };
+        self.start_busy("fetching all remotes…".to_string(), then, move |ctx| {
+            ops::fetch(ctx)
+                .map(|r| {
+                    if r.remotes.is_empty() {
+                        "no remotes to fetch".to_string()
+                    } else {
+                        format!("fetched: {}", r.remotes.join(", "))
+                    }
+                })
+                .map_err(|e| format!("{e:#}"))
+        });
     }
 
     /// Starts the delete flow from the `ConfirmDelete` prompt. A dirty worktree
@@ -2687,7 +3772,13 @@ impl App {
     /// folder-only removal is backgrounded through the Busy overlay; a branch
     /// delete runs synchronously so an unmerged or checked-out-elsewhere
     /// refusal can open the force prompt instead of failing silently.
-    fn do_delete(&mut self, name: String, branch: Option<String>, delete_branch: bool, force: bool) {
+    fn do_delete(
+        &mut self,
+        name: String,
+        branch: Option<String>,
+        delete_branch: bool,
+        force: bool,
+    ) {
         match (delete_branch, branch) {
             // Remove the folder in the background (the slow part), then delete
             // the branch on the main thread once it lands (see the DeleteBranch
@@ -2712,18 +3803,14 @@ impl App {
             // Folder-only removal (branch kept, or a detached worktree).
             _ => {
                 let thread_name = name.clone();
-                self.start_busy(
-                    format!("removing '{name}'…"),
-                    BusyThen::List,
-                    move |ctx| {
-                        ops::remove_worktree_only(ctx, &thread_name, force)
-                            .map(|info| match &info.branch {
-                                Some(_) => format!("removed '{}' (branch kept)", info.name),
-                                None => format!("removed '{}'", info.name),
-                            })
-                            .map_err(|e| format!("{e:#}"))
-                    },
-                );
+                self.start_busy(format!("removing '{name}'…"), BusyThen::List, move |ctx| {
+                    ops::remove_worktree_only(ctx, &thread_name, force)
+                        .map(|info| match &info.branch {
+                            Some(_) => format!("removed '{}' (branch kept)", info.name),
+                            None => format!("removed '{}'", info.name),
+                        })
+                        .map_err(|e| format!("{e:#}"))
+                });
             }
         }
     }
@@ -2813,6 +3900,29 @@ mod tests {
     fn type_str(app: &mut App, text: &str) {
         for c in text.chars() {
             press(app, KeyCode::Char(c));
+        }
+    }
+
+    /// Drives `tick` until an in-flight background op lands, the way the event
+    /// loop does, so the test can assert on its result.
+    fn settle_busy(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while matches!(app.view, View::Busy { .. }) {
+            app.tick();
+            assert!(std::time::Instant::now() < deadline, "busy op timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// A `LogEntry` with only its hash set, for tests that care about row
+    /// structure rather than commit contents.
+    fn log_entry(hash: &str) -> LogEntry {
+        LogEntry {
+            hash: hash.to_string(),
+            subject: String::new(),
+            author: String::new(),
+            date: String::new(),
+            refs: Vec::new(),
         }
     }
 
@@ -2971,9 +4081,9 @@ mod tests {
             } => {
                 // main is checked out, so only the two spare branches show.
                 assert_eq!(*selected, 0);
-                assert!(branches.contains(&"spare".to_string()));
-                assert!(branches.contains(&"other".to_string()));
-                assert!(!branches.contains(&"main".to_string()));
+                assert!(branches.iter().any(|c| c.branch == "spare"));
+                assert!(branches.iter().any(|c| c.branch == "other"));
+                assert!(!branches.iter().any(|c| c.branch == "main"));
             }
             _ => panic!("expected create dialog"),
         }
@@ -2982,7 +4092,7 @@ mod tests {
         let expected = match &app.view {
             View::Create {
                 branches, selected, ..
-            } => branches[*selected - 1].clone(),
+            } => branches[*selected - 1].branch.clone(),
             _ => panic!("expected create dialog"),
         };
         press(&mut app, KeyCode::Enter);
@@ -4022,7 +5132,7 @@ mod tests {
                 branches, selected, ..
             } => {
                 assert!(*selected >= 1);
-                assert_eq!(branches[*selected - 1], "spare");
+                assert_eq!(branches[*selected - 1].branch, "spare");
             }
             _ => panic!("expected the create dialog prefilled with the branch"),
         }
@@ -4036,7 +5146,7 @@ mod tests {
         // Enter on a branch drills into its commit history.
         press(&mut app, KeyCode::Enter);
         match &app.view {
-            View::BranchCommits { entries, .. } => assert!(!entries.is_empty()),
+            View::BranchCommits { lines, .. } => assert!(!lines.is_empty()),
             _ => panic!("expected the branch commits view"),
         }
         // Space marks the commit under the cursor, and Enter opens the
@@ -4052,6 +5162,350 @@ mod tests {
             }
             _ => panic!("expected the cherry-pick picker"),
         }
+    }
+
+    /// Builds a main-vs-feature conflict on `shared.txt` and drives the UI into
+    /// the conflict resolver, returning the feature worktree's path.
+    fn into_conflict_resolver(app: &mut App) -> std::path::PathBuf {
+        std::fs::write(app.ctx.repo_root.join("shared.txt"), "base\n").unwrap();
+        git(&app.ctx.repo_root, &["add", "."]);
+        git(&app.ctx.repo_root, &["commit", "-m", "base"]);
+        add_and_select_worktree(app, "feature");
+        let feat = std::path::PathBuf::from(
+            app.worktrees
+                .iter()
+                .find(|w| w.name == "feature")
+                .unwrap()
+                .path
+                .clone(),
+        );
+        // Divergent edits to the same line make a merge conflict.
+        std::fs::write(app.ctx.repo_root.join("shared.txt"), "main version\n").unwrap();
+        git(&app.ctx.repo_root, &["commit", "-am", "main edit"]);
+        std::fs::write(feat.join("shared.txt"), "feature version\n").unwrap();
+        git(&feat, &["commit", "-am", "feature edit"]);
+        // Merge main into the feature worktree through the UI.
+        press(app, KeyCode::Tab);
+        let idx = app
+            .branches
+            .iter()
+            .position(|b| b.name == "main")
+            .expect("main branch listed");
+        app.branch_selected = idx;
+        press(app, KeyCode::Char('m'));
+        if let View::MergePick {
+            targets, selected, ..
+        } = &mut app.view
+        {
+            *selected = targets.iter().position(|t| t.name == "feature").unwrap();
+        }
+        press(app, KeyCode::Enter);
+        settle(app);
+        feat
+    }
+
+    #[test]
+    fn merge_key_opens_picker_with_worktree_targets() {
+        let (_tmp, mut app) = test_app();
+        add_and_select_worktree(&mut app, "feature");
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.tab, Tab::Branches);
+        let idx = app.branches.iter().position(|b| b.name == "main").unwrap();
+        app.branch_selected = idx;
+        press(&mut app, KeyCode::Char('m'));
+        match &app.view {
+            View::MergePick {
+                source_branch,
+                targets,
+                ..
+            } => {
+                assert_eq!(source_branch, "main");
+                assert!(targets.iter().any(|t| t.name == "feature"));
+            }
+            _ => panic!("expected the merge picker"),
+        }
+    }
+
+    #[test]
+    fn merge_conflict_opens_resolver_and_completes() {
+        let (_tmp, mut app) = test_app();
+        let feat = into_conflict_resolver(&mut app);
+
+        // The resolver opened on the conflicted file with one undecided hunk.
+        match &app.view {
+            View::ConflictResolver {
+                target,
+                files,
+                current,
+                ..
+            } => {
+                assert_eq!(target, "feature");
+                assert_eq!(files, &vec!["shared.txt".to_string()]);
+                let rf = current.as_ref().expect("file loaded with a hunk");
+                assert_eq!(rf.actions.len(), 1);
+                assert!(rf.actions[0].is_none());
+            }
+            _ => panic!("expected the conflict resolver"),
+        }
+
+        // Staging before choosing a side is refused (still unresolved).
+        press(&mut app, KeyCode::Char('w'));
+        assert!(matches!(app.view, View::ConflictResolver { .. }));
+
+        // Pick a side, stage the file, then complete the merge.
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Char('w'));
+        press(&mut app, KeyCode::Char('c'));
+
+        assert!(matches!(app.view, View::List));
+        assert!(!crate::git::is_merging(&feat));
+    }
+
+    #[test]
+    fn resolver_manual_edit_writes_hand_edited_result() {
+        let (_tmp, mut app) = test_app();
+        let feat = into_conflict_resolver(&mut app);
+
+        // `e` opens the manual editor seeded with both sides; inserting a
+        // character and Ctrl+S records a Manual resolution for the hunk.
+        press(&mut app, KeyCode::Char('e'));
+        assert!(matches!(
+            &app.view,
+            View::ConflictResolver { current: Some(rf), .. } if rf.edit.is_some()
+        ));
+        press(&mut app, KeyCode::Char('Z'));
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        match &app.view {
+            View::ConflictResolver {
+                current: Some(rf), ..
+            } => {
+                assert!(rf.edit.is_none(), "editor closes on save");
+                assert!(matches!(rf.actions[0], Some(ResolutionAction::Manual(_))));
+            }
+            _ => panic!("expected the conflict resolver"),
+        }
+
+        // Stage the manual result and complete the merge.
+        press(&mut app, KeyCode::Char('w'));
+        press(&mut app, KeyCode::Char('c'));
+        assert!(matches!(app.view, View::List));
+        assert!(!crate::git::is_merging(&feat));
+        // Ours is the feature side; the seed was ours-then-theirs with a 'Z'
+        // inserted at the very front.
+        assert_eq!(
+            std::fs::read_to_string(feat.join("shared.txt")).unwrap(),
+            "Zfeature version\nmain version\n"
+        );
+    }
+
+    #[test]
+    fn resolver_manual_edit_esc_discards() {
+        let (_tmp, mut app) = test_app();
+        into_conflict_resolver(&mut app);
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Char('Z'));
+        press(&mut app, KeyCode::Esc);
+        // Esc drops the editor without recording an action.
+        match &app.view {
+            View::ConflictResolver {
+                current: Some(rf), ..
+            } => {
+                assert!(rf.edit.is_none());
+                assert!(
+                    rf.actions[0].is_none(),
+                    "discarded edit leaves hunk undecided"
+                );
+            }
+            _ => panic!("expected the conflict resolver"),
+        }
+    }
+
+    #[test]
+    fn hunk_editor_edits_and_round_trips() {
+        // Seed with two lines; the trailing newline must survive.
+        let mut ed = HunkEditor::new("ab\ncd\n");
+        assert_eq!(ed.lines, vec!["ab", "cd"]);
+        // Insert at the front of line 0.
+        ed.on_key(KeyEvent::from(KeyCode::Char('X')));
+        assert_eq!(ed.lines[0], "Xab");
+        // Enter splits after the cursor (now past 'X'), so line 0 becomes "X".
+        ed.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(ed.lines, vec!["X", "ab", "cd"]);
+        // Backspace at column 0 joins this line onto the previous one.
+        ed.on_key(KeyEvent::from(KeyCode::Backspace));
+        assert_eq!(ed.lines, vec!["Xab", "cd"]);
+        assert_eq!(ed.text(), "Xab\ncd\n");
+    }
+
+    #[test]
+    fn create_dialog_lists_remote_only_branches() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        // Simulate a teammate's branch that was fetched into a remote-tracking
+        // ref but has no local branch of the same name.
+        let sha = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&root)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        git(
+            &root,
+            &["update-ref", "refs/remotes/origin/teammate", sha.trim()],
+        );
+        press(&mut app, KeyCode::Char('n'));
+        // Filter to the teammate branch and select it in the checkout list.
+        type_str(&mut app, "teammate");
+        match &app.view {
+            View::Create { branches, .. } => {
+                let c = branches
+                    .iter()
+                    .find(|c| c.branch == "teammate")
+                    .expect("remote-only branch is offered for checkout");
+                assert_eq!(c.remote.as_deref(), Some("origin/teammate"));
+            }
+            _ => panic!("expected create dialog"),
+        }
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        wait_creating(&mut app, |_, done| done);
+        press(&mut app, KeyCode::Enter);
+        // Checking out a remote-only branch creates a local branch and worktree.
+        assert!(crate::git::branch_exists(&root, "teammate"));
+        assert!(app.worktrees.iter().any(|w| w.name == "teammate"));
+    }
+
+    #[test]
+    fn create_dialog_filters_checkout_list_by_typed_text() {
+        let (_tmp, mut app) = test_app();
+        for b in ["alpha", "beta", "alpine"] {
+            git(&app.ctx.repo_root, &["branch", b]);
+        }
+        press(&mut app, KeyCode::Char('n'));
+        // Typing "alp" narrows the checkout list to the two matching branches;
+        // the new-branch row (0) still offers to create "alp".
+        type_str(&mut app, "alp");
+        let filtered = match &app.view {
+            View::Create { branches, name, .. } => create_filtered(branches, name.as_str()),
+            _ => panic!("expected create dialog"),
+        };
+        let names: Vec<String> = match &app.view {
+            View::Create { branches, .. } => filtered
+                .iter()
+                .map(|&i| branches[i].branch.clone())
+                .collect(),
+            _ => unreachable!(),
+        };
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"alpha".to_string()));
+        assert!(names.contains(&"alpine".to_string()));
+        assert!(!names.contains(&"beta".to_string()));
+
+        // ↓ enters the filtered list and Enter checks out a matching branch.
+        press(&mut app, KeyCode::Down);
+        let expected = match &app.view {
+            View::Create {
+                branches,
+                name,
+                selected,
+                ..
+            } => {
+                let f = create_filtered(branches, name.as_str());
+                branches[f[*selected - 1]].branch.clone()
+            }
+            _ => panic!("expected create dialog"),
+        };
+        assert!(expected == "alpha" || expected == "alpine");
+    }
+
+    #[test]
+    fn resolver_abort_recovers_the_worktree() {
+        let (_tmp, mut app) = test_app();
+        let feat = into_conflict_resolver(&mut app);
+        assert!(crate::git::is_merging(&feat));
+
+        // `x` arms the confirmation; Esc backs out without aborting.
+        press(&mut app, KeyCode::Char('x'));
+        assert!(matches!(
+            app.view,
+            View::ConflictResolver {
+                confirm_abort: true,
+                ..
+            }
+        ));
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(
+            app.view,
+            View::ConflictResolver {
+                confirm_abort: false,
+                ..
+            }
+        ));
+        assert!(crate::git::is_merging(&feat));
+
+        // Confirming the abort restores the pre-merge state.
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(matches!(app.view, View::List));
+        assert!(!crate::git::is_merging(&feat));
+        assert_eq!(
+            std::fs::read_to_string(feat.join("shared.txt")).unwrap(),
+            "feature version\n"
+        );
+    }
+
+    #[test]
+    fn resolver_hunk_action_selection_updates_state() {
+        let (_tmp, mut app) = test_app();
+        into_conflict_resolver(&mut app);
+        // `t` records "keep theirs" for the current hunk.
+        press(&mut app, KeyCode::Char('t'));
+        match &app.view {
+            View::ConflictResolver {
+                current: Some(rf), ..
+            } => {
+                assert_eq!(rf.actions[0], Some(ResolutionAction::KeepTheirs));
+            }
+            _ => panic!("expected the resolver with a loaded file"),
+        }
+        // `b` overrides it with "keep both".
+        press(&mut app, KeyCode::Char('b'));
+        match &app.view {
+            View::ConflictResolver {
+                current: Some(rf), ..
+            } => {
+                assert_eq!(rf.actions[0], Some(ResolutionAction::KeepBoth));
+            }
+            _ => panic!("expected the resolver with a loaded file"),
+        }
+    }
+
+    #[test]
+    fn update_key_merges_default_branch_into_worktree() {
+        let (_tmp, mut app) = test_app();
+        add_and_select_worktree(&mut app, "feature");
+        // A new commit on main that the feature worktree doesn't have yet.
+        std::fs::write(app.ctx.repo_root.join("newfile.txt"), "x\n").unwrap();
+        git(&app.ctx.repo_root, &["add", "."]);
+        git(&app.ctx.repo_root, &["commit", "-m", "new on main"]);
+        app.selected = app
+            .worktrees
+            .iter()
+            .position(|w| w.name == "feature")
+            .unwrap();
+        press(&mut app, KeyCode::Char('u'));
+        settle(&mut app);
+        // A clean update lands back on the list with main's file pulled in.
+        assert!(matches!(app.view, View::List));
+        let feat = app.worktrees.iter().find(|w| w.name == "feature").unwrap();
+        assert!(
+            std::path::Path::new(&feat.path)
+                .join("newfile.txt")
+                .exists()
+        );
     }
 
     #[test]
@@ -4080,7 +5534,11 @@ mod tests {
         }
         press(&mut app, KeyCode::Enter);
         settle(&mut app);
-        assert!(app.worktrees.iter().any(|w| w.branch.as_deref() == Some("spare")));
+        assert!(
+            app.worktrees
+                .iter()
+                .any(|w| w.branch.as_deref() == Some("spare"))
+        );
     }
 
     #[test]
@@ -4148,7 +5606,10 @@ mod tests {
             _ => panic!("expected the switch picker to stay open"),
         }
         press(&mut app, KeyCode::Esc);
-        assert!(matches!(app.view, View::List), "second Esc closes the picker");
+        assert!(
+            matches!(app.view, View::List),
+            "second Esc closes the picker"
+        );
     }
 
     #[test]
@@ -4164,7 +5625,9 @@ mod tests {
         press(&mut app, KeyCode::Char('j'));
         press(&mut app, KeyCode::Char('k'));
         match &app.view {
-            View::Switch { filter, selected, .. } => {
+            View::Switch {
+                filter, selected, ..
+            } => {
                 assert_eq!(filter.as_str(), "jk");
                 assert_eq!(*selected, 0);
             }
@@ -4178,7 +5641,7 @@ mod tests {
         app.selected = 0;
         press(&mut app, KeyCode::Char('l'));
         match &app.view {
-            View::Log { entries, .. } => assert!(!entries.is_empty()),
+            View::Log { lines, .. } => assert!(!lines.is_empty()),
             _ => panic!("expected log overlay"),
         }
         press(&mut app, KeyCode::Char('j'));
@@ -4189,6 +5652,251 @@ mod tests {
         }
         press(&mut app, KeyCode::Esc);
         assert!(matches!(app.view, View::List));
+    }
+
+    /// End-to-end: a real merge in a real repo must come out of git, through the
+    /// app, and onto the screen as a drawn tree.
+    #[test]
+    fn real_merge_renders_as_a_commit_tree() {
+        let (_tmp, mut app) = test_app();
+        let repo = app.ctx.repo_root.clone();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&["checkout", "-b", "feature"]);
+        git(&["commit", "--allow-empty", "-m", "feature work"]);
+        git(&["checkout", "main"]);
+        git(&["commit", "--allow-empty", "-m", "main work"]);
+        git(&["merge", "--no-ff", "feature", "-m", "merge feature"]);
+
+        app.refresh();
+        press(&mut app, KeyCode::Char('l'));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 12)).unwrap();
+        terminal
+            .draw(|frame| crate::tui::ui::draw(frame, &mut app))
+            .unwrap();
+        let screen: Vec<String> = {
+            let buffer = terminal.backend().buffer().clone();
+            (0..12)
+                .map(|y| {
+                    (0..90)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect()
+        };
+        let body = screen.join("\n");
+        // The merge and both sides are listed...
+        for subject in ["merge feature", "main work", "feature work"] {
+            assert!(body.contains(subject), "missing {subject:?} in:\n{body}");
+        }
+        // ...the tips are decorated the way git decorates them...
+        assert!(body.contains("HEAD -> main"), "missing refs in:\n{body}");
+        // ...and the topology is actually drawn, with a second lane branching
+        // off and merging back rather than one flat column.
+        assert!(body.contains('●'), "no commit markers in:\n{body}");
+        assert!(
+            body.contains('╲') || body.contains('╱'),
+            "merge drew no branch lanes in:\n{body}"
+        );
+    }
+
+    /// `t` swaps the log between the commit graph and a flat list, and the
+    /// choice sticks for the next view opened.
+    #[test]
+    fn log_view_toggles_between_tree_and_flat() {
+        let (_tmp, mut app) = test_app();
+        press(&mut app, KeyCode::Char('l'));
+        assert_eq!(app.log_mode, LogMode::Tree);
+        // Tree rows carry git's art; the flat list has none.
+        match &app.view {
+            View::Log { lines, .. } => assert!(lines.iter().any(|l| l.graph.contains('*'))),
+            _ => panic!("expected the log overlay"),
+        }
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(app.log_mode, LogMode::Flat);
+        match &app.view {
+            View::Log { lines, .. } => {
+                assert!(!lines.is_empty());
+                assert!(
+                    lines
+                        .iter()
+                        .all(|l| l.graph.is_empty() && l.entry.is_some())
+                );
+            }
+            _ => panic!("expected the log overlay"),
+        }
+        // The mode is remembered on the app, so the branch view opens flat too.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter);
+        match &app.view {
+            View::BranchCommits { lines, .. } => {
+                assert!(lines.iter().all(|l| l.graph.is_empty()))
+            }
+            _ => panic!("expected the branch commits view"),
+        }
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(app.log_mode, LogMode::Tree);
+    }
+
+    /// In tree mode the cursor must step commit-to-commit, never landing on one
+    /// of git's art-only connector rows (which carry nothing to cherry-pick).
+    #[test]
+    fn branch_commits_cursor_skips_graph_art_rows() {
+        let lines = vec![
+            GraphLine {
+                graph: "* ".into(),
+                entry: Some(log_entry("aaa")),
+            },
+            GraphLine {
+                graph: "|\\".into(),
+                entry: None,
+            },
+            GraphLine {
+                graph: "| *".into(),
+                entry: Some(log_entry("bbb")),
+            },
+        ];
+        assert_eq!(first_commit_row(&lines), 0);
+        // Moving down from the commit at 0 jumps the connector at 1.
+        assert_eq!(seek_commit_row(&lines, 0, true), Some(2));
+        assert_eq!(seek_commit_row(&lines, 2, false), Some(0));
+        // At either end the cursor stays put rather than wrapping.
+        assert_eq!(seek_commit_row(&lines, 2, true), None);
+        assert_eq!(seek_commit_row(&lines, 0, false), None);
+        // Leading art still resolves to the first real commit.
+        let leading = vec![
+            GraphLine {
+                graph: "|\\".into(),
+                entry: None,
+            },
+            GraphLine {
+                graph: "* ".into(),
+                entry: Some(log_entry("aaa")),
+            },
+        ];
+        assert_eq!(first_commit_row(&leading), 1);
+    }
+
+    /// Space and `a` must not mark art rows, and a cherry-pick built from them
+    /// must only carry real commits.
+    #[test]
+    fn branch_commits_marks_only_real_commits() {
+        let (_tmp, mut app) = test_app();
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter);
+        // Replace the loaded history with one containing a connector row.
+        let View::BranchCommits { branch, .. } = &app.view else {
+            panic!("expected the branch commits view");
+        };
+        let lines = vec![
+            GraphLine {
+                graph: "* ".into(),
+                entry: Some(log_entry("aaa")),
+            },
+            GraphLine {
+                graph: "|\\".into(),
+                entry: None,
+            },
+        ];
+        app.view = View::BranchCommits {
+            branch: branch.clone(),
+            marked: vec![false; lines.len()],
+            lines,
+            selected: 0,
+        };
+        // `a` marks every commit but leaves the art row alone.
+        press(&mut app, KeyCode::Char('a'));
+        match &app.view {
+            View::BranchCommits { marked, .. } => assert_eq!(marked, &[true, false]),
+            _ => panic!("expected the branch commits view"),
+        }
+        press(&mut app, KeyCode::Char('a'));
+        match &app.view {
+            View::BranchCommits { marked, .. } => assert_eq!(marked, &[false, false]),
+            _ => panic!("expected the branch commits view"),
+        }
+    }
+
+    /// Fetch and pull are wired up on the Branches tab. Without a remote the
+    /// pull fails, which is what confirms it reached git rather than no-opping.
+    #[test]
+    fn branches_tab_pull_without_upstream_reports_error() {
+        let (_tmp, mut app) = test_app();
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.tab, Tab::Branches);
+        press(&mut app, KeyCode::Char('p'));
+        assert!(matches!(app.view, View::Busy { .. }));
+        settle_busy(&mut app);
+        let err = app.error.clone().expect("expected an upstream error");
+        assert!(err.contains("no upstream"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn branches_tab_fetch_reloads_the_branch_list() {
+        let (_tmp, mut app) = test_app();
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('f'));
+        assert!(matches!(app.view, View::Busy { .. }));
+        settle_busy(&mut app);
+        // A repo with no remotes fetches nothing, and lands back on the tab.
+        assert!(app.error.is_none(), "unexpected error: {:?}", app.error);
+        assert_eq!(app.tab, Tab::Branches);
+        assert!(matches!(app.view, View::List));
+        assert!(!app.branches.is_empty());
+    }
+
+    /// The list reloads itself on a timer, keeping the cursor on the branch it
+    /// was on even if the reload reorders things.
+    #[test]
+    fn auto_refresh_fires_on_the_interval_and_keeps_the_cursor() {
+        let (_tmp, mut app) = test_app();
+        app.worktrees.clear();
+        app.tick();
+        // Nothing reloads until the interval is up.
+        assert!(app.worktrees.is_empty());
+
+        app.last_auto_refresh = Instant::now() - AUTO_REFRESH_INTERVAL;
+        app.tick();
+        assert!(!app.worktrees.is_empty(), "expected the list to reload");
+
+        press(&mut app, KeyCode::Tab);
+        let selected = app.branches[app.branch_selected].name.clone();
+        app.last_auto_refresh = Instant::now() - AUTO_REFRESH_INTERVAL;
+        app.tick();
+        assert_eq!(app.branches[app.branch_selected].name, selected);
+    }
+
+    /// Auto-refresh must stay out of the way: it only runs on the plain list, so
+    /// it can never reload state an overlay or a prompt is reading.
+    #[test]
+    fn auto_refresh_holds_off_during_overlays_and_prompts() {
+        let (_tmp, mut app) = test_app();
+        // An open overlay defers the refresh entirely.
+        press(&mut app, KeyCode::Char('l'));
+        app.last_auto_refresh = Instant::now() - AUTO_REFRESH_INTERVAL;
+        app.worktrees.clear();
+        app.tick();
+        assert!(app.worktrees.is_empty(), "refreshed under an overlay");
+
+        // So does typing a branch name on the Branches tab.
+        app.view = View::List;
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('n'));
+        assert!(matches!(app.branch_mode, BranchMode::Create(_)));
+        app.last_auto_refresh = Instant::now() - AUTO_REFRESH_INTERVAL;
+        app.branches.clear();
+        app.tick();
+        assert!(app.branches.is_empty(), "refreshed under a prompt");
     }
 
     #[test]
@@ -4620,6 +6328,19 @@ mod tests {
             // Busy overlay (fetch with no remotes finishes quickly).
             press(&mut app, KeyCode::Char('f'));
             draw(&mut app); // busy spinner
+            settle(&mut app);
+
+            // Conflict resolver and its manual hunk editor.
+            into_conflict_resolver(&mut app);
+            draw(&mut app); // resolver with an undecided hunk
+            press(&mut app, KeyCode::Char('e'));
+            draw(&mut app); // manual hunk editor overlay (exercises the clamp)
+            type_str(&mut app, "x");
+            draw(&mut app);
+            press(&mut app, KeyCode::Esc); // discard the edit
+            press(&mut app, KeyCode::Char('x'));
+            draw(&mut app); // abort confirmation over the resolver
+            press(&mut app, KeyCode::Char('y')); // abort, back to the list
 
             // The setup wizard's screens.
             let (_tmp2, mut wizard_app) = test_app_uninitialized();

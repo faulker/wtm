@@ -109,6 +109,60 @@ pub enum Command {
         #[arg(long, short = 'n', default_value_t = 20)]
         count: u32,
     },
+    /// Merge a local branch into a worktree, or continue/abort a merge that
+    /// stopped on conflicts.
+    Merge {
+        /// Branch to merge in (omit with --continue/--abort).
+        source: Option<String>,
+        /// Worktree to merge into.
+        #[arg(long)]
+        into: String,
+        /// Force a merge commit even when a fast-forward would do.
+        #[arg(long)]
+        no_ff: bool,
+        /// Finish an in-progress merge once every conflict is resolved.
+        #[arg(long)]
+        r#continue: bool,
+        /// Abandon an in-progress merge, restoring the pre-merge state.
+        #[arg(long)]
+        abort: bool,
+        /// Commit message for --continue (defaults to git's prepared merge message).
+        #[arg(long, short = 'm')]
+        message: Option<String>,
+    },
+    /// Merge the repository's default branch into a worktree, bringing it up
+    /// to date with the mainline.
+    Update {
+        /// Worktree name.
+        name: String,
+    },
+    /// List conflicted files in a worktree mid-merge, or show one file's
+    /// parsed conflict hunks.
+    Conflicts {
+        /// Worktree name.
+        name: String,
+        /// Show this file's conflict hunks instead of just listing files.
+        file: Option<String>,
+    },
+    /// Resolve a conflicted file in a worktree mid-merge.
+    Resolve {
+        /// Worktree name.
+        name: String,
+        /// Conflicted file path, relative to the worktree root.
+        file: String,
+        /// Keep "our" side of every hunk in the file.
+        #[arg(long)]
+        ours: bool,
+        /// Keep "their" side of every hunk in the file.
+        #[arg(long)]
+        theirs: bool,
+        /// Keep both sides of every hunk, ours then theirs.
+        #[arg(long)]
+        both: bool,
+        /// Keep both sides of every hunk, theirs then ours.
+        #[arg(long)]
+        both_reversed: bool,
+    },
     /// Cherry-pick one or more commits from any branch into a worktree.
     CherryPick {
         /// Worktree to apply the commits into.

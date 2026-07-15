@@ -4,10 +4,12 @@ use anyhow::Result;
 use serde::Serialize;
 use serde_json::json;
 
+use crate::conflict::ConflictSegment;
 use crate::git::StatusEntry;
 use crate::ops::{
-    BranchCreateResult, BranchDeleteResult, BranchListResult, BranchRenameResult, CherryPickResult,
-    CommitResult, CreateResult, FetchResult, LogResult, PullResult, PushResult, StashListResult,
+    BranchCreateResult, BranchDeleteResult, BranchListResult, BranchRenameResult,
+    CherryPickOutcome, CommitResult, CompleteResolutionResult, ConflictFile, CreateResult,
+    FetchResult, LogResult, MergeOutcome, PullResult, PushResult, StashListResult, StashPopOutcome,
     StashResult, SwitchResult, WorktreeInfo,
 };
 
@@ -231,18 +233,141 @@ pub fn print_branch_rename(result: &BranchRenameResult) {
     println!("renamed branch '{}' to '{}'", result.old, result.new);
 }
 
-/// Human-readable cherry-pick confirmation.
-pub fn print_cherry_pick(result: &CherryPickResult) {
-    if result.committed {
-        println!(
-            "cherry-picked {} commit(s) into '{}'",
-            result.count, result.target
-        );
-    } else {
-        println!(
-            "loaded {} commit(s) into '{}' (review, then commit)",
-            result.count, result.target
-        );
+/// Human-readable cherry-pick outcome.
+pub fn print_cherry_pick(result: &CherryPickOutcome) {
+    match result {
+        CherryPickOutcome::Applied {
+            target,
+            count,
+            committed,
+        } => {
+            if *committed {
+                println!("cherry-picked {count} commit(s) into '{target}'");
+            } else {
+                println!("loaded {count} commit(s) into '{target}' (review, then commit)");
+            }
+        }
+        CherryPickOutcome::Conflicted { target, files } => {
+            println!(
+                "{target}: cherry-pick stopped on {} conflicted file(s):",
+                files.len()
+            );
+            for f in files {
+                println!("  {f}");
+            }
+            println!(
+                "resolve each with `wtm resolve {target} <file> --ours|--theirs|--both`, \
+                 then `wtm merge --into {target} --continue`"
+            );
+        }
+    }
+}
+
+/// Human-readable stash-pop outcome.
+pub fn print_stash_pop(result: &StashPopOutcome) {
+    match result {
+        StashPopOutcome::Applied { output, .. } => {
+            if output.is_empty() {
+                println!("stash pop: done");
+            } else {
+                println!("{output}");
+            }
+        }
+        StashPopOutcome::Conflicted { name, index, files } => {
+            println!(
+                "{name}: stash pop stopped on {} conflicted file(s):",
+                files.len()
+            );
+            for f in files {
+                println!("  {f}");
+            }
+            // The conflicting pop kept the stash; finishing means dropping it.
+            let drop_cmd = match index {
+                Some(i) => format!("wtm stash drop {name} --index {i}"),
+                None => format!("wtm stash drop {name}"),
+            };
+            println!(
+                "resolve each with `wtm resolve {name} <file> --ours|--theirs|--both`, \
+                 then `{drop_cmd}` to finish"
+            );
+        }
+    }
+}
+
+/// Human-readable merge/update outcome for the worktree named `target`.
+pub fn print_merge_outcome(target: &str, result: &MergeOutcome) {
+    match result {
+        MergeOutcome::UpToDate => println!("{target}: already up to date"),
+        MergeOutcome::Clean { commit } => println!("{target}: merged ({commit})"),
+        MergeOutcome::Conflicted { files } => {
+            println!(
+                "{target}: merge stopped on {} conflicted file(s):",
+                files.len()
+            );
+            for f in files {
+                println!("  {f}");
+            }
+            println!(
+                "resolve each with `wtm resolve {target} <file> --ours|--theirs|--both`, \
+                 then `wtm merge --into {target} --continue`"
+            );
+        }
+    }
+}
+
+/// JSON envelope for `conflicts` output when listing files (no file argument).
+pub fn conflicts_json(target: &str, files: &[String]) -> serde_json::Value {
+    json!({ "target": target, "files": files })
+}
+
+/// Human-readable list of a worktree's conflicted files.
+pub fn print_conflicts(target: &str, files: &[String]) {
+    if files.is_empty() {
+        println!("{target}: no conflicts");
+        return;
+    }
+    println!("{target}: {} conflicted file(s)", files.len());
+    for f in files {
+        println!("  {f}");
+    }
+}
+
+/// Human-readable view of one conflicted file's hunks. Agents should prefer
+/// `--json` for the structured segments.
+pub fn print_conflict_file(file: &ConflictFile) {
+    println!(
+        "{} (ours: {}, theirs: {})",
+        file.path, file.ours_label, file.theirs_label
+    );
+    let mut hunk_no = 0;
+    for segment in &file.segments {
+        if let ConflictSegment::Hunk { ours, theirs, .. } = segment {
+            hunk_no += 1;
+            println!("--- hunk {hunk_no} ---");
+            println!("<<<<<<< {}", file.ours_label);
+            print!("{ours}");
+            println!("=======");
+            print!("{theirs}");
+            println!(">>>>>>> {}", file.theirs_label);
+        }
+    }
+}
+
+/// JSON envelope for `resolve` output.
+pub fn resolve_json(target: &str, file: &str, action: &str) -> serde_json::Value {
+    json!({ "target": target, "file": file, "action": action })
+}
+
+/// Human-readable resolve confirmation.
+pub fn print_resolve(target: &str, file: &str, action: &str) {
+    println!("{target}: resolved {file} ({action})");
+}
+
+/// Human-readable resolution-complete confirmation.
+pub fn print_complete_resolution(result: &CompleteResolutionResult) {
+    match &result.commit {
+        Some(commit) => println!("{}: resolution completed ({commit})", result.target),
+        None => println!("{}: resolution completed", result.target),
     }
 }
 

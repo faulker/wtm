@@ -12,6 +12,7 @@ use rmcp::{ErrorData, ServerHandler, ServiceExt, schemars, tool, tool_handler, t
 use serde::Deserialize;
 
 use crate::config::Config;
+use crate::conflict;
 use crate::ops::{self, Ctx};
 use crate::output;
 
@@ -131,6 +132,50 @@ struct BranchLogRequest {
     name: String,
     #[schemars(description = "number of commits to show (default 20)")]
     count: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct MergeRequest {
+    #[schemars(description = "local branch to merge in")]
+    source: String,
+    #[schemars(description = "worktree to merge into")]
+    into: String,
+    #[schemars(
+        description = "force a merge commit even when a fast-forward would do (default false)"
+    )]
+    no_ff: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ReadConflictRequest {
+    #[schemars(description = "worktree name (branch name, or directory name when detached)")]
+    name: String,
+    #[schemars(description = "conflicted file path, relative to the worktree root")]
+    path: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ResolveFileRequest {
+    #[schemars(description = "worktree name (branch name, or directory name when detached)")]
+    name: String,
+    #[schemars(description = "conflicted file path, relative to the worktree root")]
+    path: String,
+    #[schemars(
+        description = "resolution to apply: \"ours\", \"theirs\", \"both\", \"both_reversed\", or \"manual\" (requires text)"
+    )]
+    action: String,
+    #[schemars(
+        description = "replacement text for the whole file; required when action is \"manual\""
+    )]
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct CompleteMergeRequest {
+    #[schemars(description = "worktree name (branch name, or directory name when detached)")]
+    name: String,
+    #[schemars(description = "commit message (defaults to git's prepared merge message)")]
+    message: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -276,7 +321,7 @@ impl WtmServer {
     }
 
     #[tool(
-        description = "Apply and drop a stash entry in a worktree (default: the most recent entry). Use this to restore previously stashed work"
+        description = "Apply and drop a stash entry in a worktree (default: the most recent entry). Use this to restore previously stashed work. On success returns status \"applied\"; on conflicts returns status \"conflicted\" with the list of conflicted files, keeps the stash, and leaves the files to resolve via read_conflict/resolve_file, after which stash_drop finishes the pop"
     )]
     fn stash_pop(
         &self,
@@ -417,7 +462,140 @@ impl WtmServer {
     }
 
     #[tool(
-        description = "Cherry-pick one or more commits (from any branch) into a worktree. Commits are applied oldest-first. With no_commit the changes are staged into the working tree without committing, so they can be reviewed or edited first; otherwise each commit is recorded with its original message"
+        description = "Merge a local branch into the branch checked out in a worktree. On success returns status \"up_to_date\" or \"clean\" (with the new commit); on conflicts returns status \"conflicted\" with the list of conflicted files and leaves the worktree mid-merge for read_conflict/resolve_file/complete_merge"
+    )]
+    fn merge(
+        &self,
+        Parameters(req): Parameters<MergeRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let result = ops::merge(
+            &self.ctx()?,
+            &req.into,
+            &req.source,
+            req.no_ff.unwrap_or(false),
+        )
+        .map_err(internal)?;
+        json_result(&result)
+    }
+
+    #[tool(
+        description = "Merge the repository's default branch into a worktree, bringing it up to date with the mainline. Same result shape as merge"
+    )]
+    fn update(
+        &self,
+        Parameters(req): Parameters<NameRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let result = ops::update(&self.ctx()?, &req.name).map_err(internal)?;
+        json_result(&result)
+    }
+
+    #[tool(description = "List the conflicted (unmerged) files in a worktree mid-merge")]
+    fn list_conflicts(
+        &self,
+        Parameters(req): Parameters<NameRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let files = ops::list_conflicts(&self.ctx()?, &req.name).map_err(internal)?;
+        json_result(&output::conflicts_json(&req.name, &files))
+    }
+
+    #[tool(
+        description = "Read and parse a conflicted file in a worktree mid-merge into its plain-text and conflict-hunk segments, so a resolution can be worked out for each hunk"
+    )]
+    fn read_conflict(
+        &self,
+        Parameters(req): Parameters<ReadConflictRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let result = ops::read_conflict(&self.ctx()?, &req.name, &req.path).map_err(internal)?;
+        json_result(&result)
+    }
+
+    #[tool(
+        description = "Resolve a conflicted file in a worktree mid-merge and stage it. \"ours\"/\"theirs\" keep one side of every hunk whole; \"both\"/\"both_reversed\" keep both sides of every hunk concatenated in that order; \"manual\" writes the given text as the file's full resolved contents"
+    )]
+    fn resolve_file(
+        &self,
+        Parameters(req): Parameters<ResolveFileRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let ctx = self.ctx()?;
+        match req.action.as_str() {
+            "ours" => ops::checkout_ours(&ctx, &req.name, &req.path).map_err(internal)?,
+            "theirs" => ops::checkout_theirs(&ctx, &req.name, &req.path).map_err(internal)?,
+            "both" | "both_reversed" => {
+                let file = ops::read_conflict(&ctx, &req.name, &req.path).map_err(internal)?;
+                let action = if req.action == "both" {
+                    conflict::ResolutionAction::KeepBoth
+                } else {
+                    conflict::ResolutionAction::KeepBothReversed
+                };
+                let hunks = file
+                    .segments
+                    .iter()
+                    .filter(|s| matches!(s, conflict::ConflictSegment::Hunk { .. }))
+                    .count();
+                let text = conflict::render(&file.segments, &vec![action; hunks]);
+                ops::write_resolution(&ctx, &req.name, &req.path, &text).map_err(internal)?;
+            }
+            "manual" => {
+                let text = req.text.ok_or_else(|| {
+                    ErrorData::invalid_params("manual resolution requires text", None)
+                })?;
+                ops::write_resolution(&ctx, &req.name, &req.path, &text).map_err(internal)?;
+            }
+            other => {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "unknown action '{other}'; expected ours, theirs, both, both_reversed, or manual"
+                    ),
+                    None,
+                ));
+            }
+        }
+        json_result(&output::resolve_json(&req.name, &req.path, &req.action))
+    }
+
+    #[tool(
+        description = "Finish an in-progress merge or cherry-pick in a worktree once every conflict has been resolved and staged. Auto-detects which is in progress. Errors if conflicts remain or neither is in progress. To finish a resolved stash pop, drop the stash with stash_drop instead"
+    )]
+    fn complete_merge(
+        &self,
+        Parameters(req): Parameters<CompleteMergeRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let ctx = self.ctx()?;
+        let kind = ops::detect_resolve_kind(&ctx, &req.name)
+            .map_err(internal)?
+            .ok_or_else(|| {
+                internal(anyhow::anyhow!(
+                    "no merge or cherry-pick in progress in '{}'",
+                    req.name
+                ))
+            })?;
+        let result = ops::complete_resolution(&ctx, &req.name, kind, req.message.as_deref())
+            .map_err(internal)?;
+        json_result(&result)
+    }
+
+    #[tool(
+        description = "Abandon an in-progress merge or cherry-pick in a worktree, restoring its pre-operation state. Auto-detects which is in progress"
+    )]
+    fn abort_merge(
+        &self,
+        Parameters(req): Parameters<NameRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let ctx = self.ctx()?;
+        let kind = ops::detect_resolve_kind(&ctx, &req.name)
+            .map_err(internal)?
+            .ok_or_else(|| {
+                internal(anyhow::anyhow!(
+                    "no merge or cherry-pick in progress in '{}'",
+                    req.name
+                ))
+            })?;
+        ops::abort_resolution(&ctx, &req.name, kind).map_err(internal)?;
+        json_result(&serde_json::json!({ "target": req.name, "aborted": true }))
+    }
+
+    #[tool(
+        description = "Cherry-pick one or more commits (from any branch) into a worktree. Commits are applied oldest-first. With no_commit the changes are staged into the working tree without committing, so they can be reviewed or edited first; otherwise each commit is recorded with its original message. On success returns status \"applied\"; on conflicts returns status \"conflicted\" with the list of conflicted files and leaves the worktree mid-cherry-pick for read_conflict/resolve_file/complete_merge (which continues the cherry-pick) or abort_merge"
     )]
     fn cherry_pick(
         &self,
@@ -442,7 +620,9 @@ impl ServerHandler for WtmServer {
                 "Manage git worktrees for this repository: create (with automated setup from \
                  .wtm.toml), list, inspect status/diffs, and remove worktrees. Also supports \
                  per-worktree commits, stashes, pulls, and pushes, plus repo-wide fetch and \
-                 branch management (list/create/delete/rename) and commit history.",
+                 branch management (list/create/delete/rename), commit history, and merging \
+                 (merge/update, then list_conflicts/read_conflict/resolve_file/complete_merge \
+                 or abort_merge when a merge stops on conflicts).",
             );
         info.server_info.name = env!("CARGO_PKG_NAME").into();
         info.server_info.version = env!("CARGO_PKG_VERSION").into();

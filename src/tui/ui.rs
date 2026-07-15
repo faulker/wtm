@@ -13,13 +13,15 @@ use ratatui::widgets::{
 };
 
 use super::app::{
-    App, BranchMode, CherryTarget, CommitFocus, DiffRow, ForceBranchReason, IgnorePrompt, RowList,
-    StashMode, Tab, TextInput, View, filtered_branches,
+    App, BranchMode, CheckoutCandidate, CherryTarget, CommitFocus, DiffRow, ForceBranchReason,
+    IgnorePrompt, LogMode, ResolverFile, RowList, StashMode, Tab, TextInput, View, create_filtered,
+    filtered_branches,
 };
 use super::config_editor::{ConfigEditor, FIELD_ROWS, ROWS as CONFIG_ROWS};
 use super::setup::{REVIEW_ROWS, SetupWizard, Step, location_preview};
 use crate::config::{DEFAULT_LOCATION, LOCATION_PRESETS};
-use crate::git::{LogEntry, StashEntry, StatusEntry};
+use crate::conflict::{ConflictSegment, ResolutionAction};
+use crate::git::{GraphLine, StashEntry, StatusEntry};
 
 /// Single accent used for titles, keys, and selection markers.
 const ACCENT: Color = Color::Cyan;
@@ -27,6 +29,16 @@ const ACCENT: Color = Color::Cyan;
 const BORDER: Color = Color::DarkGray;
 /// Background of the selected row in lists and tables.
 const SELECTION_BG: Color = Color::DarkGray;
+/// Cycled by graph column so parallel branch lines stay distinguishable as they
+/// run down the commit tree.
+const GRAPH_COLORS: [Color; 6] = [
+    Color::Cyan,
+    Color::Magenta,
+    Color::Green,
+    Color::Yellow,
+    Color::Blue,
+    Color::Red,
+];
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let [header, main, footer] = Layout::vertical([
@@ -65,19 +77,40 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ),
         View::Log {
             name,
-            entries,
+            lines,
             scroll,
         } => {
-            draw_log(frame, main, name, entries, *scroll);
+            draw_log(frame, main, name, lines, *scroll, app.log_mode);
             None
         }
         View::BranchCommits {
             branch,
-            entries,
+            lines,
             marked,
             selected,
         } => {
-            draw_branch_commits(frame, main, branch, entries, marked, *selected);
+            draw_branch_commits(frame, main, branch, lines, marked, *selected, app.log_mode);
+            None
+        }
+        View::ConflictResolver {
+            target,
+            source_label,
+            files,
+            resolved,
+            file,
+            current,
+            ..
+        } => {
+            draw_conflict_resolver(
+                frame,
+                main,
+                target,
+                source_label,
+                files,
+                resolved,
+                *file,
+                current.as_ref(),
+            );
             None
         }
         // The first-run setup wizard takes over the whole main area (there is no
@@ -184,7 +217,32 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             selected,
             mode,
             ..
-        } => draw_cherry_pick(frame, main, source_branch, summaries, targets, *selected, *mode),
+        } => draw_cherry_pick(
+            frame,
+            main,
+            source_branch,
+            summaries,
+            targets,
+            *selected,
+            *mode,
+        ),
+        View::MergePick {
+            source_branch,
+            targets,
+            selected,
+        } => draw_merge_pick(frame, main, source_branch, targets, *selected),
+        // The abort confirmation floats over the resolver drawn full-screen above.
+        View::ConflictResolver {
+            confirm_abort: true,
+            target,
+            ..
+        } => draw_confirm_popup(
+            frame,
+            main,
+            "abort",
+            &format!("abort the operation in '{target}' and discard resolutions?"),
+            "y to abort · Esc to cancel",
+        ),
         _ => {}
     }
 
@@ -584,7 +642,10 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     // The status message lives in the header now, so the key hints below stay
     // visible at all times.
     if app.show_help {
-        frame.render_widget(Paragraph::new(hint_line(&[("any key", "close help")])), area);
+        frame.render_widget(
+            Paragraph::new(hint_line(&[("any key", "close help")])),
+            area,
+        );
         return;
     }
     let hints: &[(&str, &str)] = match &app.view {
@@ -610,6 +671,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                     ("Enter", "commits / cherry-pick"),
                     ("c", "check out in a worktree"),
                     ("n", "new branch (no worktree)"),
+                    ("f", "fetch"),
+                    ("p", "pull"),
                     ("d", "delete"),
                     ("?", "help"),
                     ("q", "quit"),
@@ -619,9 +682,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                     ("Enter", "create"),
                     ("Esc", "back"),
                 ],
-                BranchMode::ConfirmDelete => {
-                    &[("y", "delete"), ("f", "force"), ("Esc", "cancel")]
-                }
+                BranchMode::ConfirmDelete => &[("y", "delete"), ("f", "force"), ("Esc", "cancel")],
             },
         },
         View::Diff {
@@ -642,6 +703,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("↑/↓", "scroll"),
             ("PgUp/PgDn", "page"),
             ("g", "top"),
+            ("t", "tree/flat"),
             ("q", "back"),
         ],
         View::BranchCommits { .. } => &[
@@ -649,6 +711,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("Space", "mark commit"),
             ("a", "all/none"),
             ("Enter", "cherry-pick"),
+            ("t", "tree/flat"),
             ("?", "help"),
             ("q", "back"),
         ],
@@ -659,6 +722,34 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("↑/↓", "pick worktree"),
             ("Enter", "choose mode"),
             ("Esc", "cancel"),
+        ],
+        View::MergePick { .. } => &[
+            ("↑/↓", "pick worktree"),
+            ("Enter", "merge"),
+            ("Esc", "cancel"),
+        ],
+        View::ConflictResolver {
+            confirm_abort: true,
+            ..
+        } => &[("y", "abort"), ("Esc", "cancel")],
+        View::ConflictResolver {
+            current: Some(rf), ..
+        } if rf.edit.is_some() => &[
+            ("type", "edit result"),
+            ("Ctrl+S", "save"),
+            ("Esc", "cancel"),
+        ],
+        View::ConflictResolver { .. } => &[
+            ("←/→", "file"),
+            ("↑/↓", "hunk"),
+            ("o/t", "ours/theirs"),
+            ("b/⇧B", "both"),
+            ("⇧O/⇧T", "whole file"),
+            ("e", "edit"),
+            ("w", "stage"),
+            ("c", "complete"),
+            ("x", "abort"),
+            ("q", "back"),
         ],
         View::Commit { focus, .. } => match focus {
             CommitFocus::Files => &[
@@ -700,19 +791,19 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         ],
         View::Busy { .. } => &[("", "working…")],
         View::Create {
-            base_pick: Some(_),
-            ..
-        } => &[("↑/↓", "pick base branch"), ("Enter", "use"), ("Esc", "back")],
+            base_pick: Some(_), ..
+        } => &[
+            ("↑/↓", "pick base branch"),
+            ("Enter", "use"),
+            ("Esc", "back"),
+        ],
         View::Create {
             selected: 0,
             base_focus: true,
             ..
-        } => &[
-            ("Enter/Space", "change base ⌄"),
-            ("Esc", "back to name"),
-        ],
+        } => &[("Enter/Space", "change base ⌄"), ("Esc", "back to name")],
         View::Create { selected: 0, .. } => &[
-            ("type", "new branch name"),
+            ("type", "name / filter branches"),
             ("⇥", "focus base ⌄"),
             ("↓", "check out existing"),
             ("Enter", "create"),
@@ -723,16 +814,12 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("Enter", "check out"),
             ("Esc", "cancel"),
         ],
-        View::ConfirmExisting { .. } => &[
-            ("↑/↓", "choose"),
-            ("Enter", "confirm"),
-            ("Esc", "cancel"),
-        ],
-        View::ConfirmReplaceChanges { .. } => &[
-            ("↑/↓", "choose"),
-            ("Enter", "confirm"),
-            ("Esc", "cancel"),
-        ],
+        View::ConfirmExisting { .. } => {
+            &[("↑/↓", "choose"), ("Enter", "confirm"), ("Esc", "cancel")]
+        }
+        View::ConfirmReplaceChanges { .. } => {
+            &[("↑/↓", "choose"), ("Enter", "confirm"), ("Esc", "cancel")]
+        }
         View::RunCommand { .. } => &[
             ("type", "command to run in the worktree"),
             ("Enter", "run"),
@@ -743,19 +830,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ("Ctrl+C ×2", "kill setup"),
         ],
         View::Creating { .. } => &[("Enter", "close")],
-        View::ConfirmDelete { .. } => &[
-            ("↑/↓", "choose"),
-            ("Enter", "confirm"),
-            ("Esc", "cancel"),
-        ],
-        View::ConfirmDeleteDirty { .. } => &[
-            ("↑/↓", "choose"),
-            ("Enter", "confirm"),
-            ("Esc", "cancel"),
-        ],
-        View::ConfirmForceBranch { .. } => {
-            &[("f / Enter", "force delete"), ("Esc", "keep branch")]
+        View::ConfirmDelete { .. } => &[("↑/↓", "choose"), ("Enter", "confirm"), ("Esc", "cancel")],
+        View::ConfirmDeleteDirty { .. } => {
+            &[("↑/↓", "choose"), ("Enter", "confirm"), ("Esc", "cancel")]
         }
+        View::ConfirmForceBranch { .. } => &[("f / Enter", "force delete"), ("Esc", "keep branch")],
         View::Config(editor) if editor.editing.is_some() => {
             &[("Enter", "save value"), ("Esc", "cancel edit")]
         }
@@ -833,7 +912,7 @@ fn draw_create_dialog(
     frame: &mut Frame,
     area: Rect,
     name: &super::app::TextInput,
-    branches: &[String],
+    branches: &[CheckoutCandidate],
     all_branches: &[String],
     base: &str,
     selected: usize,
@@ -841,10 +920,14 @@ fn draw_create_dialog(
     base_pick: Option<usize>,
     location: Option<&str>,
 ) {
+    // The typed name doubles as a live filter over the checkout list, so only
+    // matching candidates are shown (and navigable). `filtered` holds indices
+    // into `branches`, matching the key handler's `create_filtered`.
+    let filtered = create_filtered(branches, name.as_str());
     // Rows: the "new branch" action, a section header (only when there are
-    // branches to check out), then one row per existing branch.
-    let header_rows = usize::from(!branches.is_empty());
-    let list_rows = (1 + header_rows + branches.len()).min(10) as u16;
+    // branches to check out), then one row per matching existing branch.
+    let header_rows = usize::from(!filtered.is_empty());
+    let list_rows = (1 + header_rows + filtered.len()).min(10) as u16;
     let popup = centered(area, 66, 7 + list_rows);
     frame.render_widget(Clear, popup);
     frame.render_widget(panel("new worktree"), popup);
@@ -892,17 +975,29 @@ fn draw_create_dialog(
     };
     row0.extend(base_button);
     items.push(ListItem::new(Line::from(row0)));
-    if !branches.is_empty() {
-        items.push(ListItem::new(Line::styled(
-            "  or check out an existing branch:",
-            Style::new().dim(),
-        )));
+    if !filtered.is_empty() {
+        let header = if name.as_str().trim().is_empty() {
+            "  or check out an existing branch:".to_string()
+        } else {
+            format!("  or check out a match ({}):", filtered.len())
+        };
+        items.push(ListItem::new(Line::styled(header, Style::new().dim())));
     }
-    for branch in branches {
-        items.push(ListItem::new(Line::from(vec![
+    for &idx in &filtered {
+        let candidate = &branches[idx];
+        let mut spans = vec![
             Span::styled("⎇ ", Style::new().fg(ACCENT)),
-            Span::raw(branch.clone()),
-        ])));
+            Span::raw(candidate.branch.clone()),
+        ];
+        // Flag remote-only branches (a teammate's work) so it is clear that
+        // checking one out creates a local tracking branch.
+        if let Some(remote) = &candidate.remote {
+            spans.push(Span::styled(
+                format!("  ({remote})"),
+                Style::new().fg(Color::Cyan).dim(),
+            ));
+        }
+        items.push(ListItem::new(Line::from(spans)));
     }
     // The section header is a non-selectable row, so shift the highlight past it
     // for any existing-branch selection. While the base button is focused, drop
@@ -993,7 +1088,11 @@ fn draw_confirm_existing(
         } else {
             Style::new().dim()
         };
-        let style = if on { base.bg(SELECTION_BG).bold() } else { base };
+        let style = if on {
+            base.bg(SELECTION_BG).bold()
+        } else {
+            base
+        };
         Line::from(vec![
             Span::styled(marker.to_string(), style.fg(ACCENT)),
             Span::styled(label, style),
@@ -1008,7 +1107,11 @@ fn draw_confirm_existing(
         },
         is_wt,
     ));
-    lines.push(option(selected == 1, "replace it (delete, then create)".to_string(), true));
+    lines.push(option(
+        selected == 1,
+        "replace it (delete, then create)".to_string(),
+        true,
+    ));
     lines.push(option(selected == 2, "cancel".to_string(), true));
     let para = Paragraph::new(lines).block(panel("directory exists"));
     frame.render_widget(para, popup);
@@ -1029,7 +1132,10 @@ fn draw_confirm_replace_changes(frame: &mut Frame, area: Rect, path: &str, selec
             Style::new().fg(Color::Red),
         ),
         Line::from(""),
-        radio_option(selected == 0, "force delete (lose all changes), then create".to_string()),
+        radio_option(
+            selected == 0,
+            "force delete (lose all changes), then create".to_string(),
+        ),
         radio_option(selected == 1, "cancel".to_string()),
     ];
     let para = Paragraph::new(lines).block(panel("changes would be lost"));
@@ -1210,7 +1316,10 @@ fn draw_confirm_delete_dirty(
             Style::new().fg(Color::Red),
         ),
         Line::from(""),
-        radio_option(selected == 0, "stash the changes (keep them), then remove".to_string()),
+        radio_option(
+            selected == 0,
+            "stash the changes (keep them), then remove".to_string(),
+        ),
         radio_option(selected == 1, "discard the changes and remove".to_string()),
         radio_option(selected == 2, "cancel".to_string()),
     ];
@@ -1256,7 +1365,7 @@ fn draw_confirm_force_branch(
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) {
-    let popup = centered(area, 74, 48);
+    let popup = centered(area, 74, 58);
     frame.render_widget(Clear, popup);
     let key = |k: &str, label: &str| -> Line<'static> {
         Line::from(vec![
@@ -1264,7 +1373,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
             Span::raw(label.to_string()),
         ])
     };
-    let heading = |t: &str| -> Line<'static> { Line::from(Span::styled(t.to_string(), Style::new().bold())) };
+    let heading =
+        |t: &str| -> Line<'static> { Line::from(Span::styled(t.to_string(), Style::new().bold())) };
     let text = vec![
         heading("tabs"),
         key("⇥ Tab", "switch between the Worktrees and Branches tabs"),
@@ -1274,6 +1384,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         key("Enter", "browse changes per file (diff, stash, revert)"),
         key("n", "new worktree (new branch or existing branch)"),
         key("b", "switch the selected worktree to another branch"),
+        key("u", "update: merge the default branch into the worktree"),
         key("c", "commit (pick files, all selected by default)"),
         key("o / e", "edit repo settings / run the open command"),
         key("s", "stash manager (stash/pop/apply/drop)"),
@@ -1285,13 +1396,26 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         heading("branches tab"),
         key("↑/↓ or j/k", "select branch"),
         key("Enter", "view the branch's commits (then cherry-pick)"),
+        key("m", "merge the branch into a worktree of your choosing"),
         key("c", "check the branch out in a new worktree"),
         key("n", "create a branch only (no worktree)"),
+        key("f", "fetch all remotes (refreshes every ahead/behind)"),
+        key("p", "fast-forward the branch onto its upstream"),
         key("d", "delete the selected branch (f to force)"),
+        Line::from(""),
+        heading("conflict resolver (after a merge/update conflict)"),
+        key("←/→", "move between conflicted files"),
+        key("↑/↓", "move between hunks in the file"),
+        key("o / t", "keep ours / keep theirs for the hunk"),
+        key("b / ⇧B", "keep both (ours first / theirs first)"),
+        key("⇧O / ⇧T", "take the whole file from ours / theirs"),
+        key("w", "stage the file with your chosen resolutions"),
+        key("c / x", "complete the merge (commit) / abort it"),
         Line::from(""),
         heading("commits view (Branches tab → Enter)"),
         key("↑/↓", "move the commit cursor"),
         key("Space / a", "mark a commit / mark all for cherry-pick"),
+        key("t", "switch between the commit tree and a flat list"),
         key("Enter", "cherry-pick marked commits into a worktree"),
         Line::from("  then pick a target worktree, and choose to commit".dim()),
         Line::from("  directly (keep messages) or just load the changes.".dim()),
@@ -1348,7 +1472,9 @@ fn draw_error_popup(frame: &mut Frame, area: Rect, msg: &str) {
             ),
             Span::raw(" "),
         ]));
-    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     frame.render_widget(para, popup);
 }
 
@@ -1944,25 +2070,100 @@ fn draw_switch(
     );
 }
 
-/// Scrollable commit log, styled like the diff view.
-fn draw_log(frame: &mut Frame, area: Rect, name: &str, entries: &[LogEntry], scroll: u16) {
-    let lines: Vec<Line> = if entries.is_empty() {
+/// Renders one `git log --graph` art prefix, translating git's ASCII (`* | / \`)
+/// into box-drawing characters and coloring each column by its lane. Empty in
+/// flat mode, where rows carry no art.
+fn graph_spans(graph: &str) -> Vec<Span<'static>> {
+    graph
+        .chars()
+        .enumerate()
+        .map(|(col, c)| {
+            let ch = match c {
+                '*' => '●',
+                '|' => '│',
+                '/' => '╱',
+                '\\' => '╲',
+                '_' | '-' => '─',
+                other => other,
+            };
+            // git spaces lanes two columns apart, so halving the column index
+            // gives each lane one stable color.
+            let color = GRAPH_COLORS[(col / 2) % GRAPH_COLORS.len()];
+            Span::styled(ch.to_string(), Style::new().fg(color))
+        })
+        .collect()
+}
+
+/// Ref decorations next to a commit (`(HEAD -> main, origin/main)`), colored the
+/// way git's own log colors them: cyan HEAD, green local branches, red remotes,
+/// yellow tags. Empty for the commits nothing points at.
+fn ref_spans(refs: &[String]) -> Vec<Span<'static>> {
+    if refs.is_empty() {
+        return Vec::new();
+    }
+    let mut spans = vec![Span::styled("(", Style::new().dim())];
+    for (i, r) in refs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(", ", Style::new().dim()));
+        }
+        let color = if r.starts_with("HEAD") {
+            Color::Cyan
+        } else if r.starts_with("tag:") {
+            Color::Yellow
+        } else if r.contains('/') {
+            Color::Red
+        } else {
+            Color::Green
+        };
+        spans.push(Span::styled(r.clone(), Style::new().fg(color).bold()));
+    }
+    spans.push(Span::styled(") ", Style::new().dim()));
+    spans
+}
+
+/// The commit fields (hash, refs, subject, author/date) drawn after the graph.
+/// `hash_width` abbreviates the full hashes the branch view stores.
+fn commit_spans(e: &crate::git::LogEntry, hash_width: usize) -> Vec<Span<'static>> {
+    let short = &e.hash[..e.hash.len().min(hash_width)];
+    let mut spans = vec![Span::styled(
+        format!("{short} "),
+        Style::new().fg(Color::Yellow),
+    )];
+    spans.extend(ref_spans(&e.refs));
+    spans.push(Span::raw(format!("{}  ", e.subject)));
+    spans.push(Span::styled(
+        format!("{} · {}", e.author, e.date),
+        Style::new().dim(),
+    ));
+    spans
+}
+
+/// Scrollable commit log, styled like the diff view. In tree mode rows carry
+/// graph art and some hold art alone; in flat mode every row is a commit.
+fn draw_log(
+    frame: &mut Frame,
+    area: Rect,
+    name: &str,
+    rows: &[GraphLine],
+    scroll: u16,
+    mode: LogMode,
+) {
+    let lines: Vec<Line> = if rows.is_empty() {
         vec![Line::from("no commits".dim())]
     } else {
-        entries
-            .iter()
-            .map(|e| {
-                Line::from(vec![
-                    Span::styled(format!("{} ", e.hash), Style::new().fg(Color::Yellow)),
-                    Span::raw(format!("{}  ", e.subject)),
-                    Span::styled(format!("{} · {}", e.author, e.date), Style::new().dim()),
-                ])
+        rows.iter()
+            .map(|row| {
+                let mut spans = graph_spans(&row.graph);
+                if let Some(e) = &row.entry {
+                    spans.extend(commit_spans(e, usize::MAX));
+                }
+                Line::from(spans)
             })
             .collect()
     };
     let total = lines.len();
     let para = Paragraph::new(lines)
-        .block(panel(format!("log · {name}")))
+        .block(panel(format!("log · {name} · {}", mode.label())))
         .scroll((scroll, 0));
     frame.render_widget(para, area);
     let mut sb_state =
@@ -1982,43 +2183,47 @@ fn draw_branch_commits(
     frame: &mut Frame,
     area: Rect,
     branch: &str,
-    entries: &[LogEntry],
+    rows: &[GraphLine],
     marked: &[bool],
     selected: usize,
+    mode: LogMode,
 ) {
-    let block = panel(format!("commits · {branch}"));
-    if entries.is_empty() {
+    let block = panel(format!("commits · {branch} · {}", mode.label()));
+    if rows.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from("no commits".dim())).block(block),
             area,
         );
         return;
     }
-    let items: Vec<ListItem> = entries
+    let items: Vec<ListItem> = rows
         .iter()
         .enumerate()
-        .map(|(i, e)| {
+        .map(|(i, row)| {
+            let Some(e) = &row.entry else {
+                // An art-only row has no checkbox; pad past that column so its
+                // graph still lines up with the commits above and below.
+                let mut spans = vec![Span::raw("    ")];
+                spans.extend(graph_spans(&row.graph));
+                return ListItem::new(Line::from(spans));
+            };
             let checked = marked.get(i).copied().unwrap_or(false);
-            let check = if checked {
+            let mut spans = vec![if checked {
                 Span::styled("[x] ", Style::new().fg(Color::Green))
             } else {
                 Span::styled("[ ] ", Style::new().dim())
-            };
+            }];
+            spans.extend(graph_spans(&row.graph));
             // Full hashes are stored for cherry-pick; show an abbreviated form.
-            let short = &e.hash[..e.hash.len().min(9)];
-            ListItem::new(Line::from(vec![
-                check,
-                Span::styled(format!("{short} "), Style::new().fg(Color::Yellow)),
-                Span::raw(format!("{}  ", e.subject)),
-                Span::styled(format!("{} · {}", e.author, e.date), Style::new().dim()),
-            ]))
+            spans.extend(commit_spans(e, 9));
+            ListItem::new(Line::from(spans))
         })
         .collect();
     let list = List::new(items)
         .block(block)
         .highlight_style(Style::new().bg(SELECTION_BG).bold())
         .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
-    let mut state = ListState::default().with_selected(Some(selected.min(entries.len() - 1)));
+    let mut state = ListState::default().with_selected(Some(selected.min(rows.len() - 1)));
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -2060,7 +2265,10 @@ fn draw_cherry_pick(
                 Line::from(""),
                 Line::from("↑/↓ choose · Enter confirm · Esc back".dim()),
             ];
-            frame.render_widget(Paragraph::new(lines).block(panel("cherry-pick mode")), popup);
+            frame.render_widget(
+                Paragraph::new(lines).block(panel("cherry-pick mode")),
+                popup,
+            );
         }
         // Worktree picker.
         None => {
@@ -2101,11 +2309,294 @@ fn draw_cherry_pick(
                 ListState::default().with_selected(Some(selected.min(targets.len().max(1) - 1)));
             frame.render_stateful_widget(list, list_area, &mut state);
             frame.render_widget(
-                Paragraph::new(Line::from("↑/↓ pick · Enter choose mode · Esc cancel".dim())),
+                Paragraph::new(Line::from(
+                    "↑/↓ pick · Enter choose mode · Esc cancel".dim(),
+                )),
                 hint_area,
             );
         }
     }
+}
+
+/// The merge picker overlay: choose which worktree to merge the selected
+/// branch into. Mirrors the cherry-pick worktree picker.
+fn draw_merge_pick(
+    frame: &mut Frame,
+    area: Rect,
+    source_branch: &str,
+    targets: &[CherryTarget],
+    selected: usize,
+) {
+    let rows = targets.len().clamp(1, 12) as u16;
+    let popup = centered(area, 60, rows + 5);
+    frame.render_widget(Clear, popup);
+    let block = panel(format!("merge '{source_branch}' into worktree"));
+    frame.render_widget(&block, popup);
+    let inner = block.inner(popup);
+    let [head_area, list_area, hint_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from("into which worktree?".dim())),
+        head_area,
+    );
+    let items: Vec<ListItem> = targets
+        .iter()
+        .map(|t| {
+            let branch = match &t.branch {
+                Some(b) => format!(" ({b})"),
+                None => " (detached)".to_string(),
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled("● ", Style::new().fg(Color::Green)),
+                Span::raw(t.name.clone()),
+                Span::styled(branch, Style::new().dim()),
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .highlight_style(Style::new().bg(SELECTION_BG).bold())
+        .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
+    let mut state =
+        ListState::default().with_selected(Some(selected.min(targets.len().max(1) - 1)));
+    frame.render_stateful_widget(list, list_area, &mut state);
+    frame.render_widget(
+        Paragraph::new(Line::from("↑/↓ pick · Enter merge · Esc cancel".dim())),
+        hint_area,
+    );
+}
+
+/// Short label and color for a hunk's chosen resolution action.
+fn action_label(action: Option<&ResolutionAction>) -> (&'static str, Color) {
+    match action {
+        None => ("… pick a side", Color::DarkGray),
+        Some(ResolutionAction::KeepOurs) => ("OURS", Color::Green),
+        Some(ResolutionAction::KeepTheirs) => ("THEIRS", Color::Blue),
+        Some(ResolutionAction::KeepBoth) => ("BOTH", Color::Cyan),
+        Some(ResolutionAction::KeepBothReversed) => ("BOTH (theirs first)", Color::Cyan),
+        Some(ResolutionAction::Manual(_)) => ("MANUAL", Color::Yellow),
+    }
+}
+
+/// One side of a hunk, each line prefixed with `marker` and colored, capped so
+/// a huge hunk can't blow out the pane. An empty side is called out explicitly.
+fn push_side(lines: &mut Vec<Line<'static>>, marker: &str, text: &str, color: Color) {
+    let body: Vec<&str> = text.lines().collect();
+    if body.is_empty() {
+        lines.push(Line::styled(
+            format!("  {marker} (nothing on this side)"),
+            Style::new().fg(color).dim(),
+        ));
+        return;
+    }
+    const MAX: usize = 200;
+    for l in body.iter().take(MAX) {
+        lines.push(Line::styled(
+            format!("  {marker} {l}"),
+            Style::new().fg(color),
+        ));
+    }
+    if body.len() > MAX {
+        lines.push(Line::styled(
+            format!("  {marker} … {} more line(s)", body.len() - MAX),
+            Style::new().fg(color).dim(),
+        ));
+    }
+}
+
+/// Up to a few lines of plain context between hunks, so the resolver reads in
+/// place without dumping an entire unconflicted file into the pane.
+fn context_lines(text: &str) -> Vec<String> {
+    let all: Vec<&str> = text.lines().collect();
+    const MAX: usize = 4;
+    if all.len() <= MAX {
+        return all.into_iter().map(str::to_string).collect();
+    }
+    let mut out: Vec<String> = all.iter().take(2).map(|s| (*s).to_string()).collect();
+    out.push(format!("⋯ {} line(s)", all.len() - 3));
+    out.push(all[all.len() - 1].to_string());
+    out
+}
+
+/// The conflict resolver: conflicted files on the left with a resolved marker,
+/// and the selected file's hunks on the right as OURS vs THEIRS blocks with the
+/// current hunk and its chosen action highlighted.
+#[allow(clippy::too_many_arguments)]
+fn draw_conflict_resolver(
+    frame: &mut Frame,
+    area: Rect,
+    target: &str,
+    source_label: &str,
+    files: &[String],
+    resolved: &[bool],
+    file: usize,
+    current: Option<&ResolverFile>,
+) {
+    let [list_area, detail_area] =
+        Layout::horizontal([Constraint::Length(36), Constraint::Min(20)]).areas(area);
+
+    // Left: conflicted files, each with a resolved/unresolved marker.
+    let items: Vec<ListItem> = files
+        .iter()
+        .enumerate()
+        .map(|(i, path)| {
+            let done = resolved.get(i).copied().unwrap_or(false);
+            let mark = if done {
+                Span::styled("✓ ", Style::new().fg(Color::Green))
+            } else {
+                Span::styled("• ", Style::new().fg(Color::Yellow))
+            };
+            let name = if done {
+                Style::new().dim()
+            } else {
+                Style::new()
+            };
+            ListItem::new(Line::from(vec![mark, Span::styled(path.clone(), name)]))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(panel(format!("conflicts · {target}")))
+        .highlight_style(Style::new().bg(SELECTION_BG).bold())
+        .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
+    let mut state =
+        ListState::default().with_selected(Some(file.min(files.len().saturating_sub(1))));
+    frame.render_stateful_widget(list, list_area, &mut state);
+
+    let path = files.get(file).map(String::as_str).unwrap_or("");
+
+    // Right: a resolved note, or the file's hunks.
+    let Some(rf) = current else {
+        let para = Paragraph::new(vec![
+            Line::from(""),
+            Line::styled(
+                "  ✓ resolved — no conflicts remain in this file",
+                Style::new().fg(Color::Green),
+            ),
+            Line::from(""),
+            Line::styled(format!("  incoming: {source_label}"), Style::new().dim()),
+            Line::styled(
+                "  press c to complete once every file is done",
+                Style::new().dim(),
+            ),
+        ])
+        .block(panel(format!("resolve · {path}")));
+        frame.render_widget(para, detail_area);
+        return;
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("OURS ", Style::new().fg(Color::Green).bold()),
+        Span::styled(rf.file.ours_label.clone(), Style::new().fg(Color::Green)),
+        Span::styled("   vs   ", Style::new().dim()),
+        Span::styled("THEIRS ", Style::new().fg(Color::Blue).bold()),
+        Span::styled(rf.file.theirs_label.clone(), Style::new().fg(Color::Blue)),
+    ]));
+    lines.push(Line::from(""));
+
+    let mut hunk_i = 0usize;
+    // Line offset of the current hunk's header, used to keep it in view.
+    let mut current_line = 0usize;
+    for seg in &rf.file.segments {
+        match seg {
+            ConflictSegment::Plain(text) => {
+                for l in context_lines(text) {
+                    lines.push(Line::styled(format!("  {l}"), Style::new().dim()));
+                }
+            }
+            ConflictSegment::Hunk { ours, theirs, .. } => {
+                let is_cur = hunk_i == rf.hunk;
+                if is_cur {
+                    current_line = lines.len();
+                }
+                let (label, color) = action_label(rf.actions.get(hunk_i).and_then(|a| a.as_ref()));
+                let marker = if is_cur { "◆" } else { "◇" };
+                let hstyle = if is_cur {
+                    Style::new().bg(SELECTION_BG).bold()
+                } else {
+                    Style::new().bold()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{marker} hunk {} ", hunk_i + 1), hstyle.fg(ACCENT)),
+                    Span::styled(format!("[{label}]"), Style::new().fg(color).bold()),
+                ]));
+                push_side(&mut lines, "‹", ours, Color::Green);
+                lines.push(Line::styled("  ─────", Style::new().dim()));
+                push_side(&mut lines, "›", theirs, Color::Blue);
+                lines.push(Line::from(""));
+                hunk_i += 1;
+            }
+        }
+    }
+
+    // Scroll so the current hunk's header sits near the top of the pane.
+    let scroll = current_line.saturating_sub(1) as u16;
+    let total = lines.len();
+    let para = Paragraph::new(lines)
+        .block(panel(format!("resolve · {path}")))
+        .scroll((scroll, 0));
+    frame.render_widget(para, detail_area);
+    let mut sb = ScrollbarState::new(total.saturating_sub(detail_area.height as usize))
+        .position(scroll as usize);
+    frame.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .style(Style::new().fg(BORDER))
+            .thumb_style(Style::new().fg(ACCENT)),
+        detail_area,
+        &mut sb,
+    );
+
+    // The manual editor floats over the resolver when open on the current hunk.
+    if let Some(editor) = &rf.edit {
+        draw_hunk_editor(frame, area, rf.hunk, editor);
+    }
+}
+
+/// Floating multi-line editor for hand-editing one hunk's resolved text, with a
+/// visible block cursor. Saved with Ctrl+S, discarded with Esc.
+fn draw_hunk_editor(frame: &mut Frame, area: Rect, hunk: usize, editor: &super::app::HunkEditor) {
+    // Clamp bounds carefully: on a tiny terminal the available height can fall
+    // below the preferred minimum, and `clamp` panics when min > max.
+    let max_h = area.height.saturating_sub(2).max(3);
+    let min_h = 6.min(max_h);
+    let height = (editor.lines.len() as u16 + 4).clamp(min_h, max_h);
+    let popup = centered(area, area.width.saturating_sub(8).min(90), height);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        panel(format!("edit hunk {} · Ctrl+S save · Esc cancel", hunk + 1)),
+        popup,
+    );
+    let inner = popup.inner(ratatui::layout::Margin::new(2, 1));
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (r, text) in editor.lines.iter().enumerate() {
+        if r == editor.row {
+            // Split the cursor line so the character under the cursor is shown
+            // inverted, giving a visible caret (or a trailing block at line end).
+            let chars: Vec<char> = text.chars().collect();
+            let mut spans = Vec::new();
+            spans.push(Span::raw(
+                chars[..editor.col.min(chars.len())]
+                    .iter()
+                    .collect::<String>(),
+            ));
+            let cursor_style = Style::new().bg(ACCENT).fg(Color::Black);
+            if editor.col < chars.len() {
+                spans.push(Span::styled(chars[editor.col].to_string(), cursor_style));
+                spans.push(Span::raw(
+                    chars[editor.col + 1..].iter().collect::<String>(),
+                ));
+            } else {
+                spans.push(Span::styled(" ", cursor_style));
+            }
+            lines.push(Line::from(spans));
+        } else {
+            lines.push(Line::raw(text.clone()));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// A small centered overlay showing that a background op is running.
@@ -2158,7 +2649,128 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use super::spinner_glyph;
+    use super::*;
+    use crate::git::LogEntry;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    /// Renders `draw` into an off-screen terminal and returns what each row of
+    /// the buffer reads as, so a test can assert on the drawn output.
+    fn render(width: u16, height: u16, draw: impl FnOnce(&mut Frame, Rect)) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, frame.area())).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn entry(hash: &str, subject: &str, refs: &[&str]) -> LogEntry {
+        LogEntry {
+            hash: hash.to_string(),
+            subject: subject.to_string(),
+            author: "Ada".to_string(),
+            date: "1 hour ago".to_string(),
+            refs: refs.iter().map(|r| r.to_string()).collect(),
+        }
+    }
+
+    /// The tree view draws git's art as box-drawing characters, keeps the
+    /// art-only connector rows, and decorates the refs.
+    #[test]
+    fn log_tree_draws_graph_art_and_refs() {
+        let rows = vec![
+            GraphLine {
+                graph: "* ".into(),
+                entry: Some(entry("1a2b3c4", "merge feature", &["HEAD -> main"])),
+            },
+            GraphLine {
+                graph: "|\\".into(),
+                entry: None,
+            },
+            GraphLine {
+                graph: "| * ".into(),
+                entry: Some(entry("5d6e7f8", "add tests", &[])),
+            },
+        ];
+        let out = render(78, 6, |frame, area| {
+            draw_log(frame, area, "main", &rows, 0, LogMode::Tree)
+        });
+        assert!(out[0].contains("log · main · tree"), "{out:#?}");
+        // git's `*` and `|` become `●` and `│`; the `\` becomes `╲`.
+        assert!(
+            out[1].contains("● 1a2b3c4 (HEAD -> main) merge feature"),
+            "{out:#?}"
+        );
+        assert!(out[2].contains("│╲"), "{out:#?}");
+        assert!(out[3].contains("│ ● 5d6e7f8 add tests"), "{out:#?}");
+    }
+
+    /// The flat view is the same rows with no art and no blank connector lines.
+    #[test]
+    fn log_flat_draws_commits_without_art() {
+        let rows = vec![GraphLine {
+            graph: String::new(),
+            entry: Some(entry("1a2b3c4", "fix parser", &[])),
+        }];
+        let out = render(78, 4, |frame, area| {
+            draw_log(frame, area, "main", &rows, 0, LogMode::Flat)
+        });
+        assert!(out[0].contains("log · main · flat"), "{out:#?}");
+        assert!(out[1].contains("1a2b3c4 fix parser"), "{out:#?}");
+        assert!(!out[1].contains('●'), "{out:#?}");
+    }
+
+    /// Branch commits keep their checkbox column, and art-only rows indent past
+    /// it so the graph still lines up.
+    #[test]
+    fn branch_commits_align_art_rows_under_the_checkbox() {
+        let rows = vec![
+            GraphLine {
+                graph: "* ".into(),
+                entry: Some(entry("1a2b3c4d5e", "merge feature", &[])),
+            },
+            GraphLine {
+                graph: "|\\".into(),
+                entry: None,
+            },
+        ];
+        let out = render(78, 5, |frame, area| {
+            draw_branch_commits(frame, area, "main", &rows, &[true, false], 0, LogMode::Tree)
+        });
+        assert!(out[0].contains("commits · main · tree"), "{out:#?}");
+        // A marked commit, its art, then the hash abbreviated to 9 chars.
+        assert!(out[1].contains("[x] ● 1a2b3c4d5 merge feature"), "{out:#?}");
+        // The connector must sit under the commit's lane rather than under the
+        // checkbox column. Both searches skip the panel's left border, which is
+        // itself a `│`.
+        let column = |row: &str, needle: char| {
+            row.chars()
+                .skip(1)
+                .position(|c| c == needle)
+                .map(|i| i + 1)
+                .unwrap_or_else(|| panic!("no {needle} in {row:?}"))
+        };
+        assert_eq!(
+            column(&out[2], '│'),
+            column(&out[1], '●'),
+            "art row misaligned: {out:#?}"
+        );
+    }
+
+    #[test]
+    fn empty_log_says_so() {
+        let out = render(40, 4, |frame, area| {
+            draw_log(frame, area, "main", &[], 0, LogMode::Tree)
+        });
+        assert!(out[1].contains("no commits"), "{out:#?}");
+    }
 
     #[test]
     fn spinner_glyph_cycles_through_all_frames() {
