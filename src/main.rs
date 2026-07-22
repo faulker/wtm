@@ -197,13 +197,26 @@ fn run(cli: Cli) -> Result<()> {
                 output::print_fetch(&result);
             }
         }
-        Command::Switch { name, branch } => {
+        Command::Switch {
+            name,
+            branch,
+            create,
+        } => {
             let ctx = Ctx::discover_initialized(&cwd)?;
-            let result = ops::switch_branch(&ctx, &name, &branch)?;
+            let result = ops::switch_branch(&ctx, &name, &branch, create)?;
             if cli.json {
                 output::print_json(&result)?;
             } else {
                 output::print_switch(&result);
+            }
+        }
+        Command::Rename { name, new_name } => {
+            let ctx = Ctx::discover_initialized(&cwd)?;
+            let result = ops::rename_worktree(&ctx, &name, &new_name)?;
+            if cli.json {
+                output::print_json(&result)?;
+            } else {
+                output::print_worktree_rename(&result);
             }
         }
         Command::Branch { action } => {
@@ -292,7 +305,7 @@ fn run(cli: Cli) -> Result<()> {
                 let Some(source) = source else {
                     bail!("a source branch is required (or use --continue/--abort)");
                 };
-                let result = ops::merge(&ctx, &into, &source, no_ff)?;
+                let result = ops::merge(&ctx, &into, &source, no_ff, false)?;
                 if cli.json {
                     output::print_json(&result)?;
                 } else {
@@ -300,9 +313,9 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Command::Update { name } => {
+        Command::Update { name, autostash } => {
             let ctx = Ctx::discover_initialized(&cwd)?;
-            let result = ops::update(&ctx, &name)?;
+            let result = ops::update(&ctx, &name, autostash)?;
             if cli.json {
                 output::print_json(&result)?;
             } else {

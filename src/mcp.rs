@@ -90,8 +90,14 @@ struct PushRequest {
 struct SwitchRequest {
     #[schemars(description = "worktree name (branch name, or directory name when detached)")]
     name: String,
-    #[schemars(description = "existing local branch to check out in the worktree")]
+    #[schemars(
+        description = "branch to check out: a local branch, or a remote-only branch (short name or '<remote>/<branch>'), which becomes a new local tracking branch"
+    )]
     branch: String,
+    #[schemars(
+        description = "create the branch off the worktree's HEAD if it doesn't exist anywhere yet, like git switch -c (default false)"
+    )]
+    create: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -116,6 +122,14 @@ struct BranchRenameRequest {
     old: String,
     #[schemars(description = "new branch name")]
     new: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct WorktreeRenameRequest {
+    #[schemars(description = "current worktree name (branch name, or directory name when detached)")]
+    name: String,
+    #[schemars(description = "new name for the worktree and its branch")]
+    new_name: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -389,13 +403,15 @@ impl WtmServer {
     }
 
     #[tool(
-        description = "Switch a worktree to check out a different existing local branch. Refuses if the branch is already checked out in another worktree"
+        description = "Switch a worktree to check out a different branch, local or remote-only, or create a new one with create=true. Refuses if the branch is already checked out in another worktree"
     )]
     fn switch_branch(
         &self,
         Parameters(req): Parameters<SwitchRequest>,
     ) -> Result<CallToolResult, ErrorData> {
-        let result = ops::switch_branch(&self.ctx()?, &req.name, &req.branch).map_err(internal)?;
+        let result =
+            ops::switch_branch(&self.ctx()?, &req.name, &req.branch, req.create.unwrap_or(false))
+                .map_err(internal)?;
         json_result(&result)
     }
 
@@ -439,6 +455,18 @@ impl WtmServer {
         json_result(&result)
     }
 
+    #[tool(
+        description = "Rename a worktree: renames its branch and moves its directory to match the new name"
+    )]
+    fn rename_worktree(
+        &self,
+        Parameters(req): Parameters<WorktreeRenameRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let result =
+            ops::rename_worktree(&self.ctx()?, &req.name, &req.new_name).map_err(internal)?;
+        json_result(&result)
+    }
+
     #[tool(description = "Show recent commits (newest first) for a worktree's branch")]
     fn worktree_log(
         &self,
@@ -473,6 +501,7 @@ impl WtmServer {
             &req.into,
             &req.source,
             req.no_ff.unwrap_or(false),
+            false,
         )
         .map_err(internal)?;
         json_result(&result)
@@ -485,7 +514,7 @@ impl WtmServer {
         &self,
         Parameters(req): Parameters<NameRequest>,
     ) -> Result<CallToolResult, ErrorData> {
-        let result = ops::update(&self.ctx()?, &req.name).map_err(internal)?;
+        let result = ops::update(&self.ctx()?, &req.name, false).map_err(internal)?;
         json_result(&result)
     }
 

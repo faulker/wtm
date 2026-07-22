@@ -89,12 +89,26 @@ pub enum Command {
     },
     /// Fetch all remotes and prune deleted remote branches.
     Fetch,
-    /// Switch a worktree to check out a different existing local branch.
+    /// Switch a worktree to check out a different branch, optionally creating it.
     Switch {
         /// Worktree name.
         name: String,
-        /// Existing local branch to check out.
+        /// Branch to check out: a local branch, or a remote-only branch (by
+        /// short name or as `<remote>/<branch>`), which is checked out as a new
+        /// local branch tracking the remote. With --create, a brand-new local
+        /// branch of this name off the worktree's HEAD when it doesn't exist yet.
         branch: String,
+        /// Create the branch off the worktree's current HEAD if it doesn't
+        /// already exist anywhere (like `git switch -c`).
+        #[arg(long, short)]
+        create: bool,
+    },
+    /// Rename a worktree: renames its branch and moves its directory to match.
+    Rename {
+        /// Current worktree name.
+        name: String,
+        /// New name for the worktree (and its branch).
+        new_name: String,
     },
     /// Manage branches across the repo (list, create, delete, rename).
     Branch {
@@ -135,6 +149,10 @@ pub enum Command {
     Update {
         /// Worktree name.
         name: String,
+        /// Stash uncommitted changes before the merge and reapply them after,
+        /// so a dirty worktree can be updated without committing first.
+        #[arg(long)]
+        autostash: bool,
     },
     /// List conflicted files in a worktree mid-merge, or show one file's
     /// parsed conflict hunks.

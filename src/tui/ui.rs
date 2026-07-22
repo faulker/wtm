@@ -14,14 +14,16 @@ use ratatui::widgets::{
 
 use super::app::{
     App, BranchMode, CheckoutCandidate, CherryTarget, CommitFocus, DiffRow, ForceBranchReason,
-    IgnorePrompt, LogMode, ResolverFile, RowList, StashMode, Tab, TextInput, View, create_filtered,
-    filtered_branches,
+    IgnorePrompt, LogMode, ResolverFile, RowList, StashMode, Tab, TextInput, View,
+    filtered_candidates,
 };
 use super::config_editor::{ConfigEditor, FIELD_ROWS, ROWS as CONFIG_ROWS};
+use super::help::{self, Binding, HelpTab};
 use super::setup::{REVIEW_ROWS, SetupWizard, Step, location_preview};
 use crate::config::{DEFAULT_LOCATION, LOCATION_PRESETS};
 use crate::conflict::{ConflictSegment, ResolutionAction};
 use crate::git::{GraphLine, StashEntry, StatusEntry};
+use crate::ops::ResolveKind;
 
 /// Single accent used for titles, keys, and selection markers.
 const ACCENT: Color = Color::Cyan;
@@ -58,8 +60,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             rows,
             selected,
             content,
+            loading_new,
             scroll,
             confirm_revert,
+            confirm_delete,
             ignore_prompt,
             ..
         } => draw_diff(
@@ -71,16 +75,41 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             rows,
             *selected,
             content,
+            *loading_new,
             *scroll,
             *confirm_revert,
+            *confirm_delete,
             ignore_prompt.as_ref(),
         ),
         View::Log {
             name,
             lines,
-            scroll,
+            selected,
         } => {
-            draw_log(frame, main, name, lines, *scroll, app.log_mode);
+            draw_log(frame, main, name, lines, *selected, app.log_mode);
+            None
+        }
+        View::CommitDiff {
+            label,
+            rows,
+            files,
+            selected,
+            content,
+            loading_new,
+            scroll,
+            ..
+        } => {
+            draw_commit_diff(
+                frame,
+                main,
+                label,
+                files,
+                rows,
+                *selected,
+                content,
+                *loading_new,
+                *scroll,
+            );
             None
         }
         View::BranchCommits {
@@ -95,6 +124,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         View::ConflictResolver {
             target,
             source_label,
+            kind,
             files,
             resolved,
             file,
@@ -106,6 +136,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 main,
                 target,
                 source_label,
+                kind,
                 files,
                 resolved,
                 *file,
@@ -186,6 +217,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         View::ConfirmForceBranch { branch, reason } => {
             draw_confirm_force_branch(frame, main, branch, reason)
         }
+        View::ConfirmPullRebase { name } => draw_confirm_pull_rebase(frame, main, name),
+        View::ConfirmUpdateStash {
+            name,
+            dirty,
+            selected,
+        } => draw_confirm_update_stash(frame, main, name, *dirty, *selected),
         View::Setup(wizard) => draw_setup(frame, main, wizard),
         View::Config(editor) => draw_config(frame, main, editor),
         View::Commit {
@@ -210,6 +247,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         } => draw_switch(frame, main, name, branches, filter, *selected),
         View::Busy { label, .. } => draw_busy(frame, main, label, app.tick_count),
         View::RunCommand { name, input, .. } => draw_run_command(frame, main, name, input),
+        View::RenameWorktree { name, input } => draw_rename_worktree(frame, main, name, input),
         View::CherryPick {
             source_branch,
             summaries,
@@ -249,7 +287,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // The help overlay sits on top of whatever view is active, so `?` works
     // everywhere and returns to where it was opened.
     if app.show_help {
-        draw_help(frame, main);
+        draw_help(frame, main, app);
     }
 
     // Clicks go to the topmost selectable list: an overlay's own list when one
@@ -310,20 +348,30 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(right).alignment(Alignment::Right), area);
 }
 
-/// Footer as key hints: the key in accent, its label dimmed.
-fn hint_line(hints: &[(&str, &str)]) -> Line<'static> {
+/// Footer as key hints: the key in accent, its label dimmed. Bindings with no
+/// `short` label are help-panel-only and skipped here.
+fn hint_line(bindings: &[Binding]) -> Line<'static> {
     let mut spans = Vec::new();
-    for (i, (key, label)) in hints.iter().enumerate() {
-        if i > 0 {
+    for (key, label) in bindings.iter().filter_map(|b| b.short.map(|s| (b.key, s))) {
+        if !spans.is_empty() {
             spans.push(Span::raw("  "));
         }
         spans.push(Span::styled(
-            (*key).to_string(),
+            key.to_string(),
             Style::new().fg(ACCENT).bold(),
         ));
         spans.push(Span::styled(format!(" {label}"), Style::new().dim()));
     }
     Line::from(spans)
+}
+
+/// Shorthand for the footer-only hints of views that have no help section.
+const fn hint(key: &'static str, label: &'static str) -> Binding {
+    Binding {
+        key,
+        short: Some(label),
+        long: label,
+    }
 }
 
 fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) -> Option<RowList> {
@@ -354,16 +402,22 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) -> Option<RowList> {
                 ),
                 None => Span::styled("–".to_string(), Style::new().dim()),
             };
-            let flags = if wt.locked {
-                Span::styled("locked", Style::new().fg(Color::Red))
-            } else {
-                Span::raw("")
-            };
+            // Both a merged branch and a lock can apply; show whichever hold.
+            let mut flag_spans = Vec::new();
+            if wt.merged {
+                flag_spans.push(Span::styled("✓merged", Style::new().fg(Color::Green)));
+            }
+            if wt.locked {
+                if !flag_spans.is_empty() {
+                    flag_spans.push(Span::raw(" "));
+                }
+                flag_spans.push(Span::styled("locked", Style::new().fg(Color::Red)));
+            }
             Row::new(vec![
                 Cell::from(name),
                 Cell::from(changes),
                 Cell::from(upstream),
-                Cell::from(flags),
+                Cell::from(Line::from(flag_spans)),
                 Cell::from(Span::styled(wt.path.clone(), Style::new().dim())),
             ])
         })
@@ -384,11 +438,13 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) -> Option<RowList> {
             Constraint::Length(name_w),
             Constraint::Length(12),
             Constraint::Length(9),
-            Constraint::Length(7),
+            Constraint::Length(15),
             Constraint::Min(20),
         ],
     )
-    .header(Row::new(["NAME", "CHANGES", "UPSTREAM", "", "PATH"]).style(Style::new().dim().bold()))
+    .header(
+        Row::new(["NAME", "CHANGES", "UPSTREAM", "FLAGS", "PATH"]).style(Style::new().dim().bold()),
+    )
     .block(block)
     .row_highlight_style(Style::new().bg(SELECTION_BG).bold())
     .highlight_symbol(Span::styled("▌ ", Style::new().fg(ACCENT)));
@@ -424,8 +480,10 @@ fn draw_diff(
     rows: &[DiffRow],
     selected: usize,
     content: &str,
+    loading_new: bool,
     scroll: u16,
     confirm_revert: bool,
+    confirm_delete: bool,
     ignore_prompt: Option<&IgnorePrompt>,
 ) -> Option<RowList> {
     if files.is_empty() {
@@ -527,7 +585,11 @@ fn draw_diff(
         }
         _ => {
             let path = current_diff_path(rows, files, selected);
-            let lines = if content.is_empty() {
+            // While a switch to a new file is still computing off-thread, show a
+            // placeholder rather than the previous file's diff.
+            let lines = if loading_new {
+                vec![Line::from("loading diff…".dim())]
+            } else if content.is_empty() {
                 vec![Line::from("no textual diff (binary or empty)".dim())]
             } else {
                 content.lines().map(diff_line).collect()
@@ -566,12 +628,28 @@ fn draw_diff(
         );
     }
 
+    if confirm_delete {
+        let label = current_diff_path(rows, files, selected);
+        let label = if label.is_empty() {
+            "delete file?".to_string()
+        } else {
+            format!("delete '{label}' from the worktree?")
+        };
+        draw_confirm_popup(
+            frame,
+            area,
+            "delete file",
+            &label,
+            "y to delete · Esc to cancel",
+        );
+    }
+
     if let Some(prompt) = ignore_prompt {
         draw_ignore_prompt(frame, area, prompt);
     }
 
     // A confirm/ignore popup is modal, so suppress list clicks behind it.
-    if confirm_revert || ignore_prompt.is_some() {
+    if confirm_revert || confirm_delete || ignore_prompt.is_some() {
         None
     } else {
         Some(list_hit)
@@ -634,7 +712,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     // footer only shows how to dismiss it.
     if app.error.is_some() {
         frame.render_widget(
-            Paragraph::new(hint_line(&[("any key", "dismiss error")])),
+            Paragraph::new(hint_line(&[hint("any key", "dismiss error")])),
             area,
         );
         return;
@@ -643,232 +721,233 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     // visible at all times.
     if app.show_help {
         frame.render_widget(
-            Paragraph::new(hint_line(&[("any key", "close help")])),
+            Paragraph::new(hint_line(&[
+                hint("⇥", "tab"),
+                hint("↑/↓", "scroll"),
+                hint("Esc", "close"),
+            ])),
             area,
         );
         return;
     }
-    let hints: &[(&str, &str)] = match &app.view {
+    let hints: &[Binding] = match &app.view {
         View::List => match app.tab {
-            Tab::Worktrees => &[
-                ("⇥", "branches"),
-                ("Enter", "changes"),
-                ("n", "new"),
-                ("b", "switch branch"),
-                ("c", "commit"),
-                ("s", "stash"),
-                ("p", "pull"),
-                ("⇧P", "push"),
-                ("f", "fetch"),
-                ("l", "log"),
-                ("d", "delete"),
-                ("?", "help"),
-                ("q", "quit"),
-            ],
+            Tab::Worktrees => help::WORKTREES,
             Tab::Branches => match &app.branch_mode {
-                BranchMode::List => &[
-                    ("⇥", "worktrees"),
-                    ("Enter", "commits / cherry-pick"),
-                    ("c", "check out in a worktree"),
-                    ("n", "new branch (no worktree)"),
-                    ("f", "fetch"),
-                    ("p", "pull"),
-                    ("d", "delete"),
-                    ("?", "help"),
-                    ("q", "quit"),
-                ],
+                BranchMode::List => help::BRANCHES,
                 BranchMode::Create(_) => &[
-                    ("type", "branch name"),
-                    ("Enter", "create"),
-                    ("Esc", "back"),
+                    hint("type", "branch name"),
+                    hint("Enter", "create"),
+                    hint("Esc", "back"),
                 ],
-                BranchMode::ConfirmDelete => &[("y", "delete"), ("f", "force"), ("Esc", "cancel")],
+                BranchMode::Rename(_) => &[
+                    hint("type", "new branch name"),
+                    hint("Enter", "rename"),
+                    hint("Esc", "back"),
+                ],
+                BranchMode::ConfirmDelete => &[
+                    hint("y", "delete"),
+                    hint("f", "force"),
+                    hint("Esc", "cancel"),
+                ],
             },
         },
         View::Diff {
             confirm_revert: true,
             ..
-        } => &[("y", "discard changes"), ("Esc", "cancel")],
-        View::Diff { .. } => &[
-            ("Space", "mark"),
-            ("c", "commit"),
-            ("s", "stash file"),
-            ("⇧S", "stash marked"),
-            ("⇧R", "revert"),
-            ("i", "ignore"),
-            ("?", "help"),
-            ("q", "back"),
-        ],
+        } => &[hint("y", "discard changes"), hint("Esc", "cancel")],
+        View::Diff {
+            confirm_delete: true,
+            ..
+        } => &[hint("y", "delete file"), hint("Esc", "cancel")],
+        View::Diff { .. } => help::DIFF,
         View::Log { .. } => &[
-            ("↑/↓", "scroll"),
-            ("PgUp/PgDn", "page"),
-            ("g", "top"),
-            ("t", "tree/flat"),
-            ("q", "back"),
+            hint("↑/↓", "commit"),
+            hint("Enter", "browse files"),
+            hint("g", "top"),
+            hint("t", "tree/flat"),
+            hint("q", "back"),
         ],
-        View::BranchCommits { .. } => &[
-            ("↑/↓", "select"),
-            ("Space", "mark commit"),
-            ("a", "all/none"),
-            ("Enter", "cherry-pick"),
-            ("t", "tree/flat"),
-            ("?", "help"),
-            ("q", "back"),
+        View::CommitDiff { .. } => &[
+            hint("↑/↓", "file"),
+            hint("⇧↑/⇧↓", "scroll diff"),
+            hint("t", "tree/flat"),
+            hint("q", "back"),
         ],
-        View::CherryPick { mode: Some(_), .. } => {
-            &[("↑/↓", "mode"), ("Enter", "confirm"), ("Esc", "back")]
-        }
+        View::BranchCommits { .. } => help::BRANCH_COMMITS,
+        View::CherryPick { mode: Some(_), .. } => &[
+            hint("↑/↓", "mode"),
+            hint("Enter", "confirm"),
+            hint("Esc", "back"),
+        ],
         View::CherryPick { .. } => &[
-            ("↑/↓", "pick worktree"),
-            ("Enter", "choose mode"),
-            ("Esc", "cancel"),
+            hint("↑/↓", "pick worktree"),
+            hint("Enter", "choose mode"),
+            hint("Esc", "cancel"),
         ],
         View::MergePick { .. } => &[
-            ("↑/↓", "pick worktree"),
-            ("Enter", "merge"),
-            ("Esc", "cancel"),
+            hint("↑/↓", "pick worktree"),
+            hint("Enter", "merge"),
+            hint("Esc", "cancel"),
         ],
         View::ConflictResolver {
             confirm_abort: true,
             ..
-        } => &[("y", "abort"), ("Esc", "cancel")],
+        } => &[hint("y", "abort"), hint("Esc", "cancel")],
         View::ConflictResolver {
             current: Some(rf), ..
         } if rf.edit.is_some() => &[
-            ("type", "edit result"),
-            ("Ctrl+S", "save"),
-            ("Esc", "cancel"),
+            hint("type", "edit result"),
+            hint("Ctrl+S", "save"),
+            hint("Esc", "cancel"),
         ],
-        View::ConflictResolver { .. } => &[
-            ("←/→", "file"),
-            ("↑/↓", "hunk"),
-            ("o/t", "ours/theirs"),
-            ("b/⇧B", "both"),
-            ("⇧O/⇧T", "whole file"),
-            ("e", "edit"),
-            ("w", "stage"),
-            ("c", "complete"),
-            ("x", "abort"),
-            ("q", "back"),
-        ],
+        View::ConflictResolver { .. } => help::RESOLVER,
         View::Commit { focus, .. } => match focus {
-            CommitFocus::Files => &[
-                ("↑/↓", "file"),
-                ("Space", "toggle"),
-                ("a", "all/none"),
-                ("Tab", "message"),
-                ("Enter", "commit"),
-                ("Esc", "cancel"),
-            ],
+            CommitFocus::Files => help::COMMIT_FILES,
             CommitFocus::Message => &[
-                ("type", "commit message"),
-                ("Tab", "pick files"),
-                ("Enter", "commit"),
-                ("Esc", "cancel"),
+                hint("type", "commit message"),
+                hint("Tab", "pick files"),
+                hint("Enter", "commit"),
+                hint("Esc", "cancel"),
             ],
         },
         View::Stash { mode, .. } => match mode {
-            StashMode::List => &[
-                ("↑/↓", "select"),
-                ("s", "stash"),
-                ("p", "pop"),
-                ("a", "apply"),
-                ("x", "drop"),
-                ("Esc", "close"),
-            ],
+            StashMode::List => help::STASH_LIST,
             StashMode::Message(_) => &[
-                ("type", "message (optional)"),
-                ("Enter", "stash"),
-                ("Esc", "back"),
+                hint("type", "message (optional)"),
+                hint("Enter", "stash"),
+                hint("Esc", "back"),
             ],
-            StashMode::ConfirmDrop => &[("y", "drop"), ("Esc", "cancel")],
+            StashMode::ConfirmDrop => &[hint("y", "drop"), hint("Esc", "cancel")],
         },
         View::Switch { .. } => &[
-            ("type", "filter"),
-            ("↑/↓", "select"),
-            ("Enter", "switch"),
-            ("Esc", "clear/close"),
+            hint("type", "filter"),
+            hint("↑/↓", "select"),
+            hint("Enter", "switch"),
+            hint("Esc", "clear/close"),
         ],
-        View::Busy { .. } => &[("", "working…")],
+        View::Busy { .. } => &[hint("", "working…")],
         View::Create {
             base_pick: Some(_), ..
         } => &[
-            ("↑/↓", "pick base branch"),
-            ("Enter", "use"),
-            ("Esc", "back"),
+            hint("↑/↓", "pick base branch"),
+            hint("Enter", "use"),
+            hint("Esc", "back"),
         ],
         View::Create {
             selected: 0,
             base_focus: true,
             ..
-        } => &[("Enter/Space", "change base ⌄"), ("Esc", "back to name")],
+        } => &[
+            hint("Enter/Space", "change base ⌄"),
+            hint("Esc", "back to name"),
+        ],
         View::Create { selected: 0, .. } => &[
-            ("type", "name / filter branches"),
-            ("⇥", "focus base ⌄"),
-            ("↓", "check out existing"),
-            ("Enter", "create"),
-            ("Esc", "cancel"),
+            hint("type", "name / filter branches"),
+            hint("⇥", "focus base ⌄"),
+            hint("↓", "check out existing"),
+            hint("Enter", "create"),
+            hint("Esc", "cancel"),
         ],
         View::Create { .. } => &[
-            ("↑/↓", "pick branch"),
-            ("Enter", "check out"),
-            ("Esc", "cancel"),
+            hint("↑/↓", "pick branch"),
+            hint("Enter", "check out"),
+            hint("Esc", "cancel"),
         ],
-        View::ConfirmExisting { .. } => {
-            &[("↑/↓", "choose"), ("Enter", "confirm"), ("Esc", "cancel")]
-        }
-        View::ConfirmReplaceChanges { .. } => {
-            &[("↑/↓", "choose"), ("Enter", "confirm"), ("Esc", "cancel")]
-        }
+        View::ConfirmExisting { .. } => &[
+            hint("↑/↓", "choose"),
+            hint("Enter", "confirm"),
+            hint("Esc", "cancel"),
+        ],
+        View::ConfirmReplaceChanges { .. } => &[
+            hint("↑/↓", "choose"),
+            hint("Enter", "confirm"),
+            hint("Esc", "cancel"),
+        ],
         View::RunCommand { .. } => &[
-            ("type", "command to run in the worktree"),
-            ("Enter", "run"),
-            ("Esc", "cancel"),
+            hint("type", "command to run in the worktree"),
+            hint("Enter", "run"),
+            hint("Esc", "cancel"),
+        ],
+        View::RenameWorktree { .. } => &[
+            hint("type", "new worktree name"),
+            hint("Enter", "rename"),
+            hint("Esc", "cancel"),
         ],
         View::Creating { done: false, .. } => &[
-            ("type + Enter", "answer a prompt"),
-            ("Ctrl+C ×2", "kill setup"),
+            hint("type + Enter", "answer a prompt"),
+            hint("Ctrl+C ×2", "kill setup"),
         ],
-        View::Creating { .. } => &[("Enter", "close")],
-        View::ConfirmDelete { .. } => &[("↑/↓", "choose"), ("Enter", "confirm"), ("Esc", "cancel")],
-        View::ConfirmDeleteDirty { .. } => {
-            &[("↑/↓", "choose"), ("Enter", "confirm"), ("Esc", "cancel")]
-        }
-        View::ConfirmForceBranch { .. } => &[("f / Enter", "force delete"), ("Esc", "keep branch")],
+        View::Creating { .. } => &[hint("Enter", "close")],
+        View::ConfirmDelete { .. } => &[
+            hint("↑/↓", "choose"),
+            hint("Enter", "confirm"),
+            hint("Esc", "cancel"),
+        ],
+        View::ConfirmDeleteDirty { .. } => &[
+            hint("↑/↓", "choose"),
+            hint("Enter", "confirm"),
+            hint("Esc", "cancel"),
+        ],
+        View::ConfirmForceBranch { .. } => &[
+            hint("f / Enter", "force delete"),
+            hint("Esc", "keep branch"),
+        ],
+        View::ConfirmPullRebase { .. } => &[
+            hint("y / Enter", "pull with rebase"),
+            hint("Esc", "cancel"),
+        ],
+        View::ConfirmUpdateStash { .. } => &[
+            hint("↑/↓", "choose"),
+            hint("Enter", "confirm"),
+            hint("Esc", "cancel"),
+        ],
         View::Config(editor) if editor.editing.is_some() => {
-            &[("Enter", "save value"), ("Esc", "cancel edit")]
+            &[hint("Enter", "save value"), hint("Esc", "cancel edit")]
         }
-        View::Config(_) => &[("↑/↓", "select"), ("Enter", "edit/save"), ("Esc", "cancel")],
+        View::Config(_) => &[
+            hint("↑/↓", "select"),
+            hint("Enter", "edit/save"),
+            hint("Esc", "cancel"),
+        ],
         View::Setup(wizard) => match &wizard.step {
-            Step::CloneAsk { .. } => &[("←/→", "choose"), ("Enter", "confirm"), ("Esc", "quit")],
+            Step::CloneAsk { .. } => &[
+                hint("←/→", "choose"),
+                hint("Enter", "confirm"),
+                hint("Esc", "quit"),
+            ],
             Step::ClonePath { .. } => &[
-                ("type", "a path"),
-                ("Tab", "browse"),
-                ("Enter", "load"),
-                ("Esc", "back"),
+                hint("type", "a path"),
+                hint("Tab", "browse"),
+                hint("Enter", "load"),
+                hint("Esc", "back"),
             ],
             Step::CloneBrowse { .. } => &[
-                ("↑/↓", "select"),
-                ("Enter", "open/pick"),
-                ("Backspace", "up"),
-                ("Esc", "back"),
+                hint("↑/↓", "select"),
+                hint("Enter", "open/pick"),
+                hint("Backspace", "up"),
+                hint("Esc", "back"),
             ],
-            Step::Location { .. } => &[("↑/↓", "select"), ("Enter", "confirm"), ("Esc", "back")],
+            Step::Location { .. } => &[
+                hint("↑/↓", "select"),
+                hint("Enter", "confirm"),
+                hint("Esc", "back"),
+            ],
             Step::LocationCustom { .. } | Step::CopyFiles { .. } => {
-                &[("Enter", "confirm"), ("Esc", "back")]
+                &[hint("Enter", "confirm"), hint("Esc", "back")]
             }
             Step::RunCommands { .. } => &[
-                ("Enter", "add command"),
-                ("blank Enter", "finish"),
-                ("Esc", "back"),
+                hint("Enter", "add command"),
+                hint("blank Enter", "finish"),
+                hint("Esc", "back"),
             ],
             Step::Review {
                 editing: Some(_), ..
-            } => &[("Enter", "save"), ("Esc", "cancel edit")],
+            } => &[hint("Enter", "save"), hint("Esc", "cancel edit")],
             Step::Review { .. } => &[
-                ("↑/↓", "select"),
-                ("Enter", "edit/write"),
-                ("Esc", "start over"),
+                hint("↑/↓", "select"),
+                hint("Enter", "edit/write"),
+                hint("Esc", "start over"),
             ],
         },
     };
@@ -922,8 +1001,8 @@ fn draw_create_dialog(
 ) {
     // The typed name doubles as a live filter over the checkout list, so only
     // matching candidates are shown (and navigable). `filtered` holds indices
-    // into `branches`, matching the key handler's `create_filtered`.
-    let filtered = create_filtered(branches, name.as_str());
+    // into `branches`, matching the key handler's `filtered_candidates`.
+    let filtered = filtered_candidates(branches, name.as_str());
     // Rows: the "new branch" action, a section header (only when there are
     // branches to check out), then one row per matching existing branch.
     let header_rows = usize::from(!filtered.is_empty());
@@ -1202,6 +1281,33 @@ fn draw_run_command(frame: &mut Frame, area: Rect, name: &str, input: &super::ap
     );
 }
 
+/// The worktree rename prompt: a small centered dialog with the new name,
+/// prefilled with the current one.
+fn draw_rename_worktree(
+    frame: &mut Frame,
+    area: Rect,
+    name: &str,
+    input: &super::app::TextInput,
+) {
+    let popup = centered(area, 64, 5);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(panel(format!("rename '{name}'")), popup);
+    let inner = popup.inner(ratatui::layout::Margin::new(2, 1));
+    let [prompt_area, hint_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+    frame.render_widget(
+        Paragraph::new(prompt_line_at(input.as_str(), input.cursor)),
+        prompt_area,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "renames the branch and moves the directory · Esc cancels",
+            Style::new().dim(),
+        )),
+        hint_area,
+    );
+}
+
 /// Styles one line of setup output: step results and errors stand out,
 /// echoed user input shows its prompt, plain command output stays dim.
 fn output_line(line: &str) -> Line<'_> {
@@ -1327,6 +1433,42 @@ fn draw_confirm_delete_dirty(
     frame.render_widget(para, popup);
 }
 
+/// Prompt shown before updating a worktree that has uncommitted changes: offer
+/// to stash them for the merge and reapply after, update as-is, or cancel.
+fn draw_confirm_update_stash(
+    frame: &mut Frame,
+    area: Rect,
+    name: &str,
+    dirty: usize,
+    selected: usize,
+) {
+    let popup = centered(area, 68, 9);
+    frame.render_widget(Clear, popup);
+    let lines = vec![
+        Line::from(vec![
+            Span::raw("worktree "),
+            Span::styled(format!("'{name}'"), Style::new().bold()),
+            Span::raw(format!(
+                " has {dirty} uncommitted change{}",
+                if dirty == 1 { "" } else { "s" }
+            )),
+        ]),
+        Line::styled(
+            "updating may conflict with them; how should they be handled?",
+            Style::new().fg(Color::Yellow),
+        ),
+        Line::from(""),
+        radio_option(
+            selected == 0,
+            "stash them, update, then reapply (recommended)".to_string(),
+        ),
+        radio_option(selected == 1, "update without stashing".to_string()),
+        radio_option(selected == 2, "cancel".to_string()),
+    ];
+    let para = Paragraph::new(lines).block(panel("update from default branch"));
+    frame.render_widget(para, popup);
+}
+
 /// Prompt shown when a branch could not be safely deleted after its folder was
 /// removed: offer to force, explaining why git refused.
 fn draw_confirm_force_branch(
@@ -1364,9 +1506,35 @@ fn draw_confirm_force_branch(
     frame.render_widget(para, popup);
 }
 
-fn draw_help(frame: &mut Frame, area: Rect) {
-    let popup = centered(area, 74, 58);
+/// Prompt shown when a fast-forward pull was refused because the worktree's
+/// branch has diverged from its upstream: offer to retry the pull with a
+/// rebase instead.
+fn draw_confirm_pull_rebase(frame: &mut Frame, area: Rect, name: &str) {
+    let popup = centered(area, 68, 8);
     frame.render_widget(Clear, popup);
+    let lines = vec![
+        Line::styled(
+            format!("⚠ '{name}' has diverged from its upstream"),
+            Style::new().fg(Color::Red),
+        ),
+        Line::from("a plain fast-forward pull isn't possible".dim()),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("y / Enter", Style::new().fg(ACCENT).bold()),
+            Span::raw("  pull with rebase (replay local commits on top)"),
+        ]),
+        Line::from(vec![
+            Span::styled("Esc", Style::new().fg(ACCENT).bold()),
+            Span::raw("  leave the branch as it is"),
+        ]),
+    ];
+    let para = Paragraph::new(lines).block(panel("pull needs a rebase"));
+    frame.render_widget(para, popup);
+}
+
+/// The help panel: a tabbed, scrollable overlay. Content comes from the
+/// `help` registry, the same data the footer hints are built from.
+fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
     let key = |k: &str, label: &str| -> Line<'static> {
         Line::from(vec![
             Span::styled(format!("  {k:<12}"), Style::new().fg(ACCENT).bold()),
@@ -1375,66 +1543,81 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     };
     let heading =
         |t: &str| -> Line<'static> { Line::from(Span::styled(t.to_string(), Style::new().bold())) };
-    let text = vec![
-        heading("tabs"),
-        key("⇥ Tab", "switch between the Worktrees and Branches tabs"),
-        Line::from(""),
-        heading("worktrees tab"),
-        key("↑/↓ or j/k", "select worktree"),
-        key("Enter", "browse changes per file (diff, stash, revert)"),
-        key("n", "new worktree (new branch or existing branch)"),
-        key("b", "switch the selected worktree to another branch"),
-        key("u", "update: merge the default branch into the worktree"),
-        key("c", "commit (pick files, all selected by default)"),
-        key("o / e", "edit repo settings / run the open command"),
-        key("s", "stash manager (stash/pop/apply/drop)"),
-        key("p / ⇧P", "pull (fast-forward) / push the worktree"),
-        key("f / l", "fetch all remotes / commit log"),
-        key("d", "delete worktree (folder, or folder + branch)"),
-        key("r / q", "refresh the list / quit"),
-        Line::from(""),
-        heading("branches tab"),
-        key("↑/↓ or j/k", "select branch"),
-        key("Enter", "view the branch's commits (then cherry-pick)"),
-        key("m", "merge the branch into a worktree of your choosing"),
-        key("c", "check the branch out in a new worktree"),
-        key("n", "create a branch only (no worktree)"),
-        key("f", "fetch all remotes (refreshes every ahead/behind)"),
-        key("p", "fast-forward the branch onto its upstream"),
-        key("d", "delete the selected branch (f to force)"),
-        Line::from(""),
-        heading("conflict resolver (after a merge/update conflict)"),
-        key("←/→", "move between conflicted files"),
-        key("↑/↓", "move between hunks in the file"),
-        key("o / t", "keep ours / keep theirs for the hunk"),
-        key("b / ⇧B", "keep both (ours first / theirs first)"),
-        key("⇧O / ⇧T", "take the whole file from ours / theirs"),
-        key("w", "stage the file with your chosen resolutions"),
-        key("c / x", "complete the merge (commit) / abort it"),
-        Line::from(""),
-        heading("commits view (Branches tab → Enter)"),
-        key("↑/↓", "move the commit cursor"),
-        key("Space / a", "mark a commit / mark all for cherry-pick"),
-        key("t", "switch between the commit tree and a flat list"),
-        key("Enter", "cherry-pick marked commits into a worktree"),
-        Line::from("  then pick a target worktree, and choose to commit".dim()),
-        Line::from("  directly (keep messages) or just load the changes.".dim()),
-        Line::from(""),
-        heading("changes (diff) view"),
-        key("↑/↓ or j/k", "move the file cursor"),
-        key("⇧↑/⇧↓", "scroll the diff (or mouse wheel)"),
-        key("Space / a", "mark a file (or folder) / mark all for commit"),
-        key("c", "commit the marked files"),
-        key("s / ⇧S", "stash the highlighted / every marked file"),
-        key("⇧R / i", "revert file / add file or glob to .gitignore"),
-        Line::from(""),
-        heading("changes view status codes  (col 1 = staged · col 2 = working tree)"),
-        Line::from("  M modified · A added · D deleted · R renamed · C copied".dim()),
-        Line::from("  ?? untracked · UU conflict (both sides changed)".dim()),
-        Line::from("  e.g.  ' M' edited, unstaged · 'M ' staged · 'MM' staged + more edits · 'A ' new file staged".dim()),
-    ];
-    let para = Paragraph::new(text).block(panel("help  ·  ? or any key to close"));
-    frame.render_widget(para, popup);
+
+    let mut text: Vec<Line> = Vec::new();
+    for section in help::sections(app.help_tab) {
+        if !text.is_empty() {
+            text.push(Line::from(""));
+        }
+        text.push(heading(section.heading));
+        for b in section.bindings {
+            text.push(key(b.key, b.long));
+        }
+        for note in section.notes {
+            text.push(Line::from(format!("  {note}").dim()));
+        }
+    }
+
+    // Size to the content so short tabs get a small panel, but never grow past
+    // the terminal: the old fixed 58-row popup silently lost its tail on short
+    // screens. 4 = the block's two borders plus the tab bar and its spacer.
+    const CHROME: u16 = 4;
+    let content_height = text.len() as u16;
+    let max_height = (area.height * 9 / 10).max(CHROME + 1);
+    let popup = centered(
+        area,
+        78,
+        content_height.saturating_add(CHROME).min(max_height),
+    );
+    frame.render_widget(Clear, popup);
+    let block = panel("help");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let [bar, _gap, body] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+    ])
+    .areas(inner);
+    draw_help_tabs(frame, bar, app.help_tab);
+
+    // Clamp here rather than in `App`, as the diff and log views do: the
+    // viewport height is only known at render time.
+    let max_scroll = content_height.saturating_sub(body.height);
+    let scroll = app.help_scroll.min(max_scroll);
+    frame.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        body,
+    );
+    if max_scroll > 0 {
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            body,
+            &mut ScrollbarState::new(max_scroll as usize).position(scroll as usize),
+        );
+    }
+}
+
+/// The help panel's tab bar, styled to match the main window's (`draw_tab_bar`).
+fn draw_help_tabs(frame: &mut Frame, area: Rect, active: HelpTab) {
+    let mut spans = Vec::new();
+    for tab in HelpTab::ALL {
+        if tab == active {
+            spans.push(Span::styled(
+                format!(" {} ", tab.title()),
+                Style::new().fg(Color::Black).bg(ACCENT).bold(),
+            ));
+        } else {
+            spans.push(Span::styled(
+                format!(" {} ", tab.title()),
+                Style::new().fg(BORDER),
+            ));
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// A centered, red-bordered popup for `app.error`: unlike the one-line status
@@ -1754,7 +1937,7 @@ fn draw_commit(
     files: &[StatusEntry],
     marked: &[bool],
     cursor: usize,
-    input: &str,
+    input: &super::app::TextInput,
     focus: &CommitFocus,
 ) -> Option<RowList> {
     let list_rows = (files.len() as u16).clamp(1, 10);
@@ -1817,7 +2000,10 @@ fn draw_commit(
         Paragraph::new(Line::styled("Commit message:", label_style)),
         label_area,
     );
-    frame.render_widget(Paragraph::new(prompt_line(input)), prompt_area);
+    frame.render_widget(
+        Paragraph::new(prompt_line_at(input.as_str(), input.cursor)),
+        prompt_area,
+    );
 
     let selected_count = marked.iter().filter(|m| **m).count();
     frame.render_widget(
@@ -1948,11 +2134,17 @@ fn draw_branches(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
             } else {
                 Span::styled("no upstream".to_string(), Style::new().dim())
             };
+            let flags = if b.merged {
+                Span::styled("✓merged", Style::new().fg(Color::Green))
+            } else {
+                Span::styled("–".to_string(), Style::new().dim())
+            };
             let last = Span::styled(format!("{}  {}", b.date, b.subject), Style::new().dim());
             Row::new(vec![
                 Cell::from(Line::from(name)),
                 Cell::from(Line::from(checkout)),
                 Cell::from(Line::from(track)),
+                Cell::from(Line::from(flags)),
                 Cell::from(Line::from(last)),
             ])
         })
@@ -1963,11 +2155,12 @@ fn draw_branches(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
             Constraint::Length(22),
             Constraint::Length(24),
             Constraint::Length(14),
+            Constraint::Length(9),
             Constraint::Min(20),
         ],
     )
     .header(
-        Row::new(["BRANCH", "CHECKED OUT", "UPSTREAM", "LAST COMMIT"])
+        Row::new(["BRANCH", "CHECKED OUT", "UPSTREAM", "FLAGS", "LAST COMMIT"])
             .style(Style::new().dim().bold()),
     )
     .block(block)
@@ -1984,6 +2177,16 @@ fn draw_branches(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
                 "new branch (no worktree)",
                 buf,
                 "branch only, from HEAD · Esc cancels",
+            );
+            None
+        }
+        BranchMode::Rename(buf) => {
+            draw_input_popup(
+                frame,
+                area,
+                "rename branch",
+                buf,
+                "new branch name · Esc cancels",
             );
             None
         }
@@ -2013,16 +2216,16 @@ fn draw_branches(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
 
 /// The switch-branch picker: a type-to-filter prompt over a centered list of
 /// branches the selected worktree can switch onto (those not checked out
-/// anywhere else).
+/// anywhere else, plus remote-only branches).
 fn draw_switch(
     frame: &mut Frame,
     area: Rect,
     name: &str,
-    branches: &[String],
+    branches: &[CheckoutCandidate],
     filter: &TextInput,
     selected: usize,
 ) {
-    let matches = filtered_branches(branches, filter.as_str());
+    let matches = filtered_candidates(branches, filter.as_str());
     // +2 rows: the filter prompt and the hint line below the list.
     let rows = matches.len().clamp(1, 12) as u16;
     let popup = centered(area, 52, rows + 4);
@@ -2041,18 +2244,36 @@ fn draw_switch(
         filter_area,
     );
     if matches.is_empty() {
+        // Nothing matches, but Enter creates the typed name as a new branch, so
+        // say so rather than leaving the picker looking like a dead end.
+        let typed = filter.as_str().trim();
+        let empty = if typed.is_empty() {
+            "no other branches · type a name to create a branch".to_string()
+        } else {
+            format!("no match · Enter creates & switches to '{typed}'")
+        };
         frame.render_widget(
-            Paragraph::new(Line::styled("no matching branches", Style::new().dim())),
+            Paragraph::new(Line::styled(empty, Style::new().dim())),
             list_area,
         );
     } else {
         let items: Vec<ListItem> = matches
             .iter()
-            .map(|b| {
-                ListItem::new(Line::from(vec![
+            .map(|&idx| {
+                let candidate = &branches[idx];
+                let mut spans = vec![
                     Span::styled("⎇ ", Style::new().fg(ACCENT)),
-                    Span::raw((*b).to_string()),
-                ]))
+                    Span::raw(candidate.branch.clone()),
+                ];
+                // Flag remote-only branches, since switching onto one checks it
+                // out as a new local tracking branch.
+                if let Some(remote) = &candidate.remote {
+                    spans.push(Span::styled(
+                        format!("  ({remote})"),
+                        Style::new().fg(Color::Cyan).dim(),
+                    ));
+                }
+                ListItem::new(Line::from(spans))
             })
             .collect();
         let list = List::new(items)
@@ -2063,7 +2284,7 @@ fn draw_switch(
     }
     frame.render_widget(
         Paragraph::new(Line::styled(
-            "type to filter · ↑/↓ pick · Enter switch · Esc clear/cancel",
+            "type to filter or name a new branch · ↑/↓ pick · Enter switch/create · Esc clear/cancel",
             Style::new().dim(),
         )),
         hint_area,
@@ -2145,34 +2366,136 @@ fn draw_log(
     area: Rect,
     name: &str,
     rows: &[GraphLine],
-    scroll: u16,
+    selected: usize,
     mode: LogMode,
 ) {
-    let lines: Vec<Line> = if rows.is_empty() {
-        vec![Line::from("no commits".dim())]
-    } else {
-        rows.iter()
-            .map(|row| {
-                let mut spans = graph_spans(&row.graph);
-                if let Some(e) = &row.entry {
-                    spans.extend(commit_spans(e, usize::MAX));
-                }
-                Line::from(spans)
-            })
-            .collect()
+    let block = panel(format!("log · {name} · {}", mode.label()));
+    if rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from("no commits".dim())).block(block),
+            area,
+        );
+        return;
+    }
+    let items: Vec<ListItem> = rows
+        .iter()
+        .map(|row| {
+            let mut spans = graph_spans(&row.graph);
+            if let Some(e) = &row.entry {
+                spans.extend(commit_spans(e, usize::MAX));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::new().bg(SELECTION_BG).bold())
+        .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
+    let mut state = ListState::default().with_selected(Some(selected.min(rows.len() - 1)));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// Read-only browser for a single commit's changes: the changed files (tree or
+/// flat) on the left, the selected file's diff on the right. A trimmed-down
+/// twin of `draw_diff` with no commit/stash/revert affordances.
+#[allow(clippy::too_many_arguments)]
+fn draw_commit_diff(
+    frame: &mut Frame,
+    area: Rect,
+    label: &str,
+    files: &[StatusEntry],
+    rows: &[DiffRow],
+    selected: usize,
+    content: &str,
+    loading_new: bool,
+    scroll: u16,
+) {
+    if files.is_empty() {
+        let para = Paragraph::new(Line::from("this commit changed no files".dim()))
+            .block(panel(format!("commit · {label}")));
+        frame.render_widget(para, area);
+        return;
+    }
+
+    let [list_area, diff_area] =
+        Layout::horizontal([Constraint::Length(36), Constraint::Min(20)]).areas(area);
+
+    // Left: the changed files as a folder tree or flat list (no checkboxes).
+    let items: Vec<ListItem> = rows
+        .iter()
+        .map(|row| match row {
+            DiffRow::Folder { label, depth, .. } => {
+                let indent = "  ".repeat(*depth);
+                ListItem::new(Line::from(vec![
+                    Span::raw(indent),
+                    Span::styled(format!("{label}/"), Style::new().fg(ACCENT).bold()),
+                ]))
+            }
+            DiffRow::File {
+                index,
+                label,
+                depth,
+            } => {
+                let indent = "  ".repeat(*depth);
+                let code = files.get(*index).map(|f| f.code.trim()).unwrap_or("");
+                let style = files
+                    .get(*index)
+                    .map(|f| status_style(&f.code))
+                    .unwrap_or_default();
+                ListItem::new(Line::from(vec![
+                    Span::raw(indent),
+                    Span::styled(format!("{code:<2} "), style),
+                    Span::raw(label.clone()),
+                ]))
+            }
+        })
+        .collect();
+    let block = panel(format!("files · {label}"));
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::new().bg(SELECTION_BG).bold())
+        .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
+    let mut state = ListState::default().with_selected(Some(selected.min(rows.len() - 1)));
+    frame.render_stateful_widget(list, list_area, &mut state);
+
+    // Right: the diff of the highlighted file (or a folder summary).
+    let (title, lines): (String, Vec<Line>) = match rows.get(selected) {
+        Some(DiffRow::Folder { prefix, .. }) => {
+            let count = files
+                .iter()
+                .filter(|f| f.path.starts_with(prefix.as_str()))
+                .count();
+            (
+                format!("folder · {prefix}"),
+                vec![Line::from(
+                    format!("{count} changed file(s) under {prefix}").dim(),
+                )],
+            )
+        }
+        _ => {
+            let path = current_diff_path(rows, files, selected);
+            let lines = if loading_new {
+                vec![Line::from("loading diff…".dim())]
+            } else if content.is_empty() {
+                vec![Line::from("no textual diff (binary or empty)".dim())]
+            } else {
+                content.lines().map(diff_line).collect()
+            };
+            (format!("diff · {path}"), lines)
+        }
     };
     let total = lines.len();
     let para = Paragraph::new(lines)
-        .block(panel(format!("log · {name} · {}", mode.label())))
+        .block(panel(title))
         .scroll((scroll, 0));
-    frame.render_widget(para, area);
-    let mut sb_state =
-        ScrollbarState::new(total.saturating_sub(area.height as usize)).position(scroll as usize);
+    frame.render_widget(para, diff_area);
+    let mut sb_state = ScrollbarState::new(total.saturating_sub(diff_area.height as usize))
+        .position(scroll as usize);
     frame.render_stateful_widget(
         Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .style(Style::new().fg(BORDER))
             .thumb_style(Style::new().fg(ACCENT)),
-        area,
+        diff_area,
         &mut sb_state,
     );
 }
@@ -2425,11 +2748,23 @@ fn context_lines(text: &str) -> Vec<String> {
 /// and the selected file's hunks on the right as OURS vs THEIRS blocks with the
 /// current hunk and its chosen action highlighted.
 #[allow(clippy::too_many_arguments)]
+/// Human phrase for where the incoming ("theirs") side comes from, so the
+/// resolver can say "incoming from the merge" instead of the bare "THEIRS".
+fn incoming_source(kind: &ResolveKind) -> &'static str {
+    match kind {
+        ResolveKind::Merge => "the merge",
+        ResolveKind::CherryPick => "the cherry-pick",
+        ResolveKind::StashPop { .. } => "the stash",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn draw_conflict_resolver(
     frame: &mut Frame,
     area: Rect,
     target: &str,
     source_label: &str,
+    kind: &ResolveKind,
     files: &[String],
     resolved: &[bool],
     file: usize,
@@ -2476,7 +2811,10 @@ fn draw_conflict_resolver(
                 Style::new().fg(Color::Green),
             ),
             Line::from(""),
-            Line::styled(format!("  incoming: {source_label}"), Style::new().dim()),
+            Line::styled(
+                format!("  incoming from {} · {source_label}", incoming_source(kind)),
+                Style::new().dim(),
+            ),
             Line::styled(
                 "  press c to complete once every file is done",
                 Style::new().dim(),
@@ -2488,12 +2826,25 @@ fn draw_conflict_resolver(
     };
 
     let mut lines: Vec<Line<'static>> = Vec::new();
+    // Spell out which side is which: OURS is what is already in this worktree
+    // (the local/current branch), THEIRS is what is being pulled in.
     lines.push(Line::from(vec![
-        Span::styled("OURS ", Style::new().fg(Color::Green).bold()),
-        Span::styled(rf.file.ours_label.clone(), Style::new().fg(Color::Green)),
-        Span::styled("   vs   ", Style::new().dim()),
-        Span::styled("THEIRS ", Style::new().fg(Color::Blue).bold()),
-        Span::styled(rf.file.theirs_label.clone(), Style::new().fg(Color::Blue)),
+        Span::styled("‹ OURS ", Style::new().fg(Color::Green).bold()),
+        Span::styled(
+            format!("(current · {})", rf.file.ours_label),
+            Style::new().fg(Color::Green),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("› THEIRS ", Style::new().fg(Color::Blue).bold()),
+        Span::styled(
+            format!(
+                "(incoming from {} · {})",
+                incoming_source(kind),
+                rf.file.theirs_label
+            ),
+            Style::new().fg(Color::Blue),
+        ),
     ]));
     lines.push(Line::from(""));
 
@@ -2617,10 +2968,19 @@ fn spinner_glyph(tick: u64) -> char {
 }
 
 /// A generic single-line text input overlay with a dim hint underneath.
-fn draw_input_popup(frame: &mut Frame, area: Rect, title: &str, input: &str, hint: &str) {
+fn draw_input_popup(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    input: &super::app::TextInput,
+    hint: &str,
+) {
     let popup = centered(area, 64, 4);
     frame.render_widget(Clear, popup);
-    let lines = vec![prompt_line(input), Line::from(hint.to_string().dim())];
+    let lines = vec![
+        prompt_line_at(input.as_str(), input.cursor),
+        Line::from(hint.to_string().dim()),
+    ];
     frame.render_widget(Paragraph::new(lines).block(panel(title.to_string())), popup);
 }
 
@@ -2710,6 +3070,39 @@ mod tests {
         );
         assert!(out[2].contains("│╲"), "{out:#?}");
         assert!(out[3].contains("│ ● 5d6e7f8 add tests"), "{out:#?}");
+    }
+
+    /// The footer and the help panel now read the same bindings, so a help-only
+    /// entry must not leak into the footer and the hints must stay exactly what
+    /// they were before the two lists were merged.
+    #[test]
+    fn footer_hints_skip_help_only_bindings() {
+        let line = hint_line(help::WORKTREES).to_string();
+        assert_eq!(
+            line,
+            "⇥ branches  Enter changes  n new  b switch branch  c commit  s stash  \
+             p pull  ⇧P push  f fetch  l log  d delete  ⇧R rename  ? help  q quit"
+        );
+        // `u`, `o`, `e` and the cursor keys are documented in help but have no
+        // footer label, so they are absent above.
+        assert!(!line.contains("select worktree"), "{line}");
+    }
+
+    /// Every help tab is reachable from the bar, and the active one is marked.
+    #[test]
+    fn help_tab_bar_draws_every_tab() {
+        let out = render(78, 1, |frame, area| {
+            draw_help_tabs(frame, area, HelpTab::Changes)
+        });
+        for tab in HelpTab::ALL {
+            assert!(
+                out[0].contains(tab.title()),
+                "{} missing: {out:#?}",
+                tab.title()
+            );
+        }
+        // The six titles have to fit the panel's width without being clipped.
+        assert!(!out[0].ends_with('…'), "{out:#?}");
     }
 
     /// The flat view is the same rows with no art and no blank connector lines.

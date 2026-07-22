@@ -1,6 +1,7 @@
 //! Core worktree operations shared by the CLI, TUI, and MCP server.
 
 use std::io::{BufRead, BufReader, Write};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::mpsc::channel;
@@ -64,6 +65,11 @@ pub struct WorktreeInfo {
     /// Ahead/behind upstream; `null` when no upstream is configured.
     pub ahead_behind: Option<AheadBehind>,
     pub locked: bool,
+    /// True when this worktree's branch is fully contained in the repo's
+    /// default branch (every commit already merged), so the worktree is safe to
+    /// clean up. False for the main worktree, a detached HEAD, the default
+    /// branch itself, or a branch with commits not yet on the mainline.
+    pub merged: bool,
 }
 
 /// Outcome of one setup step during `create`.
@@ -181,6 +187,14 @@ fn kill_process_group(pid: u32) {
 /// Lists all worktrees with dirty counts and ahead/behind info.
 pub fn list(ctx: &Ctx) -> Result<Vec<WorktreeInfo>> {
     let wts = git::list_worktrees(&ctx.repo_root)?;
+    // The mainline every worktree's branch is measured against for the "merged"
+    // flag, plus its first-parent trunk (computed once). Best-effort: a repo with
+    // no resolvable default just leaves the flag unset.
+    let default = git::default_branch(&ctx.repo_root).ok();
+    let trunk = match &default {
+        Some(d) => git::first_parent_commits(&ctx.repo_root, d).unwrap_or_default(),
+        None => HashSet::new(),
+    };
     let mut infos = Vec::with_capacity(wts.len());
     for wt in wts {
         if wt.is_bare {
@@ -195,6 +209,17 @@ pub fn list(ctx: &Ctx) -> Result<Vec<WorktreeInfo>> {
         } else {
             (0, None)
         };
+        // Whether this worktree's branch has been merged into the default
+        // branch. Skip the main worktree and the default branch itself (nothing
+        // to merge into), and detached HEADs (no branch tip).
+        let merged = match (&default, &wt.branch) {
+            (Some(default), Some(branch))
+                if !is_main && branch != default && git::branch_exists(&ctx.repo_root, branch) =>
+            {
+                branch_merged_into(&ctx.repo_root, default, branch, &trunk)?
+            }
+            _ => false,
+        };
         infos.push(WorktreeInfo {
             name: worktree_name(&wt.branch, &wt.path),
             branch: wt.branch,
@@ -203,6 +228,7 @@ pub fn list(ctx: &Ctx) -> Result<Vec<WorktreeInfo>> {
             dirty,
             ahead_behind,
             locked: wt.is_locked,
+            merged,
         });
     }
     Ok(infos)
@@ -588,11 +614,31 @@ pub fn file_diff(ctx: &Ctx, name: &str, path: &str, untracked: bool) -> Result<S
     git::diff_file(Path::new(&info.path), path, untracked).map_err(Into::into)
 }
 
+/// Files changed by commit `hash`, viewed from the worktree named `name`.
+pub fn commit_files(ctx: &Ctx, name: &str, hash: &str) -> Result<Vec<StatusEntry>> {
+    let info = find(ctx, name)?.ok_or_else(|| not_found(ctx, name))?;
+    git::commit_files(Path::new(&info.path), hash).map_err(Into::into)
+}
+
+/// Unified diff of a single `path` as changed by commit `hash`, viewed from the
+/// worktree named `name`.
+pub fn commit_file_diff(ctx: &Ctx, name: &str, hash: &str, path: &str) -> Result<String> {
+    let info = find(ctx, name)?.ok_or_else(|| not_found(ctx, name))?;
+    git::commit_file_diff(Path::new(&info.path), hash, path).map_err(Into::into)
+}
+
 /// Discards uncommitted changes to `path` in the worktree named `name`,
 /// restoring it to HEAD (or removing it if it was untracked).
 pub fn revert_file(ctx: &Ctx, name: &str, path: &str, untracked: bool) -> Result<()> {
     let info = find(ctx, name)?.ok_or_else(|| not_found(ctx, name))?;
     git::revert_file(Path::new(&info.path), path, untracked).map_err(Into::into)
+}
+
+/// Deletes `path` from the worktree named `name`, removing it from disk (and
+/// staging the removal for tracked files).
+pub fn delete_file(ctx: &Ctx, name: &str, path: &str, untracked: bool) -> Result<()> {
+    let info = find(ctx, name)?.ok_or_else(|| not_found(ctx, name))?;
+    git::delete_file(Path::new(&info.path), path, untracked).map_err(Into::into)
 }
 
 /// Derives a `.gitignore` glob from a file path: `*.ext` when the file has an
@@ -700,6 +746,8 @@ pub struct BranchListItem {
     pub behind: u32,
     pub subject: String,
     pub date: String,
+    /// Whether the branch's work has been merged into the repo's default branch.
+    pub merged: bool,
 }
 
 /// Result of `branch list`.
@@ -729,6 +777,19 @@ pub struct BranchDeleteResult {
 pub struct BranchRenameResult {
     pub old: String,
     pub new: String,
+}
+
+/// Result of `rename` (a worktree): the branch was renamed and the directory
+/// moved to match.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorktreeRenameResult {
+    pub old_name: String,
+    pub new_name: String,
+    pub old_path: String,
+    pub new_path: String,
+    /// Whether a branch was renamed (false for a detached-HEAD worktree, where
+    /// only the directory moved).
+    pub renamed_branch: bool,
 }
 
 /// Result of `log`.
@@ -954,7 +1015,20 @@ pub fn pull(ctx: &Ctx, name: &str, rebase: bool) -> Result<PullResult> {
             info.name
         );
     }
-    let output = git::pull(dir, rebase)?;
+    let output = match git::pull(dir, rebase) {
+        Ok(o) => o,
+        // A refused fast-forward means the branch has diverged; point at the
+        // rebase escape hatch instead of leaving the raw git error alone.
+        Err(e) if !rebase && git::is_non_fast_forward(&e.to_string()) => {
+            return Err(anyhow!(e).context(format!(
+                "'{}' has diverged from its upstream, so a fast-forward pull isn't \
+                 possible; retry with `wtm pull {} --rebase` to rebase the local \
+                 commits onto the upstream",
+                info.name, info.name
+            )));
+        }
+        Err(e) => return Err(e.into()),
+    };
     let already_up_to_date = output.contains("Already up to date");
     let ahead_behind = git::ahead_behind(dir)?;
     Ok(PullResult {
@@ -1006,24 +1080,35 @@ pub fn fetch(ctx: &Ctx) -> Result<FetchResult> {
 pub fn branch_list(ctx: &Ctx) -> Result<BranchListResult> {
     let details = git::branch_details(&ctx.repo_root)?;
     let worktrees = git::list_worktrees(&ctx.repo_root)?;
-    let branches = details
-        .into_iter()
-        .map(|d| {
-            let checked_out_path = worktrees
-                .iter()
-                .find(|w| w.branch.as_deref() == Some(&d.name))
-                .map(|w| w.path.to_string_lossy().to_string());
-            BranchListItem {
-                name: d.name,
-                checked_out_path,
-                upstream: d.upstream,
-                ahead: d.ahead,
-                behind: d.behind,
-                subject: d.subject,
-                date: d.date,
-            }
-        })
-        .collect();
+    // The mainline every branch's "merged" flag is measured against, plus its
+    // first-parent trunk (computed once). Best-effort: a repo with no resolvable
+    // default leaves every branch unflagged.
+    let default = git::default_branch(&ctx.repo_root).ok();
+    let trunk = match &default {
+        Some(d) => git::first_parent_commits(&ctx.repo_root, d).unwrap_or_default(),
+        None => HashSet::new(),
+    };
+    let mut branches = Vec::with_capacity(details.len());
+    for d in details {
+        let checked_out_path = worktrees
+            .iter()
+            .find(|w| w.branch.as_deref() == Some(&d.name))
+            .map(|w| w.path.to_string_lossy().to_string());
+        let merged = match &default {
+            Some(default) => branch_merged_into(&ctx.repo_root, default, &d.name, &trunk)?,
+            None => false,
+        };
+        branches.push(BranchListItem {
+            name: d.name,
+            checked_out_path,
+            upstream: d.upstream,
+            ahead: d.ahead,
+            behind: d.behind,
+            subject: d.subject,
+            date: d.date,
+            merged,
+        });
+    }
     Ok(BranchListResult { branches })
 }
 
@@ -1065,6 +1150,53 @@ pub fn branch_rename(ctx: &Ctx, old: &str, new: &str) -> Result<BranchRenameResu
     Ok(BranchRenameResult {
         old: old.to_string(),
         new: new.to_string(),
+    })
+}
+
+/// Renames the worktree addressed by `name` to `new_name`: renames its branch
+/// (when it is on one) and moves its directory to a sibling folder named after
+/// `new_name`, so the worktree stays addressable by the new name. Refuses on the
+/// main worktree, which is the repository itself.
+pub fn rename_worktree(ctx: &Ctx, name: &str, new_name: &str) -> Result<WorktreeRenameResult> {
+    let new_name = new_name.trim();
+    if new_name.is_empty() {
+        bail!("new name must not be empty");
+    }
+    let info = find(ctx, name)?.ok_or_else(|| not_found(ctx, name))?;
+    if info.is_main {
+        bail!("cannot rename the main worktree");
+    }
+    let old_path = PathBuf::from(&info.path);
+    let new_path = old_path
+        .parent()
+        .map(|p| p.join(sanitize_dir_name(new_name)))
+        .ok_or_else(|| anyhow!("worktree path has no parent: {}", info.path))?;
+    if new_path != old_path && new_path.exists() {
+        bail!("target directory already exists: {}", new_path.display());
+    }
+    // Rename the branch first so it tracks the new name; git updates the
+    // checked-out worktree's HEAD as part of `branch -m`.
+    let renamed_branch = match &info.branch {
+        Some(branch) if branch != new_name => {
+            if git::branch_exists(&ctx.repo_root, new_name) {
+                bail!("branch '{new_name}' already exists");
+            }
+            git::branch_rename(&ctx.repo_root, branch, new_name)?;
+            true
+        }
+        Some(_) => false,
+        None => false,
+    };
+    // Then move the directory to match, unless it already sits at the target.
+    if new_path != old_path {
+        git::worktree_move(&ctx.repo_root, &old_path, &new_path)?;
+    }
+    Ok(WorktreeRenameResult {
+        old_name: name.to_string(),
+        new_name: new_name.to_string(),
+        old_path: info.path,
+        new_path: new_path.to_string_lossy().to_string(),
+        renamed_branch,
     })
 }
 
@@ -1191,7 +1323,13 @@ pub fn cherry_pick(
 /// worktree is left mid-merge (see [`MergeOutcome::Conflicted`]) so the
 /// conflicts can be resolved in place; `git::merge_abort` and
 /// `git::merge_continue` finish it either way.
-pub fn merge(ctx: &Ctx, target: &str, source_branch: &str, no_ff: bool) -> Result<MergeOutcome> {
+pub fn merge(
+    ctx: &Ctx,
+    target: &str,
+    source_branch: &str,
+    no_ff: bool,
+    autostash: bool,
+) -> Result<MergeOutcome> {
     let info = find(ctx, target)?.ok_or_else(|| not_found(ctx, target))?;
     if !git::branch_exists(&ctx.repo_root, source_branch) {
         bail!("no local branch named '{source_branch}'");
@@ -1203,7 +1341,7 @@ pub fn merge(ctx: &Ctx, target: &str, source_branch: &str, no_ff: bool) -> Resul
         );
     }
     let dir = Path::new(&info.path);
-    match git::merge(dir, source_branch, no_ff)? {
+    match git::merge(dir, source_branch, no_ff, autostash)? {
         git::MergeStatus::AlreadyUpToDate => Ok(MergeOutcome::UpToDate),
         git::MergeStatus::Merged => Ok(MergeOutcome::Clean {
             commit: git::short_hash(dir)?,
@@ -1215,7 +1353,10 @@ pub fn merge(ctx: &Ctx, target: &str, source_branch: &str, no_ff: bool) -> Resul
 /// Merges the repository's default branch into the worktree named `target`,
 /// bringing its branch up to date with the mainline. Errors when the target
 /// already has the default branch checked out.
-pub fn update(ctx: &Ctx, target: &str) -> Result<MergeOutcome> {
+/// When `autostash` is set, uncommitted local changes are stashed before the
+/// merge and re-applied after it finishes (git's `--autostash`), so a dirty
+/// worktree can be updated without committing or losing the in-progress work.
+pub fn update(ctx: &Ctx, target: &str, autostash: bool) -> Result<MergeOutcome> {
     let info = find(ctx, target)?.ok_or_else(|| not_found(ctx, target))?;
     let default = git::default_branch(&ctx.repo_root)?;
     if info.branch.as_deref() == Some(default.as_str()) {
@@ -1225,7 +1366,7 @@ pub fn update(ctx: &Ctx, target: &str) -> Result<MergeOutcome> {
             info.name
         );
     }
-    merge(ctx, target, &default, false)
+    merge(ctx, target, &default, false, autostash)
 }
 
 /// A conflicted file's contents, parsed into segments, ready for a resolver
@@ -1398,35 +1539,95 @@ pub fn abort_resolution(ctx: &Ctx, target: &str, kind: ResolveKind) -> Result<()
     Ok(())
 }
 
-/// Switches the worktree named `name` to check out the existing local branch
-/// `branch`. Refuses when the branch is already checked out in another worktree
-/// (git forbids this) or is already the worktree's current branch.
-pub fn switch_branch(ctx: &Ctx, name: &str, branch: &str) -> Result<SwitchResult> {
+/// Switches the worktree named `name` to check out `branch`. Resolves `branch`
+/// against local branches first, then falls back to the remotes, checking a
+/// remote-only branch out as a new local branch that tracks it. When `create` is
+/// set and no such branch exists anywhere, a new local branch of that name is
+/// created off the worktree's current HEAD and checked out. Refuses when the
+/// branch is already checked out in another worktree (git forbids this) or is
+/// already the worktree's current branch.
+pub fn switch_branch(ctx: &Ctx, name: &str, branch: &str, create: bool) -> Result<SwitchResult> {
     let info = find(ctx, name)?.ok_or_else(|| not_found(ctx, name))?;
-    if info.branch.as_deref() == Some(branch) {
-        bail!(
-            "worktree '{}' already has '{branch}' checked out",
-            info.name
-        );
+    let dir = Path::new(&info.path);
+    match resolve_switch_target(ctx, branch)? {
+        Some((branch, remote_ref)) => {
+            if info.branch.as_deref() == Some(branch.as_str()) {
+                bail!(
+                    "worktree '{}' already has '{branch}' checked out",
+                    info.name
+                );
+            }
+            if let Some(other) = list(ctx)?
+                .into_iter()
+                .find(|i| i.path != info.path && i.branch.as_deref() == Some(branch.as_str()))
+            {
+                bail!(
+                    "branch '{branch}' is already checked out in worktree '{}'",
+                    other.name
+                );
+            }
+            match &remote_ref {
+                Some(remote_ref) => git::switch_track(dir, &branch, remote_ref)?,
+                None => git::switch(dir, &branch)?,
+            }
+            Ok(SwitchResult {
+                name: branch.clone(),
+                branch,
+                path: info.path,
+            })
+        }
+        // No branch of that name exists locally or on any remote.
+        None if create => {
+            let branch = branch.trim();
+            if branch.is_empty() {
+                bail!("branch name must not be empty");
+            }
+            git::switch_create(dir, branch)?;
+            Ok(SwitchResult {
+                name: branch.to_string(),
+                branch: branch.to_string(),
+                path: info.path,
+            })
+        }
+        None => bail!("no branch named '{branch}' (searched local branches and remotes)"),
     }
-    if !git::branch_exists(&ctx.repo_root, branch) {
-        bail!("no local branch named '{branch}'");
+}
+
+/// Resolves what a caller asked to switch to into the local branch name to check
+/// out and, when that branch does not exist locally yet, the remote ref to create
+/// it from. Accepts a local branch name, a remote-only branch's short name, or a
+/// fully qualified `<remote>/<branch>` ref. Returns `Ok(None)` when nothing of
+/// that name exists locally or on a remote (so a caller may choose to create it);
+/// an ambiguous remote match is still a hard error.
+fn resolve_switch_target(ctx: &Ctx, branch: &str) -> Result<Option<(String, Option<String>)>> {
+    if git::branch_exists(&ctx.repo_root, branch) {
+        return Ok(Some((branch.to_string(), None)));
     }
-    if let Some(other) = list(ctx)?
-        .into_iter()
-        .find(|i| i.path != info.path && i.branch.as_deref() == Some(branch))
-    {
-        bail!(
-            "branch '{branch}' is already checked out in worktree '{}'",
-            other.name
-        );
+    let remotes = git::remote_branches(&ctx.repo_root)?;
+    // A fully qualified ref is unambiguous, so honor that spelling first; the
+    // local branch it creates is named after the branch, not the remote.
+    let resolved = match remotes.iter().find(|(_, full)| full == branch) {
+        Some(hit) => hit.clone(),
+        None => {
+            let mut matches = remotes.iter().filter(|(short, _)| short == branch);
+            let Some(first) = matches.next() else {
+                return Ok(None);
+            };
+            if matches.next().is_some() {
+                bail!(
+                    "branch '{branch}' exists on more than one remote; use a '<remote>/{branch}' name"
+                );
+            }
+            first.clone()
+        }
+    };
+    let (short, remote_ref) = resolved;
+    // `<remote>/<branch>` can resolve onto a branch that does exist locally, in
+    // which case switch to the local branch instead of trying to recreate it.
+    if git::branch_exists(&ctx.repo_root, &short) {
+        return Ok(Some((short, None)));
     }
-    git::switch(Path::new(&info.path), branch)?;
-    Ok(SwitchResult {
-        name: branch.to_string(),
-        branch: branch.to_string(),
-        path: info.path,
-    })
+    Ok(Some((short, Some(remote_ref))))
 }
 
 /// Finds a worktree by name, matching branch name first, then directory name.
@@ -1450,6 +1651,32 @@ fn not_found(ctx: &Ctx, name: &str) -> anyhow::Error {
         })
         .unwrap_or_default();
     anyhow!("no worktree named '{name}' (known: {known})")
+}
+
+/// Whether `branch` has been merged into `default`, given `default`'s
+/// first-parent trunk (from [`git::first_parent_commits`], computed once per
+/// listing). A branch counts as merged only when it is fully contained in
+/// `default` (no commits of its own left outstanding) AND its tip sits *off*
+/// `default`'s first-parent trunk, i.e. it was merged in from the side via a
+/// merge commit. A brand-new branch, or one that is merely behind `default`
+/// without ever diverging, has its tip on the trunk and so is not reported as
+/// merged (it has nothing that was actually merged in). Fast-forward merges,
+/// which leave no merge commit, are the known blind spot: the branch becomes
+/// part of the trunk and is indistinguishable from an ordinary ancestor.
+fn branch_merged_into(
+    dir: &Path,
+    default: &str,
+    branch: &str,
+    trunk: &HashSet<String>,
+) -> Result<bool> {
+    if branch == default {
+        return Ok(false);
+    }
+    if git::commits_ahead_of(dir, default, branch)? != 0 {
+        return Ok(false);
+    }
+    let tip = git::rev_parse(dir, branch)?;
+    Ok(!trunk.contains(&tip))
 }
 
 /// Display/addressing name for a worktree: its branch, or directory name when
@@ -1743,6 +1970,37 @@ mod tests {
         PathBuf::from(r.path)
     }
 
+    /// Simulates a teammate's fetched branch: `<remote>/<branch>` pointing at
+    /// HEAD, with no local branch of its own. The remote is registered (but
+    /// never fetched from), since git only treats the ref as a remote-tracking
+    /// branch when its remote is configured.
+    fn make_remote_ref(ctx: &Ctx, remote: &str, branch: &str) {
+        if !git::remotes(&ctx.repo_root)
+            .unwrap()
+            .iter()
+            .any(|r| r == remote)
+        {
+            git(
+                &ctx.repo_root,
+                &["remote", "add", remote, "https://example.invalid/repo.git"],
+            );
+        }
+        let out = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&ctx.repo_root)
+            .output()
+            .unwrap();
+        let sha = String::from_utf8(out.stdout).unwrap();
+        git(
+            &ctx.repo_root,
+            &[
+                "update-ref",
+                &format!("refs/remotes/{remote}/{branch}"),
+                sha.trim(),
+            ],
+        );
+    }
+
     #[test]
     fn removes_worktree_and_merged_branch() {
         let (_tmp, ctx) = temp_ctx();
@@ -1797,6 +2055,91 @@ mod tests {
         let wts = git::list_worktrees(&ctx.repo_root).unwrap();
         let moved = wts.iter().find(|w| w.path == path).unwrap();
         assert_eq!(moved.branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn switch_checks_out_remote_only_branch_as_tracking_branch() {
+        let (_tmp, ctx) = temp_ctx();
+        make_worktree(&ctx, "feat");
+        make_remote_ref(&ctx, "origin", "teammate");
+        assert!(!git::branch_exists(&ctx.repo_root, "teammate"));
+
+        let r = switch_branch(&ctx, "feat", "teammate", false).unwrap();
+        assert_eq!(r.branch, "teammate");
+        // The remote-only branch now exists locally, tracking the remote.
+        assert!(git::branch_exists(&ctx.repo_root, "teammate"));
+        assert_eq!(
+            git::branch_upstream(&ctx.repo_root, "teammate").unwrap(),
+            Some(("origin".to_string(), "teammate".to_string()))
+        );
+    }
+
+    #[test]
+    fn switch_accepts_fully_qualified_remote_ref() {
+        let (_tmp, ctx) = temp_ctx();
+        make_worktree(&ctx, "feat");
+        make_remote_ref(&ctx, "origin", "teammate");
+
+        // `origin/teammate` names the same branch; the local one it creates is
+        // named for the branch, not the remote.
+        let r = switch_branch(&ctx, "feat", "origin/teammate", false).unwrap();
+        assert_eq!(r.branch, "teammate");
+        assert!(!git::branch_exists(&ctx.repo_root, "origin/teammate"));
+    }
+
+    #[test]
+    fn switch_to_unknown_branch_errors() {
+        let (_tmp, ctx) = temp_ctx();
+        make_worktree(&ctx, "feat");
+        let err = switch_branch(&ctx, "feat", "ghost", false).unwrap_err();
+        assert!(
+            err.to_string().contains("no branch named 'ghost'"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn switch_with_create_makes_a_new_branch_off_head() {
+        let (_tmp, ctx) = temp_ctx();
+        let path = make_worktree(&ctx, "feat");
+        assert!(!git::branch_exists(&ctx.repo_root, "brand-new"));
+
+        let r = switch_branch(&ctx, "feat", "brand-new", true).unwrap();
+        assert_eq!(r.branch, "brand-new");
+        // The new branch exists and is what the worktree now has checked out.
+        assert!(git::branch_exists(&ctx.repo_root, "brand-new"));
+        let info = find(&ctx, "brand-new").unwrap().unwrap();
+        assert_eq!(info.branch.as_deref(), Some("brand-new"));
+        assert_eq!(info.path, path.to_string_lossy());
+    }
+
+    #[test]
+    fn switch_with_create_still_switches_onto_an_existing_branch() {
+        let (_tmp, ctx) = temp_ctx();
+        make_worktree(&ctx, "feat");
+        git::branch_create(&ctx.repo_root, "existing", None).unwrap();
+
+        // `create` only kicks in when the branch is missing; an existing branch
+        // is switched onto, not recreated (which would error).
+        let r = switch_branch(&ctx, "feat", "existing", true).unwrap();
+        assert_eq!(r.branch, "existing");
+    }
+
+    #[test]
+    fn switch_to_branch_on_multiple_remotes_asks_to_disambiguate() {
+        let (_tmp, ctx) = temp_ctx();
+        make_worktree(&ctx, "feat");
+        make_remote_ref(&ctx, "origin", "shared");
+        make_remote_ref(&ctx, "upstream", "shared");
+
+        let err = switch_branch(&ctx, "feat", "shared", false).unwrap_err();
+        assert!(
+            err.to_string().contains("more than one remote"),
+            "unexpected error: {err:#}"
+        );
+        // The fully qualified spelling resolves it.
+        let r = switch_branch(&ctx, "feat", "upstream/shared", false).unwrap();
+        assert_eq!(r.branch, "shared");
     }
 
     #[test]
@@ -1890,13 +2233,13 @@ mod tests {
         git(&path, &["add", "."]);
         git(&path, &["commit", "-m", "feature work"]);
 
-        let outcome = merge(&ctx, "feature", "main", false).unwrap();
+        let outcome = merge(&ctx, "feature", "main", false, false).unwrap();
         assert!(matches!(outcome, MergeOutcome::Clean { .. }), "{outcome:?}");
         assert!(path.join("main.txt").exists());
         assert!(!git::is_merging(&path));
 
         // A second merge has nothing new to bring in.
-        let outcome = merge(&ctx, "feature", "main", false).unwrap();
+        let outcome = merge(&ctx, "feature", "main", false, false).unwrap();
         assert!(matches!(outcome, MergeOutcome::UpToDate), "{outcome:?}");
     }
 
@@ -1913,7 +2256,7 @@ mod tests {
         std::fs::write(path.join("shared.txt"), "feature version\n").unwrap();
         git(&path, &["commit", "-am", "feature edit"]);
 
-        let outcome = merge(&ctx, "feature", "main", false).unwrap();
+        let outcome = merge(&ctx, "feature", "main", false, false).unwrap();
         let MergeOutcome::Conflicted { files } = outcome else {
             panic!("expected a conflict, got {outcome:?}");
         };
@@ -1942,7 +2285,7 @@ mod tests {
         std::fs::write(path.join("shared.txt"), "feature version\n").unwrap();
         git(&path, &["commit", "-am", "feature edit"]);
 
-        let outcome = merge(&ctx, "feature", "main", false).unwrap();
+        let outcome = merge(&ctx, "feature", "main", false, false).unwrap();
         assert!(matches!(outcome, MergeOutcome::Conflicted { .. }));
 
         // Resolve the conflict, stage it, and let merge_continue commit it.
@@ -1962,8 +2305,8 @@ mod tests {
     fn merge_rejects_missing_source_and_self_merge() {
         let (_tmp, ctx) = temp_ctx();
         make_worktree(&ctx, "feature");
-        assert!(merge(&ctx, "feature", "nope", false).is_err());
-        assert!(merge(&ctx, "feature", "feature", false).is_err());
+        assert!(merge(&ctx, "feature", "nope", false, false).is_err());
+        assert!(merge(&ctx, "feature", "feature", false, false).is_err());
     }
 
     #[test]
@@ -1974,12 +2317,12 @@ mod tests {
         git(&ctx.repo_root, &["add", "."]);
         git(&ctx.repo_root, &["commit", "-m", "advance main"]);
 
-        let outcome = update(&ctx, "feature").unwrap();
+        let outcome = update(&ctx, "feature", false).unwrap();
         assert!(matches!(outcome, MergeOutcome::Clean { .. }), "{outcome:?}");
         assert!(path.join("new.txt").exists());
 
         // The main worktree has the default branch itself: nothing to update.
-        assert!(update(&ctx, "main").is_err());
+        assert!(update(&ctx, "main", false).is_err());
     }
 
     #[test]
@@ -2077,6 +2420,144 @@ mod tests {
         assert_eq!(conflict::render(&segments, &[]), text);
     }
 
+    /// Item 8: a worktree whose branch's commits have all landed in the default
+    /// branch is flagged merged; a brand-new branch that merely points at main's
+    /// tip is not (nothing has been merged), nor is one with its own outstanding
+    /// commit, nor the main worktree.
+    #[test]
+    fn list_flags_merged_worktrees() {
+        let (_tmp, ctx) = temp_ctx();
+        // A branch created off the original main that never gets any work: it
+        // ends up *behind* main once main advances, but was never merged.
+        make_worktree(&ctx, "stale-branch");
+        // A branch whose work has actually been merged back into main.
+        let merged_wt = make_worktree(&ctx, "merged-branch");
+        std::fs::write(merged_wt.join("f.txt"), "x\n").unwrap();
+        git(&merged_wt, &["add", "f.txt"]);
+        git(&merged_wt, &["commit", "-m", "merged work"]);
+        // This merge advances main past stale-branch's tip.
+        git(&ctx.repo_root, &["merge", "--no-ff", "-m", "merge", "merged-branch"]);
+        // A brand-new branch off the advanced main, with no work of its own.
+        make_worktree(&ctx, "fresh-branch");
+        // A branch with its own commit not in main: not merged.
+        let ahead = make_worktree(&ctx, "ahead-branch");
+        std::fs::write(ahead.join("f.txt"), "y\n").unwrap();
+        git(&ahead, &["add", "f.txt"]);
+        git(&ahead, &["commit", "-m", "ahead work"]);
+
+        let infos = list(&ctx).unwrap();
+        let merged = |name: &str| infos.iter().find(|i| i.name == name).unwrap().merged;
+        assert!(merged("merged-branch"), "branch merged into main is flagged");
+        assert!(!merged("fresh-branch"), "brand-new branch is not merged");
+        assert!(
+            !merged("stale-branch"),
+            "a branch merely behind main was never merged"
+        );
+        assert!(!merged("ahead-branch"), "branch with own commit is not");
+        // The main worktree is never flagged.
+        assert!(!infos.iter().find(|i| i.is_main).unwrap().merged);
+    }
+
+    /// The Branches tab's merged flag mirrors the worktree merged flag: a branch
+    /// whose work has landed in main is flagged, a brand-new one is not, and the
+    /// default branch itself is never flagged.
+    #[test]
+    fn branch_list_flags_merged_branches() {
+        let (_tmp, ctx) = temp_ctx();
+        let merged_wt = make_worktree(&ctx, "merged-branch");
+        std::fs::write(merged_wt.join("f.txt"), "x\n").unwrap();
+        git(&merged_wt, &["add", "f.txt"]);
+        git(&merged_wt, &["commit", "-m", "merged work"]);
+        git(&ctx.repo_root, &["merge", "--no-ff", "-m", "merge", "merged-branch"]);
+        make_worktree(&ctx, "fresh-branch");
+
+        let result = branch_list(&ctx).unwrap();
+        let merged = |name: &str| result.branches.iter().find(|b| b.name == name).unwrap().merged;
+        assert!(merged("merged-branch"), "merged branch is flagged");
+        assert!(!merged("fresh-branch"), "brand-new branch is not");
+        assert!(!merged("main"), "the default branch is never flagged");
+    }
+
+    /// Renaming a worktree renames its branch and moves its directory to a
+    /// sibling folder named after the new name, keeping it addressable.
+    #[test]
+    fn rename_worktree_renames_branch_and_moves_directory() {
+        let (_tmp, ctx) = temp_ctx();
+        let old_path = make_worktree(&ctx, "feature");
+
+        let result = rename_worktree(&ctx, "feature", "renamed").unwrap();
+        assert!(result.renamed_branch);
+        assert_eq!(result.new_name, "renamed");
+
+        // The old branch and directory are gone; the new ones are in place.
+        assert!(!git::branch_exists(&ctx.repo_root, "feature"));
+        assert!(git::branch_exists(&ctx.repo_root, "renamed"));
+        assert!(!old_path.exists(), "old directory moved");
+        assert!(PathBuf::from(&result.new_path).exists(), "new directory present");
+
+        // It is addressable by the new name and reports the renamed branch.
+        let info = find(&ctx, "renamed").unwrap().unwrap();
+        assert_eq!(info.branch.as_deref(), Some("renamed"));
+    }
+
+    /// The main worktree is the repository itself and cannot be renamed.
+    #[test]
+    fn rename_worktree_refuses_the_main_worktree() {
+        let (_tmp, ctx) = temp_ctx();
+        let main = list(&ctx)
+            .unwrap()
+            .into_iter()
+            .find(|i| i.is_main)
+            .unwrap()
+            .name;
+        let err = rename_worktree(&ctx, &main, "whatever").unwrap_err();
+        assert!(err.to_string().contains("main worktree"), "{err}");
+    }
+
+    /// Item 4: a commit's changed files and a single file's diff are readable.
+    #[test]
+    fn commit_files_and_diff_report_a_commits_changes() {
+        let (_tmp, ctx) = temp_ctx();
+        std::fs::write(ctx.repo_root.join("a.txt"), "hello\n").unwrap();
+        git(&ctx.repo_root, &["add", "a.txt"]);
+        git(&ctx.repo_root, &["commit", "-m", "add a"]);
+        let hash = git::run(&ctx.repo_root, &["rev-parse", "HEAD"]).unwrap();
+
+        // The main worktree's name is how ops addresses it.
+        let main = list(&ctx).unwrap();
+        let name = main.iter().find(|i| i.is_main).unwrap().name.clone();
+
+        let files = commit_files(&ctx, &name, &hash).unwrap();
+        assert!(files.iter().any(|f| f.path == "a.txt"), "{files:?}");
+        let diff = commit_file_diff(&ctx, &name, &hash, "a.txt").unwrap();
+        assert!(diff.contains("hello"), "diff shows the added line: {diff}");
+    }
+
+    /// Item 6: updating a dirty worktree with autostash stashes the local edit,
+    /// merges the mainline, and reapplies the edit afterwards.
+    #[test]
+    fn update_with_autostash_preserves_local_changes() {
+        let (_tmp, ctx) = temp_ctx();
+        // Give the worktree its own history so an update actually merges.
+        let wt = make_worktree(&ctx, "feature");
+        // Advance main so there is something to pull in.
+        std::fs::write(ctx.repo_root.join("main.txt"), "main\n").unwrap();
+        git(&ctx.repo_root, &["add", "main.txt"]);
+        git(&ctx.repo_root, &["commit", "-m", "main work"]);
+        // Leave an uncommitted local change in the worktree.
+        std::fs::write(wt.join("local.txt"), "work in progress\n").unwrap();
+
+        let outcome = update(&ctx, "feature", true).unwrap();
+        assert!(matches!(outcome, MergeOutcome::Clean { .. }));
+        // The mainline commit landed and the local change was reapplied.
+        assert!(wt.join("main.txt").exists(), "mainline change merged in");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("local.txt")).unwrap(),
+            "work in progress\n",
+            "local edit reapplied after the update"
+        );
+    }
+
     /// Sets up a real conflicted merge: `feature` and `main` each edit the
     /// same line of `shared.txt`. Returns the ctx and the target worktree's
     /// path, already mid-merge.
@@ -2089,7 +2570,7 @@ mod tests {
         git(&ctx.repo_root, &["commit", "-am", "main edit"]);
         std::fs::write(path.join("shared.txt"), "feature version\n").unwrap();
         git(&path, &["commit", "-am", "feature edit"]);
-        let outcome = merge(ctx, "feature", "main", false).unwrap();
+        let outcome = merge(ctx, "feature", "main", false, false).unwrap();
         assert!(matches!(outcome, MergeOutcome::Conflicted { .. }));
         path
     }
@@ -2417,6 +2898,35 @@ mod tests {
         assert_eq!(
             git::run(&ctx.repo_root, &["log", "-1", "--format=%s", "side"]).unwrap(),
             "local"
+        );
+    }
+
+    /// A pull of a diverged worktree turns the refused fast-forward into a
+    /// hint pointing at `--rebase`, and the error is recognizably
+    /// non-fast-forward so the TUI can offer the retry.
+    #[test]
+    fn pull_of_a_diverged_worktree_hints_at_rebase() {
+        let (tmp, ctx) = temp_ctx();
+        let bare = with_origin(tmp.path(), &ctx);
+        advance_remote(tmp.path(), &bare, "main", "remote-work");
+        // A different local commit forks the histories.
+        git(&ctx.repo_root, &["commit", "--allow-empty", "-m", "local"]);
+
+        let err = pull(&ctx, "main", false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--rebase"), "unexpected error: {msg}");
+        assert!(git::is_non_fast_forward(&msg), "unexpected error: {msg}");
+
+        // The rebase retry the hint suggests completes and keeps both sides.
+        let r = pull(&ctx, "main", true).unwrap();
+        assert!(!r.already_up_to_date);
+        assert_eq!(
+            git::run(&ctx.repo_root, &["log", "-1", "--format=%s"]).unwrap(),
+            "local"
+        );
+        assert_eq!(
+            git::run(&ctx.repo_root, &["log", "-1", "--format=%s", "HEAD~1"]).unwrap(),
+            "remote-work"
         );
     }
 }

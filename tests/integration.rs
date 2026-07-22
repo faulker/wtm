@@ -242,6 +242,30 @@ fn remove_can_delete_branch() {
 }
 
 #[test]
+fn rename_worktree_renames_branch_and_moves_directory() {
+    let (_tmp, repo) = setup_repo();
+    stdout_json(&wtm(&repo, &["create", "before", "--json"]));
+
+    let renamed = stdout_json(&wtm(&repo, &["rename", "before", "after", "--json"]));
+    assert_eq!(renamed["new_name"], "after");
+    assert_eq!(renamed["renamed_branch"], true);
+    let new_path = PathBuf::from(renamed["new_path"].as_str().unwrap());
+    assert!(new_path.exists(), "the moved directory exists");
+    assert!(new_path.ends_with("after"), "{new_path:?}");
+
+    // The worktree is now addressable by its new name and branch.
+    let list = stdout_json(&wtm(&repo, &["list", "--json"]));
+    let names: Vec<&str> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|w| w["branch"].as_str())
+        .collect();
+    assert!(names.contains(&"after"), "{names:?}");
+    assert!(!names.contains(&"before"), "{names:?}");
+}
+
+#[test]
 fn main_worktree_is_protected() {
     let (_tmp, repo) = setup_repo();
     let out = wtm(&repo, &["remove", "main", "--force", "--json"]);

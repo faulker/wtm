@@ -4,7 +4,7 @@ A friendly top-level interface for git, built for working with AI agents on mult
 
 Three ways to use it:
 
-- **TUI**: run `wtm` with no arguments inside a repo. It has two tabs (press `Tab` to switch): a **Worktrees** tab (where `b` switches the selected worktree to another branch and `n` opens the new-worktree dialog) and a **Branches** tab for creating, deleting, and checking out branches. Press `?` for the full key list.
+- **TUI**: run `wtm` with no arguments inside a repo. It has two tabs (press `Tab` to switch): a **Worktrees** tab (where `b` switches the selected worktree to another branch — type a new name to create one — `n` opens the new-worktree dialog, and `⇧R` renames a worktree) and a **Branches** tab for creating, deleting, renaming (`⇧R`), and checking out branches. Both tabs flag branches whose work has landed in the repo's default branch as `✓merged`. Press `?` for help, which opens on the page for whatever you're looking at; `Tab` moves between its pages and `↑/↓` scrolls. While typing in a field, `?` is a literal character, so use `F1` there instead.
 - **CLI**: scriptable subcommands, all with `--json` output for agents
 - **MCP**: `wtm mcp` serves worktree operations as MCP tools over stdio
 
@@ -90,6 +90,7 @@ wtm init [--force]                    # guided setup, writes .wtm.toml
 wtm create <branch> [--from <base>]   # new worktree; creates the branch if needed, runs setup
 wtm list                              # all worktrees with dirty count and ahead/behind
 wtm remove <name> [--force] [--delete-branch]
+wtm rename <name> <new-name>          # rename a worktree: renames its branch and moves the folder
 wtm status <name>                     # changed files in a worktree
 wtm diff <name>                       # unified diff of uncommitted changes
 wtm path <name>                       # prints the path, e.g. cd $(wtm path feature-x)
@@ -105,7 +106,9 @@ wtm stash push <name> [-m <msg>]           # stash changes, untracked files incl
 wtm stash list|pop|apply|drop <name> [--index N]
 wtm pull <name> [--rebase]                 # fast-forward only unless --rebase
 wtm push <name> [--force-with-lease]       # publishes with -u origin when no upstream yet
-wtm switch <name> <branch>                 # check a different existing branch out in the worktree
+wtm switch <name> <branch> [--create]      # check a different branch out in the worktree; a remote-only
+                                           # branch becomes a local branch tracking the remote.
+                                           # --create makes a new branch off HEAD when it doesn't exist
 wtm fetch                                  # fetch all remotes, prune deleted branches
 wtm branch list                            # branches with checkout, tracking, last commit
 wtm branch create <name> [--from <ref>]    # branch without a worktree
@@ -122,7 +125,8 @@ Merging, updating, and resolving conflicts:
 
 ```sh
 wtm merge <source> --into <name>           # merge; on conflict, leaves the tree mid-merge to resolve
-wtm update <name>                          # "update from main": merge the default branch in
+wtm update <name> [--autostash]            # "update from main": merge the default branch in
+                                           #   (--autostash stashes local edits first, reapplies after)
 wtm conflicts <name>                       # list conflicted files in the worktree
 wtm conflicts <name> <file>                # inspect one file's conflict hunks (ours/theirs, --json)
 wtm resolve <name> <file> --ours           # take our side of the whole file
@@ -167,32 +171,32 @@ Worktrees are addressed by branch name (or directory name when detached). Every 
 
 ## TUI
 
-Run `wtm` inside a repo. If the repo isn't initialized yet, the setup wizard opens first (see [Settings](#settings)); once `.wtm.toml` exists you get the worktree list:
+Run `wtm` inside a repo. If the repo isn't initialized yet, the setup wizard opens first (see [Settings](#settings)); once `.wtm.toml` exists you get the worktree list. Each worktree shows its change count, ahead/behind, and a **FLAGS** column: `✓merged` marks a worktree whose branch is fully merged into the default branch (safe to clean up), and `locked` marks a locked worktree.
 
 | Key | Action |
 | --- | --- |
 | `↑`/`↓` or `j`/`k` | select worktree |
-| `Enter` | browse changes in a folder tree: the left panel groups changed files under their folders (a folder shows `[x]`/`[ ]`/`[~]` for all/none/some of its files marked); pick a file to see its diff on the right. `Space` marks/unmarks the file, or the whole folder when the cursor is on a folder row; `s` stashes just the highlighted file, `⇧S` stashes every marked (`[x]`) file, `⇧R` reverts the highlighted file, `c` commits the marked files, `i` adds the file or folder to `.gitignore` (choose the exact path or a glob that ignores everything like it), `?` shows help. New files inside brand-new folders are listed too, so you can view their contents. Updates live as files change; `r` refreshes now |
+| `Enter` | browse changes in a folder tree: the left panel groups changed files under their folders (a folder shows `[x]`/`[ ]`/`[~]` for all/none/some of its files marked); pick a file to see its diff on the right. Diffs load in the background, so switching files never freezes the UI. `t` switches the file list between the folder tree and a flat path list. `Space` marks/unmarks the file, or the whole folder when the cursor is on a folder row; `s` stashes just the highlighted file, `⇧S` stashes every marked (`[x]`) file, `⇧R` reverts the highlighted file (a brand-new file has no committed version to revert to, so it says so and points you at delete instead), `d` deletes the highlighted file from the worktree, `c` (or `Tab`) commits the marked files, `i` adds the file or folder to `.gitignore` (choose the exact path or a glob that ignores everything like it), `?` shows help. New files inside brand-new folders are listed too, so you can view their contents. Updates live as files change; `r` refreshes now |
 | `n` | new **worktree**. The top row creates a **new branch** (named as you type) branched off a base branch — press `Tab` to choose the base (defaults to the main branch). The rows below **check out an existing branch**: local branches plus **remote-only branches** (a teammate's work, shown with their `origin/…` ref) which check out into a local tracking branch. Typing **filters** that list while also naming the new branch, so you can search a long branch list. To make a branch *without* a worktree, use the branch browser (`b`) instead. If the target folder already exists you're asked to open it (when it's already a worktree), replace it, or cancel |
 | `d` | delete the selected worktree: choose folder-only (keeps the branch) or folder + branch. If the worktree has uncommitted changes you're asked to stash them (keeping the work) or discard them. If the branch can't be safely deleted (not fully merged, or checked out in another worktree) you're offered a force delete; forcing a branch that's checked out elsewhere first switches that worktree to the repo's default branch |
 | `c` | commit the selected worktree: tick which changed files to include (all selected by default; `Tab` switches between the file list and the message, `Space` toggles a file), type a message, `Enter` commits |
 | `o` | options: edit this repo's settings (`worktree_dir`, `open_command`, `setup.copy`, `setup.run`) without touching the file |
 | `e` | run the `open_command` in the selected worktree's directory (e.g. `cursor .`); prompts for a command when `open_command` isn't set |
-| `u` | update the selected worktree: merge the repo's default branch into it. On conflict, opens the conflict resolver |
+| `u` | update the selected worktree: merge the repo's default branch into it. If the worktree has uncommitted changes you're offered to stash them first and reapply them after the merge (so the update doesn't refuse on the dirty tree). On conflict, opens the conflict resolver |
 | `s` | stash manager: `s` stash current changes, `p` pop, `a` apply, `x` drop the selected entry |
-| `p` | pull the selected worktree (fast-forward only) |
+| `p` | pull the selected worktree (fast-forward only). When the pull is refused because the branch has diverged from its upstream, offers to retry the pull with a rebase |
 | `⇧P` | push the selected worktree; publishes with `-u` when there's no upstream |
 | `f` | fetch all remotes and refresh |
-| `b` | switch the selected worktree to another local branch: a picker of branches not checked out anywhere. Type to filter the list, `↑`/`↓` select, `Enter` switches, `Esc` clears the filter then closes |
+| `b` | switch the selected worktree to another branch: a picker of branches not checked out anywhere, local ones first, then remote-only branches (marked with their remote, checked out as a local tracking branch when picked). Type to filter the list, `↑`/`↓` select, `Enter` switches, `Esc` clears the filter then closes. With nothing matching what you typed, `Enter` tries it as a branch name anyway |
 | `Tab` | branch browser (Branches tab): every local branch with where it's checked out. `Enter` opens the branch's **commit history**, where `Space` marks commits (`a` all/none) and `Enter` **cherry-picks** the marked commits into a worktree you pick — choosing to commit them directly (keeping the original messages) or just load the changes for review; `t` switches that history between the commit tree and a flat list. `c` checks the branch out in a new worktree, `n` creates a **branch only** (no worktree, from HEAD), `d` deletes (`f` forces). `m` **merges** the selected branch into a worktree you pick. `f` **fetches** all remotes, refreshing every branch's ahead/behind; `p` **fast-forwards** the selected branch onto its upstream — a branch checked out in a worktree is pulled there so its files move with it, and one checked out nowhere is fast-forwarded in place without a checkout. Either way a branch that has diverged from its upstream is reported rather than merged |
-| `l` | log of recent commits for the selected worktree, drawn as a **commit tree** showing where branches fork and merge, with branch and tag names marked on the commits they point at. `t` switches between the tree and a flat list; the choice carries over to the Branches tab's commit history |
+| `l` | log of recent commits for the selected worktree, drawn as a **commit tree** showing where branches fork and merge, with branch and tag names marked on the commits they point at. `↑`/`↓` move a cursor between commits and `Enter` **browses into the highlighted commit** — a read-only view of the files it changed with each file's diff (`t` there toggles tree/flat, `⇧↑`/`⇧↓` scroll the diff). `t` switches the log between the tree and a flat list; the choice carries over to the Branches tab's commit history (where `v`/`→` browses a commit the same way) |
 | `r` | refresh (the worktree and branch lists also refresh themselves every minute, keeping your place) |
 | `?` | help (works here and in the changes view; any key closes it) |
 | `q` / `Ctrl+C` | quit |
 
-When a merge, update, cherry-pick, or stash pop hits a conflict, the **conflict resolver** opens automatically. It lists the conflicted files (each with a resolved/unresolved marker) and shows the selected file's hunks as OURS (green) vs THEIRS (blue). `←`/`→` move between files, `↑`/`↓` between hunks; `o`/`t` keep ours/theirs for the current hunk, `b`/`⇧B` keep both (ours-then-theirs or reversed, on separate lines), `⇧O`/`⇧T` take the whole file's side. `e` opens a small editor to **hand-edit the result** for the current hunk (seeded with both sides so nothing is lost); `Ctrl+S` saves that manual result, `Esc` discards it. `w` (or `Enter`) stages the resolved file (refuses until every hunk has a side), `c` completes the operation (commit the merge, continue the cherry-pick, or drop the popped stash), and `x` then `y` aborts and restores the worktree. `Esc`/`q` leaves it in progress so you can come back to it.
+When a merge, update, cherry-pick, or stash pop hits a conflict, the **conflict resolver** opens automatically. It lists the conflicted files (each with a resolved/unresolved marker) and shows the selected file's hunks as **OURS** (green — what's already in this worktree, the current branch) vs **THEIRS** (blue — what's being pulled in, labelled with where it comes from: the merge, cherry-pick, or stash). `←`/`→` move between files, `↑`/`↓` between hunks; `o`/`t` keep ours/theirs for the current hunk, `b`/`⇧B` keep both (ours-then-theirs or reversed, on separate lines), `⇧O`/`⇧T` take the whole file's side. `e` opens a small editor to **hand-edit the result** for the current hunk (seeded with both sides so nothing is lost); `Ctrl+S` saves that manual result, `Esc` discards it. `w` (or `Enter`) stages the resolved file (refuses until every hunk has a side), `c` completes the operation (commit the merge, continue the cherry-pick, or drop the popped stash), and `x` then `y` aborts and restores the worktree. `Esc`/`q` leaves it in progress so you can come back to it.
 
-Text fields (like the new-branch name) support cursor editing: `←`/`→` move, `Home`/`End` jump, and `Backspace`/`Delete` remove characters mid-string.
+Text fields (the new-branch name, the commit message, stash and branch names) support cursor editing: `←`/`→` move, `Home`/`End` jump, and `Backspace`/`Delete` remove characters mid-string.
 
 Pressing `o` opens an editor for the repo's `.wtm.toml`: pick a row with `↑`/`↓`, press `Enter` to edit it, and select the save row to write. It shows a live preview of where worktrees will land, preserves any comments in the file, and clearing a field unsets it so the default (or global value) applies again.
 

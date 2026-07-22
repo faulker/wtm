@@ -4,6 +4,7 @@
 //! than using libgit2 bindings, because git's worktree support is most
 //! complete and reliable in the CLI itself.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -220,6 +221,21 @@ pub fn switch(dir: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
+/// Creates local branch `branch` tracking `remote_ref` (e.g. `origin/feature`)
+/// and checks it out in the worktree at `dir`. Used to switch onto a branch that
+/// so far only exists on a remote.
+pub fn switch_track(dir: &Path, branch: &str, remote_ref: &str) -> Result<()> {
+    run(dir, &["switch", "-c", branch, "--track", remote_ref])?;
+    Ok(())
+}
+
+/// Creates a new local branch `branch` from the worktree's current HEAD and
+/// checks it out (`git switch -c`). Git refuses if the branch already exists.
+pub fn switch_create(dir: &Path, branch: &str) -> Result<()> {
+    run(dir, &["switch", "-c", branch])?;
+    Ok(())
+}
+
 /// Removes the worktree at `path`. `force` discards uncommitted changes.
 pub fn worktree_remove(dir: &Path, path: &Path, force: bool) -> Result<()> {
     let path_str = path.to_string_lossy();
@@ -229,6 +245,16 @@ pub fn worktree_remove(dir: &Path, path: &Path, force: bool) -> Result<()> {
     }
     args.push(&path_str);
     run(dir, &args)?;
+    Ok(())
+}
+
+/// Moves the worktree at `from` to `to` (`git worktree move`), relocating its
+/// directory and updating git's admin record. Git refuses if `to` already
+/// exists or the worktree has submodules/locks.
+pub fn worktree_move(dir: &Path, from: &Path, to: &Path) -> Result<()> {
+    let from_str = from.to_string_lossy();
+    let to_str = to.to_string_lossy();
+    run(dir, &["worktree", "move", &from_str, &to_str])?;
     Ok(())
 }
 
@@ -262,6 +288,25 @@ pub fn commits_ahead_of(dir: &Path, base: &str, branch: &str) -> Result<u32> {
     let range = format!("{base}..{branch}");
     let out = run(dir, &["rev-list", "--count", &range])?;
     Ok(out.trim().parse().unwrap_or(0))
+}
+
+/// The commits on `reference`'s first-parent trunk (`git rev-list
+/// --first-parent`), as a set of full hashes. A branch merged into `reference`
+/// through a merge commit lands on a *second*-parent side line and so is absent
+/// from this set, which is how a genuinely merged branch is told apart from one
+/// that is merely an older ancestor sitting on the mainline itself.
+pub fn first_parent_commits(dir: &Path, reference: &str) -> Result<HashSet<String>> {
+    let out = run(dir, &["rev-list", "--first-parent", reference])?;
+    Ok(out
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
+/// The full commit hash that `reference` points at (`git rev-parse`).
+pub fn rev_parse(dir: &Path, reference: &str) -> Result<String> {
+    Ok(run(dir, &["rev-parse", reference])?.trim().to_string())
 }
 
 /// Changed files in the worktree at `dir` (staged, unstaged, and untracked).
@@ -324,6 +369,66 @@ pub fn diff_file(dir: &Path, path: &str, untracked: bool) -> Result<String> {
     }
 }
 
+/// Files changed by commit `hash`, as porcelain-style `StatusEntry`s (a
+/// two-letter code plus the path). The single-letter status from
+/// `diff-tree` (A/M/D/R/…) is padded to two characters so it renders and
+/// colours the same way as working-tree status codes.
+pub fn commit_files(dir: &Path, hash: &str) -> Result<Vec<StatusEntry>> {
+    // `-r` recurses into subtrees, `-m` shows a merge commit's changes against
+    // its first parent, `--no-commit-id`/`--format=` suppress the header so only
+    // the "STATUS\tpath" lines remain.
+    let out = run(
+        dir,
+        &[
+            "show",
+            "--no-color",
+            "--name-status",
+            "--first-parent",
+            "-m",
+            "--format=",
+            hash,
+        ],
+    )?;
+    let mut seen = std::collections::HashSet::new();
+    let mut files = Vec::new();
+    for line in out.lines().filter(|l| !l.trim().is_empty()) {
+        let mut parts = line.split('\t');
+        let Some(status) = parts.next() else { continue };
+        // Renames/copies list the old path then the new; the new path is what
+        // exists in this commit, so take the last tab-separated field.
+        let Some(path) = parts.next_back() else {
+            continue;
+        };
+        // `R100`/`C075` carry a similarity score; keep just the first letter.
+        let code = status.chars().next().unwrap_or(' ');
+        if seen.insert(path.to_string()) {
+            files.push(StatusEntry {
+                code: format!("{code} "),
+                path: path.to_string(),
+            });
+        }
+    }
+    Ok(files)
+}
+
+/// Unified diff of a single `path` as changed by commit `hash` (against its
+/// first parent, or the empty tree for a root commit).
+pub fn commit_file_diff(dir: &Path, hash: &str, path: &str) -> Result<String> {
+    run(
+        dir,
+        &[
+            "show",
+            "--no-color",
+            "--first-parent",
+            "-m",
+            "--format=",
+            hash,
+            "--",
+            path,
+        ],
+    )
+}
+
 /// Discards changes to `path`, restoring it to HEAD. Untracked files are
 /// removed outright since they have no HEAD version to restore.
 pub fn revert_file(dir: &Path, path: &str, untracked: bool) -> Result<()> {
@@ -341,6 +446,18 @@ pub fn revert_file(dir: &Path, path: &str, untracked: bool) -> Result<()> {
                 path,
             ],
         )?;
+    }
+    Ok(())
+}
+
+/// Deletes `path` from the worktree entirely. Untracked files are removed with
+/// `git clean`; tracked files are removed with `git rm -f`, which deletes them
+/// from disk and stages the removal.
+pub fn delete_file(dir: &Path, path: &str, untracked: bool) -> Result<()> {
+    if untracked {
+        run(dir, &["clean", "-fd", "--", path])?;
+    } else {
+        run(dir, &["rm", "-f", "--", path])?;
     }
     Ok(())
 }
@@ -574,6 +691,14 @@ pub fn branch_upstream(dir: &Path, branch: &str) -> Result<Option<(String, Strin
 pub fn fetch_into_branch(dir: &Path, remote: &str, src: &str, branch: &str) -> Result<String> {
     let refspec = format!("{src}:{branch}");
     run(dir, &["fetch", remote, &refspec])
+}
+
+/// True when a git error message means a fast-forward-only update was refused
+/// because the branch has diverged from its upstream. Matches both `git pull
+/// --ff-only` ("Not possible to fast-forward") and the fetch refspec rejection
+/// used by [`fetch_into_branch`] ("non-fast-forward").
+pub fn is_non_fast_forward(msg: &str) -> bool {
+    msg.contains("Not possible to fast-forward") || msg.contains("non-fast-forward")
 }
 
 /// Pulls the current branch. Fast-forward only by default; `rebase` rebases
@@ -853,10 +978,17 @@ pub enum MergeStatus {
 /// files) so a resolver can take over; use `merge_abort` or `merge_continue`
 /// to finish. Any other failure (dirty tree, unknown ref) is surfaced as an
 /// error.
-pub fn merge(dir: &Path, source_ref: &str, no_ff: bool) -> Result<MergeStatus> {
+pub fn merge(dir: &Path, source_ref: &str, no_ff: bool, autostash: bool) -> Result<MergeStatus> {
     let mut args = vec!["merge"];
     if no_ff {
         args.push("--no-ff");
+    }
+    // Stash local changes before the merge and re-apply them when it ends. Git
+    // holds the stash (as MERGE_AUTOSTASH) through a conflicted merge and
+    // re-applies it on `merge --continue`/`--abort`, so no extra bookkeeping is
+    // needed here.
+    if autostash {
+        args.push("--autostash");
     }
     args.push(source_ref);
     match run(dir, &args) {
@@ -1124,6 +1256,27 @@ mod tests {
                 ("feature/x".to_string(), "origin/feature/x".to_string()),
                 ("teammate".to_string(), "origin/teammate".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn delete_file_removes_untracked_and_tracked_files() {
+        let (_tmp, repo) = temp_repo();
+        // An untracked new file is removed from disk with `git clean`.
+        std::fs::write(repo.join("new.txt"), "hi").unwrap();
+        delete_file(&repo, "new.txt", true).unwrap();
+        assert!(!repo.join("new.txt").exists());
+
+        // A committed file is removed from disk and staged for deletion.
+        std::fs::write(repo.join("tracked.txt"), "hi").unwrap();
+        run(&repo, &["add", "tracked.txt"]).unwrap();
+        run(&repo, &["commit", "-m", "add tracked"]).unwrap();
+        delete_file(&repo, "tracked.txt", false).unwrap();
+        assert!(!repo.join("tracked.txt").exists());
+        let status = status(&repo).unwrap();
+        assert!(
+            status.iter().any(|e| e.path == "tracked.txt" && e.code.starts_with('D')),
+            "expected staged deletion, got {status:?}"
         );
     }
 

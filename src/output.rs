@@ -10,7 +10,7 @@ use crate::ops::{
     BranchCreateResult, BranchDeleteResult, BranchListResult, BranchRenameResult,
     CherryPickOutcome, CommitResult, CompleteResolutionResult, ConflictFile, CreateResult,
     FetchResult, LogResult, MergeOutcome, PullResult, PushResult, StashListResult, StashPopOutcome,
-    StashResult, SwitchResult, WorktreeInfo,
+    StashResult, SwitchResult, WorktreeInfo, WorktreeRenameResult,
 };
 
 /// Serializes `value` as pretty JSON to stdout.
@@ -196,8 +196,8 @@ pub fn print_branch_list(result: &BranchListResult) {
         .unwrap_or(4)
         .max(4);
     println!(
-        "{:<name_w$}  {:<10}  {:<10}  LAST COMMIT",
-        "NAME", "CHECKOUT", "UPSTREAM"
+        "{:<name_w$}  {:<10}  {:<10}  {:<7}  LAST COMMIT",
+        "NAME", "CHECKOUT", "UPSTREAM", "FLAGS"
     );
     for b in &result.branches {
         let checkout = if b.checked_out_path.is_some() {
@@ -210,8 +210,9 @@ pub fn print_branch_list(result: &BranchListResult) {
         } else {
             "-".to_string()
         };
+        let flags = if b.merged { "merged" } else { "-" };
         println!(
-            "{:<name_w$}  {checkout:<10}  {upstream:<10}  {} ({})",
+            "{:<name_w$}  {checkout:<10}  {upstream:<10}  {flags:<7}  {} ({})",
             b.name, b.subject, b.date
         );
     }
@@ -231,6 +232,14 @@ pub fn print_branch_delete(result: &BranchDeleteResult) {
 /// Human-readable branch-rename confirmation.
 pub fn print_branch_rename(result: &BranchRenameResult) {
     println!("renamed branch '{}' to '{}'", result.old, result.new);
+}
+
+/// Human-readable worktree-rename confirmation.
+pub fn print_worktree_rename(result: &WorktreeRenameResult) {
+    println!(
+        "renamed worktree '{}' to '{}' ({} → {})",
+        result.old_name, result.new_name, result.old_path, result.new_path
+    );
 }
 
 /// Human-readable cherry-pick outcome.

@@ -2,6 +2,7 @@
 
 mod app;
 mod config_editor;
+mod help;
 mod setup;
 mod ui;
 

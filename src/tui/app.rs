@@ -10,9 +10,10 @@ use ratatui::crossterm::event::{
 use ratatui::layout::Rect;
 
 use super::config_editor::{ConfigEditor, EditorOutcome};
+use super::help::HelpTab;
 use super::setup::{self, SetupWizard, WizardOutcome};
 use crate::conflict::{self, ConflictSegment, ResolutionAction};
-use crate::git::{GraphLine, LogEntry, StashEntry, StatusEntry};
+use crate::git::{self, GraphLine, LogEntry, StashEntry, StatusEntry};
 use crate::ops::{self, BranchListItem, ConflictFile, Ctx, SetupControl, WorktreeInfo};
 use crate::settings::ConfigDraft;
 
@@ -89,6 +90,14 @@ impl TextInput {
     pub fn trimmed(&self) -> String {
         self.value.trim().to_string()
     }
+
+    /// A prefilled input with the cursor at the end, for edit-in-place prompts
+    /// like rename.
+    pub fn with_value(value: impl Into<String>) -> Self {
+        let value = value.into();
+        let cursor = value.chars().count();
+        Self { value, cursor }
+    }
 }
 
 /// Message from the background create thread.
@@ -134,6 +143,15 @@ impl LogMode {
             LogMode::Flat => "flat",
         }
     }
+}
+
+/// Where the commit browser (`View::CommitDiff`) was opened from, so Esc can
+/// return there with the cursor where it was left.
+pub enum CommitDiffBack {
+    /// The worktree log, restoring `selected`.
+    Log { selected: usize },
+    /// A branch's commit list, restoring the branch and `selected`.
+    Branch { branch: String, selected: usize },
 }
 
 /// Index of the first row holding a commit, skipping any leading art-only rows.
@@ -185,9 +203,10 @@ pub struct CheckoutCandidate {
 }
 
 /// Indices into `branches` whose name matches `filter` (case-insensitive
-/// substring); an empty filter matches everything. Used by both the create
-/// dialog's key handling and its rendering so they stay in lockstep.
-pub fn create_filtered(branches: &[CheckoutCandidate], filter: &str) -> Vec<usize> {
+/// substring); an empty filter matches everything. Used by the create dialog and
+/// the switch picker, in each case by both the key handling and the renderer, so
+/// that the two stay in lockstep.
+pub fn filtered_candidates(branches: &[CheckoutCandidate], filter: &str) -> Vec<usize> {
     let needle = filter.trim().to_lowercase();
     branches
         .iter()
@@ -217,11 +236,27 @@ pub enum View {
         selected: usize,
         /// Diff text for the file under the cursor (empty on a folder row).
         content: String,
+        /// Path the current `content` reflects, so an auto-refresh of the same
+        /// file can keep the diff on screen (no flicker) while a switch to a
+        /// different file shows a loading placeholder until its diff arrives.
+        content_path: Option<String>,
+        /// Monotonic token bumped on every load; a background diff result is
+        /// only accepted when its token still matches, so results from files
+        /// the user has already navigated past are discarded.
+        load_gen: u64,
+        /// In-flight background diff load: (token, path, diff text). Diffs are
+        /// computed off the UI thread so switching files never blocks the app.
+        pending: Option<Receiver<(u64, String, String)>>,
+        /// True while a load for a *different* file is in flight, so the UI can
+        /// show "loading…" instead of the previous file's stale diff.
+        loading_new: bool,
         scroll: u16,
         /// When the diff was last recomputed, used to throttle auto-refresh.
         last_refresh: Instant,
         /// True while confirming a revert of the highlighted file.
         confirm_revert: bool,
+        /// True while confirming a delete of the highlighted file.
+        confirm_delete: bool,
         /// Present while choosing what to add to `.gitignore` for the
         /// highlighted file or folder (the exact path vs. a glob pattern).
         ignore_prompt: Option<IgnorePrompt>,
@@ -241,7 +276,7 @@ pub enum View {
         /// Base ref a new branch is created from (defaults to the main branch).
         base: String,
         /// 0 = new branch; 1..=filtered.len() = check out the Nth *filtered*
-        /// candidate (see `create_filtered`), not `branches` directly.
+        /// candidate (see `filtered_candidates`), not `branches` directly.
         selected: usize,
         /// True when the `[ Base: … ⌄ ]` button is focused (via Tab from the
         /// new-branch row), so Enter/Space opens the base picker instead of
@@ -310,17 +345,41 @@ pub enum View {
         /// 0 = Stash, 1 = Discard, 2 = Cancel.
         selected: usize,
     },
+    /// Updating a dirty worktree: offer to stash local changes, merge the
+    /// default branch, then reapply them (git `--autostash`), rather than let
+    /// the merge refuse on the uncommitted work.
+    ConfirmUpdateStash {
+        name: String,
+        /// Number of uncommitted changes, for the prompt wording.
+        dirty: usize,
+        /// 0 = stash, update, reapply; 1 = update without stashing; 2 = cancel.
+        selected: usize,
+    },
     /// The folder is gone but its branch could not be safely deleted; offer to
     /// force. `reason` explains why git refused so the wording can match.
     ConfirmForceBranch {
         branch: String,
         reason: ForceBranchReason,
     },
+    /// A fast-forward pull failed because the worktree's branch has diverged
+    /// from its upstream; offer to retry the pull with a rebase.
+    ConfirmPullRebase {
+        /// Worktree whose pull was refused.
+        name: String,
+    },
     /// Prompt for a one-off command to run in a worktree's directory, shown by
     /// the `e` key when no `open_command` is configured.
     RunCommand {
         name: String,
         path: String,
+        input: TextInput,
+    },
+    /// Prompt for a worktree's new name, shown by the `R` key on the Worktrees
+    /// tab. Submitting renames the branch and moves the directory to match.
+    RenameWorktree {
+        /// Current name of the worktree being renamed.
+        name: String,
+        /// New name, prefilled with the current one.
         input: TextInput,
     },
     /// First-run setup wizard, shown until `.wtm.toml` exists.
@@ -336,7 +395,7 @@ pub enum View {
         marked: Vec<bool>,
         /// Cursor into `files` while the file list has focus.
         cursor: usize,
-        input: String,
+        input: TextInput,
         focus: CommitFocus,
     },
     /// Stash manager for one worktree.
@@ -346,25 +405,52 @@ pub enum View {
         selected: usize,
         mode: StashMode,
     },
-    /// Picker for switching the selected worktree onto a different existing
-    /// local branch (one that isn't checked out anywhere else).
+    /// Picker for switching the selected worktree onto a different branch: any
+    /// local branch not checked out elsewhere, plus remote-only branches.
     Switch {
         /// Worktree being switched.
         name: String,
         /// Branches available to switch to (not checked out in any worktree).
-        branches: Vec<String>,
+        /// Remote-only ones carry their remote ref and become local tracking
+        /// branches when picked.
+        branches: Vec<CheckoutCandidate>,
         /// Live type-to-filter text; narrows `branches` by case-insensitive
-        /// substring match.
+        /// substring match. With no match, Enter tries the text as a branch name.
         filter: TextInput,
         /// Cursor into the FILTERED branch list, not `branches` directly.
         selected: usize,
     },
-    /// Scrollable commit log for one worktree. Rows are graph lines: in
-    /// `LogMode::Tree` some carry only art (no commit), in `LogMode::Flat`
-    /// every row is a commit with no art.
+    /// Commit log for one worktree with a movable cursor. Rows are graph lines:
+    /// in `LogMode::Tree` some carry only art (no commit), in `LogMode::Flat`
+    /// every row is a commit with no art. Enter opens the commit browser
+    /// (`CommitDiff`) for the commit under the cursor.
     Log {
         name: String,
         lines: Vec<GraphLine>,
+        /// Cursor into `lines`; the cursor skips art-only rows.
+        selected: usize,
+    },
+    /// Read-only browser for the files changed by one commit: the changed files
+    /// on the left (tree or flat, shared with the changes view via `file_tree`)
+    /// and the selected file's diff on the right. Diffs load off the UI thread
+    /// exactly like `Diff`. Reached with Enter from `Log`.
+    CommitDiff {
+        /// Worktree the commit is viewed from (addressed by name in ops).
+        name: String,
+        /// Full commit hash being browsed.
+        hash: String,
+        /// Short hash + subject, for the panel title.
+        label: String,
+        /// Where the browser was opened from, so Esc returns there.
+        back: CommitDiffBack,
+        files: Vec<StatusEntry>,
+        rows: Vec<DiffRow>,
+        selected: usize,
+        content: String,
+        content_path: Option<String>,
+        load_gen: u64,
+        pending: Option<Receiver<(u64, String, String)>>,
+        loading_new: bool,
         scroll: u16,
     },
     /// Commit history of a branch on the Branches tab, with multi-select for
@@ -599,6 +685,12 @@ pub enum BusyThen {
     List,
     Stash(String),
     Branch,
+    /// A fast-forward pull of the named worktree: a success lands on the list
+    /// like `List`, but a non-fast-forward failure opens the rebase prompt
+    /// instead of the error box.
+    Pull {
+        name: String,
+    },
     /// After a backgrounded worktree removal succeeds, delete its branch on the
     /// main thread (so a refused delete can open the force prompt). Carries the
     /// worktree name and the branch to delete.
@@ -695,24 +787,42 @@ pub fn build_diff_rows(files: &[StatusEntry]) -> Vec<DiffRow> {
     rows
 }
 
+/// Builds a flat changed-file list: every file on its own row, labelled by its
+/// full path (no folder grouping), sorted so the list reads top-down.
+pub fn build_flat_rows(files: &[StatusEntry]) -> Vec<DiffRow> {
+    let mut order: Vec<usize> = (0..files.len()).collect();
+    order.sort_by(|&a, &b| files[a].path.cmp(&files[b].path));
+    order
+        .into_iter()
+        .map(|idx| DiffRow::File {
+            index: idx,
+            label: files[idx].path.clone(),
+            depth: 0,
+        })
+        .collect()
+}
+
+/// Builds the changed-file rows in tree or flat layout per `tree`.
+pub fn build_rows(files: &[StatusEntry], tree: bool) -> Vec<DiffRow> {
+    if tree {
+        build_diff_rows(files)
+    } else {
+        build_flat_rows(files)
+    }
+}
+
+/// Whether a porcelain status `code` marks a file that has no committed version
+/// to revert to: untracked (`??`) or newly added to the index (`A`).
+pub fn is_new_file(code: &str) -> bool {
+    code.starts_with('?') || code.starts_with('A')
+}
+
 /// The `files` index for the row at `cursor`, or `None` when it is a folder.
 pub fn current_file_index(rows: &[DiffRow], cursor: usize) -> Option<usize> {
     match rows.get(cursor) {
         Some(DiffRow::File { index, .. }) => Some(*index),
         _ => None,
     }
-}
-
-/// Branches from `branches` whose name contains `filter`, matched case
-/// insensitively. An empty filter matches everything. Used by both the
-/// switch-picker key handling and its renderer, so the two stay in sync.
-pub fn filtered_branches<'a>(branches: &'a [String], filter: &str) -> Vec<&'a str> {
-    let filter = filter.to_lowercase();
-    branches
-        .iter()
-        .map(|b| b.as_str())
-        .filter(|b| filter.is_empty() || b.to_lowercase().contains(&filter))
-        .collect()
 }
 
 /// Which part of the commit dialog has keyboard focus.
@@ -728,7 +838,7 @@ pub enum CommitFocus {
 pub enum StashMode {
     List,
     /// Typing an optional message for a new stash.
-    Message(String),
+    Message(TextInput),
     /// Confirming a drop of the selected entry.
     ConfirmDrop,
 }
@@ -747,7 +857,9 @@ pub enum ForceBranchReason {
 pub enum BranchMode {
     List,
     /// Typing a name for a new branch.
-    Create(String),
+    Create(TextInput),
+    /// Renaming the selected branch; the input is prefilled with its old name.
+    Rename(TextInput),
     /// Confirming deletion of the selected branch (`f` forces on refusal).
     ConfirmDelete,
 }
@@ -827,12 +939,23 @@ pub struct App {
     /// Whether commit history is drawn as a graph or a flat list, shared by the
     /// log and branch-commit views. Toggled with `t`.
     pub log_mode: LogMode,
+    /// Whether changed-file lists group files under a folder tree (`true`) or
+    /// list every file by its full path (`false`). Shared by the changes view
+    /// and the commit browser; toggled with `t`.
+    pub file_tree: bool,
     /// When the list last reloaded itself (by timer or by `r`), used to pace
     /// `auto_refresh`.
     last_auto_refresh: Instant,
-    /// When true, the help overlay is drawn on top of the active view; the next
-    /// key press dismisses it and returns to that view.
+    /// When true, the help panel is drawn on top of the active view. It handles
+    /// its own keys (tab switching, scrolling); anything else closes it and
+    /// returns to the view underneath.
     pub show_help: bool,
+    /// Which help tab is showing. Set from the active view each time help opens,
+    /// so help lands on the page for whatever the user is looking at.
+    pub help_tab: HelpTab,
+    /// Scroll offset within the active help tab. Reset whenever the tab changes;
+    /// clamped against the content at render time, as the diff and log views do.
+    pub help_scroll: u16,
     pub quit: bool,
 }
 
@@ -868,8 +991,11 @@ impl App {
             worktree_base,
             tick_count: 0,
             log_mode: LogMode::Tree,
+            file_tree: true,
             last_auto_refresh: Instant::now(),
             show_help: false,
+            help_tab: HelpTab::Basics,
+            help_scroll: 0,
             quit: false,
         };
         if initialized {
@@ -989,6 +1115,7 @@ impl App {
                         self.refresh();
                         match then {
                             BusyThen::List
+                            | BusyThen::Pull { .. }
                             | BusyThen::DeleteBranch { .. }
                             | BusyThen::Resolve { .. } => {}
                             BusyThen::Stash(name) => self.load_stash(name, StashMode::List),
@@ -998,6 +1125,12 @@ impl App {
                             }
                         }
                     }
+                    // A pull refused because the branch diverged gets a
+                    // recovery prompt (retry with rebase) instead of the error.
+                    (Err(e), BusyThen::Pull { name }) if git::is_non_fast_forward(&e) => {
+                        self.refresh();
+                        self.view = View::ConfirmPullRebase { name };
+                    }
                     (Err(e), _) => {
                         self.set_error(e);
                         self.refresh();
@@ -1006,10 +1139,17 @@ impl App {
             }
             return;
         }
-        if let View::Diff { last_refresh, .. } = &self.view {
-            if last_refresh.elapsed() >= DIFF_REFRESH_INTERVAL {
+        if matches!(self.view, View::Diff { .. }) {
+            self.poll_diff_load();
+            if let View::Diff { last_refresh, .. } = &self.view
+                && last_refresh.elapsed() >= DIFF_REFRESH_INTERVAL
+            {
                 self.refresh_diff();
             }
+            return;
+        }
+        if matches!(self.view, View::CommitDiff { .. }) {
+            self.poll_commit_diff_load();
             return;
         }
         let View::Creating {
@@ -1073,6 +1213,87 @@ impl App {
         }
     }
 
+    /// True when the active view has a text field listening for characters, so
+    /// `?` must reach it as a literal rather than opening help. F1 is the way in
+    /// from these views.
+    fn view_takes_text_input(&self) -> bool {
+        match &self.view {
+            // Row 0 with the base button unfocused and no picker open is the
+            // new-branch name field, which doubles as the branch filter.
+            View::Create {
+                selected: 0,
+                base_focus: false,
+                base_pick: None,
+                ..
+            } => true,
+            View::Commit {
+                focus: CommitFocus::Message,
+                ..
+            } => true,
+            View::Stash {
+                mode: StashMode::Message(_),
+                ..
+            } => true,
+            View::Switch { .. } | View::RunCommand { .. } | View::RenameWorktree { .. } => true,
+            View::Creating { done: false, .. } => true,
+            View::Config(editor) => editor.editing.is_some(),
+            View::ConflictResolver {
+                current: Some(rf), ..
+            } => rf.edit.is_some(),
+            View::List => matches!(
+                self.branch_mode,
+                BranchMode::Create(_) | BranchMode::Rename(_)
+            ),
+            View::Setup(wizard) => matches!(
+                &wizard.step,
+                setup::Step::ClonePath { .. }
+                    | setup::Step::LocationCustom { .. }
+                    | setup::Step::CopyFiles { .. }
+                    | setup::Step::RunCommands { .. }
+                    | setup::Step::Review {
+                        editing: Some(_),
+                        ..
+                    }
+            ),
+            _ => false,
+        }
+    }
+
+    /// Opens the help panel on the page documenting the active view.
+    fn open_help(&mut self) {
+        self.help_tab = HelpTab::for_view(&self.view, self.tab);
+        self.help_scroll = 0;
+        self.show_help = true;
+    }
+
+    fn set_help_tab(&mut self, tab: HelpTab) {
+        self.help_tab = tab;
+        self.help_scroll = 0;
+    }
+
+    /// Keys for the help panel: switch tabs, scroll, or close on anything else
+    /// (Esc, q, ?, F1).
+    fn on_help_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                self.set_help_tab(self.help_tab.next())
+            }
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+                self.set_help_tab(self.help_tab.prev())
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.help_scroll = self.help_scroll.saturating_add(1)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.help_scroll = self.help_scroll.saturating_sub(1)
+            }
+            KeyCode::PageDown => self.help_scroll = self.help_scroll.saturating_add(10),
+            KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(10),
+            KeyCode::Home | KeyCode::Char('g') => self.help_scroll = 0,
+            _ => self.show_help = false,
+        }
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) {
         self.message = None;
         // A modal error popup swallows the very next key press, dismissing
@@ -1105,10 +1326,19 @@ impl App {
             }
             return;
         }
-        // The help overlay swallows the next key press, returning to the view
-        // underneath it.
+        // The help panel is modal: it handles its own keys and everything else
+        // closes it, returning to the view underneath.
         if self.show_help {
-            self.show_help = false;
+            self.on_help_key(key);
+            return;
+        }
+        // Opening help is handled here rather than per-view so every view gets
+        // it. `?` is a character a text field would type, so it only opens help
+        // where nothing is listening for input; F1 works everywhere.
+        if key.code == KeyCode::F(1)
+            || (key.code == KeyCode::Char('?') && !self.view_takes_text_input())
+        {
+            self.open_help();
             return;
         }
         match &mut self.view {
@@ -1136,6 +1366,24 @@ impl App {
                         let cmd = input.trimmed();
                         if !cmd.is_empty() {
                             self.spawn_in_dir(&cmd, &path, &name);
+                        }
+                    }
+                }
+                _ => {
+                    input.on_key(key);
+                }
+            },
+            View::RenameWorktree { input, .. } => match key.code {
+                KeyCode::Esc => self.view = View::List,
+                KeyCode::Enter => {
+                    if let View::RenameWorktree { name, input } =
+                        std::mem::replace(&mut self.view, View::List)
+                    {
+                        let new = input.trimmed();
+                        if new.is_empty() {
+                            self.message = Some("new name must not be empty".to_string());
+                        } else {
+                            self.rename_worktree(name, new);
                         }
                     }
                 }
@@ -1202,6 +1450,17 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') => self.view = View::List,
                 _ => {}
             },
+            View::ConfirmUpdateStash { selected, .. } => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if *selected < 2 {
+                        *selected += 1;
+                    }
+                }
+                KeyCode::Enter => self.apply_update_stash(),
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') => self.view = View::List,
+                _ => {}
+            },
             View::ConfirmForceBranch { branch, .. } => match key.code {
                 KeyCode::Enter | KeyCode::Char('f') | KeyCode::Char('y') => {
                     let branch = branch.clone();
@@ -1218,6 +1477,16 @@ impl App {
                     self.message = Some(format!("kept branch '{branch}'"));
                     self.view = View::List;
                     self.refresh();
+                }
+                _ => {}
+            },
+            View::ConfirmPullRebase { name } => match key.code {
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('r') => {
+                    let name = name.clone();
+                    self.start_pull_rebase(name);
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
+                    self.view = View::List;
                 }
                 _ => {}
             },
@@ -1244,6 +1513,7 @@ impl App {
             View::Stash { .. } => self.on_stash_key(key),
             View::Switch { .. } => self.on_switch_key(key),
             View::Log { .. } => self.on_log_key(key),
+            View::CommitDiff { .. } => self.on_commit_diff_key(key),
             View::BranchCommits { .. } => self.on_branch_commits_key(key),
             View::CherryPick { .. } => self.on_cherry_pick_key(key),
             View::MergePick { .. } => self.on_merge_pick_key(key),
@@ -1343,6 +1613,7 @@ impl App {
             KeyCode::Char('b') => self.open_switch(),
             KeyCode::Char('u') => self.start_update(),
             KeyCode::Char('l') => self.open_log(),
+            KeyCode::Char('R') => self.open_rename_worktree(),
             KeyCode::Char('d') => {
                 if let Some(wt) = self.selected_worktree() {
                     if wt.is_main {
@@ -1363,8 +1634,46 @@ impl App {
                     self.open_diff(name);
                 }
             }
-            KeyCode::Char('?') => self.show_help = true,
             _ => {}
+        }
+    }
+
+    /// Opens the rename prompt for the selected worktree, prefilled with its
+    /// current name. Refuses the main worktree (it is the repository itself).
+    fn open_rename_worktree(&mut self) {
+        if let Some(wt) = self.selected_worktree() {
+            if wt.is_main {
+                self.message = Some("cannot rename the main worktree".to_string());
+            } else {
+                let name = wt.name.clone();
+                self.view = View::RenameWorktree {
+                    input: TextInput::with_value(name.clone()),
+                    name,
+                };
+            }
+        }
+    }
+
+    /// Renames a worktree (its branch and directory), then refreshes the list
+    /// and keeps the renamed worktree highlighted. Runs synchronously since the
+    /// git operations are fast and local.
+    fn rename_worktree(&mut self, name: String, new_name: String) {
+        match ops::rename_worktree(&self.ctx, &name, &new_name) {
+            Ok(r) => {
+                self.message = Some(format!(
+                    "renamed worktree '{}' to '{}'",
+                    r.old_name, r.new_name
+                ));
+                self.refresh();
+                if let Some(idx) = self
+                    .worktrees
+                    .iter()
+                    .position(|w| w.name == r.new_name)
+                {
+                    self.selected = idx;
+                }
+            }
+            Err(e) => self.set_error(format!("{e:#}")),
         }
     }
 
@@ -1373,7 +1682,7 @@ impl App {
         match ops::status(&self.ctx, &name) {
             Ok((_, files)) => {
                 let marked = vec![true; files.len()];
-                let rows = build_diff_rows(&files);
+                let rows = build_rows(&files, self.file_tree);
                 self.view = View::Diff {
                     name,
                     files,
@@ -1381,9 +1690,14 @@ impl App {
                     rows,
                     selected: 0,
                     content: String::new(),
+                    content_path: None,
+                    load_gen: 0,
+                    pending: None,
+                    loading_new: false,
                     scroll: 0,
                     last_refresh: Instant::now(),
                     confirm_revert: false,
+                    confirm_delete: false,
                     ignore_prompt: None,
                 };
                 self.load_diff_content(true);
@@ -1411,41 +1725,127 @@ impl App {
         };
         let entry = current_file_index(rows, *selected).and_then(|i| files.get(i).cloned());
         let name = name.clone();
-        let content = match entry {
-            Some(e) => {
-                let untracked = e.code.starts_with('?');
-                match ops::file_diff(&self.ctx, &name, &e.path, untracked) {
-                    Ok(c) => c,
-                    Err(err) => format!("error: {err:#}"),
+        // A folder (or empty) row has no diff; clear it synchronously and cancel
+        // any in-flight file load so its late result can't overwrite the blank.
+        let Some(e) = entry else {
+            if let View::Diff {
+                content,
+                content_path,
+                pending,
+                loading_new,
+                scroll,
+                ..
+            } = &mut self.view
+            {
+                content.clear();
+                *content_path = None;
+                *pending = None;
+                *loading_new = false;
+                if reset_scroll {
+                    *scroll = 0;
                 }
             }
-            None => String::new(),
+            return;
         };
+        let path = e.path.clone();
+        let untracked = e.code.starts_with('?');
+        // Bump the generation, decide whether this is a switch to a new file
+        // (so the UI shows a placeholder) or a same-file refresh (keep the diff
+        // on screen to avoid flicker), and reset scroll now if we're switching.
+        let (token, is_new) = if let View::Diff {
+            load_gen,
+            content_path,
+            scroll,
+            ..
+        } = &mut self.view
+        {
+            *load_gen = load_gen.wrapping_add(1);
+            let is_new = content_path.as_deref() != Some(path.as_str());
+            if reset_scroll {
+                *scroll = 0;
+            }
+            (*load_gen, is_new)
+        } else {
+            return;
+        };
+        // Compute the diff off the UI thread; the result is picked up in `tick`
+        // via `poll_diff_load` and applied only if its generation still matches.
+        let (tx, rx) = channel();
+        let ctx = self.ctx.clone();
+        let path_for_thread = path.clone();
+        std::thread::spawn(move || {
+            let content = match ops::file_diff(&ctx, &name, &path_for_thread, untracked) {
+                Ok(c) => c,
+                Err(err) => format!("error: {err:#}"),
+            };
+            let _ = tx.send((token, path_for_thread, content));
+        });
+        if let View::Diff {
+            pending,
+            loading_new,
+            ..
+        } = &mut self.view
+        {
+            *pending = Some(rx);
+            *loading_new = is_new;
+        }
+    }
+
+    /// Applies the newest background diff result to the Diff view, if one has
+    /// arrived and still matches the current generation. Called each tick so a
+    /// diff computed off the UI thread lands without blocking navigation.
+    fn poll_diff_load(&mut self) {
+        let View::Diff {
+            pending, load_gen, ..
+        } = &self.view
+        else {
+            return;
+        };
+        let Some(rx) = pending else {
+            return;
+        };
+        let token = *load_gen;
+        // Drain to the most recent message so a burst of fast navigation doesn't
+        // apply stale intermediate diffs.
+        let mut got = None;
+        while let Ok(msg) = rx.try_recv() {
+            got = Some(msg);
+        }
+        let Some((g, path, content)) = got else {
+            return;
+        };
+        if g != token {
+            return;
+        }
         if let View::Diff {
             content: slot,
+            content_path,
+            pending,
+            loading_new,
             scroll,
             ..
         } = &mut self.view
         {
             *slot = content;
-            if reset_scroll {
-                *scroll = 0;
-            } else {
-                // Keep the reader's place, but don't let a shrunken diff leave
-                // the viewport scrolled past the last line.
-                let max = slot.lines().count().saturating_sub(1) as u16;
-                *scroll = (*scroll).min(max);
-            }
+            *content_path = Some(path);
+            *pending = None;
+            *loading_new = false;
+            // Don't let a shrunken diff leave the viewport past the last line.
+            let max = slot.lines().count().saturating_sub(1) as u16;
+            *scroll = (*scroll).min(max);
         }
     }
 
-    /// Handles mouse input. The scroll wheel moves the diff or log viewport;
-    /// other mouse events are ignored.
+    /// Handles mouse input. The scroll wheel moves the help, diff, or log
+    /// viewport; other mouse events are ignored.
     pub fn on_mouse(&mut self, mouse: MouseEvent) {
         // A left click moves the selection to the clicked row, mirroring the
-        // arrow keys.
+        // arrow keys. The help panel is modal, so a click on the view behind it
+        // must not move that view's cursor.
         if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-            self.on_click(mouse.column, mouse.row);
+            if !self.show_help {
+                self.on_click(mouse.column, mouse.row);
+            }
             return;
         }
         // Scroll three lines per wheel notch, matching Shift+Up/Down.
@@ -1454,8 +1854,24 @@ impl App {
             MouseEventKind::ScrollUp => |s: u16| s.saturating_sub(3),
             _ => return,
         };
+        if self.show_help {
+            self.help_scroll = delta(self.help_scroll);
+            return;
+        }
         match &mut self.view {
-            View::Diff { scroll, .. } | View::Log { scroll, .. } => *scroll = delta(*scroll),
+            View::Diff { scroll, .. } | View::CommitDiff { scroll, .. } => {
+                *scroll = delta(*scroll)
+            }
+            // The log has no free scroll offset any more; the wheel steps the
+            // commit cursor instead, matching the arrow keys.
+            View::Log {
+                lines, selected, ..
+            } => {
+                let forward = delta(1) > 1;
+                if let Some(next) = seek_commit_row(lines, *selected, forward) {
+                    *selected = next;
+                }
+            }
             _ => {}
         }
     }
@@ -1513,6 +1929,7 @@ impl App {
             rows,
             selected,
             confirm_revert,
+            confirm_delete,
             ignore_prompt,
             ..
         } = &mut self.view
@@ -1530,6 +1947,21 @@ impl App {
                     }
                 }
                 KeyCode::Esc | KeyCode::Char('n') => *confirm_revert = false,
+                _ => {}
+            }
+            return;
+        }
+        if *confirm_delete {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    let entry =
+                        current_file_index(rows, *selected).and_then(|i| files.get(i).cloned());
+                    *confirm_delete = false;
+                    if let Some(e) = entry {
+                        self.delete_file(e);
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('n') => *confirm_delete = false,
                 _ => {}
             }
             return;
@@ -1626,8 +2058,22 @@ impl App {
             }
             KeyCode::Char('S') => self.stash_marked(),
             KeyCode::Char('R') => {
+                match current_file_index(rows, *selected).and_then(|i| files.get(i)) {
+                    // A newly added file has no committed version to restore, so
+                    // revert can't do anything; point the user at delete instead.
+                    Some(e) if is_new_file(&e.code) => {
+                        let path = e.path.clone();
+                        self.message = Some(format!(
+                            "'{path}' is new (not yet committed); nothing to revert to. Press d to delete it."
+                        ));
+                    }
+                    Some(_) => *confirm_revert = true,
+                    None => {}
+                }
+            }
+            KeyCode::Char('d') => {
                 if current_file_index(rows, *selected).is_some() {
-                    *confirm_revert = true;
+                    *confirm_delete = true;
                 }
             }
             KeyCode::Char('i') => match rows.get(*selected) {
@@ -1651,10 +2097,36 @@ impl App {
                 }
                 None => {}
             },
-            KeyCode::Char('c') => self.commit_from_diff(),
-            KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Char('t') => self.toggle_file_layout(),
+            KeyCode::Char('c') | KeyCode::Tab => self.commit_from_diff(),
             _ => {}
         }
+    }
+
+    /// Flips the changed-file list between the folder tree and a flat path list,
+    /// rebuilding the rows and keeping the cursor on the same file when possible.
+    fn toggle_file_layout(&mut self) {
+        self.file_tree = !self.file_tree;
+        let tree = self.file_tree;
+        if let View::Diff {
+            files,
+            rows,
+            selected,
+            ..
+        } = &mut self.view
+        {
+            // Remember the file under the cursor so the toggle doesn't jump.
+            let path = current_file_index(rows, *selected).map(|i| files[i].path.clone());
+            *rows = build_rows(files, tree);
+            *selected = path
+                .and_then(|p| {
+                    rows.iter().position(|r| {
+                        matches!(r, DiffRow::File { index, .. } if files[*index].path == p)
+                    })
+                })
+                .unwrap_or(0);
+        }
+        self.load_diff_content(true);
     }
 
     /// Adds `pattern` to the worktree's `.gitignore`, then reloads the view.
@@ -1687,6 +2159,7 @@ impl App {
             return;
         };
         let name = name.clone();
+        let tree = self.file_tree;
         // Remember which file is under the cursor so we can tell whether the
         // refresh lands on the same file (keep scroll) or a different one
         // because the list shifted (reset scroll).
@@ -1724,7 +2197,7 @@ impl App {
                         .iter()
                         .map(|f| old.get(f.path.as_str()).copied().unwrap_or(true))
                         .collect();
-                    *rows = build_diff_rows(&new_files);
+                    *rows = build_rows(&new_files, tree);
                     *files = new_files;
                     *marked = new_marked;
                     *selected = (*selected).min(rows.len().saturating_sub(1));
@@ -1815,6 +2288,21 @@ impl App {
         self.refresh();
     }
 
+    /// Deletes a single file from the diff view, then reloads it.
+    fn delete_file(&mut self, entry: StatusEntry) {
+        let View::Diff { name, .. } = &self.view else {
+            return;
+        };
+        let name = name.clone();
+        let untracked = entry.code.starts_with('?');
+        match ops::delete_file(&self.ctx, &name, &entry.path, untracked) {
+            Ok(_) => self.message = Some(format!("deleted '{}'", entry.path)),
+            Err(e) => self.set_error(format!("{e:#}")),
+        }
+        self.refresh_diff();
+        self.refresh();
+    }
+
     /// Opens the commit dialog from the diff view, carrying the files marked
     /// there as the initial selection.
     fn commit_from_diff(&mut self) {
@@ -1836,7 +2324,7 @@ impl App {
             files: files.clone(),
             marked: marked.clone(),
             cursor: 0,
-            input: String::new(),
+            input: TextInput::default(),
             focus: CommitFocus::Message,
         };
     }
@@ -1972,7 +2460,7 @@ impl App {
             KeyCode::Down => {
                 *base_focus = false;
                 // Navigation is over the filtered checkout list, not `branches`.
-                let filtered = create_filtered(branches, name.as_str());
+                let filtered = filtered_candidates(branches, name.as_str());
                 if *selected < filtered.len() {
                     *selected += 1;
                 }
@@ -1994,7 +2482,7 @@ impl App {
                     // Map the filtered cursor back to the real candidate. A
                     // remote-only branch is created as a local tracking branch
                     // off its remote ref; a local branch is checked out directly.
-                    let filtered = create_filtered(branches, name.as_str());
+                    let filtered = filtered_candidates(branches, name.as_str());
                     let Some(&idx) = filtered.get(*selected - 1) else {
                         return;
                     };
@@ -2222,7 +2710,7 @@ impl App {
                     files,
                     marked,
                     cursor: 0,
-                    input: String::new(),
+                    input: TextInput::default(),
                     focus: CommitFocus::Message,
                 };
             }
@@ -2281,13 +2769,9 @@ impl App {
                 }
                 _ => {}
             },
-            CommitFocus::Message => match key.code {
-                KeyCode::Backspace => {
-                    input.pop();
-                }
-                KeyCode::Char(c) => input.push(c),
-                _ => {}
-            },
+            CommitFocus::Message => {
+                input.on_key(key);
+            }
         }
     }
 
@@ -2304,7 +2788,7 @@ impl App {
         else {
             return;
         };
-        let message = input.trim().to_string();
+        let message = input.trimmed();
         if message.is_empty() {
             self.message = Some("commit message must not be empty".to_string());
             return;
@@ -2386,7 +2870,7 @@ impl App {
                     }
                 }
                 KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
-                KeyCode::Char('s') => *mode = StashMode::Message(String::new()),
+                KeyCode::Char('s') => *mode = StashMode::Message(TextInput::default()),
                 KeyCode::Char('p') => {
                     let name = name.clone();
                     let index = entries.get(*selected).map(|e| e.index);
@@ -2408,15 +2892,13 @@ impl App {
                 KeyCode::Esc => *mode = StashMode::List,
                 KeyCode::Enter => {
                     let name = name.clone();
-                    let msg = buf.trim().to_string();
+                    let msg = buf.trimmed();
                     let msg = if msg.is_empty() { None } else { Some(msg) };
                     self.stash_push(name, msg);
                 }
-                KeyCode::Backspace => {
-                    buf.pop();
+                _ => {
+                    buf.on_key(key);
                 }
-                KeyCode::Char(c) => buf.push(c),
-                _ => {}
             },
             StashMode::ConfirmDrop => match key.code {
                 KeyCode::Enter | KeyCode::Char('y') => {
@@ -2492,7 +2974,8 @@ impl App {
     }
 
     /// Opens the switch-branch picker for the selected worktree: local branches
-    /// not checked out in any worktree (so git will let us switch onto them).
+    /// not checked out in any worktree (so git will let us switch onto them),
+    /// followed by remote-only branches.
     fn open_switch(&mut self) {
         let Some(wt) = self.selected_worktree() else {
             return;
@@ -2505,19 +2988,36 @@ impl App {
             .iter()
             .filter_map(|w| w.branch.clone())
             .collect();
-        let branches: Vec<String> = match crate::git::local_branches(&self.ctx.repo_root) {
-            Ok(all) => all
-                .into_iter()
-                .filter(|b| !checked_out.contains(b))
-                .collect(),
+        let local = match crate::git::local_branches(&self.ctx.repo_root) {
+            Ok(all) => all,
             Err(e) => {
                 self.set_error(format!("{e:#}"));
                 return;
             }
         };
-        if branches.is_empty() {
-            self.message = Some("no other branches available to switch to".to_string());
-            return;
+        let mut branches: Vec<CheckoutCandidate> = local
+            .iter()
+            .filter(|b| !checked_out.contains(b))
+            .map(|b| CheckoutCandidate {
+                branch: b.clone(),
+                remote: None,
+            })
+            .collect();
+        // Remote-only branches (a teammate's work with no local copy) follow the
+        // local ones, so switching onto one creates a local tracking branch.
+        // Remotes are best-effort: a repo without them just yields the local list.
+        if let Ok(remotes) = crate::git::remote_branches(&self.ctx.repo_root) {
+            let mut seen = local;
+            for (short, remote_ref) in remotes {
+                if seen.contains(&short) {
+                    continue;
+                }
+                seen.push(short.clone());
+                branches.push(CheckoutCandidate {
+                    branch: short,
+                    remote: Some(remote_ref),
+                });
+            }
         }
         self.view = View::Switch {
             name,
@@ -2528,8 +3028,9 @@ impl App {
     }
 
     /// Drives the switch-branch picker: type to filter the branch list, move
-    /// the cursor within the filtered results, or switch on Enter. Esc clears
-    /// an active filter first, then closes the view on a second press.
+    /// the cursor within the filtered results, or switch on Enter (with no
+    /// match, on the typed name itself). Esc clears an active filter first,
+    /// then closes the view on a second press.
     fn on_switch_key(&mut self, key: KeyEvent) {
         let View::Switch {
             name,
@@ -2550,39 +3051,51 @@ impl App {
                 }
             }
             KeyCode::Down => {
-                let count = filtered_branches(branches, filter.as_str()).len();
+                let count = filtered_candidates(branches, filter.as_str()).len();
                 if *selected + 1 < count {
                     *selected += 1;
                 }
             }
             KeyCode::Up => *selected = selected.saturating_sub(1),
             KeyCode::Enter => {
-                let branch = filtered_branches(branches, filter.as_str())
-                    .get(*selected)
-                    .map(|b| (*b).to_string());
-                if let Some(branch) = branch {
+                let filtered = filtered_candidates(branches, filter.as_str());
+                // Picking a listed candidate switches onto it. With no match, the
+                // typed name is created as a new local branch if it doesn't exist
+                // anywhere (and otherwise switched onto, e.g. a branch added since
+                // the list was built) — so typing a fresh name makes a branch.
+                let choice = match filtered.get(*selected) {
+                    Some(&idx) => Some((branches[idx].branch.clone(), false)),
+                    None => {
+                        let typed = filter.as_str().trim().to_string();
+                        (!typed.is_empty()).then_some((typed, true))
+                    }
+                };
+                if let Some((branch, create)) = choice {
                     let name = name.clone();
-                    self.request_switch(name, branch);
+                    self.request_switch(name, branch, create);
                 }
             }
             _ => {
                 if filter.on_key(key) {
                     // The filtered set just changed; keep the cursor in bounds
                     // rather than pointing past the new (likely shorter) list.
-                    let count = filtered_branches(branches, filter.as_str()).len();
+                    let count = filtered_candidates(branches, filter.as_str()).len();
                     *selected = (*selected).min(count.saturating_sub(1));
                 }
             }
         }
     }
 
-    /// Switches the worktree named `name` onto `branch` in the background.
-    fn request_switch(&mut self, name: String, branch: String) {
+    /// Switches the worktree named `name` onto `branch` in the background,
+    /// creating `branch` as a new local branch off its HEAD when `create` is set
+    /// and no such branch exists yet.
+    fn request_switch(&mut self, name: String, branch: String, create: bool) {
+        let verb = if create { "creating" } else { "switching to" };
         self.start_busy(
-            format!("switching {name} to {branch}…"),
+            format!("{verb} {branch} in {name}…"),
             BusyThen::List,
             move |ctx| {
-                ops::switch_branch(ctx, &name, &branch)
+                ops::switch_branch(ctx, &name, &branch, create)
                     .map(|r| format!("switched '{}' to '{}'", r.name, r.branch))
                     .map_err(|e| format!("{e:#}"))
             },
@@ -2619,18 +3132,40 @@ impl App {
             match key.code {
                 KeyCode::Esc => self.branch_mode = BranchMode::List,
                 KeyCode::Enter => {
-                    let name = buf.trim().to_string();
+                    let name = buf.trimmed();
                     if name.is_empty() {
                         self.message = Some("branch name must not be empty".to_string());
                         return;
                     }
                     self.branch_create(name);
                 }
-                KeyCode::Backspace => {
-                    buf.pop();
+                _ => {
+                    buf.on_key(key);
                 }
-                KeyCode::Char(c) => buf.push(c),
-                _ => {}
+            }
+            return;
+        }
+        // Text-entry mode owns keystrokes while renaming the selected branch.
+        if let BranchMode::Rename(buf) = &mut self.branch_mode {
+            match key.code {
+                KeyCode::Esc => self.branch_mode = BranchMode::List,
+                KeyCode::Enter => {
+                    let new = buf.trimmed();
+                    if new.is_empty() {
+                        self.message = Some("branch name must not be empty".to_string());
+                        return;
+                    }
+                    if let Some(old) = self
+                        .branches
+                        .get(self.branch_selected)
+                        .map(|b| b.name.clone())
+                    {
+                        self.branch_rename(old, new);
+                    }
+                }
+                _ => {
+                    buf.on_key(key);
+                }
             }
             return;
         }
@@ -2678,7 +3213,16 @@ impl App {
             // `p` then fast-forwards the selected one onto its upstream.
             KeyCode::Char('f') => self.start_fetch(),
             KeyCode::Char('p') => self.start_branch_pull(),
-            KeyCode::Char('n') => self.branch_mode = BranchMode::Create(String::new()),
+            KeyCode::Char('n') => self.branch_mode = BranchMode::Create(TextInput::default()),
+            KeyCode::Char('R') => {
+                if let Some(name) = self
+                    .branches
+                    .get(self.branch_selected)
+                    .map(|b| b.name.clone())
+                {
+                    self.branch_mode = BranchMode::Rename(TextInput::with_value(name));
+                }
+            }
             KeyCode::Char('d') => {
                 if !self.branches.is_empty() {
                     self.branch_mode = BranchMode::ConfirmDelete;
@@ -2702,7 +3246,6 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('?') => self.show_help = true,
             _ => {}
         }
     }
@@ -2789,10 +3332,44 @@ impl App {
                 }
             }
             KeyCode::Enter => self.open_cherry_pick(),
+            KeyCode::Char('v') | KeyCode::Right => self.open_commit_diff_from_branch(),
             KeyCode::Char('t') => self.toggle_log_mode(),
-            KeyCode::Char('?') => self.show_help = true,
             _ => {}
         }
+    }
+
+    /// Opens the read-only commit browser for the commit highlighted in a
+    /// branch's history. The commit is viewed from the main worktree since a
+    /// branch's commits are shared across the repo regardless of checkout.
+    fn open_commit_diff_from_branch(&mut self) {
+        let View::BranchCommits {
+            branch,
+            lines,
+            selected,
+            ..
+        } = &self.view
+        else {
+            return;
+        };
+        let Some(entry) = lines.get(*selected).and_then(|l| l.entry.as_ref()) else {
+            return;
+        };
+        let Some(vantage) = self.worktrees.iter().find(|w| w.is_main) else {
+            self.set_error("no main worktree to view the commit from");
+            return;
+        };
+        let name = vantage.name.clone();
+        let hash = entry.hash.clone();
+        let label = format!(
+            "{} {}",
+            entry.hash.chars().take(9).collect::<String>(),
+            entry.subject
+        );
+        let back = CommitDiffBack::Branch {
+            branch: branch.clone(),
+            selected: *selected,
+        };
+        self.open_commit_diff(name, hash, label, back);
     }
 
     /// Builds the cherry-pick worktree picker from the marked commits (or the
@@ -2998,7 +3575,6 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
             KeyCode::Enter => self.run_merge(),
             KeyCode::Esc | KeyCode::Char('q') => self.view = View::List,
-            KeyCode::Char('?') => self.show_help = true,
             _ => {}
         }
     }
@@ -3036,7 +3612,7 @@ impl App {
                 kind: ops::ResolveKind::Merge,
             },
             move |ctx| {
-                ops::merge(ctx, &tn, &src, false)
+                ops::merge(ctx, &tn, &src, false, false)
                     .map(|outcome| match outcome {
                         ops::MergeOutcome::UpToDate => format!("'{tn}' already up to date"),
                         ops::MergeOutcome::Clean { commit } => {
@@ -3060,7 +3636,38 @@ impl App {
             self.message = Some("the main worktree is already on the default branch".to_string());
             return;
         }
-        let name = wt.name.clone();
+        // A dirty worktree can't be merged into cleanly: git refuses when local
+        // edits overlap the update. Offer to stash those changes, update, then
+        // reapply them (git's --autostash) instead of failing outright.
+        if wt.dirty > 0 {
+            self.view = View::ConfirmUpdateStash {
+                name: wt.name.clone(),
+                dirty: wt.dirty,
+                selected: 0,
+            };
+            return;
+        }
+        self.run_update(wt.name.clone(), false);
+    }
+
+    /// Acts on the dirty-worktree update prompt: stash+update+reapply, update
+    /// without stashing, or cancel.
+    fn apply_update_stash(&mut self) {
+        let View::ConfirmUpdateStash { name, selected, .. } = &self.view else {
+            return;
+        };
+        let name = name.clone();
+        match selected {
+            0 => self.run_update(name, true),
+            1 => self.run_update(name, false),
+            _ => self.view = View::List,
+        }
+    }
+
+    /// Merges the default branch into the worktree named `name` in the
+    /// background. With `autostash`, local changes are stashed first and
+    /// re-applied after the merge (including after resolving any conflicts).
+    fn run_update(&mut self, name: String, autostash: bool) {
         let n = name.clone();
         self.start_busy(
             format!("updating '{name}' from the default branch…"),
@@ -3070,7 +3677,7 @@ impl App {
                 kind: ops::ResolveKind::Merge,
             },
             move |ctx| {
-                ops::update(ctx, &n)
+                ops::update(ctx, &n, autostash)
                     .map(|outcome| match outcome {
                         ops::MergeOutcome::UpToDate => format!("'{n}' already up to date"),
                         ops::MergeOutcome::Clean { commit } => format!("updated '{n}' ({commit})"),
@@ -3220,7 +3827,6 @@ impl App {
                     *confirm_abort = true;
                 }
             }
-            KeyCode::Char('?') => self.show_help = true,
             _ => {}
         }
     }
@@ -3481,6 +4087,18 @@ impl App {
         );
     }
 
+    /// Renames the selected branch, then reloads the Branches tab.
+    fn branch_rename(&mut self, old: String, new: String) {
+        match ops::branch_rename(&self.ctx, &old, &new) {
+            Ok(r) => {
+                self.message = Some(format!("renamed branch '{}' to '{}'", r.old, r.new));
+                self.branch_mode = BranchMode::List;
+                self.load_branches(self.branch_selected);
+            }
+            Err(e) => self.set_error(format!("{e:#}")),
+        }
+    }
+
     /// Deletes a branch. A refused non-force delete keeps the confirm open so
     /// the user can retry with `f` (force). Runs synchronously (a fast local
     /// op) so that retry flow stays intact.
@@ -3525,10 +4143,11 @@ impl App {
         let name = wt.name.clone();
         match self.worktree_log_lines(&name) {
             Ok(lines) => {
+                let selected = first_commit_row(&lines);
                 self.view = View::Log {
                     name,
                     lines,
-                    scroll: 0,
+                    selected,
                 }
             }
             Err(e) => self.set_error(e),
@@ -3546,21 +4165,326 @@ impl App {
     }
 
     fn on_log_key(&mut self, key: KeyEvent) {
-        let View::Log { scroll, .. } = &mut self.view else {
+        let View::Log {
+            lines, selected, ..
+        } = &mut self.view
+        else {
             return;
         };
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.view = View::List,
-            KeyCode::Down | KeyCode::Char('j') => *scroll = scroll.saturating_add(1),
-            KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
-            KeyCode::PageDown => *scroll = scroll.saturating_add(20),
-            KeyCode::PageUp => *scroll = scroll.saturating_sub(20),
-            KeyCode::Home | KeyCode::Char('g') => *scroll = 0,
+            // Move the cursor to the next/previous row that holds a commit,
+            // skipping the art-only connector rows git draws between them.
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(next) = seek_commit_row(lines, *selected, true) {
+                    *selected = next;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(prev) = seek_commit_row(lines, *selected, false) {
+                    *selected = prev;
+                }
+            }
+            KeyCode::Home | KeyCode::Char('g') => *selected = first_commit_row(lines),
+            // Open the commit browser for the commit under the cursor.
+            KeyCode::Enter => self.open_commit_diff_from_log(),
             // Swap between the commit graph and the plain list, reloading in
             // place and returning to the top since the rows no longer line up.
             KeyCode::Char('t') => self.toggle_log_mode(),
-            KeyCode::Char('?') => self.show_help = true,
             _ => {}
+        }
+    }
+
+    /// Opens the read-only commit browser for the commit highlighted in the log.
+    fn open_commit_diff_from_log(&mut self) {
+        let View::Log {
+            name,
+            lines,
+            selected,
+        } = &self.view
+        else {
+            return;
+        };
+        let Some(entry) = lines.get(*selected).and_then(|l| l.entry.as_ref()) else {
+            return;
+        };
+        let name = name.clone();
+        let hash = entry.hash.clone();
+        let label = format!(
+            "{} {}",
+            entry.hash.chars().take(9).collect::<String>(),
+            entry.subject
+        );
+        let back = CommitDiffBack::Log {
+            selected: *selected,
+        };
+        self.open_commit_diff(name, hash, label, back);
+    }
+
+    /// Opens the read-only commit browser for `hash`, loading its changed-file
+    /// list and the first file's diff (off-thread).
+    fn open_commit_diff(
+        &mut self,
+        name: String,
+        hash: String,
+        label: String,
+        back: CommitDiffBack,
+    ) {
+        match ops::commit_files(&self.ctx, &name, &hash) {
+            Ok(files) => {
+                let rows = build_rows(&files, self.file_tree);
+                self.view = View::CommitDiff {
+                    name,
+                    hash,
+                    label,
+                    back,
+                    files,
+                    rows,
+                    selected: 0,
+                    content: String::new(),
+                    content_path: None,
+                    load_gen: 0,
+                    pending: None,
+                    loading_new: false,
+                    scroll: 0,
+                };
+                self.load_commit_diff_content(true);
+            }
+            Err(e) => self.set_error(format!("{e:#}")),
+        }
+    }
+
+    /// Key handling for the read-only commit browser: navigate files, scroll the
+    /// diff, toggle tree/flat, or go back to where it was opened from.
+    fn on_commit_diff_key(&mut self, key: KeyEvent) {
+        let View::CommitDiff {
+            rows, selected, ..
+        } = &mut self.view
+        else {
+            return;
+        };
+        // Scroll the diff pane (same modifiers as the changes view).
+        let shift_down = key.code == KeyCode::Down && key.modifiers.contains(KeyModifiers::SHIFT);
+        let shift_up = key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::SHIFT);
+        if shift_down || key.code == KeyCode::Char('J') {
+            self.scroll_commit_diff(|s| s.saturating_add(3));
+            return;
+        }
+        if shift_up || key.code == KeyCode::Char('K') {
+            self.scroll_commit_diff(|s| s.saturating_sub(3));
+            return;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.close_commit_diff(),
+            KeyCode::Down | KeyCode::Char('j') => {
+                if *selected + 1 < rows.len() {
+                    *selected += 1;
+                    self.load_commit_diff_content(true);
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if *selected > 0 {
+                    *selected -= 1;
+                    self.load_commit_diff_content(true);
+                }
+            }
+            KeyCode::Home | KeyCode::Char('g') => self.scroll_commit_diff(|_| 0),
+            KeyCode::Char('t') => self.toggle_commit_diff_layout(),
+            _ => {}
+        }
+    }
+
+    /// Returns from the commit browser to whichever view opened it.
+    fn close_commit_diff(&mut self) {
+        let View::CommitDiff { name, back, .. } = &self.view else {
+            return;
+        };
+        let name = name.clone();
+        match back {
+            CommitDiffBack::Log { selected } => {
+                let selected = *selected;
+                match self.worktree_log_lines(&name) {
+                    Ok(lines) => {
+                        self.view = View::Log {
+                            name,
+                            selected: selected.min(lines.len().saturating_sub(1)),
+                            lines,
+                        }
+                    }
+                    Err(e) => {
+                        self.set_error(e);
+                        self.view = View::List;
+                    }
+                }
+            }
+            CommitDiffBack::Branch { branch, selected } => {
+                let branch = branch.clone();
+                let selected = *selected;
+                match self.branch_log_lines(&branch) {
+                    Ok(lines) => {
+                        self.view = View::BranchCommits {
+                            branch,
+                            marked: vec![false; lines.len()],
+                            selected: selected.min(lines.len().saturating_sub(1)),
+                            lines,
+                        }
+                    }
+                    Err(e) => {
+                        self.set_error(e);
+                        self.view = View::List;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Flips the commit browser's file list between tree and flat, keeping the
+    /// cursor on the same file, then reloads its diff.
+    fn toggle_commit_diff_layout(&mut self) {
+        self.file_tree = !self.file_tree;
+        let tree = self.file_tree;
+        if let View::CommitDiff {
+            files,
+            rows,
+            selected,
+            ..
+        } = &mut self.view
+        {
+            let path = current_file_index(rows, *selected).map(|i| files[i].path.clone());
+            *rows = build_rows(files, tree);
+            *selected = path
+                .and_then(|p| {
+                    rows.iter().position(|r| {
+                        matches!(r, DiffRow::File { index, .. } if files[*index].path == p)
+                    })
+                })
+                .unwrap_or(0);
+        }
+        self.load_commit_diff_content(true);
+    }
+
+    /// Applies `f` to the commit browser's diff scroll offset.
+    fn scroll_commit_diff(&mut self, f: impl FnOnce(u16) -> u16) {
+        if let View::CommitDiff { scroll, .. } = &mut self.view {
+            *scroll = f(*scroll);
+        }
+    }
+
+    /// Loads the diff for the file under the commit browser's cursor off the UI
+    /// thread, mirroring `load_diff_content`. `reset_scroll` sends the viewport
+    /// to the top when the selected file changes.
+    fn load_commit_diff_content(&mut self, reset_scroll: bool) {
+        let View::CommitDiff {
+            name,
+            hash,
+            rows,
+            files,
+            selected,
+            ..
+        } = &self.view
+        else {
+            return;
+        };
+        let entry = current_file_index(rows, *selected).and_then(|i| files.get(i).cloned());
+        let name = name.clone();
+        let hash = hash.clone();
+        // Folder / empty row: clear synchronously and cancel any in-flight load.
+        let Some(e) = entry else {
+            if let View::CommitDiff {
+                content,
+                content_path,
+                pending,
+                loading_new,
+                scroll,
+                ..
+            } = &mut self.view
+            {
+                content.clear();
+                *content_path = None;
+                *pending = None;
+                *loading_new = false;
+                if reset_scroll {
+                    *scroll = 0;
+                }
+            }
+            return;
+        };
+        let path = e.path.clone();
+        let (token, is_new) = if let View::CommitDiff {
+            load_gen,
+            content_path,
+            scroll,
+            ..
+        } = &mut self.view
+        {
+            *load_gen = load_gen.wrapping_add(1);
+            let is_new = content_path.as_deref() != Some(path.as_str());
+            if reset_scroll {
+                *scroll = 0;
+            }
+            (*load_gen, is_new)
+        } else {
+            return;
+        };
+        let (tx, rx) = channel();
+        let ctx = self.ctx.clone();
+        let path_for_thread = path.clone();
+        std::thread::spawn(move || {
+            let content = match ops::commit_file_diff(&ctx, &name, &hash, &path_for_thread) {
+                Ok(c) => c,
+                Err(err) => format!("error: {err:#}"),
+            };
+            let _ = tx.send((token, path_for_thread, content));
+        });
+        if let View::CommitDiff {
+            pending,
+            loading_new,
+            ..
+        } = &mut self.view
+        {
+            *pending = Some(rx);
+            *loading_new = is_new;
+        }
+    }
+
+    /// Applies the newest background commit-diff result, if it still matches the
+    /// current generation. Mirrors `poll_diff_load` for the commit browser.
+    fn poll_commit_diff_load(&mut self) {
+        let View::CommitDiff {
+            pending, load_gen, ..
+        } = &self.view
+        else {
+            return;
+        };
+        let Some(rx) = pending else {
+            return;
+        };
+        let token = *load_gen;
+        let mut got = None;
+        while let Ok(msg) = rx.try_recv() {
+            got = Some(msg);
+        }
+        let Some((g, path, content)) = got else {
+            return;
+        };
+        if g != token {
+            return;
+        }
+        if let View::CommitDiff {
+            content: slot,
+            content_path,
+            pending,
+            loading_new,
+            scroll,
+            ..
+        } = &mut self.view
+        {
+            *slot = content;
+            *content_path = Some(path);
+            *pending = None;
+            *loading_new = false;
+            let max = slot.lines().count().saturating_sub(1) as u16;
+            *scroll = (*scroll).min(max);
         }
     }
 
@@ -3572,10 +4496,11 @@ impl App {
                 let name = name.clone();
                 match self.worktree_log_lines(&name) {
                     Ok(lines) => {
+                        let selected = first_commit_row(&lines);
                         self.view = View::Log {
                             name,
                             lines,
-                            scroll: 0,
+                            selected,
                         }
                     }
                     Err(e) => self.set_error(e),
@@ -3620,13 +4545,16 @@ impl App {
         self.view = View::Busy { label, rx, then };
     }
 
-    /// Pulls the selected worktree (fast-forward only) in the background.
+    /// Pulls the selected worktree (fast-forward only) in the background. When
+    /// the pull is refused because the branch has diverged, tick() opens the
+    /// `ConfirmPullRebase` prompt instead of showing the error.
     fn start_pull(&mut self) {
         let Some(wt) = self.selected_worktree() else {
             return;
         };
         let name = wt.name.clone();
-        self.start_busy(format!("pulling {name}…"), BusyThen::List, move |ctx| {
+        let then = BusyThen::Pull { name: name.clone() };
+        self.start_busy(format!("pulling {name}…"), then, move |ctx| {
             ops::pull(ctx, &name, false)
                 .map(|r| {
                     if r.already_up_to_date {
@@ -3637,6 +4565,20 @@ impl App {
                 })
                 .map_err(|e| format!("{e:#}"))
         });
+    }
+
+    /// Retries a refused fast-forward pull with a rebase, from the
+    /// `ConfirmPullRebase` prompt.
+    fn start_pull_rebase(&mut self, name: String) {
+        self.start_busy(
+            format!("rebasing {name} onto its upstream…"),
+            BusyThen::List,
+            move |ctx| {
+                ops::pull(ctx, &name, true)
+                    .map(|r| format!("pulled '{}' with rebase", r.name))
+                    .map_err(|e| format!("{e:#}"))
+            },
+        );
     }
 
     /// Pushes the selected worktree (auto-publishing when it has no upstream).
@@ -3945,6 +4887,32 @@ mod tests {
         app.on_key(KeyEvent::new(code, KeyModifiers::SHIFT));
     }
 
+    /// Waits out an in-flight background diff load (item 1 made file diffs
+    /// async), so tests can assert on `content` right after navigating.
+    fn settle_diff(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while matches!(app.view, View::Diff { pending: Some(_), .. }) {
+            app.poll_diff_load();
+            assert!(std::time::Instant::now() < deadline, "diff load timed out");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// Branch names the switch picker currently offers under its filter, in
+    /// display order. Panics unless the picker is open.
+    fn switch_matches(app: &App) -> Vec<String> {
+        let View::Switch {
+            branches, filter, ..
+        } = &app.view
+        else {
+            panic!("expected the switch picker");
+        };
+        filtered_candidates(branches, filter.as_str())
+            .into_iter()
+            .map(|i| branches[i].branch.clone())
+            .collect()
+    }
+
     fn scroll_wheel(app: &mut App, kind: MouseEventKind) {
         app.on_mouse(MouseEvent {
             kind,
@@ -3981,6 +4949,7 @@ mod tests {
                     if let Some(i) = current_file_index(rows, *selected)
                         && files[i].path == path
                     {
+                        settle_diff(app);
                         return;
                     }
                     assert!(*selected + 1 < rows.len(), "{path} not in the diff list");
@@ -4014,6 +4983,16 @@ mod tests {
     }
 
     #[test]
+    fn is_new_file_flags_untracked_and_added_codes() {
+        assert!(is_new_file("??"));
+        assert!(is_new_file("A "));
+        assert!(is_new_file("AM"));
+        assert!(!is_new_file(" M"));
+        assert!(!is_new_file("M "));
+        assert!(!is_new_file(" D"));
+    }
+
+    #[test]
     fn lists_main_worktree_on_startup() {
         let (_tmp, app) = test_app();
         assert_eq!(app.worktrees.len(), 1);
@@ -4025,12 +5004,108 @@ mod tests {
         let (_tmp, mut app) = test_app();
         press(&mut app, KeyCode::Char('?'));
         assert!(app.show_help);
-        // Any key closes the overlay, returning to the underlying view.
+        // Help opens on the page for the view underneath, not a fixed one.
+        assert_eq!(app.help_tab, HelpTab::Worktrees);
+        // Any key the panel doesn't use closes it, returning to that view.
         press(&mut app, KeyCode::Char('x'));
         assert!(!app.show_help);
         assert!(matches!(app.view, View::List));
         press(&mut app, KeyCode::Char('q'));
         assert!(app.quit);
+    }
+
+    #[test]
+    fn help_opens_on_the_tab_for_the_active_view() {
+        let (_tmp, mut app) = test_app();
+        // The Branches tab of the list gets the Branches page.
+        app.tab = Tab::Branches;
+        press(&mut app, KeyCode::Char('?'));
+        assert_eq!(app.help_tab, HelpTab::Branches);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.show_help);
+        // Views with no page of their own land on Basics.
+        app.tab = Tab::Worktrees;
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::F(1));
+        assert!(app.show_help);
+        assert_eq!(app.help_tab, HelpTab::Basics);
+    }
+
+    #[test]
+    fn help_tabs_cycle_and_reset_scroll() {
+        let (_tmp, mut app) = test_app();
+        press(&mut app, KeyCode::Char('?'));
+        assert_eq!(app.help_tab, HelpTab::Worktrees);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.help_scroll, 1);
+        // Switching tabs starts the new page from the top.
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.help_tab, HelpTab::Branches);
+        assert_eq!(app.help_scroll, 0);
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.help_tab, HelpTab::Worktrees);
+        // Scrolling up off the top saturates rather than wrapping around.
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.help_scroll, 0);
+        assert!(app.show_help);
+    }
+
+    /// The regression this panel exists for: the old fixed 58-row popup ran off
+    /// the bottom of a short terminal and silently dropped its last sections.
+    /// Every tab must now fit and stay scrollable at 80x24.
+    #[test]
+    fn help_fits_and_scrolls_on_a_short_terminal() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (_tmp, mut app) = test_app();
+        press(&mut app, KeyCode::Char('?'));
+        for _ in 0..HelpTab::ALL.len() {
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal
+                .draw(|frame| super::super::ui::draw(frame, &mut app))
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            let rows: Vec<String> = (0..24)
+                .map(|y| (0..80).map(|x| buf[(x, y)].symbol()).collect())
+                .collect();
+            let screen = rows.join("\n");
+            assert!(
+                screen.contains(app.help_tab.title()),
+                "{} not drawn:\n{screen}",
+                app.help_tab.title()
+            );
+            // Scrolling to the bottom must reach the last line of the page.
+            for _ in 0..40 {
+                press(&mut app, KeyCode::Down);
+            }
+            press(&mut app, KeyCode::Tab);
+        }
+        // Six tabs later we are back where we started, still in help.
+        assert!(app.show_help);
+        assert_eq!(app.help_tab, HelpTab::Worktrees);
+    }
+
+    #[test]
+    fn f1_opens_help_where_question_mark_is_a_literal() {
+        let (_tmp, mut app) = test_app();
+        press(&mut app, KeyCode::Char('n'));
+        // The create dialog's name field must receive '?' as text.
+        type_str(&mut app, "fix/what?");
+        assert!(!app.show_help);
+        let View::Create { name, .. } = &app.view else {
+            panic!("expected the create dialog");
+        };
+        assert_eq!(name.value, "fix/what?");
+        // F1 is the way into help from a view that is taking input.
+        press(&mut app, KeyCode::F(1));
+        assert!(app.show_help);
+        // Closing help leaves the typed name untouched.
+        press(&mut app, KeyCode::Esc);
+        let View::Create { name, .. } = &app.view else {
+            panic!("expected the create dialog");
+        };
+        assert_eq!(name.value, "fix/what?");
     }
 
     #[test]
@@ -4181,18 +5256,13 @@ mod tests {
     }
 
     #[test]
-    fn switch_with_no_other_branches_reports_message() {
+    fn switch_with_no_other_branches_still_opens_the_picker() {
         let (_tmp, mut app) = test_app();
-        // Only the main branch exists and it is checked out, so there is nothing
-        // to switch onto: the picker doesn't open and a message explains why.
+        // Only the main branch exists and it is checked out, so the list is
+        // empty. The picker still opens: a branch can be typed in by hand.
         press(&mut app, KeyCode::Char('b'));
-        assert!(matches!(app.view, View::List));
-        assert!(
-            app.message
-                .as_deref()
-                .unwrap()
-                .contains("no other branches")
-        );
+        assert!(matches!(app.view, View::Switch { .. }));
+        assert!(switch_matches(&app).is_empty());
     }
 
     #[test]
@@ -4201,6 +5271,42 @@ mod tests {
         press(&mut app, KeyCode::Char('d'));
         assert!(matches!(app.view, View::List));
         assert!(app.message.as_deref().unwrap().contains("main worktree"));
+    }
+
+    #[test]
+    fn reverting_a_new_file_reports_it_cannot_be_reverted() {
+        let (_tmp, mut app) = test_app();
+        press(&mut app, KeyCode::Enter);
+        // The only change is the untracked `.wtm.toml`, so the cursor sits on a
+        // brand-new file. Revert has nothing to restore to.
+        press(&mut app, KeyCode::Char('R'));
+        match &app.view {
+            View::Diff { confirm_revert, .. } => {
+                assert!(!confirm_revert, "revert must not prompt for a new file")
+            }
+            _ => panic!("expected diff view"),
+        }
+        let msg = app.message.as_deref().unwrap();
+        assert!(msg.contains("new") && msg.contains("delete"), "got: {msg}");
+    }
+
+    #[test]
+    fn deleting_a_file_from_the_diff_view_removes_it() {
+        let (_tmp, mut app) = test_app();
+        press(&mut app, KeyCode::Enter);
+        // 'd' asks to confirm; 'y' deletes the highlighted file.
+        press(&mut app, KeyCode::Char('d'));
+        match &app.view {
+            View::Diff { confirm_delete, .. } => assert!(confirm_delete),
+            _ => panic!("expected diff view"),
+        }
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.message.as_deref().unwrap().contains("deleted"));
+        // After deleting the sole change, the diff view has no files left.
+        match &app.view {
+            View::Diff { files, .. } => assert!(files.is_empty()),
+            _ => panic!("expected diff view"),
+        }
     }
 
     #[test]
@@ -4435,6 +5541,7 @@ mod tests {
 
         // Click the second row (y = inner.y + 1).
         click(&mut app, 1, 3);
+        settle_diff(&mut app);
         match &app.view {
             View::Diff {
                 selected,
@@ -4966,6 +6073,34 @@ mod tests {
         assert!(out.status.success(), "git {args:?} failed");
     }
 
+    /// Simulates a teammate's fetched branch: `<remote>/<branch>` pointing at
+    /// HEAD, with no local branch of its own. The remote is registered (but
+    /// never fetched from), since git only treats the ref as a remote-tracking
+    /// branch when its remote is configured.
+    fn make_remote_ref(root: &Path, remote: &str, branch: &str) {
+        git(
+            root,
+            &["remote", "add", remote, "https://example.invalid/repo.git"],
+        );
+        let sha = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(root)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        git(
+            root,
+            &[
+                "update-ref",
+                &format!("refs/remotes/{remote}/{branch}"),
+                sha.trim(),
+            ],
+        );
+    }
+
     /// Writes an untracked file into the main worktree so it reads as dirty.
     fn dirty_main(app: &mut App) {
         std::fs::write(app.ctx.repo_root.join("scratch.txt"), "work\n").unwrap();
@@ -4987,6 +6122,25 @@ mod tests {
         assert!(app.message.as_deref().unwrap().starts_with("committed"));
         app.refresh();
         assert_eq!(app.worktrees[0].dirty, 0, "worktree should be clean now");
+    }
+
+    /// Item 7: the commit message field supports mid-string editing with the
+    /// arrow keys, not just append/backspace at the end.
+    #[test]
+    fn commit_message_supports_cursor_editing() {
+        let (_tmp, mut app) = test_app();
+        dirty_main(&mut app);
+        press(&mut app, KeyCode::Char('c'));
+        type_str(&mut app, "fix bug");
+        // Move the cursor back over "bug" and insert a word before it.
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Left);
+        }
+        type_str(&mut app, "the ");
+        match &app.view {
+            View::Commit { input, .. } => assert_eq!(input.as_str(), "fix the bug"),
+            _ => panic!("expected the commit dialog"),
+        }
     }
 
     #[test]
@@ -5389,7 +6543,7 @@ mod tests {
         // the new-branch row (0) still offers to create "alp".
         type_str(&mut app, "alp");
         let filtered = match &app.view {
-            View::Create { branches, name, .. } => create_filtered(branches, name.as_str()),
+            View::Create { branches, name, .. } => filtered_candidates(branches, name.as_str()),
             _ => panic!("expected create dialog"),
         };
         let names: Vec<String> = match &app.view {
@@ -5413,7 +6567,7 @@ mod tests {
                 selected,
                 ..
             } => {
-                let f = create_filtered(branches, name.as_str());
+                let f = filtered_candidates(branches, name.as_str());
                 branches[f[*selected - 1]].branch.clone()
             }
             _ => panic!("expected create dialog"),
@@ -5508,6 +6662,76 @@ mod tests {
         );
     }
 
+    /// Item 6: updating a worktree that has uncommitted changes prompts before
+    /// merging; choosing "stash, update, reapply" keeps the local edit.
+    #[test]
+    fn update_on_dirty_worktree_offers_to_stash_and_reapplies() {
+        let (_tmp, mut app) = test_app();
+        add_and_select_worktree(&mut app, "feature");
+        let feat_path = app
+            .worktrees
+            .iter()
+            .find(|w| w.name == "feature")
+            .unwrap()
+            .path
+            .clone();
+        // Advance main so an update has something to merge.
+        std::fs::write(app.ctx.repo_root.join("newfile.txt"), "x\n").unwrap();
+        git(&app.ctx.repo_root, &["add", "."]);
+        git(&app.ctx.repo_root, &["commit", "-m", "new on main"]);
+        // Leave an uncommitted change in the worktree.
+        std::fs::write(std::path::Path::new(&feat_path).join("wip.txt"), "wip\n").unwrap();
+        app.refresh();
+        app.selected = app
+            .worktrees
+            .iter()
+            .position(|w| w.name == "feature")
+            .unwrap();
+
+        // `u` now asks how to handle the dirty tree instead of updating blindly.
+        press(&mut app, KeyCode::Char('u'));
+        assert!(matches!(app.view, View::ConfirmUpdateStash { .. }));
+        // Default choice (0) is stash+update+reapply.
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        assert!(matches!(app.view, View::List));
+        let dir = std::path::Path::new(&feat_path);
+        assert!(dir.join("newfile.txt").exists(), "mainline change merged");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("wip.txt")).unwrap(),
+            "wip\n",
+            "local edit reapplied after update"
+        );
+    }
+
+    #[test]
+    fn flat_rows_drop_folder_grouping() {
+        let files = vec![
+            StatusEntry {
+                code: " M".to_string(),
+                path: "src/app.rs".to_string(),
+            },
+            StatusEntry {
+                code: " M".to_string(),
+                path: "README.md".to_string(),
+            },
+        ];
+        // The tree groups the src/ file under a folder row; the flat list has
+        // only file rows, each labelled by its full path.
+        let tree = build_rows(&files, true);
+        assert!(tree.iter().any(|r| matches!(r, DiffRow::Folder { .. })));
+        let flat = build_rows(&files, false);
+        assert!(flat.iter().all(|r| matches!(r, DiffRow::File { .. })));
+        let labels: Vec<&str> = flat
+            .iter()
+            .filter_map(|r| match r {
+                DiffRow::File { label, .. } => Some(label.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels, vec!["README.md", "src/app.rs"]);
+    }
+
     #[test]
     fn switch_picker_lists_available_branches_and_switches() {
         let (_tmp, mut app) = test_app();
@@ -5519,9 +6743,13 @@ mod tests {
         press(&mut app, KeyCode::Char('b'));
         match &app.view {
             View::Switch { branches, .. } => {
-                assert!(branches.iter().any(|b| b == "spare"));
+                assert!(branches.iter().any(|b| b.branch == "spare"));
                 // The worktree's own current branch is not offered.
-                assert!(!branches.iter().any(|b| b == "main" || b == "master"));
+                assert!(
+                    !branches
+                        .iter()
+                        .any(|b| b.branch == "main" || b.branch == "master")
+                );
             }
             _ => panic!("expected the switch picker"),
         }
@@ -5530,7 +6758,7 @@ mod tests {
             branches, selected, ..
         } = &mut app.view
         {
-            *selected = branches.iter().position(|b| b == "spare").unwrap();
+            *selected = branches.iter().position(|b| b.branch == "spare").unwrap();
         }
         press(&mut app, KeyCode::Enter);
         settle(&mut app);
@@ -5556,37 +6784,91 @@ mod tests {
         }
         // Typing narrows the filtered set (case-insensitive substring match).
         type_str(&mut app, "FEATURE");
-        match &app.view {
-            View::Switch {
-                branches, filter, ..
-            } => {
-                assert_eq!(
-                    filtered_branches(branches, filter.as_str()),
-                    vec!["feature-auth", "feature-billing"]
-                );
-            }
-            _ => panic!("expected the switch picker"),
-        }
+        assert_eq!(switch_matches(&app), vec!["feature-auth", "feature-billing"]);
         // Narrowing further to a single match, Enter switches to that match
         // (not to an index into the full, unfiltered branch list).
         type_str(&mut app, "-billing");
-        match &app.view {
-            View::Switch {
-                branches, filter, ..
-            } => {
-                assert_eq!(
-                    filtered_branches(branches, filter.as_str()),
-                    vec!["feature-billing"]
-                );
-            }
-            _ => panic!("expected the switch picker"),
-        }
+        assert_eq!(switch_matches(&app), vec!["feature-billing"]);
         press(&mut app, KeyCode::Enter);
         settle(&mut app);
         assert!(
             app.worktrees
                 .iter()
                 .any(|w| w.branch.as_deref() == Some("feature-billing"))
+        );
+    }
+
+    #[test]
+    fn switch_picker_lists_remote_only_branches_and_checks_them_out() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        make_remote_ref(&root, "origin", "teammate");
+        app.refresh();
+        app.selected = 0;
+
+        press(&mut app, KeyCode::Char('b'));
+        match &app.view {
+            View::Switch { branches, .. } => {
+                let c = branches
+                    .iter()
+                    .find(|c| c.branch == "teammate")
+                    .expect("remote-only branch is offered to switch onto");
+                assert_eq!(c.remote.as_deref(), Some("origin/teammate"));
+            }
+            _ => panic!("expected the switch picker"),
+        }
+        // Switching onto it creates the local branch that tracks the remote.
+        type_str(&mut app, "teammate");
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        assert!(crate::git::branch_exists(&root, "teammate"));
+        assert!(
+            app.worktrees
+                .iter()
+                .any(|w| w.branch.as_deref() == Some("teammate"))
+        );
+    }
+
+    #[test]
+    fn switch_enter_with_no_match_tries_the_typed_branch() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        app.refresh();
+        app.selected = 0;
+        press(&mut app, KeyCode::Char('b'));
+
+        // A branch created outside the app is absent from the picker's list, but
+        // typing its name and hitting Enter still switches onto it.
+        git(&root, &["branch", "late"]);
+        type_str(&mut app, "late");
+        assert!(switch_matches(&app).is_empty());
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        assert!(
+            app.worktrees
+                .iter()
+                .any(|w| w.branch.as_deref() == Some("late"))
+        );
+    }
+
+    #[test]
+    fn switch_enter_with_unknown_typed_branch_creates_it() {
+        let (_tmp, mut app) = test_app();
+        app.refresh();
+        app.selected = 0;
+        press(&mut app, KeyCode::Char('b'));
+        // Typing a name that matches no existing branch and hitting Enter creates
+        // a new branch of that name and switches the worktree onto it.
+        type_str(&mut app, "brand-new");
+        assert!(switch_matches(&app).is_empty());
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        assert_eq!(app.error, None, "creating a new branch should not error");
+        assert!(
+            app.worktrees
+                .iter()
+                .any(|w| w.branch.as_deref() == Some("brand-new")),
+            "the worktree switched onto the newly created branch"
         );
     }
 
@@ -5636,22 +6918,93 @@ mod tests {
     }
 
     #[test]
-    fn log_overlay_opens_and_scrolls() {
+    fn log_overlay_opens_with_a_commit_cursor() {
         let (_tmp, mut app) = test_app();
         app.selected = 0;
         press(&mut app, KeyCode::Char('l'));
         match &app.view {
-            View::Log { lines, .. } => assert!(!lines.is_empty()),
-            _ => panic!("expected log overlay"),
-        }
-        press(&mut app, KeyCode::Char('j'));
-        press(&mut app, KeyCode::PageDown);
-        match &app.view {
-            View::Log { scroll, .. } => assert_eq!(*scroll, 21),
+            View::Log {
+                lines, selected, ..
+            } => {
+                assert!(!lines.is_empty());
+                // The cursor lands on a real commit, not an art-only row.
+                assert!(lines[*selected].entry.is_some());
+            }
             _ => panic!("expected log overlay"),
         }
         press(&mut app, KeyCode::Esc);
         assert!(matches!(app.view, View::List));
+    }
+
+    /// Item 4: the commit browser renders the changed file and its diff.
+    #[test]
+    fn commit_browser_renders_files_and_diff() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("greet.txt"), "howdy\n").unwrap();
+        git(&root, &["add", "greet.txt"]);
+        git(&root, &["commit", "-m", "add greet"]);
+        app.refresh();
+        app.selected = 0;
+        press(&mut app, KeyCode::Char('l'));
+        press(&mut app, KeyCode::Enter);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while matches!(app.view, View::CommitDiff { pending: Some(_), .. }) {
+            app.poll_commit_diff_load();
+            assert!(std::time::Instant::now() < deadline, "diff load timed out");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|frame| super::super::ui::draw(frame, &mut app))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let screen: String = (0..24)
+            .map(|y| {
+                (0..100)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(screen.contains("greet.txt"), "file listed:\n{screen}");
+        assert!(screen.contains("howdy"), "diff shown:\n{screen}");
+    }
+
+    /// Item 4: from the log, Enter opens a read-only browser of the commit's
+    /// changed files, and the selected file's diff loads (off-thread).
+    #[test]
+    fn log_enter_browses_a_commits_files() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("hello.txt"), "hi\n").unwrap();
+        git(&root, &["add", "hello.txt"]);
+        git(&root, &["commit", "-m", "add hello"]);
+        app.refresh();
+        app.selected = 0;
+        press(&mut app, KeyCode::Char('l'));
+        // The newest commit is at the top, under the cursor.
+        press(&mut app, KeyCode::Enter);
+        // Settle the async diff load.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while matches!(app.view, View::CommitDiff { pending: Some(_), .. }) {
+            app.poll_commit_diff_load();
+            assert!(std::time::Instant::now() < deadline, "diff load timed out");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        match &app.view {
+            View::CommitDiff { files, content, .. } => {
+                assert!(files.iter().any(|f| f.path == "hello.txt"), "{files:?}");
+                assert!(content.contains("hi"), "diff shows the added line: {content}");
+            }
+            _ => panic!("expected the commit browser"),
+        }
+        // Esc returns to the log.
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.view, View::Log { .. }));
     }
 
     /// End-to-end: a real merge in a real repo must come out of git, through the
@@ -6052,6 +7405,62 @@ mod tests {
         press(&mut app, KeyCode::Char('f'));
         assert!(matches!(app.view, View::List));
         assert!(!crate::git::branch_exists(&app.ctx.repo_root, "feature"));
+    }
+
+    /// A pull refused because the branch diverged opens the rebase prompt
+    /// instead of the error box, and confirming retries the pull with a
+    /// rebase.
+    #[test]
+    fn diverged_pull_prompts_to_rebase_and_retries() {
+        let (tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        // Wire the repo to a bare origin, then diverge: one commit reaches the
+        // remote from an independent clone, a different one lands locally.
+        let bare = tmp.path().join("origin.git");
+        git(
+            tmp.path(),
+            &["init", "--bare", "-b", "main", bare.to_str().unwrap()],
+        );
+        git(&root, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git(&root, &["push", "-u", "origin", "main"]);
+        let clone = tmp.path().join("clone");
+        git(
+            tmp.path(),
+            &["clone", bare.to_str().unwrap(), clone.to_str().unwrap()],
+        );
+        git(&clone, &["config", "user.email", "t@e.st"]);
+        git(&clone, &["config", "user.name", "t"]);
+        git(&clone, &["commit", "--allow-empty", "-m", "remote-work"]);
+        git(&clone, &["push", "origin", "main"]);
+        git(&root, &["commit", "--allow-empty", "-m", "local-work"]);
+
+        press(&mut app, KeyCode::Char('p'));
+        settle(&mut app);
+        match &app.view {
+            View::ConfirmPullRebase { name } => assert_eq!(name, "main"),
+            _ => panic!("expected the rebase prompt after a diverged pull"),
+        }
+        assert_eq!(app.error, None, "the raw git error should be suppressed");
+
+        // Confirming retries with a rebase: local work ends up on top.
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        assert!(matches!(app.view, View::List));
+        assert_eq!(app.error, None);
+        assert_eq!(app.message.as_deref(), Some("pulled 'main' with rebase"));
+        let subject = crate::git::run(&root, &["log", "-1", "--format=%s"]).unwrap();
+        assert_eq!(subject, "local-work");
+    }
+
+    /// Esc on the rebase prompt backs out without touching the branch.
+    #[test]
+    fn diverged_pull_prompt_can_be_dismissed() {
+        let (_tmp, mut app) = test_app();
+        app.view = View::ConfirmPullRebase {
+            name: "main".into(),
+        };
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.view, View::List));
     }
 
     #[test]
