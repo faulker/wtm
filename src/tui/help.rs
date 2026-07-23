@@ -214,6 +214,7 @@ pub const BRANCHES: &[Binding] = &[
 pub const DIFF: &[Binding] = &[
     help_only("↑/↓ or j/k", "move the file cursor"),
     help_only("⇧↑/⇧↓", "scroll the diff (or mouse wheel)"),
+    help_only("←/→ or h/l", "collapse/expand the folder (Enter toggles)"),
     both("Space", "mark", "mark a file (or folder) for commit"),
     help_only("a", "mark or unmark every file"),
     both("c", "commit", "commit the marked files"),
@@ -276,6 +277,7 @@ pub const BRANCH_COMMITS: &[Binding] = &[
 pub const COMMIT_DIFF: &[Binding] = &[
     both("↑/↓ or j/k", "file", "move between the commit's changed files"),
     help_only("⇧↑/⇧↓", "scroll the diff (or mouse wheel)"),
+    help_only("←/→ or h/l", "collapse/expand the folder (Enter toggles)"),
     both("t", "tree/flat", "toggle folder tree vs. flat file list"),
     both("?", "help", "show this help"),
     both("q", "back", "back to the commit list"),

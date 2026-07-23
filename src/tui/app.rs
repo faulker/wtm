@@ -1,5 +1,6 @@
 //! TUI application state and key handling.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
@@ -741,6 +742,9 @@ pub enum DiffRow {
         prefix: String,
         label: String,
         depth: usize,
+        /// True when the folder is collapsed: its files and subfolders are
+        /// omitted from `rows` and the renderer shows a closed arrow.
+        collapsed: bool,
     },
     /// A changed file; `index` points into the Diff view's `files`/`marked`.
     File {
@@ -752,8 +756,9 @@ pub enum DiffRow {
 
 /// Builds the folder-tree rows for the changed-file list. Files are sorted by
 /// path so the tree reads top-down, and each folder row is emitted once, just
-/// before the first file it contains.
-pub fn build_diff_rows(files: &[StatusEntry]) -> Vec<DiffRow> {
+/// before the first file it contains. Folders whose prefix is in `collapsed`
+/// are emitted as a single collapsed row with everything beneath them hidden.
+pub fn build_diff_rows(files: &[StatusEntry], collapsed: &HashSet<String>) -> Vec<DiffRow> {
     let mut order: Vec<usize> = (0..files.len()).collect();
     order.sort_by(|&a, &b| files[a].path.cmp(&files[b].path));
     let mut rows = Vec::new();
@@ -770,19 +775,32 @@ pub fn build_diff_rows(files: &[StatusEntry]) -> Vec<DiffRow> {
             common += 1;
         }
         stack.truncate(common);
+        // True once any folder on the stack is collapsed: everything deeper
+        // (subfolders and files) stays hidden until the stack pops above it.
+        let mut hidden = (1..=stack.len())
+            .any(|k| collapsed.contains(&format!("{}/", stack[..k].join("/"))));
         for d in &dirs[common..] {
             stack.push((*d).to_string());
+            if hidden {
+                continue;
+            }
+            let prefix = format!("{}/", stack.join("/"));
+            let is_collapsed = collapsed.contains(&prefix);
             rows.push(DiffRow::Folder {
-                prefix: format!("{}/", stack.join("/")),
+                prefix,
                 label: (*d).to_string(),
                 depth: stack.len() - 1,
+                collapsed: is_collapsed,
+            });
+            hidden = is_collapsed;
+        }
+        if !hidden {
+            rows.push(DiffRow::File {
+                index: idx,
+                label: parts[parts.len() - 1].to_string(),
+                depth: dirs.len(),
             });
         }
-        rows.push(DiffRow::File {
-            index: idx,
-            label: parts[parts.len() - 1].to_string(),
-            depth: dirs.len(),
-        });
     }
     rows
 }
@@ -803,9 +821,9 @@ pub fn build_flat_rows(files: &[StatusEntry]) -> Vec<DiffRow> {
 }
 
 /// Builds the changed-file rows in tree or flat layout per `tree`.
-pub fn build_rows(files: &[StatusEntry], tree: bool) -> Vec<DiffRow> {
+pub fn build_rows(files: &[StatusEntry], tree: bool, collapsed: &HashSet<String>) -> Vec<DiffRow> {
     if tree {
-        build_diff_rows(files)
+        build_diff_rows(files, collapsed)
     } else {
         build_flat_rows(files)
     }
@@ -943,6 +961,10 @@ pub struct App {
     /// list every file by its full path (`false`). Shared by the changes view
     /// and the commit browser; toggled with `t`.
     pub file_tree: bool,
+    /// Folder prefixes (e.g. `src/tui/`) currently collapsed in the changed-
+    /// file trees. Shared by the changes view and the commit browser so a
+    /// collapse survives refreshes and view switches.
+    pub collapsed_folders: HashSet<String>,
     /// When the list last reloaded itself (by timer or by `r`), used to pace
     /// `auto_refresh`.
     last_auto_refresh: Instant,
@@ -992,6 +1014,7 @@ impl App {
             tick_count: 0,
             log_mode: LogMode::Tree,
             file_tree: true,
+            collapsed_folders: HashSet::new(),
             last_auto_refresh: Instant::now(),
             show_help: false,
             help_tab: HelpTab::Basics,
@@ -1682,7 +1705,7 @@ impl App {
         match ops::status(&self.ctx, &name) {
             Ok((_, files)) => {
                 let marked = vec![true; files.len()];
-                let rows = build_rows(&files, self.file_tree);
+                let rows = build_rows(&files, self.file_tree, &self.collapsed_folders);
                 self.view = View::Diff {
                     name,
                     files,
@@ -1837,7 +1860,10 @@ impl App {
     }
 
     /// Handles mouse input. The scroll wheel moves the help, diff, or log
-    /// viewport; other mouse events are ignored.
+    /// viewport; other mouse events are ignored. In the changes view and the
+    /// commit browser the wheel is panel-aware: over the changed-file list it
+    /// moves the file cursor like the arrow keys, elsewhere it scrolls the
+    /// diff text.
     pub fn on_mouse(&mut self, mouse: MouseEvent) {
         // A left click moves the selection to the clicked row, mirroring the
         // arrow keys. The help panel is modal, so a click on the view behind it
@@ -1848,17 +1874,54 @@ impl App {
             }
             return;
         }
-        // Scroll three lines per wheel notch, matching Shift+Up/Down.
-        let delta = match mouse.kind {
-            MouseEventKind::ScrollDown => |s: u16| s.saturating_add(3),
-            MouseEventKind::ScrollUp => |s: u16| s.saturating_sub(3),
+        let down = match mouse.kind {
+            MouseEventKind::ScrollDown => true,
+            MouseEventKind::ScrollUp => false,
             _ => return,
+        };
+        // Scroll three lines per wheel notch, matching Shift+Up/Down.
+        let delta = |s: u16| {
+            if down {
+                s.saturating_add(3)
+            } else {
+                s.saturating_sub(3)
+            }
         };
         if self.show_help {
             self.help_scroll = delta(self.help_scroll);
             return;
         }
+        // Whether the pointer sits over the active view's row list (the
+        // changed-file panel in the diff views), per the geometry the renderer
+        // recorded last frame.
+        let over_list = self.row_list.is_some_and(|rl| {
+            mouse.column >= rl.inner.x
+                && mouse.column < rl.inner.x + rl.inner.width
+                && mouse.row >= rl.inner.y
+                && mouse.row < rl.inner.y + rl.inner.height
+        });
         match &mut self.view {
+            // Over the file list: one file-cursor step per wheel notch.
+            View::Diff { rows, selected, .. } if over_list => {
+                let moved = if down {
+                    (*selected + 1 < rows.len()).then(|| *selected += 1)
+                } else {
+                    (*selected > 0).then(|| *selected -= 1)
+                };
+                if moved.is_some() {
+                    self.load_diff_content(true);
+                }
+            }
+            View::CommitDiff { rows, selected, .. } if over_list => {
+                let moved = if down {
+                    (*selected + 1 < rows.len()).then(|| *selected += 1)
+                } else {
+                    (*selected > 0).then(|| *selected -= 1)
+                };
+                if moved.is_some() {
+                    self.load_commit_diff_content(true);
+                }
+            }
             View::Diff { scroll, .. } | View::CommitDiff { scroll, .. } => {
                 *scroll = delta(*scroll)
             }
@@ -1867,8 +1930,7 @@ impl App {
             View::Log {
                 lines, selected, ..
             } => {
-                let forward = delta(1) > 1;
-                if let Some(next) = seek_commit_row(lines, *selected, forward) {
+                if let Some(next) = seek_commit_row(lines, *selected, down) {
                     *selected = next;
                 }
             }
@@ -1904,6 +1966,15 @@ impl App {
                     *selected = idx;
                 }
                 self.load_diff_content(true);
+            }
+            View::CommitDiff { .. } => {
+                if let View::CommitDiff { selected, rows, .. } = &mut self.view {
+                    if idx >= rows.len() || *selected == idx {
+                        return;
+                    }
+                    *selected = idx;
+                }
+                self.load_commit_diff_content(true);
             }
             View::Commit { .. } => {
                 if let View::Commit {
@@ -2017,6 +2088,15 @@ impl App {
                 }
             }
             KeyCode::Home | KeyCode::Char('g') => self.scroll_diff(|_| 0),
+            KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
+                self.tree_nav(key.code)
+            }
+            KeyCode::Enter => {
+                // Enter toggles a folder; on a file row it does nothing.
+                if matches!(rows.get(*selected), Some(DiffRow::Folder { .. })) {
+                    self.tree_nav(key.code);
+                }
+            }
             KeyCode::Char(' ') => match rows.get(*selected) {
                 // On a file row, toggle just that file.
                 Some(DiffRow::File { index, .. }) => {
@@ -2117,7 +2197,7 @@ impl App {
         {
             // Remember the file under the cursor so the toggle doesn't jump.
             let path = current_file_index(rows, *selected).map(|i| files[i].path.clone());
-            *rows = build_rows(files, tree);
+            *rows = build_rows(files, tree, &self.collapsed_folders);
             *selected = path
                 .and_then(|p| {
                     rows.iter().position(|r| {
@@ -2127,6 +2207,116 @@ impl App {
                 .unwrap_or(0);
         }
         self.load_diff_content(true);
+    }
+
+    /// Tree navigation for the changed-file browsers (changes view and commit
+    /// browser): ← collapses the folder under the cursor (or jumps to the
+    /// parent from a file), → expands a collapsed folder (or steps into an
+    /// open one), and Enter toggles a folder. No-op in the flat layout.
+    fn tree_nav(&mut self, code: KeyCode) {
+        if !self.file_tree {
+            return;
+        }
+        let is_commit = matches!(self.view, View::CommitDiff { .. });
+        let (files, rows, selected) = match &mut self.view {
+            View::Diff {
+                files,
+                rows,
+                selected,
+                ..
+            }
+            | View::CommitDiff {
+                files,
+                rows,
+                selected,
+                ..
+            } => (files, rows, selected),
+            _ => return,
+        };
+        // What the key means on the row under the cursor.
+        enum Nav {
+            Collapse(String),
+            Expand(String),
+            Parent,
+            Into,
+        }
+        let nav = match (code, rows.get(*selected)) {
+            (
+                KeyCode::Left | KeyCode::Char('h'),
+                Some(DiffRow::Folder {
+                    prefix,
+                    collapsed: false,
+                    ..
+                }),
+            ) => Nav::Collapse(prefix.clone()),
+            (KeyCode::Left | KeyCode::Char('h'), Some(_)) => Nav::Parent,
+            (
+                KeyCode::Right | KeyCode::Char('l'),
+                Some(DiffRow::Folder {
+                    prefix,
+                    collapsed: true,
+                    ..
+                }),
+            ) => Nav::Expand(prefix.clone()),
+            (
+                KeyCode::Right | KeyCode::Char('l'),
+                Some(DiffRow::Folder {
+                    collapsed: false, ..
+                }),
+            ) => Nav::Into,
+            (KeyCode::Enter, Some(DiffRow::Folder {
+                prefix, collapsed, ..
+            })) => {
+                if *collapsed {
+                    Nav::Expand(prefix.clone())
+                } else {
+                    Nav::Collapse(prefix.clone())
+                }
+            }
+            _ => return,
+        };
+        match nav {
+            Nav::Collapse(prefix) | Nav::Expand(prefix) => {
+                if !self.collapsed_folders.remove(&prefix) {
+                    self.collapsed_folders.insert(prefix.clone());
+                }
+                *rows = build_diff_rows(files, &self.collapsed_folders);
+                // Keep the cursor on the folder that was toggled.
+                *selected = rows
+                    .iter()
+                    .position(
+                        |r| matches!(r, DiffRow::Folder { prefix: p, .. } if *p == prefix),
+                    )
+                    .unwrap_or(0);
+            }
+            // ← on a file or collapsed folder: jump to the nearest folder row
+            // above with a smaller depth, i.e. the parent.
+            Nav::Parent => {
+                let depth = match rows.get(*selected) {
+                    Some(DiffRow::Folder { depth, .. } | DiffRow::File { depth, .. }) => *depth,
+                    None => return,
+                };
+                let Some(parent) = rows[..*selected]
+                    .iter()
+                    .rposition(|r| matches!(r, DiffRow::Folder { depth: d, .. } if *d < depth))
+                else {
+                    return;
+                };
+                *selected = parent;
+            }
+            // → on an open folder: step onto its first child.
+            Nav::Into => {
+                if *selected + 1 >= rows.len() {
+                    return;
+                }
+                *selected += 1;
+            }
+        }
+        if is_commit {
+            self.load_commit_diff_content(true);
+        } else {
+            self.load_diff_content(true);
+        }
     }
 
     /// Adds `pattern` to the worktree's `.gitignore`, then reloads the view.
@@ -2197,7 +2387,7 @@ impl App {
                         .iter()
                         .map(|f| old.get(f.path.as_str()).copied().unwrap_or(true))
                         .collect();
-                    *rows = build_rows(&new_files, tree);
+                    *rows = build_rows(&new_files, tree, &self.collapsed_folders);
                     *files = new_files;
                     *marked = new_marked;
                     *selected = (*selected).min(rows.len().saturating_sub(1));
@@ -4232,7 +4422,7 @@ impl App {
     ) {
         match ops::commit_files(&self.ctx, &name, &hash) {
             Ok(files) => {
-                let rows = build_rows(&files, self.file_tree);
+                let rows = build_rows(&files, self.file_tree, &self.collapsed_folders);
                 self.view = View::CommitDiff {
                     name,
                     hash,
@@ -4289,6 +4479,11 @@ impl App {
                 }
             }
             KeyCode::Home | KeyCode::Char('g') => self.scroll_commit_diff(|_| 0),
+            KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Char('h')
+            | KeyCode::Char('l')
+            | KeyCode::Enter => self.tree_nav(key.code),
             KeyCode::Char('t') => self.toggle_commit_diff_layout(),
             _ => {}
         }
@@ -4351,7 +4546,7 @@ impl App {
         } = &mut self.view
         {
             let path = current_file_index(rows, *selected).map(|i| files[i].path.clone());
-            *rows = build_rows(files, tree);
+            *rows = build_rows(files, tree, &self.collapsed_folders);
             *selected = path
                 .and_then(|p| {
                     rows.iter().position(|r| {
@@ -5796,7 +5991,7 @@ mod tests {
                 path: "README.md".into(),
             },
         ];
-        let rows = build_diff_rows(&files);
+        let rows = build_diff_rows(&files, &HashSet::new());
         // Sorted by path: README.md, then the src/ and src/tui/ folders, then
         // their two files.
         let shape: Vec<String> = rows
@@ -6718,9 +6913,9 @@ mod tests {
         ];
         // The tree groups the src/ file under a folder row; the flat list has
         // only file rows, each labelled by its full path.
-        let tree = build_rows(&files, true);
+        let tree = build_rows(&files, true, &HashSet::new());
         assert!(tree.iter().any(|r| matches!(r, DiffRow::Folder { .. })));
-        let flat = build_rows(&files, false);
+        let flat = build_rows(&files, false, &HashSet::new());
         assert!(flat.iter().all(|r| matches!(r, DiffRow::File { .. })));
         let labels: Vec<&str> = flat
             .iter()
@@ -6730,6 +6925,170 @@ mod tests {
             })
             .collect();
         assert_eq!(labels, vec!["README.md", "src/app.rs"]);
+    }
+
+    #[test]
+    fn collapsed_folders_hide_their_files_in_the_rows() {
+        let files = vec![
+            StatusEntry {
+                code: " M".into(),
+                path: "src/tui/app.rs".into(),
+            },
+            StatusEntry {
+                code: " M".into(),
+                path: "README.md".into(),
+            },
+        ];
+        let collapsed = HashSet::from(["src/".to_string()]);
+        let rows = build_diff_rows(&files, &collapsed);
+        // README.md, then a single collapsed src/ row; src/tui/ and the file
+        // beneath it are hidden.
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(
+            rows.get(1),
+            Some(DiffRow::Folder {
+                collapsed: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn folders_collapse_and_expand_in_the_diff_tree() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "a\n").unwrap();
+        std::fs::write(root.join("src/b.rs"), "b\n").unwrap();
+        app.refresh();
+        app.selected = 0;
+        press(&mut app, KeyCode::Enter);
+        select_diff_folder(&mut app, "src/");
+
+        // ← collapses the folder under the cursor: its files leave the rows.
+        press(&mut app, KeyCode::Left);
+        assert!(app.collapsed_folders.contains("src/"));
+        match &app.view {
+            View::Diff { rows, selected, .. } => {
+                assert!(matches!(
+                    rows.get(*selected),
+                    Some(DiffRow::Folder {
+                        collapsed: true,
+                        ..
+                    })
+                ));
+                assert!(
+                    !rows
+                        .iter()
+                        .any(|r| matches!(r, DiffRow::File { label, .. } if label == "a.rs"))
+                );
+            }
+            _ => panic!("expected diff view"),
+        }
+
+        // → expands it again.
+        press(&mut app, KeyCode::Right);
+        assert!(!app.collapsed_folders.contains("src/"));
+        match &app.view {
+            View::Diff { rows, .. } => assert!(
+                rows.iter()
+                    .any(|r| matches!(r, DiffRow::File { label, .. } if label == "a.rs"))
+            ),
+            _ => panic!("expected diff view"),
+        }
+
+        // Enter toggles, and a refresh (`r`) keeps the collapse.
+        press(&mut app, KeyCode::Enter);
+        assert!(app.collapsed_folders.contains("src/"));
+        press(&mut app, KeyCode::Char('r'));
+        match &app.view {
+            View::Diff { rows, .. } => assert!(
+                !rows
+                    .iter()
+                    .any(|r| matches!(r, DiffRow::File { label, .. } if label == "a.rs"))
+            ),
+            _ => panic!("expected diff view"),
+        }
+    }
+
+    #[test]
+    fn left_on_a_file_jumps_to_its_parent_folder() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "a\n").unwrap();
+        app.refresh();
+        app.selected = 0;
+        press(&mut app, KeyCode::Enter);
+        select_diff_file(&mut app, "src/a.rs");
+        press(&mut app, KeyCode::Left);
+        match &app.view {
+            View::Diff { rows, selected, .. } => assert!(matches!(
+                rows.get(*selected),
+                Some(DiffRow::Folder { prefix, .. }) if prefix == "src/"
+            )),
+            _ => panic!("expected diff view"),
+        }
+    }
+
+    #[test]
+    fn wheel_moves_the_file_cursor_over_the_list_and_scrolls_the_diff_elsewhere() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        std::fs::write(root.join("b.txt"), "b\n").unwrap();
+        app.refresh();
+        app.selected = 0;
+        press(&mut app, KeyCode::Enter);
+        settle_diff(&mut app);
+        // Pretend the renderer recorded the file list panel on the left.
+        let len = match &app.view {
+            View::Diff { rows, .. } => rows.len(),
+            _ => panic!("expected diff view"),
+        };
+        app.row_list = Some(RowList {
+            inner: Rect::new(0, 1, 36, 20),
+            header: 0,
+            offset: 0,
+            len,
+        });
+        let wheel = |app: &mut App, kind, column| {
+            app.on_mouse(MouseEvent {
+                kind,
+                column,
+                row: 5,
+                modifiers: KeyModifiers::empty(),
+            });
+        };
+        // Over the list, a notch moves the file cursor and leaves the diff
+        // scroll alone.
+        wheel(&mut app, MouseEventKind::ScrollDown, 5);
+        match &app.view {
+            View::Diff {
+                selected, scroll, ..
+            } => {
+                assert_eq!(*selected, 1);
+                assert_eq!(*scroll, 0);
+            }
+            _ => panic!("expected diff view"),
+        }
+        // Right of the list (the diff panel), the wheel scrolls the text.
+        wheel(&mut app, MouseEventKind::ScrollDown, 60);
+        match &app.view {
+            View::Diff {
+                selected, scroll, ..
+            } => {
+                assert_eq!(*selected, 1, "cursor stays put");
+                assert_eq!(*scroll, 3);
+            }
+            _ => panic!("expected diff view"),
+        }
+        // And scrolling up over the list moves the cursor back.
+        wheel(&mut app, MouseEventKind::ScrollUp, 5);
+        match &app.view {
+            View::Diff { selected, .. } => assert_eq!(*selected, 0),
+            _ => panic!("expected diff view"),
+        }
     }
 
     #[test]

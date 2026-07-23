@@ -19,6 +19,7 @@ use super::app::{
 };
 use super::config_editor::{ConfigEditor, FIELD_ROWS, ROWS as CONFIG_ROWS};
 use super::help::{self, Binding, HelpTab};
+use super::highlight;
 use super::setup::{REVIEW_ROWS, SetupWizard, Step, location_preview};
 use crate::config::{DEFAULT_LOCATION, LOCATION_PRESETS};
 use crate::conflict::{ConflictSegment, ResolutionAction};
@@ -98,20 +99,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             loading_new,
             scroll,
             ..
-        } => {
-            draw_commit_diff(
-                frame,
-                main,
-                label,
-                files,
-                rows,
-                *selected,
-                content,
-                *loading_new,
-                *scroll,
-            );
-            None
-        }
+        } => draw_commit_diff(
+            frame,
+            main,
+            label,
+            files,
+            rows,
+            *selected,
+            content,
+            *loading_new,
+            *scroll,
+        ),
         View::BranchCommits {
             branch,
             lines,
@@ -294,7 +292,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // is up, otherwise the full-screen list for views that respond to clicks.
     // Other overlays cover the list, so clicks are disabled while they're up.
     app.row_list = match &app.view {
-        View::List | View::Diff { .. } => list_hit,
+        View::List | View::Diff { .. } | View::CommitDiff { .. } => list_hit,
         View::Commit { .. } => overlay_hit,
         _ => None,
     };
@@ -506,6 +504,7 @@ fn draw_diff(
                 prefix,
                 label,
                 depth,
+                collapsed,
             } => {
                 let indent = "  ".repeat(*depth);
                 let states: Vec<bool> = files
@@ -521,9 +520,11 @@ fn draw_diff(
                 } else {
                     Span::styled("[ ] ", Style::new().dim())
                 };
+                let arrow = if *collapsed { "▸ " } else { "▾ " };
                 ListItem::new(Line::from(vec![
                     check,
                     Span::raw(indent),
+                    Span::styled(arrow, Style::new().fg(ACCENT)),
                     Span::styled(format!("{label}/"), Style::new().fg(ACCENT).bold()),
                 ]))
             }
@@ -592,7 +593,7 @@ fn draw_diff(
             } else if content.is_empty() {
                 vec![Line::from("no textual diff (binary or empty)".dim())]
             } else {
-                content.lines().map(diff_line).collect()
+                highlight::diff_lines(path, content)
             };
             (format!("diff · {path}"), lines)
         }
@@ -689,23 +690,6 @@ fn draw_ignore_prompt(frame: &mut Frame, area: Rect, prompt: &IgnorePrompt) {
     frame.render_widget(Paragraph::new(lines).block(panel("ignore")), popup);
 }
 
-/// Colors one diff line by its prefix.
-fn diff_line(line: &str) -> Line<'_> {
-    let style = if line.starts_with("+++") || line.starts_with("---") {
-        Style::new().add_modifier(Modifier::BOLD)
-    } else if line.starts_with('+') {
-        Style::new().fg(Color::Green)
-    } else if line.starts_with('-') {
-        Style::new().fg(Color::Red)
-    } else if line.starts_with("@@") {
-        Style::new().fg(ACCENT)
-    } else if line.starts_with("diff --git") {
-        Style::new().add_modifier(Modifier::BOLD).fg(Color::Magenta)
-    } else {
-        Style::new()
-    };
-    Line::from(Span::styled(line, style))
-}
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     // The error popup is modal and sits on top of everything else, so the
@@ -2409,12 +2393,12 @@ fn draw_commit_diff(
     content: &str,
     loading_new: bool,
     scroll: u16,
-) {
+) -> Option<RowList> {
     if files.is_empty() {
         let para = Paragraph::new(Line::from("this commit changed no files".dim()))
             .block(panel(format!("commit · {label}")));
         frame.render_widget(para, area);
-        return;
+        return None;
     }
 
     let [list_area, diff_area] =
@@ -2424,10 +2408,17 @@ fn draw_commit_diff(
     let items: Vec<ListItem> = rows
         .iter()
         .map(|row| match row {
-            DiffRow::Folder { label, depth, .. } => {
+            DiffRow::Folder {
+                label,
+                depth,
+                collapsed,
+                ..
+            } => {
                 let indent = "  ".repeat(*depth);
+                let arrow = if *collapsed { "▸ " } else { "▾ " };
                 ListItem::new(Line::from(vec![
                     Span::raw(indent),
+                    Span::styled(arrow, Style::new().fg(ACCENT)),
                     Span::styled(format!("{label}/"), Style::new().fg(ACCENT).bold()),
                 ]))
             }
@@ -2451,12 +2442,19 @@ fn draw_commit_diff(
         })
         .collect();
     let block = panel(format!("files · {label}"));
+    let inner = block.inner(list_area);
     let list = List::new(items)
         .block(block)
         .highlight_style(Style::new().bg(SELECTION_BG).bold())
         .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
     let mut state = ListState::default().with_selected(Some(selected.min(rows.len() - 1)));
     frame.render_stateful_widget(list, list_area, &mut state);
+    let list_hit = RowList {
+        inner,
+        header: 0,
+        offset: state.offset(),
+        len: rows.len(),
+    };
 
     // Right: the diff of the highlighted file (or a folder summary).
     let (title, lines): (String, Vec<Line>) = match rows.get(selected) {
@@ -2479,7 +2477,7 @@ fn draw_commit_diff(
             } else if content.is_empty() {
                 vec![Line::from("no textual diff (binary or empty)".dim())]
             } else {
-                content.lines().map(diff_line).collect()
+                highlight::diff_lines(path, content)
             };
             (format!("diff · {path}"), lines)
         }
@@ -2498,6 +2496,7 @@ fn draw_commit_diff(
         diff_area,
         &mut sb_state,
     );
+    Some(list_hit)
 }
 
 /// A branch's commit history with a commit checkbox on each row. Marked commits

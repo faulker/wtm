@@ -3,6 +3,7 @@
 mod app;
 mod config_editor;
 mod help;
+mod highlight;
 mod setup;
 mod ui;
 
