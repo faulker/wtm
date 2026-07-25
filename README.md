@@ -8,9 +8,22 @@ Three ways to use it:
 - **CLI**: scriptable subcommands, all with `--json` output for agents
 - **MCP**: `wtm mcp` serves worktree operations as MCP tools over stdio
 
+![The Worktrees tab: a table of worktrees with change counts, ahead/behind, and paths, over a preview of the selected worktree's changed files](docs/images/tui-worktrees.png)
+
+The Worktrees tab is the home screen: every worktree with how many files it has changed, how far it is ahead of or behind its upstream, and any flags (`✓merged`, `locked`). The panel underneath previews the changed files of whichever worktree you have selected, so you can see what an agent has been up to without leaving the list.
+
 ## Setup
 
-Requires Rust (edition 2024 toolchain) and `git` on your PATH.
+Requires `git` on your PATH.
+
+Prebuilt binaries for macOS (Apple Silicon and Intel) and Linux (x86_64 and ARM64) are attached to every [release](https://github.com/faulker/wtm/releases):
+
+```sh
+tar -xzf wtm-vX.Y.Z-aarch64-apple-darwin.tar.gz
+mv wtm ~/.local/bin/
+```
+
+To build from source instead you also need Rust (edition 2024 toolchain):
 
 ```sh
 cargo build --release
@@ -28,6 +41,10 @@ Every repo must be initialized before worktree commands work: until a `.wtm.toml
 ```sh
 wtm init
 ```
+
+![The Settings tab: worktree_dir, open_command, setup.copy, and setup.run, each with a hint line, plus a live preview of where worktrees will land](docs/images/tui-settings.png)
+
+The Settings tab (`o` in the TUI) edits the same four fields, with a hint under each one and a live preview of where new worktrees will land. `Enter` edits the selected row, and the `[ save .wtm.toml ]` row writes the file, comments and all.
 
 To view or change settings later, no TOML editing required:
 
@@ -173,6 +190,30 @@ Worktrees are addressed by branch name (or directory name when detached). Every 
 
 Run `wtm` inside a repo. If the repo isn't initialized yet, the setup wizard opens first (see [Settings](#settings)); once `.wtm.toml` exists you get the worktree list. Each worktree shows its change count, ahead/behind, and a **FLAGS** column: `✓merged` marks a worktree whose branch is fully merged into the default branch (safe to clean up), and `locked` marks a locked worktree.
 
+![The Changes tab: changed files grouped into a folder tree on the left, the selected file's syntax-highlighted diff on the right with added lines tinted green and removed lines red](docs/images/tui-changes.png)
+
+`Enter` on a worktree opens the Changes tab. Files are grouped under their folders on the left (`[x]`/`[ ]`/`[~]` shows how much of a folder is marked), and the selected file's diff is syntax-highlighted on the right. From here you can mark files with `Space`, commit them with `c`, stash one or all of them, undo a file, or add it to `.gitignore`.
+
+![The commit dialog over the worktree list: a checklist of the five changed files, all ticked, with a typed commit message underneath](docs/images/tui-commit.png)
+
+`c` commits without leaving the list. Tick the files you want (everything is selected by default, `Space` toggles), type a message, and `Enter` commits.
+
+![The new worktree dialog: an empty name field, a row for creating a new branch off a chosen base, and rows for checking out existing local and remote-only branches](docs/images/tui-new-worktree.png)
+
+`n` creates a worktree. The top row makes a new branch off a base you pick with `Tab`; the rows below check out an existing branch, including remote-only ones like a teammate's `origin/feature/webhooks`, which become local tracking branches. Typing filters that list and names the new branch at the same time.
+
+![The Branches tab: every local branch with where it is checked out, its upstream, a ✓merged flag on release/1.4, and the last commit on each](docs/images/tui-branches.png)
+
+The Branches tab shows every branch, where each one is checked out, and which have already landed in the default branch (`✓merged`, safe to clean up). Remote-only branches are marked with `☁`. From here you can check a branch out in a new worktree, create or delete branches, merge one into a worktree, fast-forward onto upstream, or press `Enter` to browse and cherry-pick its commits.
+
+![The commit log drawn as a tree, with branch and tag names marked on the commits they point at and a fork and merge visible in the graph](docs/images/tui-log.png)
+
+`l` draws the log as a commit tree, with branch and tag names on the commits they point at, so forks and merges are visible at a glance. `Enter` browses into a commit to read the files it changed.
+
+![The Stash tab listing two stash entries for a worktree, each with its message and branch](docs/images/tui-stash.png)
+
+`s` opens the Stash tab for the selected worktree: stash the current changes, then pop, apply, or drop any entry.
+
 | Key | Action |
 | --- | --- |
 | `↑`/`↓` or `j`/`k` | select worktree |
@@ -193,6 +234,8 @@ Run `wtm` inside a repo. If the repo isn't initialized yet, the setup wizard ope
 | `r` | refresh (the worktree and branch lists also refresh themselves every minute, keeping your place) |
 | `?` | help (works here and in the changes view; any key closes it) |
 | `q` / `Ctrl+C` | quit |
+
+![The conflict resolver: two conflicted files on the left, and on the right one hunk showing the OURS side in green and the THEIRS side in blue, waiting for a side to be picked](docs/images/tui-conflicts.png)
 
 When a merge, update, cherry-pick, or stash pop hits a conflict, the **conflict resolver** opens automatically. It lists the conflicted files (each with a resolved/unresolved marker) and shows the selected file's hunks as **OURS** (green — what's already in this worktree, the current branch) vs **THEIRS** (blue — what's being pulled in, labelled with where it comes from: the merge, cherry-pick, or stash). `←`/`→` move between files, `↑`/`↓` between hunks; `o`/`t` keep ours/theirs for the current hunk, `b`/`⇧B` keep both (ours-then-theirs or reversed, on separate lines), `⇧O`/`⇧T` take the whole file's side. `e` opens a small editor to **hand-edit the result** for the current hunk (seeded with both sides so nothing is lost); `Ctrl+S` saves that manual result, `Esc` discards it. `w` (or `Enter`) stages the resolved file (refuses until every hunk has a side), `c` completes the operation (commit the merge, continue the cherry-pick, or drop the popped stash), and `x` then `y` aborts and restores the worktree. `Esc`/`q` leaves it in progress so you can come back to it.
 
