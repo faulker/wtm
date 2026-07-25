@@ -44,7 +44,7 @@ wtm init
 
 ![The Settings tab: worktree_dir, open_command, setup.copy, and setup.run, each with a hint line, plus a live preview of where worktrees will land](docs/images/tui-settings.png)
 
-The Settings tab (`o` in the TUI) edits the same four fields, with a hint under each one and a live preview of where new worktrees will land. `Enter` edits the selected row, and the `[ save .wtm.toml ]` row writes the file, comments and all.
+The Settings tab (`o` in the TUI) edits the same fields, with a hint under each one and a live preview of where new worktrees will land. `Enter` edits the selected row, and the `[ save settings ]` row writes the file, comments and all. Below the preview it shows the running version and whether an update is waiting, with a `[ check for updates now ]` row.
 
 To view or change settings later, no TOML editing required:
 
@@ -54,6 +54,7 @@ wtm config get worktree_dir
 wtm config set worktree_dir inside
 wtm config set open_command "cursor ."
 wtm config set setup.copy ".env, .env.local"
+wtm config set --global auto_update_check false   # stop checking for new releases
 wtm config unset setup.copy      # back to the default (or the global value)
 wtm config path                  # where the config files live
 ```
@@ -87,6 +88,8 @@ Settings resolve per field: repo, then global, then built-in default.
 worktree_dir = "sibling"
 # Command the TUI's `e` key runs in a worktree's directory (e.g. open an editor).
 open_command = "cursor ."
+# Check GitHub for a newer wtm when the TUI starts. Usually set globally.
+auto_update_check = true
 
 [setup]
 # Files copied from the main worktree into the new one (if they exist).
@@ -112,6 +115,7 @@ wtm status <name>                     # changed files in a worktree
 wtm diff <name>                       # unified diff of uncommitted changes
 wtm path <name>                       # prints the path, e.g. cd $(wtm path feature-x)
 wtm config [show|get|set|unset|path]  # view and change settings
+wtm upgrade [--check]                 # update wtm itself to the latest release
 wtm mcp                               # MCP server over stdio
 ```
 
@@ -241,9 +245,32 @@ When a merge, update, cherry-pick, or stash pop hits a conflict, the **conflict 
 
 Every text field (the new-branch name, the commit message, stash and branch names, and the settings and setup-wizard inputs) supports cursor editing: `←`/`→` move, `Home`/`End` jump, and `Backspace`/`Delete` remove characters mid-string.
 
-Pressing `o` opens an editor for the repo's `.wtm.toml`: pick a row with `↑`/`↓`, press `Enter` to edit it, and select the `[ save .wtm.toml ]` row to write. It shows a live preview of where worktrees will land, preserves any comments in the file, and clearing a field unsets it so the default (or global value) applies again.
+Pressing `o` opens an editor for the repo's `.wtm.toml`: pick a row with `↑`/`↓`, press `Enter` to edit it, and select the `[ save settings ]` row to write. It shows a live preview of where worktrees will land, preserves any comments in the file, and clearing a field unsets it so the default (or global value) applies again. The `auto_update_check` row is a toggle rather than a text field (`Enter` or `Space` cycles it through on, off, and the inherited default), and it is saved in the global config since it applies to wtm rather than to one repo.
 
 While setup runs, its output streams into the progress window. Type a line and press `Enter` to answer a prompting command; press `Ctrl+C` twice to kill a stuck setup.
+
+## Staying up to date
+
+When the TUI starts it looks up the latest [release](https://github.com/faulker/wtm/releases) on a background thread. This never delays startup: the first frame draws immediately, and if the network is slow or unreachable the check simply fails silently. If a newer version exists you get a prompt with the version, a link to the release notes, and two choices, update and restart, or not now. Postponing keeps the version visible on the Settings tab and doesn't ask again until the next launch.
+
+The check uses the public release URLs, not `api.github.com`. `/releases/latest` redirects to the newest tag, so one lookup gives both the version and (via the release workflow's asset naming) every download URL. That matters because the GitHub API rate-limits anonymous callers per IP, which any shared or office network exhausts quickly, and a start-up check that fails for everyone behind one NAT would be worse than no check at all. No token is needed or used.
+
+Installing downloads the build for your platform, verifies it against the release's SHA-256 checksums, checks that the new binary runs and reports the expected version, and only then moves it over the old one. If wtm lives somewhere your user can't write (a `/usr/local` or Homebrew install owned by root) it says so up front instead of failing halfway through.
+
+From the command line:
+
+```sh
+wtm upgrade --check    # report whether a newer release exists
+wtm upgrade            # download, verify, and install it
+```
+
+To turn the automatic check off:
+
+```sh
+wtm config set --global auto_update_check false
+```
+
+Or set `WTM_NO_UPDATE_CHECK` in the environment, which skips the check without touching any config file (useful in CI or offline). Explicit `wtm upgrade` runs and the Settings tab's check-now row always check regardless. Updates need `curl`, `tar`, and `shasum` or `sha256sum` on your PATH.
 
 ## MCP server
 
@@ -282,6 +309,7 @@ src/config.rs   layered config: global file + repo .wtm.toml, location rules
 src/settings.rs wtm config and wtm init commands
 src/ops.rs      core operations shared by CLI, TUI, and MCP
 src/conflict.rs conflict-marker parsing and hunk resolution (ours/theirs/both)
+src/update.rs   GitHub release check and self-update
 src/cli.rs      clap definitions
 src/output.rs   human vs JSON rendering
 src/tui/        ratatui app (state, rendering, event loop)

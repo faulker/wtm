@@ -12,6 +12,7 @@ mod ops;
 mod output;
 mod settings;
 mod tui;
+mod update;
 
 use anyhow::{Result, anyhow, bail};
 use clap::Parser;
@@ -413,12 +414,73 @@ fn run(cli: Cli) -> Result<()> {
             settings::init(&repo_root, force, &mut stdin.lock(), &mut stdout.lock())?;
         }
         Command::Config { action } => settings::config_command(&cwd, action, cli.json)?,
+        // Deliberately not gated on a repo: updating wtm has nothing to do with
+        // any particular repository.
+        Command::Upgrade { check } => upgrade(check, cli.json)?,
         Command::Mcp => {
             // Not gated at startup: the server should come up and report a
             // clear per-call error until the repo is initialized.
             let ctx = Ctx::discover(&cwd)?;
             mcp::serve(ctx)?;
         }
+    }
+    Ok(())
+}
+
+/// `wtm upgrade`: reports the latest release and, unless `check` is set,
+/// installs it over the running binary.
+fn upgrade(check: bool, json: bool) -> Result<()> {
+    let outcome = update::check()?;
+    let release = match outcome {
+        update::CheckOutcome::UpToDate { latest } => {
+            if json {
+                output::print_json(&serde_json::json!({
+                    "current": update::CURRENT_VERSION,
+                    "latest": latest,
+                    "update_available": false,
+                }))?;
+            } else {
+                println!("wtm {} is the latest version", update::CURRENT_VERSION);
+            }
+            return Ok(());
+        }
+        update::CheckOutcome::Available(release) => release,
+    };
+    if check {
+        if json {
+            output::print_json(&serde_json::json!({
+                "current": update::CURRENT_VERSION,
+                "latest": release.version,
+                "update_available": true,
+                "url": release.url,
+            }))?;
+        } else {
+            println!(
+                "wtm {} is available (you have {})",
+                release.version,
+                update::CURRENT_VERSION
+            );
+            println!("run `wtm upgrade` to install it");
+        }
+        return Ok(());
+    }
+
+    if !json {
+        println!(
+            "updating wtm {} -> {}…",
+            update::CURRENT_VERSION,
+            release.version
+        );
+    }
+    let installed = update::install(&release)?;
+    if json {
+        output::print_json(&installed)?;
+    } else {
+        println!(
+            "updated to wtm {} at {}",
+            installed.version,
+            installed.path.display()
+        );
     }
     Ok(())
 }

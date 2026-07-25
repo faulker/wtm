@@ -34,6 +34,7 @@ Shared core:
 - `src/ops.rs`: the high-level worktree operations (the largest module; the heart of the app).
 - `src/git.rs`: git command execution and parsing.
 - `src/config.rs` + `src/settings.rs`: `.wtm.toml` loading, defaults, and the settings model.
+- `src/update.rs`: GitHub release check and self-update (`wtm upgrade`, the TUI's start-up check). Deliberately avoids `api.github.com`, which rate-limits anonymous callers per IP: `/releases/latest` redirects to the newest tag, and asset URLs are derived from the release workflow's naming convention. Keep it that way, and keep asset naming here in step with `.github/workflows/release.yml`. Network and hashing shell out to `curl`/`shasum` rather than adding crates, matching how the rest of the app shells out to `git`. Unit tests never touch the network: `App::start_update_check` skips the thread under `cfg!(test)` so tests feed results through the channel by hand.
 
 ## Model Selection
 

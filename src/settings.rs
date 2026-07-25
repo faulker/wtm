@@ -29,6 +29,10 @@ const KEYS: &[(&str, &str)] = &[
         "command the TUI's open key runs in a worktree (e.g. `cursor .`)",
     ),
     (
+        "auto_update_check",
+        "check GitHub for a newer wtm when the TUI starts (true/false)",
+    ),
+    (
         "setup.copy",
         "files copied into each new worktree, comma separated",
     ),
@@ -113,7 +117,14 @@ pub fn write_draft(repo_root: &Path, draft: &ConfigDraft) -> Result<PathBuf> {
 /// The values the repo's own `.wtm.toml` sets (ignoring the global layer), as
 /// strings for the TUI config editor. Unset keys come back empty; `copy` and
 /// `run` are comma-joined.
-pub fn repo_config_fields(repo_root: &Path) -> Result<RepoConfigFields> {
+///
+/// `auto_update_check` is the exception: it governs wtm itself rather than one
+/// repo, so it is read from `global_config` (the caller's resolved global
+/// config path, or `None` when there isn't one) instead of the repo file.
+pub fn repo_config_fields(
+    repo_root: &Path,
+    global_config: Option<&Path>,
+) -> Result<RepoConfigFields> {
     let cfg = FileConfig::load(&repo_root.join(CONFIG_FILE))?;
     let setup = cfg.setup.unwrap_or_default();
     let copy = setup
@@ -127,37 +138,72 @@ pub fn repo_config_fields(repo_root: &Path) -> Result<RepoConfigFields> {
     Ok(RepoConfigFields {
         worktree_dir: cfg.worktree_dir.unwrap_or_default(),
         open_command: cfg.open_command.unwrap_or_default(),
+        auto_update_check: global_auto_update_check(global_config),
         copy,
         run,
     })
 }
 
-/// The repo-level settings the TUI config editor shows, each empty when unset.
+/// The global config's `auto_update_check` as an editor string: `""` when
+/// unset, otherwise `"true"`/`"false"`. A missing or unreadable global config
+/// reads as unset rather than failing the whole Settings tab.
+fn global_auto_update_check(global_config: Option<&Path>) -> String {
+    global_config
+        .and_then(|path| FileConfig::load(path).ok())
+        .and_then(|cfg| cfg.auto_update_check)
+        .map(|v| v.to_string())
+        .unwrap_or_default()
+}
+
+/// The settings the TUI config editor shows, each empty when unset.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RepoConfigFields {
     pub worktree_dir: String,
     pub open_command: String,
+    /// `""`, `"true"`, or `"false"`; lives in the global config.
+    pub auto_update_check: String,
     pub copy: String,
     pub run: String,
 }
 
-/// Applies edits from the TUI config editor to the repo's `.wtm.toml`,
-/// preserving comments and the surrounding TOML. An empty value unsets the key
-/// so the default (or global value) applies again. Returns the file path.
+/// Applies edits from the TUI config editor, preserving comments and the
+/// surrounding TOML. An empty value unsets the key so the default (or global
+/// value) applies again. Returns the repo file's path.
+///
+/// Repo settings go to the repo's `.wtm.toml`; `auto_update_check` goes to
+/// `global_config`, since it is about wtm rather than about this repository.
 pub fn save_config_edits(
     repo_root: &Path,
-    worktree_dir: &str,
-    open_command: &str,
-    copy: &str,
-    run: &str,
+    global_config: Option<&Path>,
+    fields: &RepoConfigFields,
 ) -> Result<PathBuf> {
     let file = repo_root.join(CONFIG_FILE);
     let mut doc = load_doc(&file)?;
-    set_or_unset(&mut doc, "worktree_dir", worktree_dir)?;
-    set_or_unset(&mut doc, "open_command", open_command)?;
-    set_or_unset(&mut doc, "setup.copy", copy)?;
-    set_or_unset(&mut doc, "setup.run", run)?;
+    set_or_unset(&mut doc, "worktree_dir", &fields.worktree_dir)?;
+    set_or_unset(&mut doc, "open_command", &fields.open_command)?;
+    set_or_unset(&mut doc, "setup.copy", &fields.copy)?;
+    set_or_unset(&mut doc, "setup.run", &fields.run)?;
     save_doc(&file, &doc)?;
+    if let Some(path) = global_config {
+        save_global_auto_update_check(path, &fields.auto_update_check)?;
+    }
     Ok(file)
+}
+
+/// Writes (or clears) `auto_update_check` in the global config at `path`,
+/// leaving the file untouched when nothing about that key changed.
+fn save_global_auto_update_check(path: &Path, raw: &str) -> Result<()> {
+    let mut doc = load_doc(path)?;
+    let changed = if raw.trim().is_empty() {
+        apply_unset(&mut doc, "auto_update_check")?
+    } else {
+        apply_set(&mut doc, "auto_update_check", raw)?;
+        true
+    };
+    if changed {
+        save_doc(path, &doc)?;
+    }
+    Ok(())
 }
 
 /// Sets `key` to `raw`, or unsets it when `raw` is blank.
@@ -204,6 +250,11 @@ fn show(cwd: &Path, json: bool) -> Result<()> {
                 "value": cfg.open_command,
                 "source": cfg.open_command_source,
             },
+            "auto_update_check": {
+                "value": cfg.auto_update_check(),
+                "source": cfg.auto_update_check_source,
+            },
+            "version": crate::update::CURRENT_VERSION,
             "setup": {
                 "copy": { "value": cfg.setup.copy, "source": cfg.copy_source },
                 "run": { "value": cfg.setup.run, "source": cfg.run_source },
@@ -228,6 +279,11 @@ fn show(cwd: &Path, json: bool) -> Result<()> {
         cfg.open_command_source
     );
     println!(
+        "  auto_update_check = {}   ({})",
+        cfg.auto_update_check(),
+        cfg.auto_update_check_source
+    );
+    println!(
         "  setup.copy   = {:?}   ({})",
         cfg.setup.copy, cfg.copy_source
     );
@@ -236,6 +292,7 @@ fn show(cwd: &Path, json: bool) -> Result<()> {
         cfg.setup.run, cfg.run_source
     );
     println!();
+    println!("  wtm version    {}", crate::update::CURRENT_VERSION);
     println!("  repo config    {}", file_status(&repo_file));
     match &global_file {
         Some(path) => println!("  global config  {}", file_status(path)),
@@ -260,6 +317,7 @@ fn get(cwd: &Path, key: &str, json: bool) -> Result<()> {
                 .unwrap_or_else(|| DEFAULT_LOCATION.to_string())
         ),
         "open_command" => json!(cfg.open_command.clone().unwrap_or_default()),
+        "auto_update_check" => json!(cfg.auto_update_check()),
         "setup.copy" => json!(cfg.setup.copy),
         "setup.run" => json!(cfg.setup.run),
         _ => unreachable!("known_key checked"),
@@ -568,6 +626,9 @@ fn apply_set(doc: &mut DocumentMut, key: &str, raw: &str) -> Result<()> {
         "open_command" => {
             doc["open_command"] = toml_value(raw);
         }
+        "auto_update_check" => {
+            doc["auto_update_check"] = toml_value(parse_bool(raw)?);
+        }
         "setup.copy" | "setup.run" => {
             let sub = key.strip_prefix("setup.").unwrap();
             let setup = doc
@@ -587,6 +648,7 @@ fn apply_unset(doc: &mut DocumentMut, key: &str) -> Result<bool> {
     let removed = match key {
         "worktree_dir" => doc.remove("worktree_dir").is_some(),
         "open_command" => doc.remove("open_command").is_some(),
+        "auto_update_check" => doc.remove("auto_update_check").is_some(),
         "setup.copy" | "setup.run" => {
             let sub = key.strip_prefix("setup.").unwrap();
             let removed = doc
@@ -618,6 +680,15 @@ fn maybe_preset_note(raw: &str) {
             "note: {raw:?} is not a preset (sibling, inside, home), so it is treated as a \
              directory called {raw:?} in the repo root"
         );
+    }
+}
+
+/// Parses a boolean setting, accepting the spellings people actually type.
+pub(crate) fn parse_bool(raw: &str) -> Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "y" | "on" | "1" => Ok(true),
+        "false" | "no" | "n" | "off" | "0" => Ok(false),
+        other => bail!("expected true or false, got {other:?}"),
     }
 }
 
@@ -851,6 +922,17 @@ mod tests {
         assert!(transcript.contains("starting from scratch"), "{transcript}");
     }
 
+    /// Editor fields with everything unset, for building one-field cases.
+    fn fields(worktree_dir: &str, open_command: &str, copy: &str, run: &str) -> RepoConfigFields {
+        RepoConfigFields {
+            worktree_dir: worktree_dir.to_string(),
+            open_command: open_command.to_string(),
+            auto_update_check: String::new(),
+            copy: copy.to_string(),
+            run: run.to_string(),
+        }
+    }
+
     #[test]
     fn repo_config_fields_reads_current_values() {
         let dir = tempfile::tempdir().unwrap();
@@ -859,22 +941,24 @@ mod tests {
             "worktree_dir = \"home\"\n[setup]\ncopy = [\".env\", \"config/.env\"]\n",
         )
         .unwrap();
-        let fields = repo_config_fields(dir.path()).unwrap();
+        let fields = repo_config_fields(dir.path(), None).unwrap();
         assert_eq!(fields.worktree_dir, "home");
         assert_eq!(fields.open_command, "");
         assert_eq!(fields.copy, ".env, config/.env");
         assert_eq!(fields.run, "");
+        // With no global config to read, the toggle shows as unset (default).
+        assert_eq!(fields.auto_update_check, "");
     }
 
     #[test]
     fn save_and_read_open_command() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join(CONFIG_FILE);
-        save_config_edits(dir.path(), "", "cursor .", "", "").unwrap();
+        save_config_edits(dir.path(), None, &fields("", "cursor .", "", "")).unwrap();
         let cfg = FileConfig::load(&file).unwrap();
         assert_eq!(cfg.open_command.as_deref(), Some("cursor ."));
         // Clearing it unsets the key again.
-        save_config_edits(dir.path(), "", "", "", "").unwrap();
+        save_config_edits(dir.path(), None, &fields("", "", "", "")).unwrap();
         let cfg = FileConfig::load(&file).unwrap();
         assert_eq!(cfg.open_command, None);
     }
@@ -890,7 +974,7 @@ mod tests {
         .unwrap();
 
         // Change worktree_dir, add a run command, and clear copy (unset it).
-        save_config_edits(dir.path(), "inside", "", "", "npm install").unwrap();
+        save_config_edits(dir.path(), None, &fields("inside", "", "", "npm install")).unwrap();
         let text = std::fs::read_to_string(&file).unwrap();
         assert!(text.contains("# keep me"), "comment lost: {text}");
         let cfg = FileConfig::load(&file).unwrap();
@@ -898,6 +982,65 @@ mod tests {
         let setup = cfg.setup.unwrap();
         assert!(setup.copy.is_none(), "copy should have been unset");
         assert_eq!(setup.run.unwrap(), vec!["npm install".to_string()]);
+    }
+
+    #[test]
+    fn auto_update_check_round_trips_through_the_global_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.toml");
+        std::fs::write(&global, "# global notes\nworktree_dir = \"home\"\n").unwrap();
+
+        let mut edits = fields("", "", "", "");
+        edits.auto_update_check = "false".to_string();
+        save_config_edits(dir.path(), Some(&global), &edits).unwrap();
+
+        let text = std::fs::read_to_string(&global).unwrap();
+        assert!(text.contains("# global notes"), "comment lost: {text}");
+        assert_eq!(
+            FileConfig::load(&global).unwrap().auto_update_check,
+            Some(false)
+        );
+        // The repo file must not pick up the app-level setting.
+        let repo = FileConfig::load(&dir.path().join(CONFIG_FILE)).unwrap();
+        assert_eq!(repo.auto_update_check, None);
+        // Reading back shows the value the editor should display.
+        let read = repo_config_fields(dir.path(), Some(&global)).unwrap();
+        assert_eq!(read.auto_update_check, "false");
+
+        // Clearing it removes the key so the built-in default applies again.
+        edits.auto_update_check = String::new();
+        save_config_edits(dir.path(), Some(&global), &edits).unwrap();
+        assert_eq!(FileConfig::load(&global).unwrap().auto_update_check, None);
+        assert_eq!(
+            repo_config_fields(dir.path(), Some(&global))
+                .unwrap()
+                .auto_update_check,
+            ""
+        );
+    }
+
+    #[test]
+    fn auto_update_check_accepts_the_spellings_people_type() {
+        for raw in ["true", "TRUE", "yes", "on", "1"] {
+            assert!(parse_bool(raw).unwrap(), "{raw} should parse as true");
+        }
+        for raw in ["false", "No", "off", "0"] {
+            assert!(!parse_bool(raw).unwrap(), "{raw} should parse as false");
+        }
+        let err = parse_bool("maybe").unwrap_err().to_string();
+        assert!(err.contains("expected true or false"), "{err}");
+    }
+
+    #[test]
+    fn setting_auto_update_check_writes_a_toml_boolean() {
+        let mut doc = DocumentMut::new();
+        apply_set(&mut doc, "auto_update_check", "off").unwrap();
+        assert_eq!(doc.to_string().trim(), "auto_update_check = false");
+        // It must round-trip through the strict FileConfig parser.
+        let cfg: FileConfig = toml::from_str(&doc.to_string()).unwrap();
+        assert_eq!(cfg.auto_update_check, Some(false));
+        assert!(apply_unset(&mut doc, "auto_update_check").unwrap());
+        assert_eq!(doc.to_string().trim(), "");
     }
 
     #[test]

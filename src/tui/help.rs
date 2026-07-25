@@ -249,8 +249,16 @@ pub const STASH_LIST: &[Binding] = &[
 ];
 
 pub const SETTINGS: &[Binding] = &[
-    both("↑/↓", "select", "move between settings and the save row"),
-    both("Enter", "edit/save", "edit the selected setting, or save the file"),
+    both("↑/↓", "select", "move between settings and the action rows"),
+    both(
+        "Enter",
+        "edit/run",
+        "edit the selected setting, toggle auto_update_check, save, or check for updates",
+    ),
+    help_only(
+        "Space",
+        "toggle auto_update_check between on, off, and the default",
+    ),
     both("q", "quit", "quit"),
 ];
 
@@ -321,7 +329,10 @@ const BASICS_SECTIONS: &[Section] = &[
     Section {
         heading: "settings tab  (o)",
         bindings: SETTINGS,
-        notes: &["edits the repo's .wtm.toml; leaving the tab discards unsaved changes."],
+        notes: &[
+            "edits the repo's .wtm.toml; leaving the tab discards unsaved changes.",
+            "auto_update_check is saved in the global config, so it applies to every repo.",
+        ],
     },
     Section {
         heading: "changes view status codes  (col 1 = staged · col 2 = working tree)",

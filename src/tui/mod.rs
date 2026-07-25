@@ -23,8 +23,11 @@ use crate::ops::Ctx;
 use app::App;
 
 /// Runs the interactive TUI until the user quits.
+///
+/// A self-update sets `App::restart_exe`; that hand-off happens here, after the
+/// terminal has been restored, so the new binary starts from a clean terminal.
 pub fn run(ctx: Ctx) -> Result<()> {
-    let app = App::new(ctx)?;
+    let mut app = App::new(ctx)?;
     let mut terminal = ratatui::init();
     // Mouse capture lets the diff and log views respond to the scroll wheel.
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
@@ -38,21 +41,26 @@ pub fn run(ctx: Ctx) -> Result<()> {
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         );
     }
-    let result = event_loop(&mut terminal, app);
+    let result = event_loop(&mut terminal, &mut app);
     if enhanced {
         let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     }
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
-    result
+    result?;
+    if let Some(exe) = &app.restart_exe {
+        println!("restarting {}", exe.display());
+        crate::update::restart(exe)?;
+    }
+    Ok(())
 }
 
 /// Draw/input loop. Polls with a timeout so background create progress keeps
 /// the screen updating even without keypresses.
-fn event_loop(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
+fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     while !app.quit {
         app.tick();
-        terminal.draw(|frame| ui::draw(frame, &mut app))?;
+        terminal.draw(|frame| ui::draw(frame, app))?;
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),

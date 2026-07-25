@@ -1,7 +1,7 @@
 //! TUI application state and key handling.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
@@ -12,7 +12,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 
-use super::config_editor::{ConfigEditor, EditorOutcome, FIELD_ROWS, ROWS as CONFIG_ROWS};
+use super::config_editor::{self, ConfigEditor, EditorOutcome};
 use super::help::HelpTab;
 use super::theme;
 use super::setup::{self, SetupWizard, WizardOutcome};
@@ -20,6 +20,7 @@ use crate::conflict::{self, ConflictSegment, ResolutionAction};
 use crate::git::{self, GraphLine, LogEntry, StashEntry, StatusEntry};
 use crate::ops::{self, BranchListItem, ConflictFile, Ctx, SetupControl, WorktreeInfo};
 use crate::settings::ConfigDraft;
+use crate::update::{self, CheckOutcome, Release};
 
 /// A single-line text field with a movable insertion cursor. `cursor` is a
 /// character index in `0..=value.chars().count()`, so `←/→`, Home/End, and
@@ -415,6 +416,9 @@ pub enum ModalAction {
     StashDrop { name: String, index: Option<u32> },
     /// Abort the in-progress operation in the conflict resolver (option 0).
     ResolverAbort,
+    /// A newer wtm is published: option 0 installs it and restarts, 1 postpones
+    /// until the next launch.
+    UpdateApp(Box<Release>),
 }
 
 /// Which screen/overlay is active.
@@ -765,6 +769,11 @@ pub enum BusyThen {
         target: String,
         source_label: String,
         kind: ops::ResolveKind,
+    },
+    /// A self-update finished installing: quit the TUI so `tui::run` can hand
+    /// control to the freshly installed binary.
+    Restart {
+        exe: PathBuf,
     },
 }
 
@@ -1132,6 +1141,23 @@ pub struct App {
     /// Scroll offset within the active help tab. Reset whenever the tab changes;
     /// clamped against the content at render time, as the diff and log views do.
     pub help_scroll: u16,
+    /// An update check running on a background thread. Started at launch (when
+    /// `auto_update_check` is on) and by the Settings tab's check-now row, so
+    /// the network is never touched on the UI thread.
+    update_check: Option<Task<Result<CheckOutcome, String>>>,
+    /// Whether the in-flight check was asked for by the user, in which case its
+    /// result is always reported, including "you're up to date". A launch check
+    /// stays silent unless there is something to install.
+    update_check_requested: bool,
+    /// The newer release the last check found, kept so the Settings tab can
+    /// keep showing it after the prompt is postponed.
+    pub update_available: Option<Release>,
+    /// Set once the update prompt has been shown, so postponing it isn't undone
+    /// by the next tick reopening the same modal.
+    update_prompted: bool,
+    /// Set by a completed self-update: the binary `tui::run` should hand over to
+    /// once the terminal is restored.
+    pub restart_exe: Option<PathBuf>,
     pub quit: bool,
 }
 
@@ -1185,12 +1211,137 @@ impl App {
             show_help: false,
             help_tab: HelpTab::Basics,
             help_scroll: 0,
+            update_check: None,
+            update_check_requested: false,
+            update_available: None,
+            update_prompted: false,
+            restart_exe: None,
             quit: false,
         };
         if initialized {
             app.refresh();
         }
+        // Fire and forget: the check runs on its own thread and its result is
+        // drained by `tick`, so a slow or offline network never delays the
+        // first frame. Never in unit tests, which must not reach the network.
+        if !cfg!(test) && update::auto_check_enabled(&app.ctx.config) {
+            app.start_update_check(false);
+        }
         Ok(app)
+    }
+
+    /// Starts a background update check unless one is already running.
+    /// `requested` marks a user-initiated check, which reports its result even
+    /// when there is nothing to install.
+    fn start_update_check(&mut self, requested: bool) {
+        if self.update_check.is_some() {
+            self.update_check_requested |= requested;
+            return;
+        }
+        self.update_check_requested = requested;
+        let (tx, rx) = channel();
+        // Unit tests push a result through this channel by hand instead, so no
+        // test run ever depends on the network.
+        if !cfg!(test) {
+            std::thread::spawn(move || {
+                let _ = tx.send(update::check().map_err(|e| format!("{e:#}")));
+            });
+        }
+        self.update_check = Some(Task::new(rx));
+    }
+
+    /// Drains a finished update check. A newer release opens the update prompt
+    /// once the screen is free; a failed background check is swallowed, since an
+    /// unattended check must never interrupt with an error.
+    fn poll_update_check(&mut self) {
+        let Some(task) = &self.update_check else {
+            return;
+        };
+        let Some(result) = task.poll_latest() else {
+            return;
+        };
+        self.update_check = None;
+        let requested = std::mem::take(&mut self.update_check_requested);
+        match result {
+            Ok(CheckOutcome::Available(release)) => {
+                if requested {
+                    self.message = Some(format!("wtm {} is available", release.version));
+                }
+                self.update_available = Some(release);
+                // A user-triggered check re-offers the prompt even if an earlier
+                // one was postponed.
+                if requested {
+                    self.update_prompted = false;
+                }
+            }
+            Ok(CheckOutcome::UpToDate { latest }) => {
+                self.update_available = None;
+                if requested {
+                    self.message = Some(format!("wtm {latest} is the latest version"));
+                }
+            }
+            Err(e) if requested => self.set_error(format!("update check failed: {e}")),
+            Err(_) => {}
+        }
+    }
+
+    /// Opens the update prompt once a newer release is known and the screen is
+    /// free. Held back while a modal, error, or drill-in owns the screen so an
+    /// update never interrupts work in progress.
+    fn maybe_prompt_update(&mut self) {
+        if self.update_prompted
+            || self.modal.is_some()
+            || self.error.is_some()
+            || self.show_help
+            || !matches!(self.view, View::List)
+        {
+            return;
+        }
+        let Some(release) = self.update_available.clone() else {
+            return;
+        };
+        self.update_prompted = true;
+        let body = vec![
+            Line::from(format!(
+                "wtm {} is available (you have {}).",
+                release.version,
+                update::CURRENT_VERSION
+            )),
+            Line::from(""),
+            Line::from(format!("Release notes: {}", release.url)),
+            Line::from(""),
+            Line::from("Updating replaces this binary and relaunches wtm."),
+        ];
+        self.modal = Some(Modal::Confirm {
+            title: format!("update to wtm {}", release.version),
+            body,
+            options: vec![
+                ConfirmOption::new("update and restart").key('u'),
+                ConfirmOption::new("not now").key('n'),
+            ],
+            selected: 0,
+            action: ModalAction::UpdateApp(Box::new(release)),
+        });
+    }
+
+    /// Downloads and installs `release` in the background, then quits so the
+    /// new binary can take over. The binary being replaced is resolved up front
+    /// so `BusyThen::Restart` knows what to hand control to.
+    fn start_update_install(&mut self, release: Release) {
+        let exe = match update::current_binary() {
+            Ok(exe) => exe,
+            Err(e) => return self.set_error(format!("{e:#}")),
+        };
+        let version = release.version.clone();
+        self.start_busy(
+            format!("installing wtm {version}"),
+            BusyThen::Restart { exe },
+            move |_ctx| {
+                update::install(&release)
+                    .map(|done| format!("updated to wtm {}", done.version))
+                    .map_err(|e| format!("{e:#}"))
+            },
+        );
     }
 
     /// Drills into `screen`, remembering the current one so `pop_screen`
@@ -1289,6 +1440,11 @@ impl App {
         self.tick_count = self.tick_count.wrapping_add(1);
         self.expire_message();
         self.auto_refresh();
+        // The update check is view-independent: drain it every tick so a check
+        // that lands while the user is deep in a diff still prompts once they
+        // come back to the list.
+        self.poll_update_check();
+        self.maybe_prompt_update();
         if let View::Busy { rx, .. } = &self.view {
             if let Some(result) = rx.poll_latest() {
                 // Pull the follow-up out of the view so we can mutate self, then
@@ -1304,6 +1460,13 @@ impl App {
                 // the (possibly force-prompting) branch delete rather than
                 // showing a message here.
                 match (result, then) {
+                    // The new binary is in place: quit so `tui::run` can
+                    // restore the terminal and hand over to it.
+                    (Ok(m), BusyThen::Restart { exe }) => {
+                        self.message = Some(m);
+                        self.restart_exe = Some(exe);
+                        self.quit = true;
+                    }
                     (Ok(_), BusyThen::DeleteBranch { name, branch }) => {
                         self.refresh();
                         self.delete_branch_step(name, branch);
@@ -1328,7 +1491,8 @@ impl App {
                             BusyThen::List
                             | BusyThen::Pull { .. }
                             | BusyThen::DeleteBranch { .. }
-                            | BusyThen::Resolve { .. } => {}
+                            | BusyThen::Resolve { .. }
+                            | BusyThen::Restart { .. } => {}
                             BusyThen::Stash(name) => self.reload_stash_tab(name),
                             BusyThen::Branch => {
                                 self.load_branches(self.branch_selected);
@@ -1893,6 +2057,14 @@ impl App {
             ModalAction::ResolverAbort => {
                 if let ModalResult::Confirmed(_) = result {
                     self.abort_resolver();
+                }
+            }
+            // Postponing (option 1, Esc, or n) leaves `update_available` set so
+            // the Settings tab still shows it, but `update_prompted` keeps the
+            // prompt from reappearing on the next tick.
+            ModalAction::UpdateApp(release) => {
+                if let ModalResult::Confirmed(0) = result {
+                    self.start_update_install(*release);
                 }
             }
         }
@@ -2593,13 +2765,11 @@ impl App {
                     }
                 }
                 // Non-uniform layout: each field is a value line plus a dim
-                // hint line, so only even offsets are a field's value row, and
-                // the save row follows one more line after the preview.
+                // hint line, with unselectable preview and version lines before
+                // the action rows, so `row_at_line` owns the decoding.
                 Tab::Settings if self.settings.editing.is_none() => {
-                    if idx < FIELD_ROWS * 2 && idx % 2 == 0 {
-                        self.settings.selected = idx / 2;
-                    } else if idx == FIELD_ROWS * 2 + 1 {
-                        self.settings.selected = CONFIG_ROWS - 1;
+                    if let Some(row) = config_editor::row_at_line(idx) {
+                        self.settings.selected = row;
                     }
                 }
                 Tab::Settings => {}
@@ -3525,11 +3695,8 @@ impl App {
     /// Switches to the Settings tab with the repo's `.wtm.toml` freshly read,
     /// so it never shows values that have gone stale on disk.
     fn open_settings_tab(&mut self) {
-        match ConfigEditor::load(self.ctx.repo_root.clone()) {
-            Ok(editor) => {
-                self.settings = editor;
-                self.tab = Tab::Settings;
-            }
+        match self.settings.reload() {
+            Ok(()) => self.tab = Tab::Settings,
             Err(e) => self.set_error(format!("{e:#}")),
         }
     }
@@ -3541,6 +3708,10 @@ impl App {
                 if self.message.is_none() {
                     self.message = Some(format!("saved {}", path.display()));
                 }
+            }
+            EditorOutcome::CheckForUpdates => {
+                self.start_update_check(true);
+                self.message = Some("checking for updates…".to_string());
             }
             // The editor swallows Esc itself while a field is being edited, so
             // `Cancel` only arrives when nothing is in progress — and then Esc/q
@@ -5341,7 +5512,11 @@ mod tests {
             repo_root: crate::git::repo_root(&repo).unwrap(),
             config: crate::config::Config::default(),
         };
-        let app = App::new(ctx).unwrap();
+        let mut app = App::new(ctx).unwrap();
+        // Same reasoning for the Settings tab's global-config target: point it
+        // inside the temp dir so saving can never rewrite the developer's own
+        // ~/.config/wtm/config.toml.
+        app.settings.global_config = Some(tmp.path().join("global.toml"));
         (tmp, app)
     }
 
@@ -8285,9 +8460,10 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         type_str(&mut app, ".env, config/.env.local");
         press(&mut app, KeyCode::Enter);
-        // Down to setup.run (3) then to save row (4) and save.
-        press(&mut app, KeyCode::Down);
-        press(&mut app, KeyCode::Down);
+        // Walk down to the save row and save.
+        while app.settings.selected < config_editor::SAVE_ROW {
+            press(&mut app, KeyCode::Down);
+        }
         press(&mut app, KeyCode::Enter);
 
         assert_eq!(app.tab, Tab::Settings, "saving stays on the tab");
@@ -8312,15 +8488,15 @@ mod tests {
         press(&mut app, KeyCode::Char('o'));
         // Row 0 (worktree_dir) should load the existing "home".
         assert_eq!(app.tab, Tab::Settings);
-        assert_eq!(app.settings.worktree_dir, "home");
+        assert_eq!(app.settings.fields.worktree_dir, "home");
         // Clear worktree_dir back to empty.
         press(&mut app, KeyCode::Enter);
         for _ in 0..4 {
             press(&mut app, KeyCode::Backspace);
         }
         press(&mut app, KeyCode::Enter);
-        // Save (down past open_command, setup.copy, setup.run to the save row).
-        for _ in 0..4 {
+        // Save (down past the other settings to the save row).
+        while app.settings.selected < config_editor::SAVE_ROW {
             press(&mut app, KeyCode::Down);
         }
         press(&mut app, KeyCode::Enter);
@@ -8343,6 +8519,192 @@ mod tests {
         assert!(matches!(app.view, View::List));
         let after = std::fs::read_to_string(app.ctx.repo_root.join(".wtm.toml")).unwrap();
         assert_eq!(before, after, "cancel must not write the file");
+    }
+
+    /// A release newer than whatever this build is, for the update-prompt tests.
+    fn newer_release() -> Release {
+        Release {
+            tag: "v99.0.0".to_string(),
+            version: "99.0.0".to_string(),
+            url: "https://example.test/releases/tag/v99.0.0".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_found_update_prompts_once_and_postponing_dismisses_it() {
+        let (_tmp, mut app) = test_app();
+        app.update_available = Some(newer_release());
+
+        app.tick();
+        let Some(Modal::Confirm { title, body, .. }) = &app.modal else {
+            panic!("an available update should open the prompt");
+        };
+        assert!(title.contains("99.0.0"), "{title}");
+        let text = body
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains(update::CURRENT_VERSION),
+            "current version missing: {text}"
+        );
+        // No API means no notes body, so the prompt links to the release page.
+        assert!(
+            text.contains("https://example.test/releases/tag/v99.0.0"),
+            "release page link missing: {text}"
+        );
+
+        // "not now" (option 1) closes it without installing anything.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.modal.is_none());
+        assert!(!matches!(app.view, View::Busy { .. }), "must not install");
+
+        // Later ticks must not nag again, even though the release is still known
+        // (the Settings tab keeps showing it).
+        app.tick();
+        app.tick();
+        assert!(app.modal.is_none(), "postponing must survive later ticks");
+        assert!(app.update_available.is_some());
+    }
+
+    #[test]
+    fn the_update_prompt_waits_until_the_screen_is_free() {
+        let (_tmp, mut app) = test_app();
+        app.update_available = Some(newer_release());
+        // Drill into a dialog: an update must never interrupt work in progress.
+        press(&mut app, KeyCode::Char('n'));
+        assert!(matches!(app.view, View::Create { .. }));
+
+        app.tick();
+        assert!(app.modal.is_none(), "no prompt over another screen");
+
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.view, View::List));
+        app.tick();
+        assert!(app.modal.is_some(), "prompt once back on the list");
+    }
+
+    #[test]
+    fn a_silent_check_reporting_up_to_date_says_nothing() {
+        let (_tmp, mut app) = test_app();
+        let (tx, rx) = channel();
+        tx.send(Ok(CheckOutcome::UpToDate {
+            latest: update::CURRENT_VERSION.to_string(),
+        }))
+        .unwrap();
+        app.update_check = Some(Task::new(rx));
+        app.update_check_requested = false;
+
+        app.tick();
+        assert!(app.modal.is_none());
+        assert!(app.message.is_none(), "a launch check stays quiet");
+        assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn a_failed_launch_check_is_swallowed_but_a_requested_one_reports() {
+        let (_tmp, mut app) = test_app();
+        let (tx, rx) = channel();
+        tx.send(Err("no network".to_string())).unwrap();
+        app.update_check = Some(Task::new(rx));
+        app.update_check_requested = false;
+        app.tick();
+        assert!(app.error.is_none(), "an unattended check must not pop up");
+
+        let (tx, rx) = channel();
+        tx.send(Err("no network".to_string())).unwrap();
+        app.update_check = Some(Task::new(rx));
+        app.update_check_requested = true;
+        app.tick();
+        assert!(
+            app.error.as_deref().unwrap().contains("no network"),
+            "a requested check reports its failure"
+        );
+    }
+
+    #[test]
+    fn check_now_reports_being_up_to_date() {
+        let (_tmp, mut app) = test_app();
+        press(&mut app, KeyCode::Char('o')); // Settings tab
+        while app.settings.selected < config_editor::CHECK_ROW {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(app.message.as_deref().unwrap().contains("checking"));
+        assert!(app.update_check.is_some(), "a check should be in flight");
+
+        // Answer it, keeping the "requested" flag the key press set.
+        let (tx, rx) = channel();
+        tx.send(Ok(CheckOutcome::UpToDate {
+            latest: "1.2.3".to_string(),
+        }))
+        .unwrap();
+        app.update_check = Some(Task::new(rx));
+        app.tick();
+        assert!(
+            app.message.as_deref().unwrap().contains("1.2.3"),
+            "a requested check always reports: {:?}",
+            app.message
+        );
+    }
+
+    #[test]
+    fn check_now_reoffers_a_previously_postponed_update() {
+        let (_tmp, mut app) = test_app();
+        app.update_available = Some(newer_release());
+        app.tick();
+        press(&mut app, KeyCode::Esc); // postpone
+        assert!(app.modal.is_none());
+
+        // Asking explicitly must offer it again rather than staying silent.
+        app.start_update_check(true);
+        let (tx, rx) = channel();
+        tx.send(Ok(CheckOutcome::Available(newer_release()))).unwrap();
+        app.update_check = Some(Task::new(rx));
+        app.tick();
+        assert!(app.modal.is_some(), "check-now re-offers the update");
+    }
+
+    #[test]
+    fn accepting_the_update_starts_a_background_install() {
+        let (_tmp, mut app) = test_app();
+        app.update_available = Some(newer_release());
+        app.tick();
+        // Option 0 is "update and restart".
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(app.view, View::Busy { .. }),
+            "installing runs off the UI thread"
+        );
+        // The release carries no asset for this platform, so the install fails
+        // and surfaces as an error rather than quitting or restarting.
+        settle_busy(&mut app);
+        assert!(app.error.is_some(), "a failed install must be reported");
+        assert!(app.restart_exe.is_none(), "nothing to restart");
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn the_settings_tab_toggle_writes_the_global_config() {
+        let (tmp, mut app) = test_app();
+        let global = tmp.path().join("global.toml");
+        press(&mut app, KeyCode::Char('o'));
+        while app.settings.selected < config_editor::UPDATE_ROW {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Enter); // default -> on
+        press(&mut app, KeyCode::Enter); // on -> off
+        assert_eq!(app.settings.fields.auto_update_check, "false");
+        press(&mut app, KeyCode::Down); // save row
+        press(&mut app, KeyCode::Enter);
+
+        let text = std::fs::read_to_string(&global).unwrap();
+        assert!(text.contains("auto_update_check = false"), "{text}");
+        // It belongs to the global config, not to this repo.
+        let repo = std::fs::read_to_string(app.ctx.repo_root.join(".wtm.toml")).unwrap();
+        assert!(!repo.contains("auto_update_check"), "{repo}");
     }
 
     #[test]

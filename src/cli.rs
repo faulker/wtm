@@ -205,6 +205,12 @@ pub enum Command {
         #[command(subcommand)]
         action: Option<ConfigAction>,
     },
+    /// Update wtm itself to the latest release published on GitHub.
+    Upgrade {
+        /// Only report whether a newer release exists; don't install anything.
+        #[arg(long)]
+        check: bool,
+    },
     /// Run an MCP server over stdio exposing worktree operations as tools.
     Mcp,
 }

@@ -18,6 +18,11 @@ pub const CONFIG_FILE: &str = ".wtm.toml";
 /// The rule used when `worktree_dir` isn't set anywhere.
 pub const DEFAULT_LOCATION: &str = "sibling";
 
+/// Whether the start-up update check runs when `auto_update_check` isn't set
+/// anywhere. On by default: the check is backgrounded and never blocks the UI,
+/// and a stale worktree manager is worth telling the user about.
+pub const DEFAULT_AUTO_UPDATE_CHECK: bool = true;
+
 /// Predefined location rules accepted by `worktree_dir`, with a short
 /// human-readable label for each.
 pub const LOCATION_PRESETS: &[(&str, &str)] = &[
@@ -55,6 +60,9 @@ pub struct FileConfig {
     /// Command run in a worktree's directory by the TUI's "open" key (e.g.
     /// `cursor .` to open an editor there).
     pub open_command: Option<String>,
+    /// Whether the TUI checks GitHub for a newer wtm on start. Unset means
+    /// [`DEFAULT_AUTO_UPDATE_CHECK`].
+    pub auto_update_check: Option<bool>,
     pub setup: Option<FileSetup>,
 }
 
@@ -90,6 +98,10 @@ pub struct Config {
     /// Command the TUI runs in a worktree's directory on the "open" key.
     pub open_command: Option<String>,
     pub open_command_source: Source,
+    /// Raw `auto_update_check` setting; `None` means
+    /// [`DEFAULT_AUTO_UPDATE_CHECK`].
+    pub auto_update_check: Option<bool>,
+    pub auto_update_check_source: Source,
     pub setup: Setup,
     pub copy_source: Source,
     pub run_source: Source,
@@ -111,6 +123,8 @@ impl Default for Config {
             worktree_dir_source: Source::Default,
             open_command: None,
             open_command_source: Source::Default,
+            auto_update_check: None,
+            auto_update_check_source: Source::Default,
             setup: Setup::default(),
             copy_source: Source::Default,
             run_source: Source::Default,
@@ -140,6 +154,8 @@ impl Config {
         }
         let (worktree_dir, worktree_dir_source) = pick(global.worktree_dir, repo.worktree_dir);
         let (open_command, open_command_source) = pick(global.open_command, repo.open_command);
+        let (auto_update_check, auto_update_check_source) =
+            pick(global.auto_update_check, repo.auto_update_check);
         let global_setup = global.setup.unwrap_or_default();
         let repo_setup = repo.setup.unwrap_or_default();
         let (copy, copy_source) = pick(global_setup.copy, repo_setup.copy);
@@ -149,6 +165,8 @@ impl Config {
             worktree_dir_source,
             open_command,
             open_command_source,
+            auto_update_check,
+            auto_update_check_source,
             setup: Setup {
                 copy: copy.unwrap_or_default(),
                 run: run.unwrap_or_default(),
@@ -156,6 +174,11 @@ impl Config {
             copy_source,
             run_source,
         }
+    }
+
+    /// Whether the TUI should check GitHub for a newer wtm on start.
+    pub fn auto_update_check(&self) -> bool {
+        self.auto_update_check.unwrap_or(DEFAULT_AUTO_UPDATE_CHECK)
     }
 
     /// Absolute directory new worktrees are created under for a repo rooted
@@ -319,6 +342,20 @@ mod tests {
         assert_eq!(cfg.copy_source, Source::Global);
         assert_eq!(cfg.setup.run, vec!["npm install".to_string()]);
         assert_eq!(cfg.run_source, Source::Repo);
+    }
+
+    #[test]
+    fn auto_update_check_defaults_on_and_merges_like_other_keys() {
+        assert!(Config::default().auto_update_check());
+        let global: FileConfig = toml::from_str("auto_update_check = false").unwrap();
+        let cfg = Config::merge(global.clone(), FileConfig::default());
+        assert!(!cfg.auto_update_check());
+        assert_eq!(cfg.auto_update_check_source, Source::Global);
+        // A repo can opt back in over a global opt-out.
+        let repo: FileConfig = toml::from_str("auto_update_check = true").unwrap();
+        let cfg = Config::merge(global, repo);
+        assert!(cfg.auto_update_check());
+        assert_eq!(cfg.auto_update_check_source, Source::Repo);
     }
 
     #[test]

@@ -16,15 +16,18 @@ use super::app::{
     App, CheckoutCandidate, CherryTarget, CommitFocus, ConfirmOption, DiffRow, LogMode, Modal,
     ResolverFile, RowList, Tab, TextInput, View, filtered_candidates,
 };
-use super::config_editor::{ConfigEditor, FIELD_ROWS, ROWS as CONFIG_ROWS};
+use super::config_editor::{
+    CHECK_ROW, ConfigEditor, FIELD_ROWS, FORM_LINES, SAVE_ROW, UPDATE_ROW,
+};
 use super::help::{self, Binding, HelpTab};
 use super::highlight;
 use super::setup::{REVIEW_ROWS, SetupWizard, Step, location_preview};
 use super::theme::{self, ACCENT, BORDER, GRAPH_COLORS, SELECTION_BG};
-use crate::config::{DEFAULT_LOCATION, LOCATION_PRESETS};
+use crate::config::{DEFAULT_AUTO_UPDATE_CHECK, DEFAULT_LOCATION, LOCATION_PRESETS};
 use crate::conflict::{ConflictSegment, ResolutionAction};
 use crate::git::{GraphLine, StatusEntry};
 use crate::ops::{self, ResolveKind};
+use crate::update::{CURRENT_VERSION, Release};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let [header, main, footer] = Layout::vertical([
@@ -113,7 +116,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     app.changes.scroll,
                 ),
                 Tab::Stash => draw_stash_tab(frame, body, app),
-                Tab::Settings => draw_settings_tab(frame, body, &app.settings),
+                Tab::Settings => {
+                    draw_settings_tab(frame, body, &app.settings, app.update_available.as_ref())
+                }
             }
         }
     };
@@ -1492,21 +1497,29 @@ fn draw_review(
     })
 }
 
-/// The Settings tab: editable rows for worktree_dir, setup.copy, and
-/// setup.run, a live resolved-location preview, and a save row. The form keeps
-/// a fixed width inside the full-height panel so long paths don't stretch it.
-fn draw_settings_tab(frame: &mut Frame, area: Rect, editor: &ConfigEditor) -> Option<RowList> {
+/// The Settings tab: editable rows for the repo settings, the update-check
+/// toggle, a live resolved-location preview, the running version, a save row,
+/// and a check-for-updates row. The form keeps a fixed width inside the
+/// full-height panel so long paths don't stretch it.
+fn draw_settings_tab(
+    frame: &mut Frame,
+    area: Rect,
+    editor: &ConfigEditor,
+    update_available: Option<&Release>,
+) -> Option<RowList> {
     let labels = [
-        "worktree_dir",
-        "open_command",
-        "setup.copy  ",
-        "setup.run   ",
+        "worktree_dir     ",
+        "open_command     ",
+        "setup.copy       ",
+        "setup.run        ",
+        "auto_update_check",
     ];
     let hints = [
         "sibling · inside · home · or a path ({repo} = repo name)",
         "command the open key (e) runs in a worktree, e.g. cursor .",
         "files copied into each new worktree, comma separated",
         "commands run in each new worktree, comma separated",
+        "check GitHub for a newer wtm on start · saved for all repos",
     ];
     let mut lines: Vec<Line> = Vec::new();
     for row in 0..FIELD_ROWS {
@@ -1525,6 +1538,19 @@ fn draw_settings_tab(frame: &mut Frame, area: Rect, editor: &ConfigEditor) -> Op
             (true, Some(input)) => {
                 push_cursor_spans(&mut spans, input.as_str(), input.cursor, highlight)
             }
+            // The toggle has no free text, so it renders its state rather than
+            // an editable value, spelling out what the default resolves to.
+            _ if row == UPDATE_ROW => spans.push(Span::styled(
+                match editor.fields.auto_update_check.as_str() {
+                    "true" => "on".to_string(),
+                    "false" => "off".to_string(),
+                    _ => format!(
+                        "(default: {})",
+                        if DEFAULT_AUTO_UPDATE_CHECK { "on" } else { "off" }
+                    ),
+                },
+                highlight,
+            )),
             _ if editor.field(row).is_empty() => {
                 spans.push(Span::styled("(default)".to_string(), highlight.dim()))
             }
@@ -1538,10 +1564,10 @@ fn draw_settings_tab(frame: &mut Frame, area: Rect, editor: &ConfigEditor) -> Op
     }
 
     // Live preview of where worktrees will actually be created.
-    let raw_dir = if editor.worktree_dir.trim().is_empty() {
+    let raw_dir = if editor.fields.worktree_dir.trim().is_empty() {
         DEFAULT_LOCATION
     } else {
-        editor.worktree_dir.trim()
+        editor.fields.worktree_dir.trim()
     };
     let resolved = crate::config::resolve_worktree_dir(raw_dir, &editor.repo_root)
         .map(|p| p.display().to_string())
@@ -1551,13 +1577,35 @@ fn draw_settings_tab(frame: &mut Frame, area: Rect, editor: &ConfigEditor) -> Op
         Style::new().fg(Color::Green),
     )));
 
-    let save_row = CONFIG_ROWS - 1;
-    let save_style = if editor.selected == save_row {
-        Style::new().bg(SELECTION_BG).bold().fg(ACCENT)
-    } else {
-        Style::new().bold()
+    // Running version, plus whatever the last update check turned up.
+    let mut version = vec![Span::styled(
+        format!(" wtm {CURRENT_VERSION}"),
+        Style::new().dim(),
+    )];
+    match update_available {
+        Some(release) => version.push(Span::styled(
+            format!("  ·  {} available", release.version),
+            Style::new().fg(Color::Yellow).bold(),
+        )),
+        None => version.push(Span::styled("  ·  up to date", Style::new().dim())),
+    }
+    lines.push(Line::from(version));
+
+    let action_style = |row: usize| {
+        if editor.selected == row {
+            Style::new().bg(SELECTION_BG).bold().fg(ACCENT)
+        } else {
+            Style::new().bold()
+        }
     };
-    lines.push(Line::from(Span::styled(" [ save .wtm.toml ] ", save_style)));
+    lines.push(Line::from(Span::styled(
+        " [ save settings ] ",
+        action_style(SAVE_ROW),
+    )));
+    lines.push(Line::from(Span::styled(
+        " [ check for updates now ] ",
+        action_style(CHECK_ROW),
+    )));
 
     let block = panel("settings");
     let inner = block.inner(area);
@@ -1573,13 +1621,13 @@ fn draw_settings_tab(frame: &mut Frame, area: Rect, editor: &ConfigEditor) -> Op
     let [_, form] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(form);
     frame.render_widget(Paragraph::new(lines), form);
-    // Rows are field value+hint line pairs, then the preview line, then the
-    // save row: the same line layout `on_click`'s decode logic assumes.
+    // The line layout is shared with `config_editor::row_at_line`, which
+    // `on_click` uses to turn a clicked line back into a row.
     Some(RowList {
         inner: form,
         header: 0,
         offset: 0,
-        len: FIELD_ROWS * 2 + 2,
+        len: FORM_LINES,
     })
 }
 
@@ -2804,6 +2852,9 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::config_editor::{
+        CHECK_LINE, PREVIEW_LINE, SAVE_LINE, VERSION_LINE,
+    };
     use crate::git::LogEntry;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -2957,6 +3008,79 @@ mod tests {
             draw_log(frame, area, "main", &[], 0, LogMode::Tree);
         });
         assert!(out[1].contains("no commits"), "{out:#?}");
+    }
+
+    /// An editor with a known worktree_dir, for the settings render tests.
+    fn settings_editor(auto_update_check: &str) -> ConfigEditor {
+        ConfigEditor {
+            repo_root: std::path::PathBuf::from("/tmp/proj"),
+            global_config: None,
+            fields: crate::settings::RepoConfigFields {
+                worktree_dir: "inside".to_string(),
+                auto_update_check: auto_update_check.to_string(),
+                ..Default::default()
+            },
+            selected: 0,
+            editing: None,
+        }
+    }
+
+    /// The line offsets `config_editor::row_at_line` decodes clicks with must
+    /// match what is actually drawn, or clicking a row would select another.
+    #[test]
+    fn settings_tab_draws_rows_where_the_click_decoder_expects_them() {
+        let editor = settings_editor("false");
+        let out = render(90, 26, |frame, area| {
+            draw_settings_tab(frame, area, &editor, None);
+        });
+        // The form starts after the panel border and one blank spacer line.
+        let form_start = 2;
+        let line = |offset: usize| out[form_start + offset].as_str();
+
+        for (row, label) in [
+            (0, "worktree_dir"),
+            (1, "open_command"),
+            (2, "setup.copy"),
+            (3, "setup.run"),
+            (UPDATE_ROW, "auto_update_check"),
+        ] {
+            assert!(
+                line(row * 2).contains(label),
+                "row {row} should be {label}: {:?}",
+                line(row * 2)
+            );
+        }
+        assert!(line(UPDATE_ROW * 2).contains("off"), "{:?}", line(8));
+        assert!(line(PREVIEW_LINE).contains("new worktrees go in"));
+        assert!(line(VERSION_LINE).contains(CURRENT_VERSION));
+        assert!(line(SAVE_LINE).contains("save settings"));
+        assert!(line(CHECK_LINE).contains("check for updates"));
+    }
+
+    #[test]
+    fn settings_tab_shows_the_version_and_any_update() {
+        let editor = settings_editor("");
+        // With nothing newer found, the version line says so.
+        let out = render(90, 26, |frame, area| {
+            draw_settings_tab(frame, area, &editor, None);
+        });
+        let version_line = &out[2 + VERSION_LINE];
+        assert!(version_line.contains(CURRENT_VERSION), "{version_line}");
+        assert!(version_line.contains("up to date"), "{version_line}");
+        // The unset toggle spells out which default it inherits.
+        assert!(out[2 + UPDATE_ROW * 2].contains("default"), "{out:#?}");
+
+        // A found release is called out instead.
+        let release = Release {
+            tag: "v9.9.9".to_string(),
+            version: "9.9.9".to_string(),
+            url: String::new(),
+        };
+        let out = render(90, 26, |frame, area| {
+            draw_settings_tab(frame, area, &editor, Some(&release));
+        });
+        let version_line = &out[2 + VERSION_LINE];
+        assert!(version_line.contains("9.9.9 available"), "{version_line}");
     }
 
     #[test]

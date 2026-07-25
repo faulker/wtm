@@ -525,6 +525,61 @@ fn config_show_get_and_unknown_keys() {
 }
 
 #[test]
+fn auto_update_check_is_a_boolean_setting() {
+    let (_tmp, repo) = setup_repo();
+
+    // It defaults to on and shows up in `config show` alongside the version.
+    let out = wtm(&repo, &["config", "get", "auto_update_check"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "true");
+    let shown = stdout_json(&wtm(&repo, &["config", "--json"]));
+    assert_eq!(shown["auto_update_check"]["value"], true);
+    assert_eq!(shown["auto_update_check"]["source"], "default");
+    assert_eq!(shown["version"], env!("CARGO_PKG_VERSION"));
+
+    // Setting it writes a real TOML boolean, not the string "false".
+    let out = wtm(&repo, &["config", "set", "auto_update_check", "false"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = std::fs::read_to_string(repo.join(".wtm.toml")).unwrap();
+    assert!(text.contains("auto_update_check = false"), "{text}");
+    let shown = stdout_json(&wtm(&repo, &["config", "--json"]));
+    assert_eq!(shown["auto_update_check"]["value"], false);
+    assert_eq!(shown["auto_update_check"]["source"], "repo");
+
+    // Non-boolean values are refused rather than silently stored.
+    let out = wtm(&repo, &["config", "set", "auto_update_check", "maybe"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("expected true or false"), "{err}");
+
+    // Unsetting restores the default.
+    let out = wtm(&repo, &["config", "unset", "auto_update_check"]);
+    assert!(out.status.success());
+    let out = wtm(&repo, &["config", "get", "auto_update_check"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "true");
+}
+
+#[test]
+fn upgrade_check_reports_the_running_version() {
+    let (_tmp, repo) = setup_repo();
+    // `wtm upgrade --check` reaches GitHub, so this only asserts the shape of
+    // whichever answer comes back, and tolerates a sandbox with no network.
+    let out = wtm(&repo, &["upgrade", "--check", "--json"]);
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("error"), "unexpected failure: {err}");
+        return;
+    }
+    let json = stdout_json(&out);
+    assert_eq!(json["current"], env!("CARGO_PKG_VERSION"));
+    assert!(json["update_available"].is_boolean());
+    assert!(json["latest"].is_string());
+}
+
+#[test]
 fn config_set_edits_lists_and_preserves_comments() {
     let (_tmp, repo) = setup_repo();
     std::fs::write(
