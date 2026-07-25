@@ -5,6 +5,7 @@ mod config_editor;
 mod help;
 mod highlight;
 mod setup;
+mod theme;
 mod ui;
 
 use std::time::Duration;

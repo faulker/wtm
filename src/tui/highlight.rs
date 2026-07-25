@@ -15,6 +15,8 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
+use super::theme;
+
 /// Background tint for added lines (dark green, dark-terminal friendly).
 const ADD_BG: Color = Color::Rgb(16, 60, 30);
 /// Background tint for removed lines (dark red).
@@ -105,7 +107,7 @@ fn diff_line(line: &str, highlighter: &mut Option<HighlightLines<'static>>) -> L
     if line.starts_with("diff --git") {
         return Line::styled(
             line.to_string(),
-            Style::new().add_modifier(Modifier::BOLD).fg(Color::Magenta),
+            Style::new().add_modifier(Modifier::BOLD).fg(theme::INFO),
         );
     }
     // Code lines: a marker column (+/-/space) followed by the code itself.
@@ -157,8 +159,8 @@ mod tests {
         let diff = "diff --git a/x.rs b/x.rs\n@@ -1,2 +1,2 @@\n-let a = 1;\n+let a = 2;\n context";
         let lines = render("x.rs", diff);
         assert_eq!(lines.len(), 5);
-        // The header keeps its magenta bold styling with no tint.
-        assert_eq!(lines[0].style.fg, Some(Color::Magenta));
+        // The header keeps its INFO-colored bold styling with no tint.
+        assert_eq!(lines[0].style.fg, Some(theme::INFO));
         // The hunk header uses the accent.
         assert_eq!(lines[1].style.fg, Some(Color::Cyan));
         // Every span of a removed line carries the red tint, added the green.

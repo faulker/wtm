@@ -173,13 +173,16 @@ pub fn remote_branches(dir: &Path) -> Result<Vec<(String, String)>> {
     Ok(out
         .lines()
         .filter(|l| !l.is_empty() && !l.ends_with("/HEAD"))
-        // `refname:short` is `<remote>/<branch>`; split on the first slash so a
-        // branch name that itself contains slashes stays intact.
-        .filter_map(|full| {
-            full.split_once('/')
-                .map(|(_, branch)| (branch.to_string(), full.to_string()))
-        })
+        .filter_map(|full| remote_short_name(full).map(|branch| (branch.to_string(), full.to_string())))
         .collect())
+}
+
+/// Strips the `<remote>/` prefix off a `refname:short` value from
+/// `refs/remotes` (e.g. `origin/feature` -> `feature`), splitting on the
+/// first slash so a branch name that itself contains slashes stays intact.
+/// Returns `None` for a bare remote name with no branch component.
+pub fn remote_short_name(full: &str) -> Option<&str> {
+    full.split_once('/').map(|(_, branch)| branch)
 }
 
 /// True if `branch` exists as a local branch.
@@ -813,21 +816,13 @@ pub fn branch_rename(dir: &Path, old: &str, new: &str) -> Result<()> {
     Ok(())
 }
 
-/// Lists local branches with upstream tracking, tip subject, and date,
-/// most recently committed first.
-pub fn branch_details(dir: &Path) -> Result<Vec<BranchDetail>> {
+/// Lists refs matching `pattern` (e.g. `refs/heads` or `refs/remotes`) with
+/// upstream tracking, tip subject, and date, most recently committed first.
+pub fn ref_details(dir: &Path, pattern: &str) -> Result<Vec<BranchDetail>> {
     // Fields are separated by 0x1f so subjects containing spaces stay intact.
     let format = "--format=%(refname:short)\u{1f}%(upstream:short)\u{1f}\
                   %(upstream:track)\u{1f}%(contents:subject)\u{1f}%(committerdate:relative)";
-    let out = run(
-        dir,
-        &[
-            "for-each-ref",
-            "--sort=-committerdate",
-            format,
-            "refs/heads",
-        ],
-    )?;
+    let out = run(dir, &["for-each-ref", "--sort=-committerdate", format, pattern])?;
     Ok(parse_branch_details(&out))
 }
 
@@ -1096,7 +1091,7 @@ fn parse_stash_branch(subject: &str) -> String {
     }
 }
 
-/// Parses `branch_details` output (one branch per line, 0x1f-separated fields).
+/// Parses `ref_details` output (one branch per line, 0x1f-separated fields).
 pub fn parse_branch_details(out: &str) -> Vec<BranchDetail> {
     out.lines()
         .filter_map(|line| {

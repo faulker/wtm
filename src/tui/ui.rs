@@ -13,35 +13,18 @@ use ratatui::widgets::{
 };
 
 use super::app::{
-    App, BranchMode, CheckoutCandidate, CherryTarget, CommitFocus, DiffRow, ForceBranchReason,
-    IgnorePrompt, LogMode, ResolverFile, RowList, StashMode, Tab, TextInput, View,
-    filtered_candidates,
+    App, CheckoutCandidate, CherryTarget, CommitFocus, ConfirmOption, DiffRow, LogMode, Modal,
+    ResolverFile, RowList, Tab, TextInput, View, filtered_candidates,
 };
 use super::config_editor::{ConfigEditor, FIELD_ROWS, ROWS as CONFIG_ROWS};
 use super::help::{self, Binding, HelpTab};
 use super::highlight;
 use super::setup::{REVIEW_ROWS, SetupWizard, Step, location_preview};
+use super::theme::{self, ACCENT, BORDER, GRAPH_COLORS, SELECTION_BG};
 use crate::config::{DEFAULT_LOCATION, LOCATION_PRESETS};
 use crate::conflict::{ConflictSegment, ResolutionAction};
-use crate::git::{GraphLine, StashEntry, StatusEntry};
-use crate::ops::ResolveKind;
-
-/// Single accent used for titles, keys, and selection markers.
-const ACCENT: Color = Color::Cyan;
-/// Border color for all panels.
-const BORDER: Color = Color::DarkGray;
-/// Background of the selected row in lists and tables.
-const SELECTION_BG: Color = Color::DarkGray;
-/// Cycled by graph column so parallel branch lines stay distinguishable as they
-/// run down the commit tree.
-const GRAPH_COLORS: [Color; 6] = [
-    Color::Cyan,
-    Color::Magenta,
-    Color::Green,
-    Color::Yellow,
-    Color::Blue,
-    Color::Red,
-];
+use crate::git::{GraphLine, StatusEntry};
+use crate::ops::{self, ResolveKind};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let [header, main, footer] = Layout::vertical([
@@ -54,42 +37,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_header(frame, header, app);
     // The full-screen view's clickable list, if any.
     let list_hit = match &app.view {
-        View::Diff {
-            name,
-            files,
-            marked,
-            rows,
-            selected,
-            content,
-            loading_new,
-            scroll,
-            confirm_revert,
-            confirm_delete,
-            ignore_prompt,
-            ..
-        } => draw_diff(
-            frame,
-            main,
-            name,
-            files,
-            marked,
-            rows,
-            *selected,
-            content,
-            *loading_new,
-            *scroll,
-            *confirm_revert,
-            *confirm_delete,
-            ignore_prompt.as_ref(),
-        ),
         View::Log {
             name,
             lines,
             selected,
-        } => {
-            draw_log(frame, main, name, lines, *selected, app.log_mode);
-            None
-        }
+        } => draw_log(frame, main, name, lines, *selected, app.log_mode),
         View::CommitDiff {
             label,
             rows,
@@ -115,10 +67,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             lines,
             marked,
             selected,
-        } => {
-            draw_branch_commits(frame, main, branch, lines, marked, *selected, app.log_mode);
-            None
-        }
+        } => draw_branch_commits(frame, main, branch, lines, marked, *selected, app.log_mode),
         View::ConflictResolver {
             target,
             source_label,
@@ -128,20 +77,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             file,
             current,
             ..
-        } => {
-            draw_conflict_resolver(
-                frame,
-                main,
-                target,
-                source_label,
-                kind,
-                files,
-                resolved,
-                *file,
-                current.as_ref(),
-            );
-            None
-        }
+        } => draw_conflict_resolver(
+            frame,
+            main,
+            target,
+            source_label,
+            kind,
+            files,
+            resolved,
+            *file,
+            current.as_ref(),
+        ),
         // The first-run setup wizard takes over the whole main area (there is no
         // repo state to show behind it); drawn in the overlay match below.
         View::Setup(_) => None,
@@ -152,8 +98,22 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(main);
             draw_tab_bar(frame, bar, app);
             match app.tab {
-                Tab::Worktrees => draw_list(frame, body, app),
+                Tab::Worktrees => draw_worktrees_tab(frame, body, app),
                 Tab::Branches => draw_branches(frame, body, app),
+                Tab::Changes => draw_diff(
+                    frame,
+                    body,
+                    &app.changes.name,
+                    &app.changes.files,
+                    &app.changes.marked,
+                    &app.changes.rows,
+                    app.changes.selected,
+                    &app.changes.content,
+                    app.changes.loading_new,
+                    app.changes.scroll,
+                ),
+                Tab::Stash => draw_stash_tab(frame, body, app),
+                Tab::Settings => draw_settings_tab(frame, body, &app.settings),
             }
         }
     };
@@ -183,15 +143,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             *base_pick,
             app.worktree_base.as_deref(),
         ),
-        View::ConfirmExisting {
-            path,
-            existing_name,
-            selected,
-            ..
-        } => draw_confirm_existing(frame, main, path, existing_name.as_deref(), *selected),
-        View::ConfirmReplaceChanges { path, selected, .. } => {
-            draw_confirm_replace_changes(frame, main, path, *selected)
-        }
         View::Creating {
             branch,
             lines,
@@ -200,29 +151,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             kill_armed,
             ..
         } => draw_creating(frame, main, branch, lines, *done, input, *kill_armed),
-        View::ConfirmDelete {
-            name,
-            dirty,
-            branch,
-            delete_branch,
-        } => draw_confirm_delete(frame, main, name, *dirty, branch.as_deref(), *delete_branch),
-        View::ConfirmDeleteDirty {
-            name,
-            delete_branch,
-            selected,
-            ..
-        } => draw_confirm_delete_dirty(frame, main, name, *delete_branch, *selected),
-        View::ConfirmForceBranch { branch, reason } => {
-            draw_confirm_force_branch(frame, main, branch, reason)
-        }
-        View::ConfirmPullRebase { name } => draw_confirm_pull_rebase(frame, main, name),
-        View::ConfirmUpdateStash {
-            name,
-            dirty,
-            selected,
-        } => draw_confirm_update_stash(frame, main, name, *dirty, *selected),
-        View::Setup(wizard) => draw_setup(frame, main, wizard),
-        View::Config(editor) => draw_config(frame, main, editor),
+        View::Setup(wizard) => overlay_hit = draw_setup(frame, main, wizard),
         View::Commit {
             name,
             files,
@@ -231,18 +160,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             input,
             focus,
         } => overlay_hit = draw_commit(frame, main, name, files, marked, *cursor, input, focus),
-        View::Stash {
-            name,
-            entries,
-            selected,
-            mode,
-        } => draw_stash(frame, main, name, entries, *selected, mode),
         View::Switch {
             name,
             branches,
             filter,
             selected,
-        } => draw_switch(frame, main, name, branches, filter, *selected),
+        } => overlay_hit = draw_switch(frame, main, name, branches, filter, *selected),
         View::Busy { label, .. } => draw_busy(frame, main, label, app.tick_count),
         View::RunCommand { name, input, .. } => draw_run_command(frame, main, name, input),
         View::RenameWorktree { name, input } => draw_rename_worktree(frame, main, name, input),
@@ -253,34 +176,28 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             selected,
             mode,
             ..
-        } => draw_cherry_pick(
-            frame,
-            main,
-            source_branch,
-            summaries,
-            targets,
-            *selected,
-            *mode,
-        ),
+        } => {
+            overlay_hit = draw_cherry_pick(
+                frame,
+                main,
+                source_branch,
+                summaries,
+                targets,
+                *selected,
+                *mode,
+            )
+        }
         View::MergePick {
             source_branch,
             targets,
             selected,
-        } => draw_merge_pick(frame, main, source_branch, targets, *selected),
-        // The abort confirmation floats over the resolver drawn full-screen above.
-        View::ConflictResolver {
-            confirm_abort: true,
-            target,
-            ..
-        } => draw_confirm_popup(
-            frame,
-            main,
-            "abort",
-            &format!("abort the operation in '{target}' and discard resolutions?"),
-            "y to abort · Esc to cancel",
-        ),
+        } => overlay_hit = draw_merge_pick(frame, main, source_branch, targets, *selected),
         _ => {}
     }
+
+    // A modal overlay (confirm/prompt/hunk editor) floats over the active view.
+    // Only Confirm reports its own rows; Prompt/HunkEditor have none.
+    let modal_hit = app.modal.is_some().then(|| draw_modal(frame, main, app)).flatten();
 
     // The help overlay sits on top of whatever view is active, so `?` works
     // everywhere and returns to where it was opened.
@@ -292,10 +209,24 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // is up, otherwise the full-screen list for views that respond to clicks.
     // Other overlays cover the list, so clicks are disabled while they're up.
     app.row_list = match &app.view {
-        View::List | View::Diff { .. } | View::CommitDiff { .. } => list_hit,
-        View::Commit { .. } => overlay_hit,
+        View::List
+        | View::CommitDiff { .. }
+        | View::Log { .. }
+        | View::BranchCommits { .. }
+        | View::ConflictResolver { .. } => list_hit,
+        View::Commit { .. }
+        | View::Switch { .. }
+        | View::CherryPick { .. }
+        | View::MergePick { .. }
+        | View::Setup(_) => overlay_hit,
         _ => None,
     };
+    // A modal covers the list, so clicks go to it instead when it has its own
+    // rows (Confirm); other modal kinds (Prompt, HunkEditor) just suppress
+    // clicks on whatever is behind them.
+    if let Some(modal) = &app.modal {
+        app.row_list = matches!(modal, Modal::Confirm { .. }).then_some(modal_hit).flatten();
+    }
 
     // The error popup sits on top of absolutely everything, including the
     // help overlay, and suppresses clicks on whatever is behind it. Cloned so
@@ -336,7 +267,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let right = match &app.message {
         // Errors now show as a modal popup (see `draw_error_popup`), so every
         // message reaching the header is a plain status/info line.
-        Some(msg) => Line::styled(format!("{msg} "), Style::new().fg(Color::Yellow).bold()),
+        Some(msg) => Line::styled(format!("{msg} "), Style::new().fg(theme::WARNING).bold()),
         None => Line::styled(
             format!("({count} worktree{}) ", if count == 1 { "" } else { "s" }),
             Style::new().dim(),
@@ -388,10 +319,10 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) -> Option<RowList> {
             let changes = if wt.dirty > 0 {
                 Span::styled(
                     format!("{} changed", wt.dirty),
-                    Style::new().fg(Color::Yellow),
+                    Style::new().fg(theme::WARNING),
                 )
             } else {
-                Span::styled("clean".to_string(), Style::new().fg(Color::Green))
+                Span::styled("clean".to_string(), Style::new().fg(theme::SUCCESS))
             };
             let upstream = match wt.ahead_behind {
                 Some(ab) => Span::styled(
@@ -403,13 +334,13 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) -> Option<RowList> {
             // Both a merged branch and a lock can apply; show whichever hold.
             let mut flag_spans = Vec::new();
             if wt.merged {
-                flag_spans.push(Span::styled("✓merged", Style::new().fg(Color::Green)));
+                flag_spans.push(Span::styled("✓merged", Style::new().fg(theme::SUCCESS)));
             }
             if wt.locked {
                 if !flag_spans.is_empty() {
                     flag_spans.push(Span::raw(" "));
                 }
-                flag_spans.push(Span::styled("locked", Style::new().fg(Color::Red)));
+                flag_spans.push(Span::styled("locked", Style::new().fg(theme::DANGER)));
             }
             Row::new(vec![
                 Cell::from(name),
@@ -458,6 +389,61 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) -> Option<RowList> {
     })
 }
 
+/// Worktrees tab: the worktree table on top, a read-only changed-file
+/// preview for the highlighted row on the bottom.
+fn draw_worktrees_tab(frame: &mut Frame, area: Rect, app: &mut App) -> Option<RowList> {
+    let [list_area, preview_area] =
+        Layout::vertical([Constraint::Percentage(62), Constraint::Percentage(38)]).areas(area);
+    let row_list = draw_list(frame, list_area, app);
+    if app.preview_for != Some(app.selected) {
+        app.worktree_preview = app
+            .worktrees
+            .get(app.selected)
+            .and_then(|wt| ops::status(&app.ctx, &wt.name).ok())
+            .map(|(_, files)| files)
+            .unwrap_or_default();
+        app.preview_for = Some(app.selected);
+    }
+    draw_worktree_preview(frame, preview_area, app);
+    row_list
+}
+
+/// Read-only glance at the highlighted worktree's changed files (status code
+/// and path, capped rows). No cursor or mark-for-commit state: the worktree
+/// table above still owns all interaction.
+fn draw_worktree_preview(frame: &mut Frame, area: Rect, app: &App) {
+    let title = match app.worktrees.get(app.selected) {
+        Some(wt) => format!("changes · {}", wt.name),
+        None => "changes".to_string(),
+    };
+    if app.worktree_preview.is_empty() {
+        let para = Paragraph::new(Line::from("no changes".dim())).block(panel(title));
+        frame.render_widget(para, area);
+        return;
+    }
+
+    const MAX_ROWS: usize = 8;
+    let mut lines: Vec<Line> = app
+        .worktree_preview
+        .iter()
+        .take(MAX_ROWS)
+        .map(|entry| {
+            Line::from(vec![
+                Span::styled(format!("{:<3}", entry.code), status_style(&entry.code)),
+                Span::raw(entry.path.clone()),
+            ])
+        })
+        .collect();
+    if app.worktree_preview.len() > MAX_ROWS {
+        let more = app.worktree_preview.len() - MAX_ROWS;
+        lines.push(Line::from(
+            format!("+{more} more — Enter for full changes").dim(),
+        ));
+    }
+    let para = Paragraph::new(lines).block(panel(title));
+    frame.render_widget(para, area);
+}
+
 /// Path of the changed file under the cursor row, or "" on a folder row.
 fn current_diff_path<'a>(rows: &[DiffRow], files: &'a [StatusEntry], selected: usize) -> &'a str {
     super::app::current_file_index(rows, selected)
@@ -480,9 +466,6 @@ fn draw_diff(
     content: &str,
     loading_new: bool,
     scroll: u16,
-    confirm_revert: bool,
-    confirm_delete: bool,
-    ignore_prompt: Option<&IgnorePrompt>,
 ) -> Option<RowList> {
     if files.is_empty() {
         let para = Paragraph::new(Line::from("no uncommitted changes".dim()))
@@ -514,7 +497,7 @@ fn draw_diff(
                     .map(|(i, _)| marked.get(i).copied().unwrap_or(false))
                     .collect();
                 let check = if states.iter().all(|s| *s) {
-                    Span::styled("[x] ", Style::new().fg(Color::Green))
+                    Span::styled("[x] ", Style::new().fg(theme::SUCCESS))
                 } else if states.iter().any(|s| *s) {
                     Span::styled("[~] ", Style::new().fg(ACCENT))
                 } else {
@@ -536,7 +519,7 @@ fn draw_diff(
                 let indent = "  ".repeat(*depth);
                 let checked = marked.get(*index).copied().unwrap_or(false);
                 let check = if checked {
-                    Span::styled("[x] ", Style::new().fg(Color::Green))
+                    Span::styled("[x] ", Style::new().fg(theme::SUCCESS))
                 } else {
                     Span::styled("[ ] ", Style::new().dim())
                 };
@@ -613,83 +596,8 @@ fn draw_diff(
         &mut sb_state,
     );
 
-    if confirm_revert {
-        let label = current_diff_path(rows, files, selected);
-        let label = if label.is_empty() {
-            "discard changes?".to_string()
-        } else {
-            format!("discard all changes to '{label}'?")
-        };
-        draw_confirm_popup(
-            frame,
-            area,
-            "revert file",
-            &label,
-            "y to discard · Esc to cancel",
-        );
-    }
-
-    if confirm_delete {
-        let label = current_diff_path(rows, files, selected);
-        let label = if label.is_empty() {
-            "delete file?".to_string()
-        } else {
-            format!("delete '{label}' from the worktree?")
-        };
-        draw_confirm_popup(
-            frame,
-            area,
-            "delete file",
-            &label,
-            "y to delete · Esc to cancel",
-        );
-    }
-
-    if let Some(prompt) = ignore_prompt {
-        draw_ignore_prompt(frame, area, prompt);
-    }
-
-    // A confirm/ignore popup is modal, so suppress list clicks behind it.
-    if confirm_revert || confirm_delete || ignore_prompt.is_some() {
-        None
-    } else {
-        Some(list_hit)
-    }
+    Some(list_hit)
 }
-
-/// Popup for adding the highlighted file to `.gitignore`: ignore just this file,
-/// or a glob pattern that matches every file like it.
-fn draw_ignore_prompt(frame: &mut Frame, area: Rect, prompt: &IgnorePrompt) {
-    let popup = centered(area, 64, 7);
-    frame.render_widget(Clear, popup);
-    let option = |selected: bool, label: String| -> Line<'static> {
-        let marker = if selected { "▌ ● " } else { "  ○ " };
-        let style = if selected {
-            Style::new().bg(SELECTION_BG).bold()
-        } else {
-            Style::new()
-        };
-        Line::from(vec![
-            Span::styled(marker.to_string(), style.fg(ACCENT)),
-            Span::styled(label, style),
-        ])
-    };
-    let (exact, glob) = if prompt.is_folder {
-        ("just this folder", "all folders like it")
-    } else {
-        ("just this file", "all files like it")
-    };
-    let lines = vec![
-        Line::from("add to .gitignore:"),
-        Line::from(""),
-        option(prompt.selected == 0, format!("{exact}: {}", prompt.file)),
-        option(prompt.selected == 1, format!("{glob}: {}", prompt.pattern)),
-        Line::from(""),
-        Line::from("↑/↓ choose · Enter confirm · Esc cancel".dim()),
-    ];
-    frame.render_widget(Paragraph::new(lines).block(panel("ignore")), popup);
-}
-
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     // The error popup is modal and sits on top of everything else, so the
@@ -714,37 +622,22 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         );
         return;
     }
+    // A modal overlay owns the keys, so show its hints instead of the view's.
+    if let Some(modal) = &app.modal {
+        frame.render_widget(Paragraph::new(hint_line(modal_footer_hints(modal))), area);
+        return;
+    }
     let hints: &[Binding] = match &app.view {
         View::List => match app.tab {
             Tab::Worktrees => help::WORKTREES,
-            Tab::Branches => match &app.branch_mode {
-                BranchMode::List => help::BRANCHES,
-                BranchMode::Create(_) => &[
-                    hint("type", "branch name"),
-                    hint("Enter", "create"),
-                    hint("Esc", "back"),
-                ],
-                BranchMode::Rename(_) => &[
-                    hint("type", "new branch name"),
-                    hint("Enter", "rename"),
-                    hint("Esc", "back"),
-                ],
-                BranchMode::ConfirmDelete => &[
-                    hint("y", "delete"),
-                    hint("f", "force"),
-                    hint("Esc", "cancel"),
-                ],
-            },
+            Tab::Branches => help::BRANCHES,
+            Tab::Changes => help::DIFF,
+            Tab::Stash => help::STASH_LIST,
+            Tab::Settings if app.settings.editing.is_some() => {
+                &[hint("Enter", "save value"), hint("Esc", "cancel edit")]
+            }
+            Tab::Settings => help::SETTINGS,
         },
-        View::Diff {
-            confirm_revert: true,
-            ..
-        } => &[hint("y", "discard changes"), hint("Esc", "cancel")],
-        View::Diff {
-            confirm_delete: true,
-            ..
-        } => &[hint("y", "delete file"), hint("Esc", "cancel")],
-        View::Diff { .. } => help::DIFF,
         View::Log { .. } => &[
             hint("↑/↓", "commit"),
             hint("Enter", "browse files"),
@@ -774,17 +667,6 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             hint("Enter", "merge"),
             hint("Esc", "cancel"),
         ],
-        View::ConflictResolver {
-            confirm_abort: true,
-            ..
-        } => &[hint("y", "abort"), hint("Esc", "cancel")],
-        View::ConflictResolver {
-            current: Some(rf), ..
-        } if rf.edit.is_some() => &[
-            hint("type", "edit result"),
-            hint("Ctrl+S", "save"),
-            hint("Esc", "cancel"),
-        ],
         View::ConflictResolver { .. } => help::RESOLVER,
         View::Commit { focus, .. } => match focus {
             CommitFocus::Files => help::COMMIT_FILES,
@@ -794,15 +676,6 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 hint("Enter", "commit"),
                 hint("Esc", "cancel"),
             ],
-        },
-        View::Stash { mode, .. } => match mode {
-            StashMode::List => help::STASH_LIST,
-            StashMode::Message(_) => &[
-                hint("type", "message (optional)"),
-                hint("Enter", "stash"),
-                hint("Esc", "back"),
-            ],
-            StashMode::ConfirmDrop => &[hint("y", "drop"), hint("Esc", "cancel")],
         },
         View::Switch { .. } => &[
             hint("type", "filter"),
@@ -838,16 +711,6 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             hint("Enter", "check out"),
             hint("Esc", "cancel"),
         ],
-        View::ConfirmExisting { .. } => &[
-            hint("↑/↓", "choose"),
-            hint("Enter", "confirm"),
-            hint("Esc", "cancel"),
-        ],
-        View::ConfirmReplaceChanges { .. } => &[
-            hint("↑/↓", "choose"),
-            hint("Enter", "confirm"),
-            hint("Esc", "cancel"),
-        ],
         View::RunCommand { .. } => &[
             hint("type", "command to run in the worktree"),
             hint("Enter", "run"),
@@ -863,37 +726,6 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             hint("Ctrl+C ×2", "kill setup"),
         ],
         View::Creating { .. } => &[hint("Enter", "close")],
-        View::ConfirmDelete { .. } => &[
-            hint("↑/↓", "choose"),
-            hint("Enter", "confirm"),
-            hint("Esc", "cancel"),
-        ],
-        View::ConfirmDeleteDirty { .. } => &[
-            hint("↑/↓", "choose"),
-            hint("Enter", "confirm"),
-            hint("Esc", "cancel"),
-        ],
-        View::ConfirmForceBranch { .. } => &[
-            hint("f / Enter", "force delete"),
-            hint("Esc", "keep branch"),
-        ],
-        View::ConfirmPullRebase { .. } => &[
-            hint("y / Enter", "pull with rebase"),
-            hint("Esc", "cancel"),
-        ],
-        View::ConfirmUpdateStash { .. } => &[
-            hint("↑/↓", "choose"),
-            hint("Enter", "confirm"),
-            hint("Esc", "cancel"),
-        ],
-        View::Config(editor) if editor.editing.is_some() => {
-            &[hint("Enter", "save value"), hint("Esc", "cancel edit")]
-        }
-        View::Config(_) => &[
-            hint("↑/↓", "select"),
-            hint("Enter", "edit/save"),
-            hint("Esc", "cancel"),
-        ],
         View::Setup(wizard) => match &wizard.step {
             Step::CloneAsk { .. } => &[
                 hint("←/→", "choose"),
@@ -936,6 +768,29 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         },
     };
     frame.render_widget(Paragraph::new(hint_line(hints)), area);
+}
+
+/// Appends `value` to `spans` with a reverse-video block cursor at character
+/// index `cursor`, so an inline editable field shows where edits will land.
+fn push_cursor_spans(spans: &mut Vec<Span<'static>>, value: &str, cursor: usize, base: Style) {
+    let byte = value
+        .char_indices()
+        .nth(cursor)
+        .map(|(b, _)| b)
+        .unwrap_or(value.len());
+    let (before, after) = value.split_at(byte);
+    spans.push(Span::styled(before.to_string(), base));
+    let mut rest = after.chars();
+    match rest.next() {
+        Some(under) => {
+            spans.push(Span::styled(
+                under.to_string(),
+                base.bg(ACCENT).fg(Color::Black),
+            ));
+            spans.push(Span::styled(rest.collect::<String>(), base));
+        }
+        None => spans.push(Span::styled("▏".to_string(), base.fg(ACCENT))),
+    }
 }
 
 /// The typed input with a block cursor at the end, styled as a prompt line.
@@ -1057,7 +912,7 @@ fn draw_create_dialog(
         if let Some(remote) = &candidate.remote {
             spans.push(Span::styled(
                 format!("  ({remote})"),
-                Style::new().fg(Color::Cyan).dim(),
+                Style::new().fg(ACCENT).dim(),
             ));
         }
         items.push(ListItem::new(Line::from(spans)));
@@ -1127,84 +982,6 @@ fn draw_base_picker(frame: &mut Frame, area: Rect, all_branches: &[String], sele
     frame.render_stateful_widget(list, inner, &mut state);
 }
 
-/// Prompt shown when a create would land on an existing directory.
-fn draw_confirm_existing(
-    frame: &mut Frame,
-    area: Rect,
-    path: &str,
-    existing_name: Option<&str>,
-    selected: usize,
-) {
-    let popup = centered(area, 70, 8);
-    frame.render_widget(Clear, popup);
-    let mut lines = vec![
-        Line::from(vec![
-            Span::raw("a directory already exists at "),
-            Span::styled(path.to_string(), Style::new().bold()),
-        ]),
-        Line::from(""),
-    ];
-    let option = |on: bool, label: String, enabled: bool| -> Line<'static> {
-        let marker = if on { "▌ ● " } else { "  ○ " };
-        let base = if enabled {
-            Style::new()
-        } else {
-            Style::new().dim()
-        };
-        let style = if on {
-            base.bg(SELECTION_BG).bold()
-        } else {
-            base
-        };
-        Line::from(vec![
-            Span::styled(marker.to_string(), style.fg(ACCENT)),
-            Span::styled(label, style),
-        ])
-    };
-    let is_wt = existing_name.is_some();
-    lines.push(option(
-        selected == 0,
-        match existing_name {
-            Some(n) => format!("open the existing worktree '{n}'"),
-            None => "open (only if it is a worktree)".to_string(),
-        },
-        is_wt,
-    ));
-    lines.push(option(
-        selected == 1,
-        "replace it (delete, then create)".to_string(),
-        true,
-    ));
-    lines.push(option(selected == 2, "cancel".to_string(), true));
-    let para = Paragraph::new(lines).block(panel("directory exists"));
-    frame.render_widget(para, popup);
-}
-
-/// Prompt shown when replacing the existing directory would discard real work:
-/// force-delete it and recreate, or cancel.
-fn draw_confirm_replace_changes(frame: &mut Frame, area: Rect, path: &str, selected: usize) {
-    let popup = centered(area, 70, 8);
-    frame.render_widget(Clear, popup);
-    let lines = vec![
-        Line::from(vec![
-            Span::raw("the worktree at "),
-            Span::styled(path.to_string(), Style::new().bold()),
-        ]),
-        Line::styled(
-            "has changes that replacing it would permanently lose",
-            Style::new().fg(Color::Red),
-        ),
-        Line::from(""),
-        radio_option(
-            selected == 0,
-            "force delete (lose all changes), then create".to_string(),
-        ),
-        radio_option(selected == 1, "cancel".to_string()),
-    ];
-    let para = Paragraph::new(lines).block(panel("changes would be lost"));
-    frame.render_widget(para, popup);
-}
-
 fn draw_creating(
     frame: &mut Frame,
     area: Rect,
@@ -1232,7 +1009,7 @@ fn draw_creating(
         if kill_armed {
             text.push(Line::styled(
                 "press Ctrl+C again to kill the setup",
-                Style::new().fg(Color::Red).bold(),
+                Style::new().fg(theme::DANGER).bold(),
             ));
         } else {
             text.push(prompt_line(input));
@@ -1296,9 +1073,9 @@ fn draw_rename_worktree(
 /// echoed user input shows its prompt, plain command output stays dim.
 fn output_line(line: &str) -> Line<'_> {
     let style = if line.starts_with("[ok]") {
-        Style::new().fg(Color::Green)
+        Style::new().fg(theme::SUCCESS)
     } else if line.starts_with("[FAILED]") || line.starts_with("error") {
-        Style::new().fg(Color::Red)
+        Style::new().fg(theme::DANGER)
     } else if line.starts_with("❯ ") {
         Style::new().fg(ACCENT)
     } else if line.starts_with("creating ")
@@ -1311,209 +1088,6 @@ fn output_line(line: &str) -> Line<'_> {
         Style::new().dim()
     };
     Line::from(Span::styled(line, style))
-}
-
-fn draw_confirm_delete(
-    frame: &mut Frame,
-    area: Rect,
-    name: &str,
-    dirty: usize,
-    branch: Option<&str>,
-    delete_branch: bool,
-) {
-    let extra = u16::from(dirty > 0);
-    let popup = centered(area, 64, 7 + extra);
-    frame.render_widget(Clear, popup);
-    let mut lines = vec![Line::from(vec![
-        Span::raw("remove worktree "),
-        Span::styled(format!("'{name}'"), Style::new().bold()),
-        Span::raw("?"),
-    ])];
-    if dirty > 0 {
-        lines.push(Line::styled(
-            format!("⚠ {dirty} uncommitted change(s) will be lost — press f to force"),
-            Style::new().fg(Color::Red),
-        ));
-    }
-    lines.push(Line::from(""));
-    let option = |selected: bool, label: String| -> Line<'static> {
-        let marker = if selected { "▌ ● " } else { "  ○ " };
-        let style = if selected {
-            Style::new().bg(SELECTION_BG).bold()
-        } else {
-            Style::new()
-        };
-        Line::from(vec![
-            Span::styled(marker.to_string(), style.fg(ACCENT)),
-            Span::styled(label, style),
-        ])
-    };
-    match branch {
-        Some(b) => {
-            lines.push(option(
-                !delete_branch,
-                format!("remove folder only (keep branch '{b}')"),
-            ));
-            lines.push(option(
-                delete_branch,
-                format!("remove folder and delete branch '{b}'"),
-            ));
-        }
-        None => lines.push(option(true, "remove the worktree folder".to_string())),
-    }
-    let para = Paragraph::new(lines).block(panel("delete"));
-    frame.render_widget(para, popup);
-}
-
-/// A radio option line, matching the style used in `draw_confirm_delete`.
-fn radio_option(selected: bool, label: String) -> Line<'static> {
-    let marker = if selected { "▌ ● " } else { "  ○ " };
-    let style = if selected {
-        Style::new().bg(SELECTION_BG).bold()
-    } else {
-        Style::new()
-    };
-    Line::from(vec![
-        Span::styled(marker.to_string(), style.fg(ACCENT)),
-        Span::styled(label, style),
-    ])
-}
-
-/// Prompt shown when the worktree being deleted has uncommitted changes:
-/// stash them, discard them, or cancel.
-fn draw_confirm_delete_dirty(
-    frame: &mut Frame,
-    area: Rect,
-    name: &str,
-    delete_branch: bool,
-    selected: usize,
-) {
-    let popup = centered(area, 66, 9);
-    frame.render_widget(Clear, popup);
-    let after = if delete_branch {
-        "the folder and branch will be removed"
-    } else {
-        "the folder will be removed"
-    };
-    let lines = vec![
-        Line::from(vec![
-            Span::raw("worktree "),
-            Span::styled(format!("'{name}'"), Style::new().bold()),
-            Span::raw(" has uncommitted changes"),
-        ]),
-        Line::styled(
-            format!("choose what to do with them, then {after}"),
-            Style::new().fg(Color::Red),
-        ),
-        Line::from(""),
-        radio_option(
-            selected == 0,
-            "stash the changes (keep them), then remove".to_string(),
-        ),
-        radio_option(selected == 1, "discard the changes and remove".to_string()),
-        radio_option(selected == 2, "cancel".to_string()),
-    ];
-    let para = Paragraph::new(lines).block(panel("uncommitted changes"));
-    frame.render_widget(para, popup);
-}
-
-/// Prompt shown before updating a worktree that has uncommitted changes: offer
-/// to stash them for the merge and reapply after, update as-is, or cancel.
-fn draw_confirm_update_stash(
-    frame: &mut Frame,
-    area: Rect,
-    name: &str,
-    dirty: usize,
-    selected: usize,
-) {
-    let popup = centered(area, 68, 9);
-    frame.render_widget(Clear, popup);
-    let lines = vec![
-        Line::from(vec![
-            Span::raw("worktree "),
-            Span::styled(format!("'{name}'"), Style::new().bold()),
-            Span::raw(format!(
-                " has {dirty} uncommitted change{}",
-                if dirty == 1 { "" } else { "s" }
-            )),
-        ]),
-        Line::styled(
-            "updating may conflict with them; how should they be handled?",
-            Style::new().fg(Color::Yellow),
-        ),
-        Line::from(""),
-        radio_option(
-            selected == 0,
-            "stash them, update, then reapply (recommended)".to_string(),
-        ),
-        radio_option(selected == 1, "update without stashing".to_string()),
-        radio_option(selected == 2, "cancel".to_string()),
-    ];
-    let para = Paragraph::new(lines).block(panel("update from default branch"));
-    frame.render_widget(para, popup);
-}
-
-/// Prompt shown when a branch could not be safely deleted after its folder was
-/// removed: offer to force, explaining why git refused.
-fn draw_confirm_force_branch(
-    frame: &mut Frame,
-    area: Rect,
-    branch: &str,
-    reason: &ForceBranchReason,
-) {
-    let popup = centered(area, 68, 8);
-    frame.render_widget(Clear, popup);
-    let (warn, action) = match reason {
-        ForceBranchReason::NotMerged => (
-            format!("branch '{branch}' is not fully merged"),
-            "force-delete it anyway (-D)".to_string(),
-        ),
-        ForceBranchReason::CheckedOutElsewhere(other) => (
-            format!("branch '{branch}' is checked out in worktree '{other}'"),
-            format!("switch '{other}' to the default branch, then delete '{branch}'"),
-        ),
-    };
-    let lines = vec![
-        Line::from("the worktree folder was removed, but the branch was kept".dim()),
-        Line::styled(format!("⚠ {warn}"), Style::new().fg(Color::Red)),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("f / Enter", Style::new().fg(ACCENT).bold()),
-            Span::raw(format!("  {action}")),
-        ]),
-        Line::from(vec![
-            Span::styled("Esc", Style::new().fg(ACCENT).bold()),
-            Span::raw("  keep the branch"),
-        ]),
-    ];
-    let para = Paragraph::new(lines).block(panel("delete branch?"));
-    frame.render_widget(para, popup);
-}
-
-/// Prompt shown when a fast-forward pull was refused because the worktree's
-/// branch has diverged from its upstream: offer to retry the pull with a
-/// rebase instead.
-fn draw_confirm_pull_rebase(frame: &mut Frame, area: Rect, name: &str) {
-    let popup = centered(area, 68, 8);
-    frame.render_widget(Clear, popup);
-    let lines = vec![
-        Line::styled(
-            format!("⚠ '{name}' has diverged from its upstream"),
-            Style::new().fg(Color::Red),
-        ),
-        Line::from("a plain fast-forward pull isn't possible".dim()),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("y / Enter", Style::new().fg(ACCENT).bold()),
-            Span::raw("  pull with rebase (replay local commits on top)"),
-        ]),
-        Line::from(vec![
-            Span::styled("Esc", Style::new().fg(ACCENT).bold()),
-            Span::raw("  leave the branch as it is"),
-        ]),
-    ];
-    let para = Paragraph::new(lines).block(panel("pull needs a rebase"));
-    frame.render_widget(para, popup);
 }
 
 /// The help panel: a tabbed, scrollable overlay. Content comes from the
@@ -1547,12 +1121,7 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
     // screens. 4 = the block's two borders plus the tab bar and its spacer.
     const CHROME: u16 = 4;
     let content_height = text.len() as u16;
-    let max_height = (area.height * 9 / 10).max(CHROME + 1);
-    let popup = centered(
-        area,
-        78,
-        content_height.saturating_add(CHROME).min(max_height),
-    );
+    let popup = modal_rect(area, content_height, 78, CHROME);
     frame.render_widget(Clear, popup);
     let block = panel("help");
     let inner = block.inner(popup);
@@ -1618,8 +1187,7 @@ fn draw_error_popup(frame: &mut Frame, area: Rect, msg: &str) {
         .sum();
     // +2 for the border, +2 for the blank line and dismiss hint below the
     // message.
-    let height = (wrapped_lines as u16 + 4).clamp(5, area.height.saturating_sub(2).max(5));
-    let popup = centered(area, width, height);
+    let popup = modal_rect(area, wrapped_lines as u16, width, 4);
     frame.render_widget(Clear, popup);
     let mut lines: Vec<Line> = msg.lines().map(Line::from).collect();
     lines.push(Line::from(""));
@@ -1629,13 +1197,13 @@ fn draw_error_popup(frame: &mut Frame, area: Rect, msg: &str) {
     ));
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(Color::Red))
+        .border_style(Style::new().fg(theme::DANGER))
         .padding(Padding::horizontal(1))
         .title(Line::from(vec![
             Span::raw(" "),
             Span::styled(
                 "error",
-                Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::new().fg(theme::DANGER).add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
         ]));
@@ -1646,34 +1214,59 @@ fn draw_error_popup(frame: &mut Frame, area: Rect, msg: &str) {
 }
 
 /// Renders the current step of the first-run setup wizard.
-fn draw_setup(frame: &mut Frame, area: Rect, wizard: &SetupWizard) {
+fn draw_setup(frame: &mut Frame, area: Rect, wizard: &SetupWizard) -> Option<RowList> {
+    // The same progress label ("step 2 of 5", …) titles every step so the user
+    // always knows where they are and that Esc steps back.
+    let progress = wizard.step.progress();
     match &wizard.step {
-        Step::CloneAsk { yes } => draw_clone_ask(frame, area, *yes),
-        Step::ClonePath { input } => draw_clone_path(frame, area, input),
-        Step::CloneBrowse { browser, .. } => draw_browser(frame, area, browser),
-        Step::Location { selected } => draw_location(frame, area, wizard, *selected),
-        Step::LocationCustom { input } => draw_wizard_input(
-            frame,
-            area,
-            "worktree location · path",
-            input,
-            "absolute, ~/..., or relative to the repo; {repo} = repo name",
-        ),
-        Step::CopyFiles { input } => draw_wizard_input(
-            frame,
-            area,
-            "files to copy into new worktrees",
-            input,
-            "comma separated, e.g. .env, .env.local (blank for none)",
-        ),
-        Step::RunCommands { commands, input } => draw_run_commands(frame, area, commands, input),
+        Step::CloneAsk { yes } => {
+            draw_clone_ask(frame, area, *yes, progress);
+            None
+        }
+        Step::ClonePath { input } => {
+            draw_clone_path(frame, area, input, progress);
+            None
+        }
+        Step::CloneBrowse { browser, .. } => draw_browser(frame, area, browser, progress),
+        Step::Location { selected } => draw_location(frame, area, wizard, *selected, progress),
+        Step::LocationCustom { input } => {
+            draw_wizard_input(
+                frame,
+                area,
+                "worktree location · path",
+                input,
+                "absolute, ~/..., or relative to the repo; {repo} = repo name",
+                progress,
+            );
+            None
+        }
+        Step::CopyFiles { input } => {
+            draw_wizard_input(
+                frame,
+                area,
+                "files to copy into new worktrees",
+                input,
+                "comma separated, e.g. .env, .env.local (blank for none)",
+                progress,
+            );
+            None
+        }
+        Step::RunCommands { commands, input } => {
+            draw_run_commands(frame, area, commands, input, progress);
+            None
+        }
         Step::Review { selected, editing } => {
-            draw_review(frame, area, wizard, *selected, editing.as_deref())
+            draw_review(frame, area, wizard, *selected, editing.as_ref(), progress)
         }
     }
 }
 
-fn draw_clone_ask(frame: &mut Frame, area: Rect, yes: bool) {
+/// Joins a step's own title with the shared progress label for its panel.
+fn wizard_title(title: &str, progress: &str) -> String {
+    format!("{title}  ·  {progress}")
+}
+
+fn draw_clone_ask(frame: &mut Frame, area: Rect, yes: bool, progress: &str) {
     let popup = centered(area, 60, 5);
     frame.render_widget(Clear, popup);
     let selected = Style::new().bg(SELECTION_BG).bold().fg(ACCENT);
@@ -1687,23 +1280,28 @@ fn draw_clone_ask(frame: &mut Frame, area: Rect, yes: bool) {
             Span::styled(" no ", if yes { plain } else { selected }),
         ]),
     ];
-    let para = Paragraph::new(lines).block(panel("wtm setup"));
+    let para = Paragraph::new(lines).block(panel(wizard_title("wtm setup", progress)));
     frame.render_widget(para, popup);
 }
 
-fn draw_clone_path(frame: &mut Frame, area: Rect, input: &str) {
+fn draw_clone_path(frame: &mut Frame, area: Rect, input: &super::app::TextInput, progress: &str) {
     let popup = centered(area, 70, 5);
     frame.render_widget(Clear, popup);
     let lines = vec![
-        prompt_line(input),
+        prompt_line_at(input.as_str(), input.cursor),
         Line::from("path to a repo or a .wtm.toml file".dim()),
         Line::from("Tab opens a file browser".dim()),
     ];
-    let para = Paragraph::new(lines).block(panel("clone settings from"));
+    let para = Paragraph::new(lines).block(panel(wizard_title("clone settings from", progress)));
     frame.render_widget(para, popup);
 }
 
-fn draw_browser(frame: &mut Frame, area: Rect, browser: &super::setup::FileBrowser) {
+fn draw_browser(
+    frame: &mut Frame,
+    area: Rect,
+    browser: &super::setup::FileBrowser,
+    progress: &str,
+) -> Option<RowList> {
     let height = (browser.entries.len() as u16 + 2).clamp(4, area.height.saturating_sub(2).max(4));
     let popup = centered(area, 70, height);
     frame.render_widget(Clear, popup);
@@ -1728,15 +1326,29 @@ fn draw_browser(frame: &mut Frame, area: Rect, browser: &super::setup::FileBrows
             })
             .collect()
     };
+    let block = panel(wizard_title(&browser.dir.display().to_string(), progress));
+    let inner = block.inner(popup);
     let list = List::new(items)
-        .block(panel(browser.dir.display().to_string()))
+        .block(block)
         .highlight_style(Style::new().bg(SELECTION_BG).bold())
         .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
     let mut state = ListState::default().with_selected(Some(browser.selected));
     frame.render_stateful_widget(list, popup, &mut state);
+    (!browser.entries.is_empty()).then_some(RowList {
+        inner,
+        header: 0,
+        offset: state.offset(),
+        len: browser.entries.len(),
+    })
 }
 
-fn draw_location(frame: &mut Frame, area: Rect, wizard: &SetupWizard, selected: usize) {
+fn draw_location(
+    frame: &mut Frame,
+    area: Rect,
+    wizard: &SetupWizard,
+    selected: usize,
+    progress: &str,
+) -> Option<RowList> {
     let popup = centered(area, 70, LOCATION_PRESETS.len() as u16 + 3);
     frame.render_widget(Clear, popup);
     let mut items: Vec<ListItem> = LOCATION_PRESETS
@@ -1753,24 +1365,49 @@ fn draw_location(frame: &mut Frame, area: Rect, wizard: &SetupWizard, selected: 
         "somewhere else: type a path",
         Style::new().bold(),
     ))));
+    let len = items.len();
+    let block = panel(wizard_title("where should new worktrees go?", progress));
+    let inner = block.inner(popup);
     let list = List::new(items)
-        .block(panel("where should new worktrees go?"))
+        .block(block)
         .highlight_style(Style::new().bg(SELECTION_BG).bold())
         .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
     let mut state = ListState::default().with_selected(Some(selected));
     frame.render_stateful_widget(list, popup, &mut state);
+    Some(RowList {
+        inner,
+        header: 0,
+        offset: state.offset(),
+        len,
+    })
 }
 
 /// A single-line wizard text input with a hint underneath.
-fn draw_wizard_input(frame: &mut Frame, area: Rect, title: &str, input: &str, hint: &str) {
+fn draw_wizard_input(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    input: &super::app::TextInput,
+    hint: &str,
+    progress: &str,
+) {
     let popup = centered(area, 70, 4);
     frame.render_widget(Clear, popup);
-    let lines = vec![prompt_line(input), Line::from(hint.to_string().dim())];
-    let para = Paragraph::new(lines).block(panel(title));
+    let lines = vec![
+        prompt_line_at(input.as_str(), input.cursor),
+        Line::from(hint.to_string().dim()),
+    ];
+    let para = Paragraph::new(lines).block(panel(wizard_title(title, progress)));
     frame.render_widget(para, popup);
 }
 
-fn draw_run_commands(frame: &mut Frame, area: Rect, commands: &[String], input: &str) {
+fn draw_run_commands(
+    frame: &mut Frame,
+    area: Rect,
+    commands: &[String],
+    input: &super::app::TextInput,
+    progress: &str,
+) {
     let height = (commands.len() as u16 + 4).clamp(4, area.height.saturating_sub(2).max(4));
     let popup = centered(area, 70, height);
     frame.render_widget(Clear, popup);
@@ -1778,11 +1415,14 @@ fn draw_run_commands(frame: &mut Frame, area: Rect, commands: &[String], input: 
         .iter()
         .map(|cmd| Line::from(format!("  {cmd}")))
         .collect();
-    lines.push(prompt_line(input));
+    lines.push(prompt_line_at(input.as_str(), input.cursor));
     lines.push(Line::from(
         "one command per line, blank Enter to finish".dim(),
     ));
-    let para = Paragraph::new(lines).block(panel("commands to run in each new worktree"));
+    let para = Paragraph::new(lines).block(panel(wizard_title(
+        "commands to run in each new worktree",
+        progress,
+    )));
     frame.render_widget(para, popup);
 }
 
@@ -1791,8 +1431,9 @@ fn draw_review(
     area: Rect,
     wizard: &SetupWizard,
     selected: usize,
-    editing: Option<&str>,
-) {
+    editing: Option<&super::app::TextInput>,
+    progress: &str,
+) -> Option<RowList> {
     let popup = centered(area, 74, 8);
     frame.render_widget(Clear, popup);
     let value = |row: usize| -> String {
@@ -1810,14 +1451,14 @@ fn draw_review(
         } else {
             Style::new()
         };
-        let shown = match (row == selected, editing) {
-            (true, Some(buf)) => format!("{buf}▏"),
-            _ => value(row),
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!(" {label} "), highlight.bold()),
-            Span::styled(shown, highlight),
-        ]));
+        let mut spans = vec![Span::styled(format!(" {label} "), highlight.bold())];
+        match (row == selected, editing) {
+            (true, Some(input)) => {
+                push_cursor_spans(&mut spans, input.as_str(), input.cursor, highlight)
+            }
+            _ => spans.push(Span::styled(value(row), highlight)),
+        }
+        lines.push(Line::from(spans));
     }
     lines.push(Line::from(""));
     let write_row = REVIEW_ROWS - 1;
@@ -1830,21 +1471,31 @@ fn draw_review(
         " [ write .wtm.toml ] ",
         write_style,
     )));
+    // Rows are `labels.len()` field lines, a blank separator, then the write
+    // row: the same line layout `on_click`'s decode logic assumes.
+    let row_lines = labels.len() as u16 + 2;
     // A cloned absolute path usually points at the other repo's location.
     if wizard.draft.worktree_dir.starts_with('/') || wizard.draft.worktree_dir.starts_with('~') {
         lines.push(Line::from(
             "check that this worktree_dir makes sense for this repo".dim(),
         ));
     }
-    let para = Paragraph::new(lines).block(panel("review settings"));
+    let block = panel(wizard_title("review settings", progress));
+    let inner = block.inner(popup);
+    let para = Paragraph::new(lines).block(block);
     frame.render_widget(para, popup);
+    Some(RowList {
+        inner,
+        header: 0,
+        offset: 0,
+        len: row_lines as usize,
+    })
 }
 
-/// The repo settings editor: editable rows for worktree_dir, setup.copy, and
-/// setup.run, a live resolved-location preview, and a save row.
-fn draw_config(frame: &mut Frame, area: Rect, editor: &ConfigEditor) {
-    let popup = centered(area, 76, 13);
-    frame.render_widget(Clear, popup);
+/// The Settings tab: editable rows for worktree_dir, setup.copy, and
+/// setup.run, a live resolved-location preview, and a save row. The form keeps
+/// a fixed width inside the full-height panel so long paths don't stretch it.
+fn draw_settings_tab(frame: &mut Frame, area: Rect, editor: &ConfigEditor) -> Option<RowList> {
     let labels = [
         "worktree_dir",
         "open_command",
@@ -1865,20 +1516,21 @@ fn draw_config(frame: &mut Frame, area: Rect, editor: &ConfigEditor) {
         } else {
             Style::new()
         };
-        let shown = match (selected, &editor.editing) {
-            (true, Some(buf)) => format!("{buf}▏"),
-            _ if editor.field(row).is_empty() => "(default)".to_string(),
-            _ => editor.field(row).to_string(),
-        };
-        let value_style = if editor.field(row).is_empty() && editor.editing.is_none() {
-            highlight.dim()
-        } else {
-            highlight
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!(" {} ", labels[row]), highlight.fg(ACCENT).bold()),
-            Span::styled(shown, value_style),
-        ]));
+        let mut spans = vec![Span::styled(
+            format!(" {} ", labels[row]),
+            highlight.fg(ACCENT).bold(),
+        )];
+        match (selected, &editor.editing) {
+            // The row being edited shows the live buffer with a movable cursor.
+            (true, Some(input)) => {
+                push_cursor_spans(&mut spans, input.as_str(), input.cursor, highlight)
+            }
+            _ if editor.field(row).is_empty() => {
+                spans.push(Span::styled("(default)".to_string(), highlight.dim()))
+            }
+            _ => spans.push(Span::styled(editor.field(row).to_string(), highlight)),
+        }
+        lines.push(Line::from(spans));
         lines.push(Line::from(Span::styled(
             format!("   {}", hints[row]),
             Style::new().dim(),
@@ -1907,8 +1559,28 @@ fn draw_config(frame: &mut Frame, area: Rect, editor: &ConfigEditor) {
     };
     lines.push(Line::from(Span::styled(" [ save .wtm.toml ] ", save_style)));
 
-    let para = Paragraph::new(lines).block(panel("edit settings"));
-    frame.render_widget(para, popup);
+    let block = panel("settings");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    // The form is a fixed-width column centered in the panel, with one blank
+    // line above it so it doesn't sit flush against the border.
+    let [_, form, _] = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(78),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
+    let [_, form] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(form);
+    frame.render_widget(Paragraph::new(lines), form);
+    // Rows are field value+hint line pairs, then the preview line, then the
+    // save row: the same line layout `on_click`'s decode logic assumes.
+    Some(RowList {
+        inner: form,
+        header: 0,
+        offset: 0,
+        len: FIELD_ROWS * 2 + 2,
+    })
 }
 
 /// Commit dialog: a checklist of changed files (all ticked by default) above a
@@ -1945,7 +1617,7 @@ fn draw_commit(
         .map(|(i, f)| {
             let checked = marked.get(i).copied().unwrap_or(false);
             let check = if checked {
-                Span::styled("[x] ", Style::new().fg(Color::Green))
+                Span::styled("[x] ", Style::new().fg(theme::SUCCESS))
             } else {
                 Span::styled("[ ] ", Style::new().dim())
             };
@@ -2008,75 +1680,69 @@ fn draw_commit(
 /// working tree, yellow when untracked.
 fn status_style(code: &str) -> Style {
     match code.chars().next() {
-        Some('?') => Style::new().fg(Color::Yellow),
-        Some(' ') | None => Style::new().fg(Color::Red),
-        _ => Style::new().fg(Color::Green),
+        Some('?') => Style::new().fg(theme::WARNING),
+        Some(' ') | None => Style::new().fg(theme::DANGER),
+        _ => Style::new().fg(theme::SUCCESS),
     }
 }
 
-/// Stash manager: the entry list, with a message input or drop confirm on top.
-fn draw_stash(
-    frame: &mut Frame,
-    area: Rect,
-    name: &str,
-    entries: &[StashEntry],
-    selected: usize,
-    mode: &StashMode,
-) {
-    let rows = (entries.len() as u16).clamp(1, 12);
-    let popup = centered(area, 74, rows + 3);
-    frame.render_widget(Clear, popup);
-    let items: Vec<ListItem> = if entries.is_empty() {
-        vec![ListItem::new(Line::from("(no stashes)".dim()))]
-    } else {
-        entries
-            .iter()
-            .map(|e| {
-                ListItem::new(Line::from(vec![
-                    Span::styled(format!("stash@{{{}}} ", e.index), Style::new().fg(ACCENT)),
-                    Span::raw(e.message.clone()),
-                ]))
-            })
-            .collect()
-    };
-    let list = List::new(items)
-        .block(panel(format!("stash · {name}")))
-        .highlight_style(Style::new().bg(SELECTION_BG).bold())
-        .highlight_symbol(Span::styled("▌ ", Style::new().fg(ACCENT)));
-    let mut state = ListState::default().with_selected(Some(selected));
-    frame.render_stateful_widget(list, popup, &mut state);
-
-    match mode {
-        StashMode::Message(buf) => draw_input_popup(
-            frame,
-            area,
-            "stash message (optional)",
-            buf,
-            "blank Enter stashes without a message",
-        ),
-        StashMode::ConfirmDrop => {
-            let entry = entries.get(selected);
-            let label = entry
-                .map(|e| format!("drop stash@{{{}}}?", e.index))
-                .unwrap_or_else(|| "drop stash?".to_string());
-            draw_confirm_popup(
-                frame,
-                area,
-                "drop stash",
-                &label,
-                "y to drop · Esc to cancel",
-            );
-        }
-        StashMode::List => {}
+/// The Stash tab: a full-width table of the selected worktree's stash entries.
+/// The message/drop prompts are modals drawn over it.
+fn draw_stash_tab(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
+    let block = panel(format!("stash · {}", app.stash_name));
+    let inner = block.inner(area);
+    if app.stash_entries.is_empty() {
+        let para = Paragraph::new(Line::from("no stashes — s stashes the current changes".dim()))
+            .block(block);
+        frame.render_widget(para, area);
+        return None;
     }
+    let rows: Vec<Row> = app
+        .stash_entries
+        .iter()
+        .map(|e| {
+            Row::new(vec![
+                Cell::from(Line::from(Span::styled(
+                    format!("stash@{{{}}}", e.index),
+                    Style::new().fg(ACCENT),
+                ))),
+                Cell::from(Line::from(Span::styled(
+                    e.message.clone(),
+                    Style::new().bold(),
+                ))),
+                Cell::from(Line::from(Span::styled(
+                    e.branch.clone(),
+                    Style::new().dim(),
+                ))),
+            ])
+        })
+        .collect();
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(12),
+            Constraint::Min(20),
+            Constraint::Length(24),
+        ],
+    )
+    .header(Row::new(["#", "MESSAGE", "BRANCH"]).style(Style::new().dim().bold()))
+    .block(block)
+    .row_highlight_style(Style::new().bg(SELECTION_BG).bold())
+    .highlight_symbol(Span::styled("▌ ", Style::new().fg(ACCENT)));
+    let mut state = TableState::default().with_selected(Some(app.stash_selected));
+    frame.render_stateful_widget(table, area, &mut state);
+    Some(RowList {
+        inner,
+        header: 1,
+        offset: state.offset(),
+        len: app.stash_entries.len(),
+    })
 }
 
-/// Branch browser: one row per local branch, with a create input or delete
-/// confirm on top.
 /// Top-of-main tab bar: the active tab in accent, the other dimmed, with a
 /// reminder that Tab switches between them.
 fn draw_tab_bar(frame: &mut Frame, area: Rect, app: &App) {
-    let tab_span = |label: &str, active: bool| {
+    let tab_span = |label: String, active: bool| {
         if active {
             Span::styled(
                 format!(" {label} "),
@@ -2086,13 +1752,18 @@ fn draw_tab_bar(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(format!(" {label} "), Style::new().fg(BORDER))
         }
     };
-    let line = Line::from(vec![
-        tab_span("Worktrees", app.tab == Tab::Worktrees),
-        Span::raw(" "),
-        tab_span("Branches", app.tab == Tab::Branches),
-        Span::styled("   ⇥ switch tab", Style::new().dim()),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+    let mut spans = Vec::new();
+    for tab in Tab::ALL {
+        if !spans.is_empty() {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(tab_span(
+            format!("{} {}", tab.glyph(), tab.title()),
+            app.tab == tab,
+        ));
+    }
+    spans.push(Span::styled("   ⇥/⇧⇥ switch", Style::new().dim()));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// The Branches tab: a full-width table of local branches, with the inline
@@ -2106,9 +1777,12 @@ fn draw_branches(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
         .iter()
         .map(|b| {
             let name = Span::styled(b.name.clone(), Style::new().bold());
-            let checkout = match &b.checked_out_path {
-                Some(p) => Span::styled(format!("● {p}"), Style::new().fg(Color::Green)),
-                None => Span::styled("–".to_string(), Style::new().dim()),
+            let checkout = match (&b.checked_out_path, &b.remote) {
+                (Some(p), _) => Span::styled(format!("● {p}"), Style::new().fg(theme::SUCCESS)),
+                (None, Some(remote)) => {
+                    Span::styled(format!("☁ {remote}"), Style::new().fg(theme::INFO).dim())
+                }
+                (None, None) => Span::styled("–".to_string(), Style::new().dim()),
             };
             let track = if b.upstream.is_some() {
                 Span::styled(
@@ -2119,7 +1793,7 @@ fn draw_branches(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
                 Span::styled("no upstream".to_string(), Style::new().dim())
             };
             let flags = if b.merged {
-                Span::styled("✓merged", Style::new().fg(Color::Green))
+                Span::styled("✓merged", Style::new().fg(theme::SUCCESS))
             } else {
                 Span::styled("–".to_string(), Style::new().dim())
             };
@@ -2153,49 +1827,13 @@ fn draw_branches(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
     let mut state = TableState::default().with_selected(Some(app.branch_selected));
     frame.render_stateful_widget(table, area, &mut state);
 
-    match &app.branch_mode {
-        BranchMode::Create(buf) => {
-            draw_input_popup(
-                frame,
-                area,
-                "new branch (no worktree)",
-                buf,
-                "branch only, from HEAD · Esc cancels",
-            );
-            None
-        }
-        BranchMode::Rename(buf) => {
-            draw_input_popup(
-                frame,
-                area,
-                "rename branch",
-                buf,
-                "new branch name · Esc cancels",
-            );
-            None
-        }
-        BranchMode::ConfirmDelete => {
-            let label = app
-                .branches
-                .get(app.branch_selected)
-                .map(|b| format!("delete branch '{}'?", b.name))
-                .unwrap_or_else(|| "delete branch?".to_string());
-            draw_confirm_popup(
-                frame,
-                area,
-                "delete branch",
-                &label,
-                "y to delete · f to force · Esc to cancel",
-            );
-            None
-        }
-        BranchMode::List => Some(RowList {
-            inner,
-            header: 1,
-            offset: state.offset(),
-            len: app.branches.len(),
-        }),
-    }
+    // The create/rename/delete prompts are modals now, drawn over this list.
+    Some(RowList {
+        inner,
+        header: 1,
+        offset: state.offset(),
+        len: app.branches.len(),
+    })
 }
 
 /// The switch-branch picker: a type-to-filter prompt over a centered list of
@@ -2208,7 +1846,7 @@ fn draw_switch(
     branches: &[CheckoutCandidate],
     filter: &TextInput,
     selected: usize,
-) {
+) -> Option<RowList> {
     let matches = filtered_candidates(branches, filter.as_str());
     // +2 rows: the filter prompt and the hint line below the list.
     let rows = matches.len().clamp(1, 12) as u16;
@@ -2227,7 +1865,7 @@ fn draw_switch(
         Paragraph::new(prompt_line_at(filter.as_str(), filter.cursor)),
         filter_area,
     );
-    if matches.is_empty() {
+    let hit = if matches.is_empty() {
         // Nothing matches, but Enter creates the typed name as a new branch, so
         // say so rather than leaving the picker looking like a dead end.
         let typed = filter.as_str().trim();
@@ -2240,6 +1878,7 @@ fn draw_switch(
             Paragraph::new(Line::styled(empty, Style::new().dim())),
             list_area,
         );
+        None
     } else {
         let items: Vec<ListItem> = matches
             .iter()
@@ -2254,7 +1893,7 @@ fn draw_switch(
                 if let Some(remote) = &candidate.remote {
                     spans.push(Span::styled(
                         format!("  ({remote})"),
-                        Style::new().fg(Color::Cyan).dim(),
+                        Style::new().fg(ACCENT).dim(),
                     ));
                 }
                 ListItem::new(Line::from(spans))
@@ -2265,7 +1904,13 @@ fn draw_switch(
             .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
         let mut state = ListState::default().with_selected(Some(selected.min(matches.len() - 1)));
         frame.render_stateful_widget(list, list_area, &mut state);
-    }
+        Some(RowList {
+            inner: list_area,
+            header: 0,
+            offset: state.offset(),
+            len: matches.len(),
+        })
+    };
     frame.render_widget(
         Paragraph::new(Line::styled(
             "type to filter or name a new branch · ↑/↓ pick · Enter switch/create · Esc clear/cancel",
@@ -2273,6 +1918,7 @@ fn draw_switch(
         )),
         hint_area,
     );
+    hit
 }
 
 /// Renders one `git log --graph` art prefix, translating git's ASCII (`* | / \`)
@@ -2312,7 +1958,7 @@ fn ref_spans(refs: &[String]) -> Vec<Span<'static>> {
             spans.push(Span::styled(", ", Style::new().dim()));
         }
         let color = if r.starts_with("HEAD") {
-            Color::Cyan
+            ACCENT
         } else if r.starts_with("tag:") {
             Color::Yellow
         } else if r.contains('/') {
@@ -2352,15 +1998,16 @@ fn draw_log(
     rows: &[GraphLine],
     selected: usize,
     mode: LogMode,
-) {
+) -> Option<RowList> {
     let block = panel(format!("log · {name} · {}", mode.label()));
     if rows.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from("no commits".dim())).block(block),
             area,
         );
-        return;
+        return None;
     }
+    let inner = block.inner(area);
     let items: Vec<ListItem> = rows
         .iter()
         .map(|row| {
@@ -2377,6 +2024,12 @@ fn draw_log(
         .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
     let mut state = ListState::default().with_selected(Some(selected.min(rows.len() - 1)));
     frame.render_stateful_widget(list, area, &mut state);
+    Some(RowList {
+        inner,
+        header: 0,
+        offset: state.offset(),
+        len: rows.len(),
+    })
 }
 
 /// Read-only browser for a single commit's changes: the changed files (tree or
@@ -2509,15 +2162,16 @@ fn draw_branch_commits(
     marked: &[bool],
     selected: usize,
     mode: LogMode,
-) {
+) -> Option<RowList> {
     let block = panel(format!("commits · {branch} · {}", mode.label()));
     if rows.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from("no commits".dim())).block(block),
             area,
         );
-        return;
+        return None;
     }
+    let inner = block.inner(area);
     let items: Vec<ListItem> = rows
         .iter()
         .enumerate()
@@ -2531,7 +2185,7 @@ fn draw_branch_commits(
             };
             let checked = marked.get(i).copied().unwrap_or(false);
             let mut spans = vec![if checked {
-                Span::styled("[x] ", Style::new().fg(Color::Green))
+                Span::styled("[x] ", Style::new().fg(theme::SUCCESS))
             } else {
                 Span::styled("[ ] ", Style::new().dim())
             }];
@@ -2547,6 +2201,12 @@ fn draw_branch_commits(
         .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
     let mut state = ListState::default().with_selected(Some(selected.min(rows.len() - 1)));
     frame.render_stateful_widget(list, area, &mut state);
+    Some(RowList {
+        inner,
+        header: 0,
+        offset: state.offset(),
+        len: rows.len(),
+    })
 }
 
 /// The cherry-pick flow overlay: first a worktree picker (`mode` is None), then
@@ -2559,7 +2219,7 @@ fn draw_cherry_pick(
     targets: &[CherryTarget],
     selected: usize,
     mode: Option<usize>,
-) {
+) -> Option<RowList> {
     let n = summaries.len();
     let plural = if n == 1 { "commit" } else { "commits" };
     match mode {
@@ -2591,6 +2251,7 @@ fn draw_cherry_pick(
                 Paragraph::new(lines).block(panel("cherry-pick mode")),
                 popup,
             );
+            None
         }
         // Worktree picker.
         None => {
@@ -2636,6 +2297,12 @@ fn draw_cherry_pick(
                 )),
                 hint_area,
             );
+            (!targets.is_empty()).then_some(RowList {
+                inner: list_area,
+                header: 0,
+                offset: state.offset(),
+                len: targets.len(),
+            })
         }
     }
 }
@@ -2648,7 +2315,7 @@ fn draw_merge_pick(
     source_branch: &str,
     targets: &[CherryTarget],
     selected: usize,
-) {
+) -> Option<RowList> {
     let rows = targets.len().clamp(1, 12) as u16;
     let popup = centered(area, 60, rows + 5);
     frame.render_widget(Clear, popup);
@@ -2689,17 +2356,23 @@ fn draw_merge_pick(
         Paragraph::new(Line::from("↑/↓ pick · Enter merge · Esc cancel".dim())),
         hint_area,
     );
+    (!targets.is_empty()).then_some(RowList {
+        inner: list_area,
+        header: 0,
+        offset: state.offset(),
+        len: targets.len(),
+    })
 }
 
 /// Short label and color for a hunk's chosen resolution action.
 fn action_label(action: Option<&ResolutionAction>) -> (&'static str, Color) {
     match action {
-        None => ("… pick a side", Color::DarkGray),
-        Some(ResolutionAction::KeepOurs) => ("OURS", Color::Green),
+        None => ("… pick a side", BORDER),
+        Some(ResolutionAction::KeepOurs) => ("OURS", theme::SUCCESS),
         Some(ResolutionAction::KeepTheirs) => ("THEIRS", Color::Blue),
         Some(ResolutionAction::KeepBoth) => ("BOTH", Color::Cyan),
         Some(ResolutionAction::KeepBothReversed) => ("BOTH (theirs first)", Color::Cyan),
-        Some(ResolutionAction::Manual(_)) => ("MANUAL", Color::Yellow),
+        Some(ResolutionAction::Manual(_)) => ("MANUAL", theme::WARNING),
     }
 }
 
@@ -2768,7 +2441,7 @@ fn draw_conflict_resolver(
     resolved: &[bool],
     file: usize,
     current: Option<&ResolverFile>,
-) {
+) -> Option<RowList> {
     let [list_area, detail_area] =
         Layout::horizontal([Constraint::Length(36), Constraint::Min(20)]).areas(area);
 
@@ -2779,9 +2452,9 @@ fn draw_conflict_resolver(
         .map(|(i, path)| {
             let done = resolved.get(i).copied().unwrap_or(false);
             let mark = if done {
-                Span::styled("✓ ", Style::new().fg(Color::Green))
+                Span::styled("✓ ", Style::new().fg(theme::SUCCESS))
             } else {
-                Span::styled("• ", Style::new().fg(Color::Yellow))
+                Span::styled("• ", Style::new().fg(theme::WARNING))
             };
             let name = if done {
                 Style::new().dim()
@@ -2791,13 +2464,21 @@ fn draw_conflict_resolver(
             ListItem::new(Line::from(vec![mark, Span::styled(path.clone(), name)]))
         })
         .collect();
+    let block = panel(format!("conflicts · {target}"));
+    let inner = block.inner(list_area);
     let list = List::new(items)
-        .block(panel(format!("conflicts · {target}")))
+        .block(block)
         .highlight_style(Style::new().bg(SELECTION_BG).bold())
         .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
     let mut state =
         ListState::default().with_selected(Some(file.min(files.len().saturating_sub(1))));
     frame.render_stateful_widget(list, list_area, &mut state);
+    let list_hit = (!files.is_empty()).then_some(RowList {
+        inner,
+        header: 0,
+        offset: state.offset(),
+        len: files.len(),
+    });
 
     let path = files.get(file).map(String::as_str).unwrap_or("");
 
@@ -2807,7 +2488,7 @@ fn draw_conflict_resolver(
             Line::from(""),
             Line::styled(
                 "  ✓ resolved — no conflicts remain in this file",
-                Style::new().fg(Color::Green),
+                Style::new().fg(theme::SUCCESS),
             ),
             Line::from(""),
             Line::styled(
@@ -2821,17 +2502,17 @@ fn draw_conflict_resolver(
         ])
         .block(panel(format!("resolve · {path}")));
         frame.render_widget(para, detail_area);
-        return;
+        return list_hit;
     };
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     // Spell out which side is which: OURS is what is already in this worktree
     // (the local/current branch), THEIRS is what is being pulled in.
     lines.push(Line::from(vec![
-        Span::styled("‹ OURS ", Style::new().fg(Color::Green).bold()),
+        Span::styled("‹ OURS ", Style::new().fg(theme::SUCCESS).bold()),
         Span::styled(
             format!("(current · {})", rf.file.ours_label),
-            Style::new().fg(Color::Green),
+            Style::new().fg(theme::SUCCESS),
         ),
     ]));
     lines.push(Line::from(vec![
@@ -2873,7 +2554,7 @@ fn draw_conflict_resolver(
                     Span::styled(format!("{marker} hunk {} ", hunk_i + 1), hstyle.fg(ACCENT)),
                     Span::styled(format!("[{label}]"), Style::new().fg(color).bold()),
                 ]));
-                push_side(&mut lines, "‹", ours, Color::Green);
+                push_side(&mut lines, "‹", ours, theme::SUCCESS);
                 lines.push(Line::styled("  ─────", Style::new().dim()));
                 push_side(&mut lines, "›", theirs, Color::Blue);
                 lines.push(Line::from(""));
@@ -2898,11 +2579,8 @@ fn draw_conflict_resolver(
         detail_area,
         &mut sb,
     );
-
-    // The manual editor floats over the resolver when open on the current hunk.
-    if let Some(editor) = &rf.edit {
-        draw_hunk_editor(frame, area, rf.hunk, editor);
-    }
+    // The manual hunk editor floats over the resolver as a modal (`draw_modal`).
+    list_hit
 }
 
 /// Floating multi-line editor for hand-editing one hunk's resolved text, with a
@@ -2966,32 +2644,149 @@ fn spinner_glyph(tick: u64) -> char {
     FRAMES[(tick % FRAMES.len() as u64) as usize]
 }
 
-/// A generic single-line text input overlay with a dim hint underneath.
-fn draw_input_popup(
-    frame: &mut Frame,
-    area: Rect,
-    title: &str,
-    input: &super::app::TextInput,
-    hint: &str,
-) {
-    let popup = centered(area, 64, 4);
-    frame.render_widget(Clear, popup);
-    let lines = vec![
-        prompt_line_at(input.as_str(), input.cursor),
-        Line::from(hint.to_string().dim()),
-    ];
-    frame.render_widget(Paragraph::new(lines).block(panel(title.to_string())), popup);
+/// Renders whichever `Modal` is active over the current view: a confirmation
+/// (body text plus selectable option rows), a single-line prompt, or the manual
+/// hunk editor. Replaces the former per-dialog `draw_confirm_*`/`draw_input_popup`
+/// functions.
+fn draw_modal(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
+    let Some(modal) = &app.modal else {
+        return None;
+    };
+    match modal {
+        Modal::Confirm {
+            title,
+            body,
+            options,
+            selected,
+            ..
+        } => {
+            let mut lines = body.clone();
+            if !options.is_empty() {
+                lines.push(Line::from(""));
+            }
+            let header_lines = lines.len() as u16;
+            for (i, opt) in options.iter().enumerate() {
+                lines.push(modal_option(i == *selected, opt));
+            }
+            let width = modal_width(&lines);
+            let popup = modal_rect(area, lines.len() as u16, width, 2);
+            frame.render_widget(Clear, popup);
+            let block = panel(title.clone());
+            let inner = block.inner(popup);
+            frame.render_widget(Paragraph::new(lines).block(block), popup);
+            (!options.is_empty()).then_some(RowList {
+                inner: Rect {
+                    x: inner.x,
+                    y: inner.y + header_lines,
+                    width: inner.width,
+                    height: options.len() as u16,
+                },
+                header: 0,
+                offset: 0,
+                len: options.len(),
+            })
+        }
+        Modal::Prompt {
+            title, input, hint, ..
+        } => {
+            let popup = modal_rect(area, 2, 64, 2);
+            frame.render_widget(Clear, popup);
+            let lines = vec![
+                prompt_line_at(input.as_str(), input.cursor),
+                Line::from(hint.clone().dim()),
+            ];
+            frame.render_widget(Paragraph::new(lines).block(panel(title.clone())), popup);
+            None
+        }
+        Modal::HunkEditor(editor) => {
+            // The panel title numbers the hunk being edited, read from the
+            // resolver screen underneath.
+            let hunk = match &app.view {
+                View::ConflictResolver {
+                    current: Some(rf), ..
+                } => rf.hunk,
+                _ => 0,
+            };
+            draw_hunk_editor(frame, area, hunk, editor);
+            None
+        }
+    }
 }
 
-/// A generic confirmation overlay: a question and a dim hint of the keys.
-fn draw_confirm_popup(frame: &mut Frame, area: Rect, title: &str, question: &str, hint: &str) {
-    let popup = centered(area, 60, 4);
-    frame.render_widget(Clear, popup);
-    let lines = vec![
-        Line::styled(question.to_string(), Style::new().bold()),
-        Line::from(hint.to_string().dim()),
+/// A confirm-modal option row: a radio marker plus the label, highlighted when
+/// selected and dimmed when disabled (an option shown but not choosable).
+fn modal_option(selected: bool, opt: &ConfirmOption) -> Line<'static> {
+    let marker = if selected { "▌ ● " } else { "  ○ " };
+    let base = if opt.enabled {
+        Style::new()
+    } else {
+        Style::new().dim()
+    };
+    let style = if selected {
+        base.bg(SELECTION_BG).bold()
+    } else {
+        base
+    };
+    let mut spans = vec![
+        Span::styled(marker.to_string(), style.fg(ACCENT)),
+        Span::styled(opt.label.clone(), style),
     ];
-    frame.render_widget(Paragraph::new(lines).block(panel(title.to_string())), popup);
+    // Show the direct-select shortcut (destructive options are the Shift-variant)
+    // so a force/delete key is discoverable without opening help.
+    if let Some(c) = opt.shortcut() {
+        spans.push(Span::styled(format!("  ({c})"), style.fg(ACCENT)));
+    }
+    Line::from(spans)
+}
+
+/// Width for a confirm modal: wide enough for its widest line plus the panel
+/// chrome, clamped to a sensible range.
+fn modal_width(lines: &[Line]) -> u16 {
+    let content = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    content.saturating_add(6).clamp(48, 80)
+}
+
+/// Footer key hints for the active modal.
+fn modal_footer_hints(modal: &Modal) -> &'static [Binding] {
+    const CONFIRM_MULTI: &[Binding] = &[
+        hint("↑/↓", "choose"),
+        hint("Enter", "confirm"),
+        hint("Esc", "cancel"),
+    ];
+    const CONFIRM_SINGLE: &[Binding] = &[hint("Enter", "confirm"), hint("Esc", "cancel")];
+    const PROMPT: &[Binding] = &[
+        hint("type", "then"),
+        hint("Enter", "confirm"),
+        hint("Esc", "cancel"),
+    ];
+    const HUNK: &[Binding] = &[
+        hint("type", "edit result"),
+        hint("Ctrl+S", "save"),
+        hint("Esc", "cancel"),
+    ];
+    match modal {
+        Modal::Confirm { options, .. } if options.len() > 1 => CONFIRM_MULTI,
+        Modal::Confirm { .. } => CONFIRM_SINGLE,
+        Modal::Prompt { .. } => PROMPT,
+        Modal::HunkEditor(_) => HUNK,
+    }
+}
+
+/// A centered popup rect sized to fit `content_height` rows of actual
+/// content plus `chrome` extra rows (borders, a tab bar, a hint line —
+/// whatever the caller draws around the content), clamped so a very long
+/// modal still leaves a margin around the frame instead of filling it, and
+/// never smaller than `chrome` plus one row of content.
+///
+/// Shared by `draw_help` and `draw_error_popup`, whose popups both size to
+/// their content instead of a fixed literal.
+fn modal_rect(area: Rect, content_height: u16, width: u16, chrome: u16) -> Rect {
+    let max_height = (area.height * 9 / 10).max(chrome + 1);
+    let height = content_height
+        .saturating_add(chrome)
+        .max(chrome + 1)
+        .min(max_height);
+    centered(area, width, height)
 }
 
 /// A rect of `width` x `height` centered inside `area`, clamped to fit.
@@ -3059,7 +2854,7 @@ mod tests {
             },
         ];
         let out = render(78, 6, |frame, area| {
-            draw_log(frame, area, "main", &rows, 0, LogMode::Tree)
+            draw_log(frame, area, "main", &rows, 0, LogMode::Tree);
         });
         assert!(out[0].contains("log · main · tree"), "{out:#?}");
         // git's `*` and `|` become `●` and `│`; the `\` becomes `╲`.
@@ -3079,7 +2874,7 @@ mod tests {
         let line = hint_line(help::WORKTREES).to_string();
         assert_eq!(
             line,
-            "⇥ branches  Enter changes  n new  b switch branch  c commit  s stash  \
+            "⇥ tabs  Enter changes  n new  b switch branch  c commit  s stash  \
              p pull  ⇧P push  f fetch  l log  d delete  ⇧R rename  ? help  q quit"
         );
         // `u`, `o`, `e` and the cursor keys are documented in help but have no
@@ -3112,7 +2907,7 @@ mod tests {
             entry: Some(entry("1a2b3c4", "fix parser", &[])),
         }];
         let out = render(78, 4, |frame, area| {
-            draw_log(frame, area, "main", &rows, 0, LogMode::Flat)
+            draw_log(frame, area, "main", &rows, 0, LogMode::Flat);
         });
         assert!(out[0].contains("log · main · flat"), "{out:#?}");
         assert!(out[1].contains("1a2b3c4 fix parser"), "{out:#?}");
@@ -3134,7 +2929,7 @@ mod tests {
             },
         ];
         let out = render(78, 5, |frame, area| {
-            draw_branch_commits(frame, area, "main", &rows, &[true, false], 0, LogMode::Tree)
+            draw_branch_commits(frame, area, "main", &rows, &[true, false], 0, LogMode::Tree);
         });
         assert!(out[0].contains("commits · main · tree"), "{out:#?}");
         // A marked commit, its art, then the hash abbreviated to 9 chars.
@@ -3159,7 +2954,7 @@ mod tests {
     #[test]
     fn empty_log_says_so() {
         let out = render(40, 4, |frame, area| {
-            draw_log(frame, area, "main", &[], 0, LogMode::Tree)
+            draw_log(frame, area, "main", &[], 0, LogMode::Tree);
         });
         assert!(out[1].contains("no commits"), "{out:#?}");
     }

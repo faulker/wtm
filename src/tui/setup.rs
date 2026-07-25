@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
+use super::app::TextInput;
 use crate::config::{self, CONFIG_FILE, DEFAULT_LOCATION, LOCATION_PRESETS};
 use crate::settings::{self, ConfigDraft};
 
@@ -26,33 +27,49 @@ pub enum Step {
     /// Yes/no: clone settings from another location?
     CloneAsk { yes: bool },
     /// Typed path to a repo or `.wtm.toml` to clone from.
-    ClonePath { input: String },
+    ClonePath { input: TextInput },
     /// File browser alternative to typing the path; `prior_input` restores
     /// the typed path when the browser is cancelled.
     CloneBrowse {
         browser: FileBrowser,
-        prior_input: String,
+        prior_input: TextInput,
     },
     /// Where new worktrees go: the presets plus "somewhere else".
     Location { selected: usize },
     /// Manual path for the "somewhere else" choice.
-    LocationCustom { input: String },
+    LocationCustom { input: TextInput },
     /// Comma-separated files to copy into new worktrees.
-    CopyFiles { input: String },
+    CopyFiles { input: TextInput },
     /// Setup commands, entered one per line until a blank one.
     RunCommands {
         commands: Vec<String>,
-        input: String,
+        input: TextInput,
     },
     /// Editable summary of the draft; the last row writes the file.
     Review {
         selected: usize,
-        editing: Option<String>,
+        editing: Option<TextInput>,
     },
 }
 
 /// Rows on the review screen, in order.
 pub const REVIEW_ROWS: usize = 4;
+
+impl Step {
+    /// A short "where am I" label for the wizard header. The two routes have
+    /// different lengths (cloning skips the location/copy/run questions), so the
+    /// total adapts to the branch the user took. Esc always steps back one.
+    pub fn progress(&self) -> &'static str {
+        match self {
+            Step::CloneAsk { .. } => "step 1 · start",
+            Step::ClonePath { .. } | Step::CloneBrowse { .. } => "step 2 of 3 · clone route",
+            Step::Location { .. } | Step::LocationCustom { .. } => "step 2 of 5",
+            Step::CopyFiles { .. } => "step 3 of 5",
+            Step::RunCommands { .. } => "step 4 of 5",
+            Step::Review { .. } => "final step · review & write",
+        }
+    }
+}
 
 /// What a key press did, for the app to act on.
 pub enum WizardOutcome {
@@ -99,14 +116,14 @@ impl SetupWizard {
                 | KeyCode::Char('l') => (Step::CloneAsk { yes: !yes }, Continue),
                 KeyCode::Char('y') => (
                     Step::ClonePath {
-                        input: String::new(),
+                        input: TextInput::default(),
                     },
                     Continue,
                 ),
                 KeyCode::Char('n') => (Step::Location { selected: 0 }, Continue),
                 KeyCode::Enter if yes => (
                     Step::ClonePath {
-                        input: String::new(),
+                        input: TextInput::default(),
                     },
                     Continue,
                 ),
@@ -139,7 +156,7 @@ impl SetupWizard {
                         }
                     }
                 }
-                KeyCode::Enter => match settings::load_clone_source(&input) {
+                KeyCode::Enter => match settings::load_clone_source(input.as_str()) {
                     Ok(draft) => {
                         self.draft = draft;
                         (
@@ -155,15 +172,10 @@ impl SetupWizard {
                         (Step::ClonePath { input }, Continue)
                     }
                 },
-                KeyCode::Backspace => {
-                    input.pop();
+                _ => {
+                    input.on_key(key);
                     (Step::ClonePath { input }, Continue)
                 }
-                KeyCode::Char(c) => {
-                    input.push(c);
-                    (Step::ClonePath { input }, Continue)
-                }
-                _ => (Step::ClonePath { input }, Continue),
             },
 
             Step::CloneBrowse {
@@ -280,14 +292,14 @@ impl SetupWizard {
                         self.draft.worktree_dir = LOCATION_PRESETS[selected].0.to_string();
                         (
                             Step::CopyFiles {
-                                input: String::new(),
+                                input: TextInput::default(),
                             },
                             Continue,
                         )
                     } else {
                         (
                             Step::LocationCustom {
-                                input: String::new(),
+                                input: TextInput::default(),
                             },
                             Continue,
                         )
@@ -304,51 +316,41 @@ impl SetupWizard {
                     Continue,
                 ),
                 KeyCode::Enter => {
-                    let path = input.trim();
+                    let path = input.trimmed();
                     self.draft.worktree_dir = if path.is_empty() {
                         DEFAULT_LOCATION.to_string()
                     } else {
-                        path.to_string()
+                        path
                     };
                     (
                         Step::CopyFiles {
-                            input: String::new(),
+                            input: TextInput::default(),
                         },
                         Continue,
                     )
                 }
-                KeyCode::Backspace => {
-                    input.pop();
+                _ => {
+                    input.on_key(key);
                     (Step::LocationCustom { input }, Continue)
                 }
-                KeyCode::Char(c) => {
-                    input.push(c);
-                    (Step::LocationCustom { input }, Continue)
-                }
-                _ => (Step::LocationCustom { input }, Continue),
             },
 
             Step::CopyFiles { mut input } => match key.code {
                 KeyCode::Esc => (Step::Location { selected: 0 }, Continue),
                 KeyCode::Enter => {
-                    self.draft.copy = settings::split_list(&input);
+                    self.draft.copy = settings::split_list(input.as_str());
                     (
                         Step::RunCommands {
                             commands: Vec::new(),
-                            input: String::new(),
+                            input: TextInput::default(),
                         },
                         Continue,
                     )
                 }
-                KeyCode::Backspace => {
-                    input.pop();
+                _ => {
+                    input.on_key(key);
                     (Step::CopyFiles { input }, Continue)
                 }
-                KeyCode::Char(c) => {
-                    input.push(c);
-                    (Step::CopyFiles { input }, Continue)
-                }
-                _ => (Step::CopyFiles { input }, Continue),
             },
 
             Step::RunCommands {
@@ -357,12 +359,12 @@ impl SetupWizard {
             } => match key.code {
                 KeyCode::Esc => (
                     Step::CopyFiles {
-                        input: self.draft.copy.join(", "),
+                        input: TextInput::with_value(self.draft.copy.join(", ")),
                     },
                     Continue,
                 ),
                 KeyCode::Enter => {
-                    let cmd = input.trim().to_string();
+                    let cmd = input.trimmed();
                     if cmd.is_empty() {
                         self.draft.run = commands;
                         (
@@ -377,21 +379,16 @@ impl SetupWizard {
                         (
                             Step::RunCommands {
                                 commands,
-                                input: String::new(),
+                                input: TextInput::default(),
                             },
                             Continue,
                         )
                     }
                 }
-                KeyCode::Backspace => {
-                    input.pop();
+                _ => {
+                    input.on_key(key);
                     (Step::RunCommands { commands, input }, Continue)
                 }
-                KeyCode::Char(c) => {
-                    input.push(c);
-                    (Step::RunCommands { commands, input }, Continue)
-                }
-                _ => (Step::RunCommands { commands, input }, Continue),
             },
 
             Step::Review {
@@ -406,7 +403,7 @@ impl SetupWizard {
                     Continue,
                 ),
                 KeyCode::Enter => {
-                    self.commit_review_edit(selected, &buf);
+                    self.commit_review_edit(selected, buf.as_str());
                     (
                         Step::Review {
                             selected,
@@ -415,8 +412,8 @@ impl SetupWizard {
                         Continue,
                     )
                 }
-                KeyCode::Backspace => {
-                    buf.pop();
+                _ => {
+                    buf.on_key(key);
                     (
                         Step::Review {
                             selected,
@@ -425,23 +422,6 @@ impl SetupWizard {
                         Continue,
                     )
                 }
-                KeyCode::Char(c) => {
-                    buf.push(c);
-                    (
-                        Step::Review {
-                            selected,
-                            editing: Some(buf),
-                        },
-                        Continue,
-                    )
-                }
-                _ => (
-                    Step::Review {
-                        selected,
-                        editing: Some(buf),
-                    },
-                    Continue,
-                ),
             },
 
             Step::Review {
@@ -479,7 +459,7 @@ impl SetupWizard {
                     (
                         Step::Review {
                             selected,
-                            editing: Some(current),
+                            editing: Some(TextInput::with_value(current)),
                         },
                         Continue,
                     )

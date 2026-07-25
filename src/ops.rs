@@ -748,6 +748,9 @@ pub struct BranchListItem {
     pub date: String,
     /// Whether the branch's work has been merged into the repo's default branch.
     pub merged: bool,
+    /// `Some("origin/feature")` when this branch exists only on a remote, with
+    /// no local branch yet; `None` for a normal local branch.
+    pub remote: Option<String>,
 }
 
 /// Result of `branch list`.
@@ -1078,7 +1081,8 @@ pub fn fetch(ctx: &Ctx) -> Result<FetchResult> {
 /// Lists local branches with tracking info and, for each, the worktree it is
 /// checked out in (if any).
 pub fn branch_list(ctx: &Ctx) -> Result<BranchListResult> {
-    let details = git::branch_details(&ctx.repo_root)?;
+    let local_details = git::ref_details(&ctx.repo_root, "refs/heads")?;
+    let remote_details = git::ref_details(&ctx.repo_root, "refs/remotes")?;
     let worktrees = git::list_worktrees(&ctx.repo_root)?;
     // The mainline every branch's "merged" flag is measured against, plus its
     // first-parent trunk (computed once). Best-effort: a repo with no resolvable
@@ -1088,8 +1092,9 @@ pub fn branch_list(ctx: &Ctx) -> Result<BranchListResult> {
         Some(d) => git::first_parent_commits(&ctx.repo_root, d).unwrap_or_default(),
         None => HashSet::new(),
     };
-    let mut branches = Vec::with_capacity(details.len());
-    for d in details {
+    let local_names: HashSet<String> = local_details.iter().map(|d| d.name.clone()).collect();
+    let mut branches = Vec::with_capacity(local_details.len());
+    for d in local_details {
         let checked_out_path = worktrees
             .iter()
             .find(|w| w.branch.as_deref() == Some(&d.name))
@@ -1107,6 +1112,36 @@ pub fn branch_list(ctx: &Ctx) -> Result<BranchListResult> {
             subject: d.subject,
             date: d.date,
             merged,
+            remote: None,
+        });
+    }
+    // Remote-tracking refs whose short name (after stripping `<remote>/`) has
+    // no matching local branch are branches that exist only on a remote —
+    // surface them as their own rows rather than leaving them invisible.
+    for d in remote_details {
+        if d.name.ends_with("/HEAD") {
+            continue;
+        }
+        let Some(short) = git::remote_short_name(&d.name) else {
+            continue;
+        };
+        if local_names.contains(short) {
+            continue;
+        }
+        let merged = match &default {
+            Some(default) => branch_merged_into(&ctx.repo_root, default, &d.name, &trunk)?,
+            None => false,
+        };
+        branches.push(BranchListItem {
+            name: short.to_string(),
+            checked_out_path: None,
+            upstream: d.upstream,
+            ahead: d.ahead,
+            behind: d.behind,
+            subject: d.subject,
+            date: d.date,
+            merged,
+            remote: Some(d.name),
         });
     }
     Ok(BranchListResult { branches })
@@ -2476,6 +2511,45 @@ mod tests {
         assert!(merged("merged-branch"), "merged branch is flagged");
         assert!(!merged("fresh-branch"), "brand-new branch is not");
         assert!(!merged("main"), "the default branch is never flagged");
+    }
+
+    /// A branch that exists only on the remote (never fetched into a local
+    /// branch) shows up as its own row, tagged with the remote it lives on,
+    /// rather than being absent from the list entirely.
+    #[test]
+    fn branch_list_surfaces_remote_only_branches() {
+        let (tmp, ctx) = temp_ctx();
+        let bare = with_origin(tmp.path(), &ctx);
+        // Push a branch to the remote from an independent clone, so it lands
+        // on "origin" without ever existing as a local branch in `ctx`.
+        let clone = tmp.path().join("clone-remote-only");
+        git(
+            tmp.path(),
+            &["clone", bare.to_str().unwrap(), clone.to_str().unwrap()],
+        );
+        git(&clone, &["config", "user.email", "t@e.st"]);
+        git(&clone, &["config", "user.name", "t"]);
+        git(&clone, &["checkout", "-b", "teammate-feature"]);
+        git(&clone, &["commit", "--allow-empty", "-m", "remote work"]);
+        git(&clone, &["push", "origin", "teammate-feature"]);
+        git(&ctx.repo_root, &["fetch", "origin"]);
+
+        let result = branch_list(&ctx).unwrap();
+        let item = result
+            .branches
+            .iter()
+            .find(|b| b.name == "teammate-feature")
+            .expect("remote-only branch is listed");
+        assert_eq!(item.remote.as_deref(), Some("origin/teammate-feature"));
+        assert_eq!(item.checked_out_path, None, "not checked out anywhere yet");
+
+        // A local branch with the same name as an existing local branch is
+        // never duplicated as a remote-only row.
+        assert_eq!(
+            result.branches.iter().filter(|b| b.name == "main").count(),
+            1,
+            "main exists locally and on origin, but appears once"
+        );
     }
 
     /// Renaming a worktree renames its branch and moves its directory to a

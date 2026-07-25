@@ -9,9 +9,12 @@ use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Rect;
+use ratatui::style::{Style, Stylize};
+use ratatui::text::{Line, Span};
 
-use super::config_editor::{ConfigEditor, EditorOutcome};
+use super::config_editor::{ConfigEditor, EditorOutcome, FIELD_ROWS, ROWS as CONFIG_ROWS};
 use super::help::HelpTab;
+use super::theme;
 use super::setup::{self, SetupWizard, WizardOutcome};
 use crate::conflict::{self, ConflictSegment, ResolutionAction};
 use crate::git::{self, GraphLine, LogEntry, StashEntry, StatusEntry};
@@ -27,41 +30,54 @@ pub struct TextInput {
     pub cursor: usize,
 }
 
+/// Byte offset of character index `idx` in `s`, or `s.len()` when past the end.
+/// Keeps single-line edits on UTF-8 char boundaries. Shared by `TextInput` and
+/// the multi-line `HunkEditor` so the boundary math lives in one place.
+fn char_byte(s: &str, idx: usize) -> usize {
+    s.char_indices().nth(idx).map(|(b, _)| b).unwrap_or(s.len())
+}
+
+/// Inserts `c` at character index `*cursor` in `s`, advancing the cursor.
+fn line_insert(s: &mut String, cursor: &mut usize, c: char) {
+    let b = char_byte(s, *cursor);
+    s.insert(b, c);
+    *cursor += 1;
+}
+
+/// Deletes the character before the cursor (Backspace), if any.
+fn line_backspace(s: &mut String, cursor: &mut usize) {
+    if *cursor > 0 {
+        let start = char_byte(s, *cursor - 1);
+        let end = char_byte(s, *cursor);
+        s.replace_range(start..end, "");
+        *cursor -= 1;
+    }
+}
+
+/// Deletes the character at the cursor (Delete), if any.
+fn line_delete(s: &mut String, cursor: usize) {
+    if cursor < s.chars().count() {
+        let start = char_byte(s, cursor);
+        let end = char_byte(s, cursor + 1);
+        s.replace_range(start..end, "");
+    }
+}
+
 impl TextInput {
     fn len(&self) -> usize {
         self.value.chars().count()
     }
 
-    /// Byte offset of character index `idx`, for slicing `value`.
-    fn byte_at(&self, idx: usize) -> usize {
-        self.value
-            .char_indices()
-            .nth(idx)
-            .map(|(b, _)| b)
-            .unwrap_or(self.value.len())
-    }
-
     fn insert(&mut self, c: char) {
-        let b = self.byte_at(self.cursor);
-        self.value.insert(b, c);
-        self.cursor += 1;
+        line_insert(&mut self.value, &mut self.cursor, c);
     }
 
     fn backspace(&mut self) {
-        if self.cursor > 0 {
-            let start = self.byte_at(self.cursor - 1);
-            let end = self.byte_at(self.cursor);
-            self.value.replace_range(start..end, "");
-            self.cursor -= 1;
-        }
+        line_backspace(&mut self.value, &mut self.cursor);
     }
 
     fn delete(&mut self) {
-        if self.cursor < self.len() {
-            let start = self.byte_at(self.cursor);
-            let end = self.byte_at(self.cursor + 1);
-            self.value.replace_range(start..end, "");
-        }
+        line_delete(&mut self.value, self.cursor);
     }
 
     /// Applies an editing key, returning true when it was consumed as text
@@ -107,6 +123,38 @@ pub enum CreateMsg {
     Done(Result<crate::ops::CreateResult, String>),
 }
 
+/// A background operation's result channel, wrapping the `mpsc::Receiver`
+/// shape shared by `Diff`/`CommitDiff`'s diff loads, `Creating`'s setup
+/// progress, and `Busy`'s op result.
+pub struct Task<T> {
+    rx: Receiver<T>,
+}
+
+impl<T> Task<T> {
+    fn new(rx: Receiver<T>) -> Self {
+        Self { rx }
+    }
+
+    /// Drains every value currently queued and returns only the most recent
+    /// one, so a burst of results (e.g. fast navigation re-triggering a diff
+    /// load) never applies a stale intermediate value. Used where only the
+    /// latest message matters.
+    fn poll_latest(&self) -> Option<T> {
+        let mut latest = None;
+        while let Ok(msg) = self.rx.try_recv() {
+            latest = Some(msg);
+        }
+        latest
+    }
+
+    /// A single non-blocking receive. Used where every queued message must
+    /// be processed in order (e.g. `Creating`'s progress stream), unlike
+    /// `poll_latest`, which discards all but the newest.
+    fn try_recv(&self) -> Option<T> {
+        self.rx.try_recv().ok()
+    }
+}
+
 /// How often the diff view recomputes itself to pick up outside edits.
 const DIFF_REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
 
@@ -144,15 +192,6 @@ impl LogMode {
             LogMode::Flat => "flat",
         }
     }
-}
-
-/// Where the commit browser (`View::CommitDiff`) was opened from, so Esc can
-/// return there with the cursor where it was left.
-pub enum CommitDiffBack {
-    /// The worktree log, restoring `selected`.
-    Log { selected: usize },
-    /// A branch's commit list, restoring the branch and `selected`.
-    Branch { branch: String, selected: usize },
 }
 
 /// Index of the first row holding a commit, skipping any leading art-only rows.
@@ -217,51 +256,170 @@ pub fn filtered_candidates(branches: &[CheckoutCandidate], filter: &str) -> Vec<
         .collect()
 }
 
+/// A modal overlay drawn on top of the active screen: a confirmation, a
+/// single-line prompt, or the manual hunk editor. Only one is ever open at a
+/// time (`App::modal`); the screen underneath stays put and reappears when the
+/// modal is dismissed. This absorbs the former per-screen confirm/prompt fields
+/// (`Diff`'s revert/delete/ignore, `ConflictResolver`'s abort/edit) and the
+/// standalone `BranchMode`/`StashMode` sub-modes.
+pub enum Modal {
+    /// A choice between one or more options. `body` carries the already-
+    /// interpolated prompt text; `options` are the selectable rows. Resolved by
+    /// `on_modal_key` into `ModalResult::Confirmed(index)` or `Cancelled`.
+    Confirm {
+        title: String,
+        body: Vec<Line<'static>>,
+        options: Vec<ConfirmOption>,
+        /// Currently highlighted option (an index into `options`).
+        selected: usize,
+        /// What the calling screen wants done with the result.
+        action: ModalAction,
+    },
+    /// A single-line text prompt, resolved into `Submitted(text)` or `Cancelled`.
+    Prompt {
+        title: String,
+        input: TextInput,
+        hint: String,
+        action: ModalAction,
+    },
+    /// The manual conflict-hunk editor. Unlike the others it edits in place and
+    /// saves back into the `ConflictResolver` screen underneath on Ctrl+S,
+    /// rather than producing a `ModalResult`.
+    HunkEditor(HunkEditor),
+}
+
+/// One selectable row of a `Modal::Confirm`.
+pub struct ConfirmOption {
+    /// Optional single-key shortcut that confirms this option directly (in
+    /// addition to navigating to it and pressing Enter). `None` for plain radio
+    /// options with no mnemonic.
+    pub key: Option<char>,
+    pub label: String,
+    /// Marks an option that discards work. Its `shortcut` is the Shift-variant
+    /// of `key`, so a destructive action can't share a lowercase key with a
+    /// screen-global binding (see `ConfirmOption::shortcut`).
+    pub destructive: bool,
+    /// False for an option shown but not choosable (e.g. "open" when the target
+    /// is not a worktree). Navigation skips disabled options and they render
+    /// dimmed.
+    pub enabled: bool,
+}
+
+impl ConfirmOption {
+    /// A plain, enabled option with no shortcut.
+    fn new(label: impl Into<String>) -> Self {
+        Self {
+            key: None,
+            label: label.into(),
+            destructive: false,
+            enabled: true,
+        }
+    }
+
+    fn key(mut self, key: char) -> Self {
+        self.key = Some(key);
+        self
+    }
+
+    fn destructive(mut self) -> Self {
+        self.destructive = true;
+        self
+    }
+
+    fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// The effective single-key shortcut. A destructive option is always the
+    /// Shift-variant of its key, so a bare lowercase used elsewhere on the
+    /// screen (e.g. `f` = fetch) can never trigger a force/delete by accident.
+    /// This is enforced here rather than at each call site so a new destructive
+    /// option can't reintroduce the collision by forgetting to uppercase.
+    pub fn shortcut(&self) -> Option<char> {
+        self.key
+            .map(|c| if self.destructive { c.to_ascii_uppercase() } else { c })
+    }
+}
+
+/// The outcome of a resolved `Modal`, handed to `dispatch_modal` so the calling
+/// screen can carry out its effect.
+pub enum ModalResult {
+    /// A `Confirm` option at this index was chosen.
+    Confirmed(usize),
+    /// A `Prompt`'s text was submitted (already trimmed).
+    Submitted(String),
+    /// The modal was dismissed without choosing (Esc/q/n).
+    Cancelled,
+}
+
+/// What a modal's calling screen wants done once the modal resolves. The modal
+/// carries only presentation; the effect lives here so `on_modal_key` stays
+/// generic and the per-action logic stays debuggable (a plain enum, not a
+/// boxed closure).
+pub enum ModalAction {
+    /// Revert the file under the Diff cursor (discard its changes).
+    RevertFile,
+    /// Delete the file under the Diff cursor from the worktree.
+    DeleteFile,
+    /// Add to `.gitignore`: option 0 ignores the exact `file`, option 1 the
+    /// derived `pattern`.
+    IgnorePath { file: String, pattern: String },
+    /// The new-worktree target directory already exists: option 0 opens it (a
+    /// worktree), 1 replaces it, 2 cancels.
+    ConfirmExisting {
+        branch: String,
+        base: Option<String>,
+        path: String,
+        existing_name: Option<String>,
+    },
+    /// Replacing the directory would discard work: option 0 force-deletes and
+    /// recreates, 1 cancels.
+    ConfirmReplaceChanges {
+        branch: String,
+        base: Option<String>,
+        path: String,
+    },
+    /// Remove a worktree: option index is `delete_branch` (0 = folder only,
+    /// 1 = folder and branch, when it has a branch). `dirty` is the cached
+    /// uncommitted count for the fallback dirtiness check.
+    DeleteWorktree {
+        name: String,
+        dirty: usize,
+        branch: Option<String>,
+    },
+    /// The worktree being removed is dirty: option 0 stashes then removes,
+    /// 1 discards and removes, 2 cancels.
+    DeleteWorktreeDirty {
+        name: String,
+        branch: Option<String>,
+        delete_branch: bool,
+    },
+    /// Update a dirty worktree: option 0 stash+update+reapply, 1 update as-is,
+    /// 2 cancel.
+    UpdateStash { name: String },
+    /// A branch could not be safely deleted after its folder was removed: option
+    /// 0 force-deletes; cancelling keeps it.
+    ForceBranch { branch: String },
+    /// A fast-forward pull was refused: option 0 retries with a rebase.
+    PullRebase { name: String },
+    /// Create a new branch from HEAD named by the submitted text.
+    BranchCreate,
+    /// Rename `old` to the submitted text.
+    BranchRename { old: String },
+    /// Delete a branch: option 0 = normal delete, 1 = force delete.
+    BranchDelete { name: String },
+    /// Stash the worktree's changes with the submitted (optional) message.
+    StashPush { name: String },
+    /// Drop the stash entry `index` on `name` (option 0 confirms).
+    StashDrop { name: String, index: Option<u32> },
+    /// Abort the in-progress operation in the conflict resolver (option 0).
+    ResolverAbort,
+}
+
 /// Which screen/overlay is active.
 pub enum View {
     List,
-    /// Per-file changes browser for one worktree: a list of changed files on
-    /// the left and the selected file's diff on the right. Files can be marked
-    /// for commit, stashed, or reverted from here. Re-runs on a throttled timer
-    /// (to catch edits made outside the app) and on `r`.
-    Diff {
-        name: String,
-        /// Changed files, parallel with `marked`.
-        files: Vec<StatusEntry>,
-        /// Whether each file is selected for commit; defaults to all true.
-        marked: Vec<bool>,
-        /// Folder-tree rows derived from `files`, rebuilt whenever `files`
-        /// changes. The cursor (`selected`) indexes into this, not `files`.
-        rows: Vec<DiffRow>,
-        /// Cursor into `rows`.
-        selected: usize,
-        /// Diff text for the file under the cursor (empty on a folder row).
-        content: String,
-        /// Path the current `content` reflects, so an auto-refresh of the same
-        /// file can keep the diff on screen (no flicker) while a switch to a
-        /// different file shows a loading placeholder until its diff arrives.
-        content_path: Option<String>,
-        /// Monotonic token bumped on every load; a background diff result is
-        /// only accepted when its token still matches, so results from files
-        /// the user has already navigated past are discarded.
-        load_gen: u64,
-        /// In-flight background diff load: (token, path, diff text). Diffs are
-        /// computed off the UI thread so switching files never blocks the app.
-        pending: Option<Receiver<(u64, String, String)>>,
-        /// True while a load for a *different* file is in flight, so the UI can
-        /// show "loading…" instead of the previous file's stale diff.
-        loading_new: bool,
-        scroll: u16,
-        /// When the diff was last recomputed, used to throttle auto-refresh.
-        last_refresh: Instant,
-        /// True while confirming a revert of the highlighted file.
-        confirm_revert: bool,
-        /// True while confirming a delete of the highlighted file.
-        confirm_delete: bool,
-        /// Present while choosing what to add to `.gitignore` for the
-        /// highlighted file or folder (the exact path vs. a glob pattern).
-        ignore_prompt: Option<IgnorePrompt>,
-    },
     /// New-worktree dialog. Row 0 creates a new branch (named in `name`) off
     /// `base`; the rows below check out an existing branch. The `name` field
     /// doubles as a live filter over the checkout list, so typing narrows the
@@ -286,38 +444,11 @@ pub enum View {
         /// Some(idx) while picking the base branch: index into `all_branches`.
         base_pick: Option<usize>,
     },
-    /// The target directory for a create already exists; offer to open it (when
-    /// it is a worktree), replace it, or cancel.
-    ConfirmExisting {
-        /// Branch to create or check out once the conflict is resolved.
-        branch: String,
-        /// Base ref for a new branch, or None for an existing-branch checkout.
-        base: Option<String>,
-        /// The conflicting directory.
-        path: String,
-        /// Name the directory is addressed by when it is a registered worktree.
-        existing_name: Option<String>,
-        /// 0 = Open (worktrees only), 1 = Replace, 2 = Cancel.
-        selected: usize,
-    },
-    /// Replacing the existing directory would discard real work (uncommitted
-    /// changes, or commits on its branch not yet in the default branch). Confirm
-    /// the force delete before recreating.
-    ConfirmReplaceChanges {
-        /// Branch to create or check out once the directory is replaced.
-        branch: String,
-        /// Base ref for a new branch, or None for an existing-branch checkout.
-        base: Option<String>,
-        /// The conflicting directory, force-deleted on confirm.
-        path: String,
-        /// 0 = Force delete (lose all changes), 1 = Cancel.
-        selected: usize,
-    },
     /// Progress of an in-flight create running on a background thread.
     Creating {
         branch: String,
         lines: Vec<String>,
-        rx: Receiver<CreateMsg>,
+        rx: Task<CreateMsg>,
         done: bool,
         /// Handle for sending input to / killing the running setup command.
         control: SetupControl,
@@ -325,48 +456,6 @@ pub enum View {
         input: String,
         /// True after one Ctrl+C; the next one kills the setup.
         kill_armed: bool,
-    },
-    /// Delete confirmation; `dirty` is the number of uncommitted changes.
-    ConfirmDelete {
-        name: String,
-        dirty: usize,
-        /// Branch checked out there, when not detached.
-        branch: Option<String>,
-        /// Currently selected option: also delete the branch afterwards.
-        delete_branch: bool,
-    },
-    /// The worktree being deleted has uncommitted changes: keep the work with a
-    /// stash, discard it (force-remove), or cancel.
-    ConfirmDeleteDirty {
-        name: String,
-        /// Branch checked out there, carried through to the branch-delete step.
-        branch: Option<String>,
-        /// Whether to also delete the branch after the folder is removed.
-        delete_branch: bool,
-        /// 0 = Stash, 1 = Discard, 2 = Cancel.
-        selected: usize,
-    },
-    /// Updating a dirty worktree: offer to stash local changes, merge the
-    /// default branch, then reapply them (git `--autostash`), rather than let
-    /// the merge refuse on the uncommitted work.
-    ConfirmUpdateStash {
-        name: String,
-        /// Number of uncommitted changes, for the prompt wording.
-        dirty: usize,
-        /// 0 = stash, update, reapply; 1 = update without stashing; 2 = cancel.
-        selected: usize,
-    },
-    /// The folder is gone but its branch could not be safely deleted; offer to
-    /// force. `reason` explains why git refused so the wording can match.
-    ConfirmForceBranch {
-        branch: String,
-        reason: ForceBranchReason,
-    },
-    /// A fast-forward pull failed because the worktree's branch has diverged
-    /// from its upstream; offer to retry the pull with a rebase.
-    ConfirmPullRebase {
-        /// Worktree whose pull was refused.
-        name: String,
     },
     /// Prompt for a one-off command to run in a worktree's directory, shown by
     /// the `e` key when no `open_command` is configured.
@@ -385,8 +474,6 @@ pub enum View {
     },
     /// First-run setup wizard, shown until `.wtm.toml` exists.
     Setup(Box<SetupWizard>),
-    /// Editor for the repo's `.wtm.toml` settings.
-    Config(Box<ConfigEditor>),
     /// Commit flow: pick which changed files to include (all by default) and
     /// type a message. Focus toggles between the file list and the message.
     Commit {
@@ -398,13 +485,6 @@ pub enum View {
         cursor: usize,
         input: TextInput,
         focus: CommitFocus,
-    },
-    /// Stash manager for one worktree.
-    Stash {
-        name: String,
-        entries: Vec<StashEntry>,
-        selected: usize,
-        mode: StashMode,
     },
     /// Picker for switching the selected worktree onto a different branch: any
     /// local branch not checked out elsewhere, plus remote-only branches.
@@ -442,15 +522,13 @@ pub enum View {
         hash: String,
         /// Short hash + subject, for the panel title.
         label: String,
-        /// Where the browser was opened from, so Esc returns there.
-        back: CommitDiffBack,
         files: Vec<StatusEntry>,
         rows: Vec<DiffRow>,
         selected: usize,
         content: String,
         content_path: Option<String>,
         load_gen: u64,
-        pending: Option<Receiver<(u64, String, String)>>,
+        pending: Option<Task<(u64, String, String)>>,
         loading_new: bool,
         scroll: u16,
     },
@@ -515,15 +593,13 @@ pub enum View {
         /// Parsed state of the file under the cursor, when it loaded and still
         /// has conflicts. `None` on an already-resolved file or a load error.
         current: Option<ResolverFile>,
-        /// True while confirming an abort of the whole merge.
-        confirm_abort: bool,
     },
     /// A git operation (pull/push/fetch/delete/…) running on a background
     /// thread. Its result message is shown and the list refreshed when it
     /// finishes; `then` decides which view to reopen afterwards.
     Busy {
         label: String,
-        rx: Receiver<Result<String, String>>,
+        rx: Task<Result<String, String>>,
         then: BusyThen,
     },
 }
@@ -540,9 +616,6 @@ pub struct ResolverFile {
     /// Cursor into the hunks (index over `Hunk` segments only). The detail
     /// pane auto-scrolls to keep this hunk in view.
     pub hunk: usize,
-    /// Present while hand-editing the current hunk's resolved text. Saving it
-    /// records a `ResolutionAction::Manual` for that hunk.
-    pub edit: Option<HunkEditor>,
 }
 
 /// A minimal multi-line text editor for hand-editing one conflict hunk's
@@ -558,15 +631,6 @@ pub struct HunkEditor {
     pub col: usize,
     /// Whether the seed text ended in a newline, reapplied by `text`.
     trailing_newline: bool,
-}
-
-/// Byte offset of character index `col` within `line`, or the line's byte
-/// length when `col` is past the end. Keeps edits on char boundaries.
-fn char_byte_index(line: &str, col: usize) -> usize {
-    line.char_indices()
-        .nth(col)
-        .map(|(b, _)| b)
-        .unwrap_or(line.len())
 }
 
 impl HunkEditor {
@@ -607,13 +671,13 @@ impl HunkEditor {
     /// Applies one key of editing (insert, delete, newline, or cursor move).
     pub fn on_key(&mut self, key: KeyEvent) {
         match key.code {
+            // Single-line edits reuse the shared `line_*` primitives; the
+            // multi-line cases (split on Enter, join across lines) stay here.
             KeyCode::Char(c) => {
-                let b = char_byte_index(&self.lines[self.row], self.col);
-                self.lines[self.row].insert(b, c);
-                self.col += 1;
+                line_insert(&mut self.lines[self.row], &mut self.col, c);
             }
             KeyCode::Enter => {
-                let b = char_byte_index(&self.lines[self.row], self.col);
+                let b = char_byte(&self.lines[self.row], self.col);
                 let rest = self.lines[self.row].split_off(b);
                 self.lines.insert(self.row + 1, rest);
                 self.row += 1;
@@ -621,10 +685,7 @@ impl HunkEditor {
             }
             KeyCode::Backspace => {
                 if self.col > 0 {
-                    let start = char_byte_index(&self.lines[self.row], self.col - 1);
-                    let end = char_byte_index(&self.lines[self.row], self.col);
-                    self.lines[self.row].replace_range(start..end, "");
-                    self.col -= 1;
+                    line_backspace(&mut self.lines[self.row], &mut self.col);
                 } else if self.row > 0 {
                     // Join this line onto the end of the previous one.
                     let cur = self.lines.remove(self.row);
@@ -634,11 +695,8 @@ impl HunkEditor {
                 }
             }
             KeyCode::Delete => {
-                let len = self.cur_len();
-                if self.col < len {
-                    let start = char_byte_index(&self.lines[self.row], self.col);
-                    let end = char_byte_index(&self.lines[self.row], self.col + 1);
-                    self.lines[self.row].replace_range(start..end, "");
+                if self.col < self.cur_len() {
+                    line_delete(&mut self.lines[self.row], self.col);
                 } else if self.row + 1 < self.lines.len() {
                     let next = self.lines.remove(self.row + 1);
                     self.lines[self.row].push_str(&next);
@@ -717,20 +775,6 @@ pub struct CherryTarget {
     pub name: String,
     /// Branch checked out there, or None when detached.
     pub branch: Option<String>,
-}
-
-/// Choice shown when adding the highlighted file or folder to `.gitignore`:
-/// the exact path, or a glob pattern that ignores everything like it.
-pub struct IgnorePrompt {
-    /// Exact path of the file or folder, relative to the worktree root.
-    /// Folder paths keep their trailing slash (e.g. `src/tui/`).
-    pub file: String,
-    /// Glob derived from the path (e.g. `*.log`), or the bare name.
-    pub pattern: String,
-    /// 0 = ignore just `file`; 1 = ignore `pattern`.
-    pub selected: usize,
-    /// True when the prompt targets a folder, which changes the wording.
-    pub is_folder: bool,
 }
 
 /// One line in the changed-files folder tree: either a folder that groups the
@@ -852,15 +896,6 @@ pub enum CommitFocus {
     Message,
 }
 
-/// Sub-state of the stash overlay.
-pub enum StashMode {
-    List,
-    /// Typing an optional message for a new stash.
-    Message(TextInput),
-    /// Confirming a drop of the selected entry.
-    ConfirmDrop,
-}
-
 /// Why a branch could not be safely deleted after its worktree was removed,
 /// used to word the force-delete prompt.
 pub enum ForceBranchReason {
@@ -871,24 +906,59 @@ pub enum ForceBranchReason {
     CheckedOutElsewhere(String),
 }
 
-/// Sub-state of the branch tab.
-pub enum BranchMode {
-    List,
-    /// Typing a name for a new branch.
-    Create(TextInput),
-    /// Renaming the selected branch; the input is prefilled with its old name.
-    Rename(TextInput),
-    /// Confirming deletion of the selected branch (`f` forces on refusal).
-    ConfirmDelete,
-}
-
-/// The two top-level tabs of the main window. `View::List` renders whichever
-/// tab is active; overlays (create, diff, switch, …) draw on top of it and
-/// leave the active tab intact when they close.
+/// The top-level tabs of the main window. `View::List` renders whichever tab
+/// is active; overlays (create, diff, switch, …) draw on top of it and leave
+/// the active tab intact when they close.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Worktrees,
+    Changes,
     Branches,
+    Stash,
+    Settings,
+}
+
+impl Tab {
+    pub const ALL: [Tab; 5] = [
+        Tab::Worktrees,
+        Tab::Changes,
+        Tab::Branches,
+        Tab::Stash,
+        Tab::Settings,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Tab::Worktrees => "Worktrees",
+            Tab::Changes => "Changes",
+            Tab::Branches => "Branches",
+            Tab::Stash => "Stash",
+            Tab::Settings => "Settings",
+        }
+    }
+
+    /// A single-character glyph shown before the tab's title in the tab bar.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Tab::Worktrees => "⌂",
+            Tab::Changes => "±",
+            Tab::Branches => "⎇",
+            Tab::Stash => "▤",
+            Tab::Settings => "⚙",
+        }
+    }
+
+    /// The next tab, wrapping at the end.
+    pub fn next(self) -> Tab {
+        let i = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+
+    /// The previous tab, wrapping at the start.
+    pub fn prev(self) -> Tab {
+        let i = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
+        Self::ALL[(i + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
 }
 
 /// Geometry of the active view's clickable row list, recorded by the renderer
@@ -924,19 +994,103 @@ impl RowList {
     }
 }
 
+/// State behind the Changes tab: a per-file changes browser for one worktree,
+/// with a list of changed files on the left and the selected file's diff on the
+/// right. Files can be marked for commit, stashed, or reverted from here.
+/// Re-runs on a throttled timer (to catch edits made outside the app) and on
+/// `r`.
+pub struct ChangesTab {
+    /// Worktree the changes belong to. Empty before the tab has been opened.
+    pub name: String,
+    /// Changed files, parallel with `marked`.
+    pub files: Vec<StatusEntry>,
+    /// Whether each file is selected for commit; defaults to all true.
+    pub marked: Vec<bool>,
+    /// Folder-tree rows derived from `files`, rebuilt whenever `files` changes.
+    /// The cursor (`selected`) indexes into this, not `files`.
+    pub rows: Vec<DiffRow>,
+    /// Cursor into `rows`.
+    pub selected: usize,
+    /// Diff text for the file under the cursor (empty on a folder row).
+    pub content: String,
+    /// Path the current `content` reflects, so an auto-refresh of the same file
+    /// can keep the diff on screen (no flicker) while a switch to a different
+    /// file shows a loading placeholder until its diff arrives.
+    pub content_path: Option<String>,
+    /// Monotonic token bumped on every load; a background diff result is only
+    /// accepted when its token still matches, so results from files the user has
+    /// already navigated past are discarded.
+    pub load_gen: u64,
+    /// In-flight background diff load: (token, path, diff text). Diffs are
+    /// computed off the UI thread so switching files never blocks the app.
+    pub pending: Option<Task<(u64, String, String)>>,
+    /// True while a load for a *different* file is in flight, so the UI can show
+    /// "loading…" instead of the previous file's stale diff.
+    pub loading_new: bool,
+    pub scroll: u16,
+    /// When the diff was last recomputed, used to throttle auto-refresh.
+    pub last_refresh: Instant,
+}
+
+impl Default for ChangesTab {
+    fn default() -> Self {
+        ChangesTab {
+            name: String::new(),
+            files: Vec::new(),
+            marked: Vec::new(),
+            rows: Vec::new(),
+            selected: 0,
+            content: String::new(),
+            content_path: None,
+            load_gen: 0,
+            pending: None,
+            loading_new: false,
+            scroll: 0,
+            last_refresh: Instant::now(),
+        }
+    }
+}
+
 pub struct App {
     pub ctx: Ctx,
     pub worktrees: Vec<WorktreeInfo>,
     pub selected: usize,
+    /// Cheap changed-file preview (`ops::status`, no diff content) for
+    /// whichever worktree row is highlighted on the Worktrees tab.
+    pub worktree_preview: Vec<StatusEntry>,
+    /// Which `selected` index `worktree_preview` currently reflects, so it's
+    /// only recomputed on an actual selection change, not every frame.
+    pub preview_for: Option<usize>,
     /// Active top-level tab. Only meaningful while `view` is `View::List`.
     pub tab: Tab,
+    /// Content of the Changes tab, populated by `open_changes_tab`.
+    pub changes: ChangesTab,
     /// Branches shown on the Branches tab, loaded by `load_branches`.
     pub branches: Vec<BranchListItem>,
     /// Cursor into `branches` on the Branches tab.
     pub branch_selected: usize,
-    /// Inline sub-state of the Branches tab (list, create-input, confirm-delete).
-    pub branch_mode: BranchMode,
+    /// Worktree the Stash tab's entries belong to. Empty before the tab has
+    /// been opened.
+    pub stash_name: String,
+    /// Stash entries shown on the Stash tab, loaded by `reload_stash_tab`.
+    pub stash_entries: Vec<StashEntry>,
+    /// Cursor into `stash_entries` on the Stash tab.
+    pub stash_selected: usize,
+    /// The repo's `.wtm.toml` as edited on the Settings tab. Reloaded from disk
+    /// every time the tab is entered, so leaving it discards unsaved edits.
+    pub settings: ConfigEditor,
+    /// The screen currently on top and interacting with the user. Always the
+    /// top of the navigation stack: `push_screen` moves it onto `stack` and puts
+    /// a new screen here; `pop_screen` restores it from `stack`.
     pub view: View,
+    /// Screens the user drilled through to reach `view`, oldest first. Popping
+    /// `view` returns to `stack.last()`, so each screen returns to whoever opened
+    /// it without carrying its own back-reference. The root worktree list is
+    /// never kept here (an empty stack means `view` is at the root).
+    pub stack: Vec<View>,
+    /// The active modal overlay (confirm/prompt/hunk editor), drawn on top of
+    /// `view` and handled by `on_modal_key` before any per-screen key handler.
+    pub modal: Option<Modal>,
     /// Set by the renderer each frame; read by `on_mouse` to resolve clicks.
     pub row_list: Option<RowList>,
     /// One-line status shown in the header. Auto-clears after a few seconds
@@ -983,6 +1137,7 @@ pub struct App {
 
 impl App {
     pub fn new(ctx: Ctx) -> anyhow::Result<App> {
+        let repo_root = ctx.repo_root.clone();
         let worktree_base = ctx
             .config
             .worktree_base(&ctx.repo_root)
@@ -1000,11 +1155,22 @@ impl App {
             ctx,
             worktrees: Vec::new(),
             selected: 0,
+            worktree_preview: Vec::new(),
+            preview_for: None,
             tab: Tab::Worktrees,
+            changes: ChangesTab::default(),
             branches: Vec::new(),
             branch_selected: 0,
-            branch_mode: BranchMode::List,
+            stash_name: String::new(),
+            stash_entries: Vec::new(),
+            stash_selected: 0,
+            // An uninitialized repo has no `.wtm.toml` to read yet, so the
+            // editor starts empty; entering the tab reloads it either way.
+            settings: ConfigEditor::load(repo_root.clone())
+                .unwrap_or_else(|_| ConfigEditor::empty(repo_root)),
             view,
+            stack: Vec::new(),
+            modal: None,
             row_list: None,
             message: None,
             message_at: None,
@@ -1027,6 +1193,28 @@ impl App {
         Ok(app)
     }
 
+    /// Drills into `screen`, remembering the current one so `pop_screen`
+    /// returns to it. Used for every navigation deeper than the worktree list
+    /// (open a diff, a log, the commit browser, …).
+    fn push_screen(&mut self, screen: View) {
+        let prev = std::mem::replace(&mut self.view, screen);
+        self.stack.push(prev);
+    }
+
+    /// Returns to whichever screen opened the current one, or the root worktree
+    /// list when there is nothing left on the stack.
+    fn pop_screen(&mut self) {
+        self.view = self.stack.pop().unwrap_or(View::List);
+    }
+
+    /// Jumps straight back to the root worktree list, discarding the whole
+    /// stack. Used by the transient merge/resolve/setup flows, which always
+    /// return to the list regardless of how they were reached.
+    fn go_root(&mut self) {
+        self.stack.clear();
+        self.view = View::List;
+    }
+
     /// Reloads the worktree list, keeping the selection in bounds.
     pub fn refresh(&mut self) {
         self.last_auto_refresh = Instant::now();
@@ -1037,6 +1225,7 @@ impl App {
             }
             Err(e) => self.set_error(format!("{e:#}")),
         }
+        self.preview_for = None;
     }
 
     /// Reloads the visible lists on a timer, so work done outside the app (an
@@ -1049,15 +1238,14 @@ impl App {
     /// swallowed rather than raised, since an unattended background refresh
     /// should never interrupt with a popup; `r` still reports errors.
     fn auto_refresh(&mut self) {
+        // Never reload while an overlay, prompt, or modal owns the screen: a
+        // confirm/prompt (e.g. naming a branch, confirming a delete) reads the
+        // list under the cursor, so leave it alone until the user is done.
         if !matches!(self.view, View::List)
             || self.error.is_some()
+            || self.modal.is_some()
             || self.last_auto_refresh.elapsed() < AUTO_REFRESH_INTERVAL
         {
-            return;
-        }
-        // Naming a branch or confirming a delete reads the list under the
-        // cursor; leave it alone until the user is done.
-        if self.tab == Tab::Branches && !matches!(self.branch_mode, BranchMode::List) {
             return;
         }
         self.last_auto_refresh = Instant::now();
@@ -1102,7 +1290,7 @@ impl App {
         self.expire_message();
         self.auto_refresh();
         if let View::Busy { rx, .. } = &self.view {
-            if let Ok(result) = rx.try_recv() {
+            if let Some(result) = rx.poll_latest() {
                 // Pull the follow-up out of the view so we can mutate self, then
                 // reopen whichever view this op should return to.
                 let then = match std::mem::replace(&mut self.view, View::List) {
@@ -1141,9 +1329,8 @@ impl App {
                             | BusyThen::Pull { .. }
                             | BusyThen::DeleteBranch { .. }
                             | BusyThen::Resolve { .. } => {}
-                            BusyThen::Stash(name) => self.load_stash(name, StashMode::List),
+                            BusyThen::Stash(name) => self.reload_stash_tab(name),
                             BusyThen::Branch => {
-                                self.branch_mode = BranchMode::List;
                                 self.load_branches(self.branch_selected);
                             }
                         }
@@ -1152,7 +1339,7 @@ impl App {
                     // recovery prompt (retry with rebase) instead of the error.
                     (Err(e), BusyThen::Pull { name }) if git::is_non_fast_forward(&e) => {
                         self.refresh();
-                        self.view = View::ConfirmPullRebase { name };
+                        self.open_pull_rebase_modal(name);
                     }
                     (Err(e), _) => {
                         self.set_error(e);
@@ -1162,11 +1349,12 @@ impl App {
             }
             return;
         }
-        if matches!(self.view, View::Diff { .. }) {
+        // The Changes tab keeps its diff fresh while it is the visible screen;
+        // a drill-in pushed on top of it (a log, a commit browser) owns the
+        // tick instead, so the tab only polls while `view` is back at the root.
+        if self.tab == Tab::Changes && matches!(self.view, View::List) {
             self.poll_diff_load();
-            if let View::Diff { last_refresh, .. } = &self.view
-                && last_refresh.elapsed() >= DIFF_REFRESH_INTERVAL
-            {
+            if self.changes.last_refresh.elapsed() >= DIFF_REFRESH_INTERVAL {
                 self.refresh_diff();
             }
             return;
@@ -1184,7 +1372,7 @@ impl App {
         if *done {
             return;
         }
-        while let Ok(msg) = rx.try_recv() {
+        while let Some(msg) = rx.try_recv() {
             match msg {
                 CreateMsg::Progress(line) => lines.push(line),
                 CreateMsg::Done(Ok(result)) => {
@@ -1240,6 +1428,14 @@ impl App {
     /// `?` must reach it as a literal rather than opening help. F1 is the way in
     /// from these views.
     fn view_takes_text_input(&self) -> bool {
+        // A prompt or the hunk editor listens for characters, so `?` must reach
+        // it as a literal rather than opening help.
+        if matches!(
+            self.modal,
+            Some(Modal::Prompt { .. } | Modal::HunkEditor(_))
+        ) {
+            return true;
+        }
         match &self.view {
             // Row 0 with the base button unfocused and no picker open is the
             // new-branch name field, which doubles as the branch filter.
@@ -1253,20 +1449,9 @@ impl App {
                 focus: CommitFocus::Message,
                 ..
             } => true,
-            View::Stash {
-                mode: StashMode::Message(_),
-                ..
-            } => true,
             View::Switch { .. } | View::RunCommand { .. } | View::RenameWorktree { .. } => true,
             View::Creating { done: false, .. } => true,
-            View::Config(editor) => editor.editing.is_some(),
-            View::ConflictResolver {
-                current: Some(rf), ..
-            } => rf.edit.is_some(),
-            View::List => matches!(
-                self.branch_mode,
-                BranchMode::Create(_) | BranchMode::Rename(_)
-            ),
+            View::List => self.tab == Tab::Settings && self.settings.editing.is_some(),
             View::Setup(wizard) => matches!(
                 &wizard.step,
                 setup::Step::ClonePath { .. }
@@ -1364,24 +1549,16 @@ impl App {
             self.open_help();
             return;
         }
+        // A modal overlay captures keys before any per-screen handler.
+        if self.modal.is_some() {
+            self.on_modal_key(key);
+            return;
+        }
         match &mut self.view {
             View::List => self.on_list_key(key),
-            View::Diff { .. } => self.on_diff_key(key),
             View::Create { .. } => self.on_create_key(key),
-            View::ConfirmExisting { .. } => self.on_confirm_existing_key(key),
-            View::ConfirmReplaceChanges { selected, .. } => match key.code {
-                KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if *selected < 1 {
-                        *selected += 1;
-                    }
-                }
-                KeyCode::Enter => self.apply_confirm_replace_changes(),
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') => self.view = View::List,
-                _ => {}
-            },
             View::RunCommand { input, .. } => match key.code {
-                KeyCode::Esc => self.view = View::List,
+                KeyCode::Esc => self.pop_screen(),
                 KeyCode::Enter => {
                     if let View::RunCommand { name, path, input } =
                         std::mem::replace(&mut self.view, View::List)
@@ -1397,7 +1574,7 @@ impl App {
                 }
             },
             View::RenameWorktree { input, .. } => match key.code {
-                KeyCode::Esc => self.view = View::List,
+                KeyCode::Esc => self.pop_screen(),
                 KeyCode::Enter => {
                     if let View::RenameWorktree { name, input } =
                         std::mem::replace(&mut self.view, View::List)
@@ -1424,7 +1601,7 @@ impl App {
             } => {
                 if *done {
                     if matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
-                        self.view = View::List;
+                        self.pop_screen();
                         self.refresh();
                     }
                     return;
@@ -1447,72 +1624,6 @@ impl App {
                     _ => {}
                 }
             }
-            View::ConfirmDelete {
-                branch,
-                delete_branch,
-                ..
-            } => match key.code {
-                KeyCode::Up | KeyCode::Down | KeyCode::Tab => {
-                    // Detached worktrees have no branch to offer deleting.
-                    if branch.is_some() {
-                        *delete_branch = !*delete_branch;
-                    }
-                }
-                KeyCode::Enter | KeyCode::Char('y') => self.begin_delete(),
-                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => self.view = View::List,
-                _ => {}
-            },
-            View::ConfirmDeleteDirty { selected, .. } => match key.code {
-                KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if *selected < 2 {
-                        *selected += 1;
-                    }
-                }
-                KeyCode::Enter => self.apply_delete_dirty(),
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') => self.view = View::List,
-                _ => {}
-            },
-            View::ConfirmUpdateStash { selected, .. } => match key.code {
-                KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if *selected < 2 {
-                        *selected += 1;
-                    }
-                }
-                KeyCode::Enter => self.apply_update_stash(),
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') => self.view = View::List,
-                _ => {}
-            },
-            View::ConfirmForceBranch { branch, .. } => match key.code {
-                KeyCode::Enter | KeyCode::Char('f') | KeyCode::Char('y') => {
-                    let branch = branch.clone();
-                    match ops::force_delete_branch(&self.ctx, &branch) {
-                        Ok(()) => {
-                            self.message = Some(format!("deleted branch '{branch}' (forced)"));
-                        }
-                        Err(e) => self.set_error(format!("{e:#}")),
-                    }
-                    self.view = View::List;
-                    self.refresh();
-                }
-                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
-                    self.message = Some(format!("kept branch '{branch}'"));
-                    self.view = View::List;
-                    self.refresh();
-                }
-                _ => {}
-            },
-            View::ConfirmPullRebase { name } => match key.code {
-                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('r') => {
-                    let name = name.clone();
-                    self.start_pull_rebase(name);
-                }
-                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('q') => {
-                    self.view = View::List;
-                }
-                _ => {}
-            },
             View::Setup(wizard) => match wizard.on_key(key, &mut self.message) {
                 WizardOutcome::Quit => self.quit = true,
                 WizardOutcome::Done => {
@@ -1521,19 +1632,7 @@ impl App {
                 }
                 WizardOutcome::Continue => {}
             },
-            View::Config(editor) => match editor.on_key(key, &mut self.message) {
-                EditorOutcome::Saved(path) => {
-                    self.reload_config();
-                    self.view = View::List;
-                    if self.message.is_none() {
-                        self.message = Some(format!("saved {}", path.display()));
-                    }
-                }
-                EditorOutcome::Cancel => self.view = View::List,
-                EditorOutcome::Continue => {}
-            },
             View::Commit { .. } => self.on_commit_key(key),
-            View::Stash { .. } => self.on_stash_key(key),
             View::Switch { .. } => self.on_switch_key(key),
             View::Log { .. } => self.on_log_key(key),
             View::CommitDiff { .. } => self.on_commit_diff_key(key),
@@ -1544,6 +1643,560 @@ impl App {
             // A background op owns the screen until tick() drains its result.
             View::Busy { .. } => {}
         }
+    }
+
+    /// Pushes a confirmation modal, highlighting the first enabled option.
+    fn push_confirm(
+        &mut self,
+        title: impl Into<String>,
+        body: Vec<Line<'static>>,
+        options: Vec<ConfirmOption>,
+        action: ModalAction,
+    ) {
+        let selected = options.iter().position(|o| o.enabled).unwrap_or(0);
+        self.modal = Some(Modal::Confirm {
+            title: title.into(),
+            body,
+            options,
+            selected,
+            action,
+        });
+    }
+
+    /// Pushes a single-line prompt modal.
+    fn push_prompt(
+        &mut self,
+        title: impl Into<String>,
+        input: TextInput,
+        hint: impl Into<String>,
+        action: ModalAction,
+    ) {
+        self.modal = Some(Modal::Prompt {
+            title: title.into(),
+            input,
+            hint: hint.into(),
+            action,
+        });
+    }
+
+    /// Key handling while a modal overlay is open. Navigation and text editing
+    /// happen in place; a terminal key resolves the modal into a `ModalResult`,
+    /// pops it, and routes the outcome to `dispatch_modal`.
+    fn on_modal_key(&mut self, key: KeyEvent) {
+        // The hunk editor edits in place and saves back into the resolver.
+        if matches!(self.modal, Some(Modal::HunkEditor(_))) {
+            self.on_hunk_editor_key(key);
+            return;
+        }
+        let result = match self.modal.as_mut() {
+            Some(Modal::Prompt { input, .. }) => match key.code {
+                KeyCode::Esc => Some(ModalResult::Cancelled),
+                KeyCode::Enter => Some(ModalResult::Submitted(input.trimmed())),
+                _ => {
+                    input.on_key(key);
+                    None
+                }
+            },
+            Some(Modal::Confirm {
+                options, selected, ..
+            }) => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    // Step to the previous enabled option.
+                    if let Some(prev) = (0..*selected).rev().find(|&i| options[i].enabled) {
+                        *selected = prev;
+                    }
+                    None
+                }
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                    if let Some(next) =
+                        (*selected + 1..options.len()).find(|&i| options[i].enabled)
+                    {
+                        *selected = next;
+                    } else if key.code == KeyCode::Tab {
+                        // Tab wraps to the first enabled option.
+                        if let Some(first) = options.iter().position(|o| o.enabled) {
+                            *selected = first;
+                        }
+                    }
+                    None
+                }
+                KeyCode::Enter | KeyCode::Char('y') => Some(ModalResult::Confirmed(*selected)),
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') => {
+                    Some(ModalResult::Cancelled)
+                }
+                KeyCode::Char(c) => options
+                    .iter()
+                    .position(|o| o.enabled && o.shortcut() == Some(c))
+                    .map(ModalResult::Confirmed),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(result) = result {
+            let action = match self.modal.take() {
+                Some(Modal::Confirm { action, .. }) | Some(Modal::Prompt { action, .. }) => action,
+                _ => return,
+            };
+            self.dispatch_modal(action, result);
+        }
+    }
+
+    /// Carries out a resolved modal's effect. The modal has already been popped;
+    /// each action decides what `Confirmed`/`Submitted`/`Cancelled` mean and may
+    /// open a follow-up modal or change the screen.
+    fn dispatch_modal(&mut self, action: ModalAction, result: ModalResult) {
+        match action {
+            ModalAction::RevertFile => {
+                if let (ModalResult::Confirmed(_), Some(e)) = (result, self.diff_cursor_file()) {
+                    self.revert_file(e);
+                }
+            }
+            ModalAction::DeleteFile => {
+                if let (ModalResult::Confirmed(_), Some(e)) = (result, self.diff_cursor_file()) {
+                    self.delete_file(e);
+                }
+            }
+            ModalAction::IgnorePath { file, pattern } => {
+                if let ModalResult::Confirmed(idx) = result {
+                    let p = if idx == 0 { file } else { pattern };
+                    self.add_ignore(&p);
+                }
+            }
+            ModalAction::ConfirmExisting {
+                branch,
+                base,
+                path,
+                existing_name,
+            } => {
+                let ModalResult::Confirmed(idx) = result else {
+                    return;
+                };
+                match idx {
+                    // Open the existing worktree.
+                    0 => match existing_name {
+                        Some(name) => self.open_changes_tab(name),
+                        None => {
+                            self.message = Some("that directory is not a worktree".to_string())
+                        }
+                    },
+                    // Replace: only stop to confirm when it holds real work.
+                    1 => match ops::target_has_changes(&self.ctx, Path::new(&path)) {
+                        Ok(true) => self.open_confirm_replace_changes(branch, base, path),
+                        Ok(false) => self.replace_target(branch, base, &path),
+                        Err(e) => self.set_error(format!("{e:#}")),
+                    },
+                    _ => {}
+                }
+            }
+            ModalAction::ConfirmReplaceChanges { branch, base, path } => {
+                if let ModalResult::Confirmed(0) = result {
+                    self.replace_target(branch, base, &path);
+                }
+            }
+            ModalAction::DeleteWorktree {
+                name,
+                dirty,
+                branch,
+            } => {
+                if let ModalResult::Confirmed(idx) = result {
+                    let delete_branch = idx == 1;
+                    self.begin_delete(name, dirty, branch, delete_branch);
+                }
+            }
+            ModalAction::DeleteWorktreeDirty {
+                name,
+                branch,
+                delete_branch,
+            } => {
+                let ModalResult::Confirmed(idx) = result else {
+                    return;
+                };
+                match idx {
+                    // Stash: keep the work, then remove the now-clean folder.
+                    0 => match ops::stash_worktree(&self.ctx, &name) {
+                        Ok(()) => self.do_delete(name, branch, delete_branch, false),
+                        Err(e) => {
+                            self.set_error(format!("{e:#}"));
+                            self.refresh();
+                        }
+                    },
+                    // Discard: force-remove the folder, throwing changes away.
+                    1 => self.do_delete(name, branch, delete_branch, true),
+                    _ => {}
+                }
+            }
+            ModalAction::UpdateStash { name } => {
+                let ModalResult::Confirmed(idx) = result else {
+                    return;
+                };
+                match idx {
+                    0 => self.run_update(name, true),
+                    1 => self.run_update(name, false),
+                    _ => {}
+                }
+            }
+            ModalAction::ForceBranch { branch } => match result {
+                ModalResult::Confirmed(_) => {
+                    match ops::force_delete_branch(&self.ctx, &branch) {
+                        Ok(()) => {
+                            self.message = Some(format!("deleted branch '{branch}' (forced)"))
+                        }
+                        Err(e) => self.set_error(format!("{e:#}")),
+                    }
+                    self.refresh();
+                }
+                ModalResult::Cancelled => {
+                    self.message = Some(format!("kept branch '{branch}'"));
+                    self.refresh();
+                }
+                _ => {}
+            },
+            ModalAction::PullRebase { name } => {
+                if let ModalResult::Confirmed(_) = result {
+                    self.start_pull_rebase(name);
+                }
+            }
+            ModalAction::BranchCreate => {
+                if let ModalResult::Submitted(name) = result {
+                    if name.is_empty() {
+                        self.message = Some("branch name must not be empty".to_string());
+                    } else {
+                        self.branch_create(name);
+                    }
+                }
+            }
+            ModalAction::BranchRename { old } => {
+                if let ModalResult::Submitted(new) = result {
+                    if new.is_empty() {
+                        self.message = Some("branch name must not be empty".to_string());
+                    } else {
+                        self.branch_rename(old, new);
+                    }
+                }
+            }
+            ModalAction::BranchDelete { name } => match result {
+                ModalResult::Confirmed(0) => self.branch_delete(name, false),
+                ModalResult::Confirmed(_) => self.branch_delete(name, true),
+                ModalResult::Submitted(_) | ModalResult::Cancelled => {}
+            },
+            ModalAction::StashPush { name } => {
+                if let ModalResult::Submitted(msg) = result {
+                    let msg = if msg.is_empty() { None } else { Some(msg) };
+                    self.stash_push(name, msg);
+                }
+            }
+            ModalAction::StashDrop { name, index } => {
+                if let ModalResult::Confirmed(_) = result {
+                    self.stash_action("drop", name, index);
+                }
+            }
+            ModalAction::ResolverAbort => {
+                if let ModalResult::Confirmed(_) = result {
+                    self.abort_resolver();
+                }
+            }
+        }
+    }
+
+    /// The `StatusEntry` under the Changes tab's cursor, or `None` on a folder
+    /// row. Used by the revert/delete confirmations.
+    fn diff_cursor_file(&self) -> Option<StatusEntry> {
+        let c = &self.changes;
+        current_file_index(&c.rows, c.selected).and_then(|i| c.files.get(i).cloned())
+    }
+
+    /// Confirmation for reverting the file under the Diff cursor.
+    fn open_revert_modal(&mut self, path: String) {
+        let body = vec![Line::from(format!("discard all changes to '{path}'?"))];
+        let options = vec![ConfirmOption::new("discard changes").destructive()];
+        self.push_confirm("revert file", body, options, ModalAction::RevertFile);
+    }
+
+    /// Confirmation for deleting the file under the Diff cursor.
+    fn open_delete_file_modal(&mut self, path: String) {
+        let body = vec![Line::from(format!("delete '{path}' from the worktree?"))];
+        let options = vec![ConfirmOption::new("delete file").destructive()];
+        self.push_confirm("delete file", body, options, ModalAction::DeleteFile);
+    }
+
+    /// Prompt for adding a file or folder to `.gitignore`.
+    fn open_ignore_modal(&mut self, file: String, pattern: String, is_folder: bool) {
+        let (exact, glob) = if is_folder {
+            ("just this folder", "all folders like it")
+        } else {
+            ("just this file", "all files like it")
+        };
+        let body = vec![
+            Line::from("add to .gitignore:"),
+            Line::from(""),
+        ];
+        let options = vec![
+            ConfirmOption::new(format!("{exact}: {file}")),
+            ConfirmOption::new(format!("{glob}: {pattern}")),
+        ];
+        self.push_confirm(
+            "ignore",
+            body,
+            options,
+            ModalAction::IgnorePath { file, pattern },
+        );
+    }
+
+    /// Confirmation shown when a new-worktree target directory already exists.
+    fn open_confirm_existing_modal(
+        &mut self,
+        branch: String,
+        base: Option<String>,
+        path: String,
+        existing_name: Option<String>,
+    ) {
+        // Whichever screen triggered the create is dismissed; the modal sits
+        // over the worktree list, and cancelling returns there.
+        self.go_root();
+        let is_wt = existing_name.is_some();
+        let body = vec![
+            Line::from(vec![
+                Span::raw("a directory already exists at "),
+                Span::styled(path.clone(), Style::new().bold()),
+            ]),
+            Line::from(""),
+        ];
+        let options = vec![
+            ConfirmOption::new(match &existing_name {
+                Some(n) => format!("open the existing worktree '{n}'"),
+                None => "open (only if it is a worktree)".to_string(),
+            })
+            .enabled(is_wt),
+            ConfirmOption::new("replace it (delete, then create)"),
+            ConfirmOption::new("cancel"),
+        ];
+        self.push_confirm(
+            "directory exists",
+            body,
+            options,
+            ModalAction::ConfirmExisting {
+                branch,
+                base,
+                path,
+                existing_name,
+            },
+        );
+    }
+
+    /// Confirmation shown when replacing a directory would discard real work.
+    fn open_confirm_replace_changes(
+        &mut self,
+        branch: String,
+        base: Option<String>,
+        path: String,
+    ) {
+        let body = vec![
+            Line::from(vec![
+                Span::raw("the worktree at "),
+                Span::styled(path.clone(), Style::new().bold()),
+            ]),
+            Line::styled(
+                "has changes that replacing it would permanently lose",
+                Style::new().fg(theme::DANGER),
+            ),
+        ];
+        let options = vec![
+            ConfirmOption::new("force delete (lose all changes), then create").destructive(),
+            ConfirmOption::new("cancel"),
+        ];
+        self.push_confirm(
+            "changes would be lost",
+            body,
+            options,
+            ModalAction::ConfirmReplaceChanges { branch, base, path },
+        );
+    }
+
+    /// Delete confirmation for the selected worktree.
+    fn open_delete_modal(&mut self, name: String, dirty: usize, branch: Option<String>) {
+        let mut body = vec![Line::from(vec![
+            Span::raw("remove worktree "),
+            Span::styled(format!("'{name}'"), Style::new().bold()),
+            Span::raw("?"),
+        ])];
+        if dirty > 0 {
+            body.push(Line::styled(
+                format!("⚠ {dirty} uncommitted change(s) will be lost — press f to force"),
+                Style::new().fg(theme::DANGER),
+            ));
+        }
+        let options = match &branch {
+            Some(b) => vec![
+                ConfirmOption::new(format!("remove folder only (keep branch '{b}')")),
+                ConfirmOption::new(format!("remove folder and delete branch '{b}'")).destructive(),
+            ],
+            None => vec![ConfirmOption::new("remove the worktree folder")],
+        };
+        self.push_confirm(
+            "delete",
+            body,
+            options,
+            ModalAction::DeleteWorktree {
+                name,
+                dirty,
+                branch,
+            },
+        );
+    }
+
+    /// Stash / discard / cancel prompt for removing a dirty worktree.
+    fn open_delete_dirty_modal(
+        &mut self,
+        name: String,
+        branch: Option<String>,
+        delete_branch: bool,
+    ) {
+        let after = if delete_branch {
+            "the folder and branch will be removed"
+        } else {
+            "the folder will be removed"
+        };
+        let body = vec![
+            Line::from(vec![
+                Span::raw("worktree "),
+                Span::styled(format!("'{name}'"), Style::new().bold()),
+                Span::raw(" has uncommitted changes"),
+            ]),
+            Line::styled(
+                format!("choose what to do with them, then {after}"),
+                Style::new().fg(theme::DANGER),
+            ),
+        ];
+        let options = vec![
+            ConfirmOption::new("stash the changes (keep them), then remove"),
+            ConfirmOption::new("discard the changes and remove").destructive(),
+            ConfirmOption::new("cancel"),
+        ];
+        self.push_confirm(
+            "uncommitted changes",
+            body,
+            options,
+            ModalAction::DeleteWorktreeDirty {
+                name,
+                branch,
+                delete_branch,
+            },
+        );
+    }
+
+    /// Prompt before updating a worktree that has uncommitted changes.
+    fn open_update_stash_modal(&mut self, name: String, dirty: usize) {
+        let body = vec![
+            Line::from(vec![
+                Span::raw("worktree "),
+                Span::styled(format!("'{name}'"), Style::new().bold()),
+                Span::raw(format!(
+                    " has {dirty} uncommitted change{}",
+                    if dirty == 1 { "" } else { "s" }
+                )),
+            ]),
+            Line::styled(
+                "updating may conflict with them; how should they be handled?",
+                Style::new().fg(theme::WARNING),
+            ),
+        ];
+        let options = vec![
+            ConfirmOption::new("stash them, update, then reapply (recommended)"),
+            ConfirmOption::new("update without stashing"),
+            ConfirmOption::new("cancel"),
+        ];
+        self.push_confirm(
+            "update from default branch",
+            body,
+            options,
+            ModalAction::UpdateStash { name },
+        );
+    }
+
+    /// Force-delete prompt shown when a branch could not be safely removed.
+    fn open_force_branch_modal(&mut self, branch: String, reason: ForceBranchReason) {
+        self.go_root();
+        let (warn, action) = match reason {
+            ForceBranchReason::NotMerged => (
+                format!("branch '{branch}' is not fully merged"),
+                "force-delete it anyway (-D)".to_string(),
+            ),
+            ForceBranchReason::CheckedOutElsewhere(other) => (
+                format!("branch '{branch}' is checked out in worktree '{other}'"),
+                format!("switch '{other}' to the default branch, then delete '{branch}'"),
+            ),
+        };
+        let body = vec![
+            Line::from("the worktree folder was removed, but the branch was kept".dim()),
+            Line::styled(format!("⚠ {warn}"), Style::new().fg(theme::DANGER)),
+        ];
+        let options = vec![ConfirmOption::new(action).key('f').destructive()];
+        self.push_confirm(
+            "delete branch?",
+            body,
+            options,
+            ModalAction::ForceBranch { branch },
+        );
+    }
+
+    /// Prompt to retry a refused fast-forward pull with a rebase.
+    fn open_pull_rebase_modal(&mut self, name: String) {
+        self.go_root();
+        let body = vec![
+            Line::styled(
+                format!("⚠ '{name}' has diverged from its upstream"),
+                Style::new().fg(theme::DANGER),
+            ),
+            Line::from("a plain fast-forward pull isn't possible".dim()),
+        ];
+        let options =
+            vec![ConfirmOption::new("pull with rebase (replay local commits on top)").key('r')];
+        self.push_confirm(
+            "pull needs a rebase",
+            body,
+            options,
+            ModalAction::PullRebase { name },
+        );
+    }
+
+    /// Delete confirmation for the selected branch (`f` forces).
+    fn open_branch_delete_modal(&mut self, name: String) {
+        let body = vec![Line::from(format!("delete branch '{name}'?"))];
+        let options = vec![
+            ConfirmOption::new("delete branch"),
+            ConfirmOption::new("force delete").key('f').destructive(),
+        ];
+        self.push_confirm(
+            "delete branch",
+            body,
+            options,
+            ModalAction::BranchDelete { name },
+        );
+    }
+
+    /// Drop confirmation for the selected stash entry.
+    fn open_stash_drop_modal(&mut self, name: String, index: Option<u32>) {
+        let label = match index {
+            Some(i) => format!("drop stash@{{{i}}}?"),
+            None => "drop stash?".to_string(),
+        };
+        let body = vec![Line::from(label)];
+        let options = vec![ConfirmOption::new("drop stash").destructive()];
+        self.push_confirm(
+            "drop stash",
+            body,
+            options,
+            ModalAction::StashDrop { name, index },
+        );
+    }
+
+    /// Abort confirmation for the conflict resolver.
+    fn open_resolver_abort_modal(&mut self, target: String) {
+        let body = vec![Line::from(format!(
+            "abort the operation in '{target}' and discard resolutions?"
+        ))];
+        let options = vec![ConfirmOption::new("abort").destructive()];
+        self.push_confirm("abort", body, options, ModalAction::ResolverAbort);
     }
 
     /// Reloads the merged config after a settings change and refreshes the
@@ -1577,7 +2230,7 @@ impl App {
                     .worktree_base(&self.ctx.repo_root)
                     .ok()
                     .map(|p| p.display().to_string());
-                self.view = View::List;
+                self.go_root();
                 self.refresh();
                 self.message = Some(format!("wrote {}", crate::config::CONFIG_FILE));
             }
@@ -1587,25 +2240,47 @@ impl App {
 
     /// Home-view key handling: cycle tabs, then dispatch to the active tab.
     fn on_list_key(&mut self, key: KeyEvent) {
-        // Tab / Shift+Tab cycle the top-level tabs, except while the Branches
-        // tab is capturing text for a new branch name.
-        let typing_branch =
-            self.tab == Tab::Branches && matches!(self.branch_mode, BranchMode::Create(_));
-        if !typing_branch && matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-            self.toggle_tab();
+        // Tab / Shift+Tab cycle the top-level tabs. (A prompt/confirm on the
+        // Branches tab is a modal, handled by `on_modal_key` before reaching
+        // here, so Tab is never captured mid-input.)
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.cycle_tab(key.code == KeyCode::Tab);
             return;
         }
         match self.tab {
             Tab::Worktrees => self.on_worktrees_tab_key(key),
+            Tab::Changes => self.on_changes_tab_key(key),
             Tab::Branches => self.on_branches_tab_key(key),
+            Tab::Stash => self.on_stash_tab_key(key),
+            Tab::Settings => self.on_settings_tab_key(key),
         }
     }
 
-    /// Switches to the other top-level tab.
-    fn toggle_tab(&mut self) {
+    /// Cycles to the next (`forward`) or previous top-level tab, then runs
+    /// whatever "on entry" loader that tab needs so its content isn't stale.
+    fn cycle_tab(&mut self, forward: bool) {
+        self.tab = if forward {
+            self.tab.next()
+        } else {
+            self.tab.prev()
+        };
         match self.tab {
-            Tab::Worktrees => self.open_branches_tab(),
-            Tab::Branches => self.tab = Tab::Worktrees,
+            Tab::Branches => self.load_branches(0),
+            // Landing on Changes shows whichever worktree is highlighted on the
+            // Worktrees tab. Coming back to the same worktree keeps the cursor
+            // where it was and just re-reads the working tree.
+            Tab::Changes => {
+                if let Some(name) = self.selected_worktree().map(|w| w.name.clone()) {
+                    if name == self.changes.name {
+                        self.refresh_diff();
+                    } else {
+                        self.open_changes_tab(name);
+                    }
+                }
+            }
+            Tab::Stash => self.open_stash_tab(),
+            Tab::Settings => self.open_settings_tab(),
+            Tab::Worktrees => {}
         }
     }
 
@@ -1624,12 +2299,9 @@ impl App {
             }
             KeyCode::Char('n') => self.open_create(),
             KeyCode::Char('c') => self.open_commit(),
-            KeyCode::Char('o') => match ConfigEditor::load(self.ctx.repo_root.clone()) {
-                Ok(editor) => self.view = View::Config(Box::new(editor)),
-                Err(e) => self.set_error(format!("{e:#}")),
-            },
+            KeyCode::Char('o') => self.open_settings_tab(),
             KeyCode::Char('e') => self.run_open_command(),
-            KeyCode::Char('s') => self.open_stash(),
+            KeyCode::Char('s') => self.open_stash_tab(),
             KeyCode::Char('p') => self.start_pull(),
             KeyCode::Char('P') => self.start_push(),
             KeyCode::Char('f') => self.start_fetch(),
@@ -1642,19 +2314,16 @@ impl App {
                     if wt.is_main {
                         self.message = Some("cannot remove the main worktree".to_string());
                     } else {
-                        self.view = View::ConfirmDelete {
-                            name: wt.name.clone(),
-                            dirty: wt.dirty,
-                            branch: wt.branch.clone(),
-                            delete_branch: false,
-                        };
+                        let (name, dirty, branch) =
+                            (wt.name.clone(), wt.dirty, wt.branch.clone());
+                        self.open_delete_modal(name, dirty, branch);
                     }
                 }
             }
             KeyCode::Enter => {
                 if let Some(wt) = self.selected_worktree() {
                     let name = wt.name.clone();
-                    self.open_diff(name);
+                    self.open_changes_tab(name);
                 }
             }
             _ => {}
@@ -1669,10 +2338,10 @@ impl App {
                 self.message = Some("cannot rename the main worktree".to_string());
             } else {
                 let name = wt.name.clone();
-                self.view = View::RenameWorktree {
+                self.push_screen(View::RenameWorktree {
                     input: TextInput::with_value(name.clone()),
                     name,
-                };
+                });
             }
         }
     }
@@ -1700,28 +2369,19 @@ impl App {
         }
     }
 
-    /// Opens the per-file changes view for the worktree named `name`.
-    fn open_diff(&mut self, name: String) {
+    /// Switches to the Changes tab, loaded with the worktree named `name`.
+    fn open_changes_tab(&mut self, name: String) {
         match ops::status(&self.ctx, &name) {
             Ok((_, files)) => {
                 let marked = vec![true; files.len()];
                 let rows = build_rows(&files, self.file_tree, &self.collapsed_folders);
-                self.view = View::Diff {
+                self.tab = Tab::Changes;
+                self.changes = ChangesTab {
                     name,
                     files,
                     marked,
                     rows,
-                    selected: 0,
-                    content: String::new(),
-                    content_path: None,
-                    load_gen: 0,
-                    pending: None,
-                    loading_new: false,
-                    scroll: 0,
-                    last_refresh: Instant::now(),
-                    confirm_revert: false,
-                    confirm_delete: false,
-                    ignore_prompt: None,
+                    ..ChangesTab::default()
                 };
                 self.load_diff_content(true);
             }
@@ -1736,37 +2396,18 @@ impl App {
     /// kept and merely clamped to the new content, so the periodic auto-refresh
     /// doesn't yank the user back to the top of the file they're reading.
     fn load_diff_content(&mut self, reset_scroll: bool) {
-        let View::Diff {
-            name,
-            files,
-            rows,
-            selected,
-            ..
-        } = &self.view
-        else {
-            return;
-        };
-        let entry = current_file_index(rows, *selected).and_then(|i| files.get(i).cloned());
-        let name = name.clone();
+        let c = &mut self.changes;
+        let entry = current_file_index(&c.rows, c.selected).and_then(|i| c.files.get(i).cloned());
+        let name = c.name.clone();
         // A folder (or empty) row has no diff; clear it synchronously and cancel
         // any in-flight file load so its late result can't overwrite the blank.
         let Some(e) = entry else {
-            if let View::Diff {
-                content,
-                content_path,
-                pending,
-                loading_new,
-                scroll,
-                ..
-            } = &mut self.view
-            {
-                content.clear();
-                *content_path = None;
-                *pending = None;
-                *loading_new = false;
-                if reset_scroll {
-                    *scroll = 0;
-                }
+            c.content.clear();
+            c.content_path = None;
+            c.pending = None;
+            c.loading_new = false;
+            if reset_scroll {
+                c.scroll = 0;
             }
             return;
         };
@@ -1775,22 +2416,12 @@ impl App {
         // Bump the generation, decide whether this is a switch to a new file
         // (so the UI shows a placeholder) or a same-file refresh (keep the diff
         // on screen to avoid flicker), and reset scroll now if we're switching.
-        let (token, is_new) = if let View::Diff {
-            load_gen,
-            content_path,
-            scroll,
-            ..
-        } = &mut self.view
-        {
-            *load_gen = load_gen.wrapping_add(1);
-            let is_new = content_path.as_deref() != Some(path.as_str());
-            if reset_scroll {
-                *scroll = 0;
-            }
-            (*load_gen, is_new)
-        } else {
-            return;
-        };
+        c.load_gen = c.load_gen.wrapping_add(1);
+        let token = c.load_gen;
+        let is_new = c.content_path.as_deref() != Some(path.as_str());
+        if reset_scroll {
+            c.scroll = 0;
+        }
         // Compute the diff off the UI thread; the result is picked up in `tick`
         // via `poll_diff_load` and applied only if its generation still matches.
         let (tx, rx) = channel();
@@ -1803,60 +2434,34 @@ impl App {
             };
             let _ = tx.send((token, path_for_thread, content));
         });
-        if let View::Diff {
-            pending,
-            loading_new,
-            ..
-        } = &mut self.view
-        {
-            *pending = Some(rx);
-            *loading_new = is_new;
-        }
+        self.changes.pending = Some(Task::new(rx));
+        self.changes.loading_new = is_new;
     }
 
     /// Applies the newest background diff result to the Diff view, if one has
     /// arrived and still matches the current generation. Called each tick so a
     /// diff computed off the UI thread lands without blocking navigation.
     fn poll_diff_load(&mut self) {
-        let View::Diff {
-            pending, load_gen, ..
-        } = &self.view
-        else {
+        let c = &mut self.changes;
+        let Some(rx) = &c.pending else {
             return;
         };
-        let Some(rx) = pending else {
-            return;
-        };
-        let token = *load_gen;
+        let token = c.load_gen;
         // Drain to the most recent message so a burst of fast navigation doesn't
         // apply stale intermediate diffs.
-        let mut got = None;
-        while let Ok(msg) = rx.try_recv() {
-            got = Some(msg);
-        }
-        let Some((g, path, content)) = got else {
+        let Some((g, path, content)) = rx.poll_latest() else {
             return;
         };
         if g != token {
             return;
         }
-        if let View::Diff {
-            content: slot,
-            content_path,
-            pending,
-            loading_new,
-            scroll,
-            ..
-        } = &mut self.view
-        {
-            *slot = content;
-            *content_path = Some(path);
-            *pending = None;
-            *loading_new = false;
-            // Don't let a shrunken diff leave the viewport past the last line.
-            let max = slot.lines().count().saturating_sub(1) as u16;
-            *scroll = (*scroll).min(max);
-        }
+        c.content = content;
+        c.content_path = Some(path);
+        c.pending = None;
+        c.loading_new = false;
+        // Don't let a shrunken diff leave the viewport past the last line.
+        let max = c.content.lines().count().saturating_sub(1) as u16;
+        c.scroll = c.scroll.min(max);
     }
 
     /// Handles mouse input. The scroll wheel moves the help, diff, or log
@@ -1900,18 +2505,25 @@ impl App {
                 && mouse.row >= rl.inner.y
                 && mouse.row < rl.inner.y + rl.inner.height
         });
-        match &mut self.view {
-            // Over the file list: one file-cursor step per wheel notch.
-            View::Diff { rows, selected, .. } if over_list => {
+        // Over the Changes tab's file list: one file-cursor step per wheel
+        // notch; anywhere else on that tab the wheel scrolls the diff text.
+        if matches!(self.view, View::List) && self.tab == Tab::Changes {
+            let c = &mut self.changes;
+            if over_list {
                 let moved = if down {
-                    (*selected + 1 < rows.len()).then(|| *selected += 1)
+                    (c.selected + 1 < c.rows.len()).then(|| c.selected += 1)
                 } else {
-                    (*selected > 0).then(|| *selected -= 1)
+                    (c.selected > 0).then(|| c.selected -= 1)
                 };
                 if moved.is_some() {
                     self.load_diff_content(true);
                 }
+            } else {
+                c.scroll = delta(c.scroll);
             }
+            return;
+        }
+        match &mut self.view {
             View::CommitDiff { rows, selected, .. } if over_list => {
                 let moved = if down {
                     (*selected + 1 < rows.len()).then(|| *selected += 1)
@@ -1922,9 +2534,7 @@ impl App {
                     self.load_commit_diff_content(true);
                 }
             }
-            View::Diff { scroll, .. } | View::CommitDiff { scroll, .. } => {
-                *scroll = delta(*scroll)
-            }
+            View::CommitDiff { scroll, .. } => *scroll = delta(*scroll),
             // The log has no free scroll offset any more; the wheel steps the
             // commit cursor instead, matching the arrow keys.
             View::Log {
@@ -1945,6 +2555,18 @@ impl App {
         let Some(idx) = self.row_list.and_then(|rl| rl.hit(col, row)) else {
             return;
         };
+        // A confirm modal sits on top of everything else, so a hit while one
+        // is open always targets its options, not the view underneath. Only
+        // enabled options are selectable, matching keyboard nav's skip-logic.
+        if let Some(Modal::Confirm {
+            options, selected, ..
+        }) = &mut self.modal
+        {
+            if idx < options.len() && options[idx].enabled {
+                *selected = idx;
+            }
+            return;
+        }
         match self.view {
             View::List => match self.tab {
                 Tab::Worktrees => {
@@ -1957,16 +2579,31 @@ impl App {
                         self.branch_selected = idx;
                     }
                 }
-            },
-            View::Diff { .. } => {
-                if let View::Diff { selected, rows, .. } = &mut self.view {
-                    if idx >= rows.len() || *selected == idx {
+                Tab::Changes => {
+                    let c = &mut self.changes;
+                    if idx >= c.rows.len() || c.selected == idx {
                         return;
                     }
-                    *selected = idx;
+                    c.selected = idx;
+                    self.load_diff_content(true);
                 }
-                self.load_diff_content(true);
-            }
+                Tab::Stash => {
+                    if idx < self.stash_entries.len() {
+                        self.stash_selected = idx;
+                    }
+                }
+                // Non-uniform layout: each field is a value line plus a dim
+                // hint line, so only even offsets are a field's value row, and
+                // the save row follows one more line after the preview.
+                Tab::Settings if self.settings.editing.is_none() => {
+                    if idx < FIELD_ROWS * 2 && idx % 2 == 0 {
+                        self.settings.selected = idx / 2;
+                    } else if idx == FIELD_ROWS * 2 + 1 {
+                        self.settings.selected = CONFIG_ROWS - 1;
+                    }
+                }
+                Tab::Settings => {}
+            },
             View::CommitDiff { .. } => {
                 if let View::CommitDiff { selected, rows, .. } = &mut self.view {
                     if idx >= rows.len() || *selected == idx {
@@ -1989,74 +2626,97 @@ impl App {
                     *focus = CommitFocus::Files;
                 }
             }
+            // Commit lists: a click lands the cursor on a commit row (art-only
+            // graph rows are not selectable, matching the arrow keys).
+            View::Log { .. } => {
+                if let View::Log {
+                    lines, selected, ..
+                } = &mut self.view
+                    && lines.get(idx).is_some_and(|l| l.entry.is_some())
+                {
+                    *selected = idx;
+                }
+            }
+            View::BranchCommits { .. } => {
+                if let View::BranchCommits {
+                    lines, selected, ..
+                } = &mut self.view
+                    && lines.get(idx).is_some_and(|l| l.entry.is_some())
+                {
+                    *selected = idx;
+                }
+            }
+            // The switch picker's cursor indexes the filtered list, which is
+            // exactly what the row list reports.
+            View::Switch { .. } => {
+                if let View::Switch { selected, .. } = &mut self.view {
+                    *selected = idx;
+                }
+            }
+            View::CherryPick { .. } => {
+                if let View::CherryPick {
+                    targets, selected, ..
+                } = &mut self.view
+                    && idx < targets.len()
+                {
+                    *selected = idx;
+                }
+            }
+            View::MergePick { .. } => {
+                if let View::MergePick {
+                    targets, selected, ..
+                } = &mut self.view
+                    && idx < targets.len()
+                {
+                    *selected = idx;
+                }
+            }
+            View::ConflictResolver { .. } => {
+                if let View::ConflictResolver { files, file, .. } = &mut self.view {
+                    if idx >= files.len() || *file == idx {
+                        return;
+                    }
+                    *file = idx;
+                }
+                self.load_resolver_file();
+            }
+            // The wizard's rows are drawn per-step, so the click target
+            // depends on which step (and, for Review, whether it's mid-edit)
+            // is currently on screen.
+            View::Setup(ref mut wizard) => match &mut wizard.step {
+                setup::Step::Location { selected } => *selected = idx,
+                setup::Step::CloneBrowse { browser, .. } => {
+                    if idx < browser.entries.len() {
+                        browser.selected = idx;
+                    }
+                }
+                // The rows aren't drawn one-per-line (a blank separator sits
+                // before the write row), so the raw row index is decoded the
+                // same way `draw_review` laid the lines out.
+                setup::Step::Review {
+                    selected,
+                    editing: None,
+                } => {
+                    if idx < setup::REVIEW_ROWS - 1 {
+                        *selected = idx;
+                    } else if idx == setup::REVIEW_ROWS {
+                        *selected = setup::REVIEW_ROWS - 1;
+                    }
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
 
-    fn on_diff_key(&mut self, key: KeyEvent) {
-        let View::Diff {
+    fn on_changes_tab_key(&mut self, key: KeyEvent) {
+        let ChangesTab {
             files,
             marked,
             rows,
             selected,
-            confirm_revert,
-            confirm_delete,
-            ignore_prompt,
             ..
-        } = &mut self.view
-        else {
-            return;
-        };
-        if *confirm_revert {
-            match key.code {
-                KeyCode::Enter | KeyCode::Char('y') => {
-                    let entry =
-                        current_file_index(rows, *selected).and_then(|i| files.get(i).cloned());
-                    *confirm_revert = false;
-                    if let Some(e) = entry {
-                        self.revert_file(e);
-                    }
-                }
-                KeyCode::Esc | KeyCode::Char('n') => *confirm_revert = false,
-                _ => {}
-            }
-            return;
-        }
-        if *confirm_delete {
-            match key.code {
-                KeyCode::Enter | KeyCode::Char('y') => {
-                    let entry =
-                        current_file_index(rows, *selected).and_then(|i| files.get(i).cloned());
-                    *confirm_delete = false;
-                    if let Some(e) = entry {
-                        self.delete_file(e);
-                    }
-                }
-                KeyCode::Esc | KeyCode::Char('n') => *confirm_delete = false,
-                _ => {}
-            }
-            return;
-        }
-        if ignore_prompt.is_some() {
-            match key.code {
-                KeyCode::Up | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('k') => {
-                    if let Some(p) = ignore_prompt {
-                        p.selected ^= 1;
-                    }
-                }
-                KeyCode::Enter => {
-                    let pattern = ignore_prompt
-                        .take()
-                        .map(|p| if p.selected == 0 { p.file } else { p.pattern });
-                    if let Some(pattern) = pattern {
-                        self.add_ignore(&pattern);
-                    }
-                }
-                KeyCode::Esc | KeyCode::Char('q') => *ignore_prompt = None,
-                _ => {}
-            }
-            return;
-        }
+        } = &mut self.changes;
         // Scroll the diff content. Shift+Up/Down works on terminals that report
         // the modifier; Shift+J/Shift+K (which arrive as capital 'J'/'K' on any
         // terminal) are the always-available fallback. Plain Up/Down still move
@@ -2073,7 +2733,8 @@ impl App {
             return;
         }
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.view = View::List,
+            // Every top-level tab quits on Esc/q; only drill-ins go "back".
+            KeyCode::Esc | KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('r') => self.refresh_diff(),
             KeyCode::Down | KeyCode::Char('j') => {
                 if *selected + 1 < rows.len() {
@@ -2137,48 +2798,47 @@ impl App {
                 }
             }
             KeyCode::Char('S') => self.stash_marked(),
-            KeyCode::Char('R') => {
-                match current_file_index(rows, *selected).and_then(|i| files.get(i)) {
+            // `u` undoes local changes to the file. `R` is reserved for rename
+            // everywhere, so revert is not bound to it here.
+            KeyCode::Char('u') => {
+                let entry =
+                    current_file_index(rows, *selected).and_then(|i| files.get(i).cloned());
+                match entry {
                     // A newly added file has no committed version to restore, so
                     // revert can't do anything; point the user at delete instead.
                     Some(e) if is_new_file(&e.code) => {
-                        let path = e.path.clone();
                         self.message = Some(format!(
-                            "'{path}' is new (not yet committed); nothing to revert to. Press d to delete it."
+                            "'{}' is new (not yet committed); nothing to revert to. Press d to delete it.",
+                            e.path
                         ));
                     }
-                    Some(_) => *confirm_revert = true,
+                    Some(e) => self.open_revert_modal(e.path),
                     None => {}
                 }
             }
             KeyCode::Char('d') => {
-                if current_file_index(rows, *selected).is_some() {
-                    *confirm_delete = true;
+                let path =
+                    current_file_index(rows, *selected).and_then(|i| files.get(i).map(|f| f.path.clone()));
+                if let Some(path) = path {
+                    self.open_delete_file_modal(path);
                 }
             }
-            KeyCode::Char('i') => match rows.get(*selected) {
-                Some(DiffRow::File { index, .. }) => {
-                    if let Some(entry) = files.get(*index) {
-                        *ignore_prompt = Some(IgnorePrompt {
-                            file: entry.path.clone(),
-                            pattern: ops::ignore_pattern(&entry.path),
-                            selected: 0,
-                            is_folder: false,
-                        });
+            KeyCode::Char('i') => {
+                let target = match rows.get(*selected) {
+                    Some(DiffRow::File { index, .. }) => files
+                        .get(*index)
+                        .map(|entry| (entry.path.clone(), ops::ignore_pattern(&entry.path), false)),
+                    Some(DiffRow::Folder { prefix, label, .. }) => {
+                        Some((prefix.clone(), format!("{label}/"), true))
                     }
+                    None => None,
+                };
+                if let Some((file, pattern, is_folder)) = target {
+                    self.open_ignore_modal(file, pattern, is_folder);
                 }
-                Some(DiffRow::Folder { prefix, label, .. }) => {
-                    *ignore_prompt = Some(IgnorePrompt {
-                        file: prefix.clone(),
-                        pattern: format!("{label}/"),
-                        selected: 0,
-                        is_folder: true,
-                    });
-                }
-                None => {}
-            },
+            }
             KeyCode::Char('t') => self.toggle_file_layout(),
-            KeyCode::Char('c') | KeyCode::Tab => self.commit_from_diff(),
+            KeyCode::Char('c') => self.commit_from_diff(),
             _ => {}
         }
     }
@@ -2188,24 +2848,21 @@ impl App {
     fn toggle_file_layout(&mut self) {
         self.file_tree = !self.file_tree;
         let tree = self.file_tree;
-        if let View::Diff {
+        let ChangesTab {
             files,
             rows,
             selected,
             ..
-        } = &mut self.view
-        {
-            // Remember the file under the cursor so the toggle doesn't jump.
-            let path = current_file_index(rows, *selected).map(|i| files[i].path.clone());
-            *rows = build_rows(files, tree, &self.collapsed_folders);
-            *selected = path
-                .and_then(|p| {
-                    rows.iter().position(|r| {
-                        matches!(r, DiffRow::File { index, .. } if files[*index].path == p)
-                    })
-                })
-                .unwrap_or(0);
-        }
+        } = &mut self.changes;
+        // Remember the file under the cursor so the toggle doesn't jump.
+        let path = current_file_index(rows, *selected).map(|i| files[i].path.clone());
+        *rows = build_rows(files, tree, &self.collapsed_folders);
+        *selected = path
+            .and_then(|p| {
+                rows.iter()
+                    .position(|r| matches!(r, DiffRow::File { index, .. } if files[*index].path == p))
+            })
+            .unwrap_or(0);
         self.load_diff_content(true);
     }
 
@@ -2219,18 +2876,17 @@ impl App {
         }
         let is_commit = matches!(self.view, View::CommitDiff { .. });
         let (files, rows, selected) = match &mut self.view {
-            View::Diff {
-                files,
-                rows,
-                selected,
-                ..
-            }
-            | View::CommitDiff {
+            View::CommitDiff {
                 files,
                 rows,
                 selected,
                 ..
             } => (files, rows, selected),
+            // Otherwise this is the Changes tab (the only other caller).
+            View::List if self.tab == Tab::Changes => {
+                let c = &mut self.changes;
+                (&mut c.files, &mut c.rows, &mut c.selected)
+            }
             _ => return,
         };
         // What the key means on the row under the cursor.
@@ -2321,10 +2977,7 @@ impl App {
 
     /// Adds `pattern` to the worktree's `.gitignore`, then reloads the view.
     fn add_ignore(&mut self, pattern: &str) {
-        let View::Diff { name, .. } = &self.view else {
-            return;
-        };
-        let name = name.clone();
+        let name = self.changes.name.clone();
         match ops::add_to_gitignore(&self.ctx, &name, pattern) {
             Ok(true) => self.message = Some(format!("added '{pattern}' to .gitignore")),
             Ok(false) => self.message = Some(format!("'{pattern}' is already in .gitignore")),
@@ -2334,96 +2987,68 @@ impl App {
         self.refresh();
     }
 
-    /// Applies `f` to the diff scroll offset, if the diff view is active.
+    /// Applies `f` to the Changes tab's diff scroll offset.
     fn scroll_diff(&mut self, f: impl FnOnce(u16) -> u16) {
-        if let View::Diff { scroll, .. } = &mut self.view {
-            *scroll = f(*scroll);
-        }
+        self.changes.scroll = f(self.changes.scroll);
     }
 
     /// Rebuilds the changed-file list and the selected file's diff in place,
-    /// preserving commit marks by path and clamping the cursor. No-op outside
-    /// the diff view.
+    /// preserving commit marks by path and clamping the cursor. No-op until the
+    /// Changes tab has been opened on a worktree.
     fn refresh_diff(&mut self) {
-        let View::Diff { name, .. } = &self.view else {
+        if self.changes.name.is_empty() {
             return;
-        };
-        let name = name.clone();
+        }
+        let name = self.changes.name.clone();
         let tree = self.file_tree;
         // Remember which file is under the cursor so we can tell whether the
         // refresh lands on the same file (keep scroll) or a different one
         // because the list shifted (reset scroll).
-        let old_path = if let View::Diff {
-            files,
-            rows,
-            selected,
-            ..
-        } = &self.view
-        {
-            current_file_index(rows, *selected)
-                .and_then(|i| files.get(i))
+        let old_path = {
+            let c = &self.changes;
+            current_file_index(&c.rows, c.selected)
+                .and_then(|i| c.files.get(i))
                 .map(|f| f.path.clone())
-        } else {
-            None
         };
         match ops::status(&self.ctx, &name) {
             Ok((_, new_files)) => {
-                if let View::Diff {
-                    files,
-                    marked,
-                    rows,
-                    selected,
-                    last_refresh,
-                    ..
-                } = &mut self.view
-                {
-                    // Carry commit marks over to files that still exist.
-                    let old: std::collections::HashMap<&str, bool> = files
-                        .iter()
-                        .zip(marked.iter())
-                        .map(|(f, m)| (f.path.as_str(), *m))
-                        .collect();
-                    let new_marked = new_files
-                        .iter()
-                        .map(|f| old.get(f.path.as_str()).copied().unwrap_or(true))
-                        .collect();
-                    *rows = build_rows(&new_files, tree, &self.collapsed_folders);
-                    *files = new_files;
-                    *marked = new_marked;
-                    *selected = (*selected).min(rows.len().saturating_sub(1));
-                    *last_refresh = Instant::now();
-                }
-                let new_path = if let View::Diff {
-                    files,
-                    rows,
-                    selected,
-                    ..
-                } = &self.view
-                {
-                    current_file_index(rows, *selected)
-                        .and_then(|i| files.get(i))
-                        .map(|f| f.path.clone())
-                } else {
-                    None
-                };
+                let c = &mut self.changes;
+                // Carry commit marks over to files that still exist.
+                let old: std::collections::HashMap<&str, bool> = c
+                    .files
+                    .iter()
+                    .zip(c.marked.iter())
+                    .map(|(f, m)| (f.path.as_str(), *m))
+                    .collect();
+                let new_marked = new_files
+                    .iter()
+                    .map(|f| old.get(f.path.as_str()).copied().unwrap_or(true))
+                    .collect();
+                c.rows = build_rows(&new_files, tree, &self.collapsed_folders);
+                c.files = new_files;
+                c.marked = new_marked;
+                c.selected = c.selected.min(c.rows.len().saturating_sub(1));
+                c.last_refresh = Instant::now();
+                let new_path = current_file_index(&c.rows, c.selected)
+                    .and_then(|i| c.files.get(i))
+                    .map(|f| f.path.clone());
                 self.load_diff_content(new_path != old_path);
             }
             // The worktree may have been removed out from under us; surface it
-            // and drop back to the list rather than looping on the error.
+            // and drop back to the worktree list rather than looping on the
+            // error.
             Err(e) => {
                 self.set_error(format!("{e:#}"));
-                self.view = View::List;
+                self.changes = ChangesTab::default();
+                self.tab = Tab::Worktrees;
                 self.refresh();
             }
         }
     }
 
-    /// Stashes a single file from the diff view, then reloads it.
+    /// Stashes a single file from the Changes tab, then reloads it.
     fn stash_file(&mut self, entry: StatusEntry) {
-        let View::Diff { name, .. } = &self.view else {
-            return;
-        };
-        let name = name.clone();
+        let name = self.changes.name.clone();
         match ops::stash_push_paths(&self.ctx, &name, std::slice::from_ref(&entry.path), None) {
             Ok(_) => self.message = Some(format!("stashed '{}'", entry.path)),
             Err(e) => self.set_error(format!("{e:#}")),
@@ -2432,22 +3057,15 @@ impl App {
         self.refresh();
     }
 
-    /// Stashes every marked (`[x]`) file from the diff view, then reloads it.
+    /// Stashes every marked (`[x]`) file from the Changes tab, then reloads it.
     /// Reports when nothing is marked rather than stashing the whole worktree.
     fn stash_marked(&mut self) {
-        let View::Diff {
-            name,
-            files,
-            marked,
-            ..
-        } = &self.view
-        else {
-            return;
-        };
-        let name = name.clone();
-        let paths: Vec<String> = files
+        let name = self.changes.name.clone();
+        let paths: Vec<String> = self
+            .changes
+            .files
             .iter()
-            .zip(marked.iter())
+            .zip(self.changes.marked.iter())
             .filter(|(_, m)| **m)
             .map(|(f, _)| f.path.clone())
             .collect();
@@ -2463,12 +3081,9 @@ impl App {
         self.refresh();
     }
 
-    /// Reverts a single file from the diff view, then reloads it.
+    /// Reverts a single file from the Changes tab, then reloads it.
     fn revert_file(&mut self, entry: StatusEntry) {
-        let View::Diff { name, .. } = &self.view else {
-            return;
-        };
-        let name = name.clone();
+        let name = self.changes.name.clone();
         let untracked = entry.code.starts_with('?');
         match ops::revert_file(&self.ctx, &name, &entry.path, untracked) {
             Ok(_) => self.message = Some(format!("reverted '{}'", entry.path)),
@@ -2478,12 +3093,9 @@ impl App {
         self.refresh();
     }
 
-    /// Deletes a single file from the diff view, then reloads it.
+    /// Deletes a single file from the Changes tab, then reloads it.
     fn delete_file(&mut self, entry: StatusEntry) {
-        let View::Diff { name, .. } = &self.view else {
-            return;
-        };
-        let name = name.clone();
+        let name = self.changes.name.clone();
         let untracked = entry.code.starts_with('?');
         match ops::delete_file(&self.ctx, &name, &entry.path, untracked) {
             Ok(_) => self.message = Some(format!("deleted '{}'", entry.path)),
@@ -2493,30 +3105,22 @@ impl App {
         self.refresh();
     }
 
-    /// Opens the commit dialog from the diff view, carrying the files marked
+    /// Opens the commit dialog from the Changes tab, carrying the files marked
     /// there as the initial selection.
     fn commit_from_diff(&mut self) {
-        let View::Diff {
-            name,
-            files,
-            marked,
-            ..
-        } = &self.view
-        else {
-            return;
-        };
-        if files.is_empty() {
+        let c = &self.changes;
+        if c.files.is_empty() {
             self.message = Some("nothing to commit".to_string());
             return;
         }
-        self.view = View::Commit {
-            name: name.clone(),
-            files: files.clone(),
-            marked: marked.clone(),
+        self.push_screen(View::Commit {
+            name: c.name.clone(),
+            files: c.files.clone(),
+            marked: c.marked.clone(),
             cursor: 0,
             input: TextInput::default(),
             focus: CommitFocus::Message,
-        };
+        });
     }
 
     /// Opens the new-worktree dialog. Row 0 creates a new branch off a base
@@ -2561,7 +3165,7 @@ impl App {
             }
         }
         let base = self.default_base(&all_branches);
-        self.view = View::Create {
+        self.push_screen(View::Create {
             name: TextInput::default(),
             branches,
             all_branches,
@@ -2569,7 +3173,7 @@ impl App {
             selected: 0,
             base_focus: false,
             base_pick: None,
-        };
+        });
     }
 
     /// The base branch a new branch should default to: the main worktree's
@@ -2632,7 +3236,7 @@ impl App {
                 if *base_focus {
                     *base_focus = false;
                 } else {
-                    self.view = View::List;
+                    self.pop_screen();
                 }
             }
             // Tab focuses the base button on the new-branch row; a second Tab (or
@@ -2696,106 +3300,11 @@ impl App {
     fn request_create(&mut self, branch: String, base: Option<String>) {
         match ops::existing_target(&self.ctx, &branch) {
             Ok(Some(target)) => {
-                self.view = View::ConfirmExisting {
-                    branch,
-                    base,
-                    path: target.path.to_string_lossy().to_string(),
-                    existing_name: target.worktree_name,
-                    // Default to Open when it's a worktree, else Replace.
-                    selected: 0,
-                };
+                let path = target.path.to_string_lossy().to_string();
+                self.open_confirm_existing_modal(branch, base, path, target.worktree_name);
             }
             Ok(None) => self.start_create(branch, base),
             Err(e) => self.set_error(format!("{e:#}")),
-        }
-    }
-
-    /// Drives the "directory already exists" prompt: Open an existing worktree,
-    /// Replace the directory, or Cancel.
-    fn on_confirm_existing_key(&mut self, key: KeyEvent) {
-        let View::ConfirmExisting {
-            existing_name,
-            selected,
-            ..
-        } = &mut self.view
-        else {
-            return;
-        };
-        // Without a worktree to open, only Replace (1) and Cancel (2) apply.
-        let first = if existing_name.is_some() { 0 } else { 1 };
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                *selected = (*selected).saturating_sub(1).max(first);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if *selected < 2 {
-                    *selected += 1;
-                }
-            }
-            KeyCode::Esc | KeyCode::Char('q') => self.view = View::List,
-            KeyCode::Enter => {
-                if *selected < first {
-                    *selected = first;
-                }
-                self.apply_confirm_existing();
-            }
-            _ => {}
-        }
-    }
-
-    /// Carries out the choice made in the "directory already exists" prompt.
-    fn apply_confirm_existing(&mut self) {
-        let View::ConfirmExisting {
-            branch,
-            base,
-            path,
-            existing_name,
-            selected,
-        } = std::mem::replace(&mut self.view, View::List)
-        else {
-            return;
-        };
-        match selected {
-            // Open the existing worktree.
-            0 => match existing_name {
-                Some(name) => self.open_diff(name),
-                None => self.message = Some("that directory is not a worktree".to_string()),
-            },
-            // Replace: remove the directory, then create fresh. Only stop to
-            // confirm when the occupying worktree holds work that would be lost.
-            1 => match ops::target_has_changes(&self.ctx, Path::new(&path)) {
-                Ok(true) => {
-                    self.view = View::ConfirmReplaceChanges {
-                        branch,
-                        base,
-                        path,
-                        selected: 1,
-                    };
-                }
-                Ok(false) => self.replace_target(branch, base, &path),
-                Err(e) => self.set_error(format!("{e:#}")),
-            },
-            // Cancel.
-            _ => {}
-        }
-    }
-
-    /// Carries out the force-delete confirmation shown when replacing a
-    /// directory that holds real work: Force delete removes it and recreates,
-    /// Cancel returns to the list.
-    fn apply_confirm_replace_changes(&mut self) {
-        let View::ConfirmReplaceChanges {
-            branch,
-            base,
-            path,
-            selected,
-        } = std::mem::replace(&mut self.view, View::List)
-        else {
-            return;
-        };
-        // 0 = Force delete; anything else cancels back to the list.
-        if selected == 0 {
-            self.replace_target(branch, base, &path);
         }
     }
 
@@ -2833,7 +3342,7 @@ impl App {
         self.view = View::Creating {
             branch,
             lines: Vec::new(),
-            rx,
+            rx: Task::new(rx),
             done: false,
             control,
             input: String::new(),
@@ -2852,11 +3361,11 @@ impl App {
         match self.ctx.config.open_command.clone() {
             Some(cmd) if !cmd.trim().is_empty() => self.spawn_in_dir(cmd.trim(), &path, &name),
             _ => {
-                self.view = View::RunCommand {
+                self.push_screen(View::RunCommand {
                     name,
                     path,
                     input: TextInput::default(),
-                }
+                })
             }
         }
     }
@@ -2895,14 +3404,14 @@ impl App {
         match ops::status(&self.ctx, &name) {
             Ok((_, files)) => {
                 let marked = vec![true; files.len()];
-                self.view = View::Commit {
+                self.push_screen(View::Commit {
                     name,
                     files,
                     marked,
                     cursor: 0,
                     input: TextInput::default(),
                     focus: CommitFocus::Message,
-                };
+                });
             }
             Err(e) => self.set_error(format!("{e:#}")),
         }
@@ -2924,7 +3433,7 @@ impl App {
         };
         match key.code {
             KeyCode::Esc => {
-                self.view = View::List;
+                self.pop_screen();
                 return;
             }
             KeyCode::Tab => {
@@ -3013,96 +3522,95 @@ impl App {
         );
     }
 
-    /// Opens the stash manager for the selected worktree.
-    fn open_stash(&mut self) {
+    /// Switches to the Settings tab with the repo's `.wtm.toml` freshly read,
+    /// so it never shows values that have gone stale on disk.
+    fn open_settings_tab(&mut self) {
+        match ConfigEditor::load(self.ctx.repo_root.clone()) {
+            Ok(editor) => {
+                self.settings = editor;
+                self.tab = Tab::Settings;
+            }
+            Err(e) => self.set_error(format!("{e:#}")),
+        }
+    }
+
+    fn on_settings_tab_key(&mut self, key: KeyEvent) {
+        match self.settings.on_key(key, &mut self.message) {
+            EditorOutcome::Saved(path) => {
+                self.reload_config();
+                if self.message.is_none() {
+                    self.message = Some(format!("saved {}", path.display()));
+                }
+            }
+            // The editor swallows Esc itself while a field is being edited, so
+            // `Cancel` only arrives when nothing is in progress — and then Esc/q
+            // quits, as on every other tab.
+            EditorOutcome::Cancel => self.quit = true,
+            EditorOutcome::Continue => {}
+        }
+    }
+
+    /// Switches to the Stash tab, loaded with the selected worktree's stashes.
+    fn open_stash_tab(&mut self) {
         let Some(wt) = self.selected_worktree() else {
             return;
         };
         let name = wt.name.clone();
-        self.load_stash(name, StashMode::List);
+        // A different worktree than last time starts at the top of its list.
+        if name != self.stash_name {
+            self.stash_selected = 0;
+        }
+        self.tab = Tab::Stash;
+        self.reload_stash_tab(name);
     }
 
-    /// (Re)loads the stash list for `name` and shows the overlay in `mode`.
-    /// Falls back to the list view when the stashes can't be read.
-    fn load_stash(&mut self, name: String, mode: StashMode) {
+    /// Re-reads the stash list for `name` into the tab, keeping the cursor on a
+    /// valid row (used on tab entry and after a background stash op).
+    fn reload_stash_tab(&mut self, name: String) {
         match ops::stash_list(&self.ctx, &name) {
             Ok(r) => {
-                self.view = View::Stash {
-                    name,
-                    entries: r.entries,
-                    selected: 0,
-                    mode,
-                };
+                self.stash_name = name;
+                self.stash_entries = r.entries;
+                self.stash_selected = self
+                    .stash_selected
+                    .min(self.stash_entries.len().saturating_sub(1));
             }
-            Err(e) => {
-                self.set_error(format!("{e:#}"));
-                self.view = View::List;
-            }
+            Err(e) => self.set_error(format!("{e:#}")),
         }
     }
 
-    fn on_stash_key(&mut self, key: KeyEvent) {
-        let View::Stash {
-            name,
-            entries,
-            selected,
-            mode,
-        } = &mut self.view
-        else {
-            return;
-        };
-        match mode {
-            StashMode::List => match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => self.view = View::List,
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if *selected + 1 < entries.len() {
-                        *selected += 1;
-                    }
+    fn on_stash_tab_key(&mut self, key: KeyEvent) {
+        let index = self.stash_entries.get(self.stash_selected).map(|e| e.index);
+        let name = self.stash_name.clone();
+        match key.code {
+            // Every top-level tab quits on Esc/q; only drill-ins go "back".
+            KeyCode::Esc | KeyCode::Char('q') => self.quit = true,
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.stash_selected + 1 < self.stash_entries.len() {
+                    self.stash_selected += 1;
                 }
-                KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
-                KeyCode::Char('s') => *mode = StashMode::Message(TextInput::default()),
-                KeyCode::Char('p') => {
-                    let name = name.clone();
-                    let index = entries.get(*selected).map(|e| e.index);
-                    self.stash_pop(name, index);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.stash_selected = self.stash_selected.saturating_sub(1)
+            }
+            KeyCode::Char('s') => self.push_prompt(
+                "stash message (optional)",
+                TextInput::default(),
+                "blank Enter stashes without a message",
+                ModalAction::StashPush { name },
+            ),
+            KeyCode::Char('p') => self.stash_pop(name, index),
+            KeyCode::Char('a') => self.stash_action("apply", name, index),
+            KeyCode::Char('x') => {
+                if !self.stash_entries.is_empty() {
+                    self.open_stash_drop_modal(name, index);
                 }
-                KeyCode::Char('a') => {
-                    let name = name.clone();
-                    let index = entries.get(*selected).map(|e| e.index);
-                    self.stash_action("apply", name, index);
-                }
-                KeyCode::Char('x') => {
-                    if !entries.is_empty() {
-                        *mode = StashMode::ConfirmDrop;
-                    }
-                }
-                _ => {}
-            },
-            StashMode::Message(buf) => match key.code {
-                KeyCode::Esc => *mode = StashMode::List,
-                KeyCode::Enter => {
-                    let name = name.clone();
-                    let msg = buf.trimmed();
-                    let msg = if msg.is_empty() { None } else { Some(msg) };
-                    self.stash_push(name, msg);
-                }
-                _ => {
-                    buf.on_key(key);
-                }
-            },
-            StashMode::ConfirmDrop => match key.code {
-                KeyCode::Enter | KeyCode::Char('y') => {
-                    let name = name.clone();
-                    let index = entries.get(*selected).map(|e| e.index);
-                    self.stash_action("drop", name, index);
-                }
-                KeyCode::Esc | KeyCode::Char('n') => *mode = StashMode::List,
-                _ => {}
-            },
+            }
+            _ => {}
         }
     }
 
-    /// Runs an apply/drop on `name`, reports the result, and reloads the overlay
+    /// Runs an apply/drop on `name`, reports the result, and reloads the tab
     /// (dirty counts and the stash list may both have changed). Pop is handled
     /// separately by `stash_pop`, since it can leave conflicts to resolve.
     fn stash_action(&mut self, action: &str, name: String, index: Option<u32>) {
@@ -3123,7 +3631,7 @@ impl App {
     }
 
     /// Pops a stash on `name` in the background. A clean pop returns to the stash
-    /// overlay; a conflicting pop routes into the resolver (kind `StashPop`),
+    /// tab; a conflicting pop routes into the resolver (kind `StashPop`),
     /// which finishes by dropping the stash once every file is resolved.
     fn stash_pop(&mut self, name: String, index: Option<u32>) {
         let n = name.clone();
@@ -3209,12 +3717,12 @@ impl App {
                 });
             }
         }
-        self.view = View::Switch {
+        self.push_screen(View::Switch {
             name,
             branches,
             filter: TextInput::default(),
             selected: 0,
-        };
+        });
     }
 
     /// Drives the switch-branch picker: type to filter the branch list, move
@@ -3237,7 +3745,7 @@ impl App {
                     *filter = TextInput::default();
                     *selected = 0;
                 } else {
-                    self.view = View::List;
+                    self.pop_screen();
                 }
             }
             KeyCode::Down => {
@@ -3292,13 +3800,6 @@ impl App {
         );
     }
 
-    /// Switches to the Branches tab, loading the branch list fresh.
-    fn open_branches_tab(&mut self) {
-        self.tab = Tab::Branches;
-        self.branch_mode = BranchMode::List;
-        self.load_branches(0);
-    }
-
     /// (Re)loads all local branches for the Branches tab, clamping the cursor.
     /// Bounces back to the Worktrees tab on error.
     fn load_branches(&mut self, selected: usize) {
@@ -3317,74 +3818,6 @@ impl App {
     /// Key handling for the Branches tab (active when `view` is `List` and
     /// `tab` is `Branches`).
     fn on_branches_tab_key(&mut self, key: KeyEvent) {
-        // Text-entry mode owns keystrokes while naming a new branch.
-        if let BranchMode::Create(buf) = &mut self.branch_mode {
-            match key.code {
-                KeyCode::Esc => self.branch_mode = BranchMode::List,
-                KeyCode::Enter => {
-                    let name = buf.trimmed();
-                    if name.is_empty() {
-                        self.message = Some("branch name must not be empty".to_string());
-                        return;
-                    }
-                    self.branch_create(name);
-                }
-                _ => {
-                    buf.on_key(key);
-                }
-            }
-            return;
-        }
-        // Text-entry mode owns keystrokes while renaming the selected branch.
-        if let BranchMode::Rename(buf) = &mut self.branch_mode {
-            match key.code {
-                KeyCode::Esc => self.branch_mode = BranchMode::List,
-                KeyCode::Enter => {
-                    let new = buf.trimmed();
-                    if new.is_empty() {
-                        self.message = Some("branch name must not be empty".to_string());
-                        return;
-                    }
-                    if let Some(old) = self
-                        .branches
-                        .get(self.branch_selected)
-                        .map(|b| b.name.clone())
-                    {
-                        self.branch_rename(old, new);
-                    }
-                }
-                _ => {
-                    buf.on_key(key);
-                }
-            }
-            return;
-        }
-        if matches!(self.branch_mode, BranchMode::ConfirmDelete) {
-            match key.code {
-                KeyCode::Enter | KeyCode::Char('y') => {
-                    if let Some(name) = self
-                        .branches
-                        .get(self.branch_selected)
-                        .map(|b| b.name.clone())
-                    {
-                        self.branch_delete(name, false);
-                    }
-                }
-                KeyCode::Char('f') => {
-                    if let Some(name) = self
-                        .branches
-                        .get(self.branch_selected)
-                        .map(|b| b.name.clone())
-                    {
-                        self.branch_delete(name, true);
-                    }
-                }
-                KeyCode::Esc | KeyCode::Char('n') => self.branch_mode = BranchMode::List,
-                _ => {}
-            }
-            return;
-        }
-        // BranchMode::List
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Down | KeyCode::Char('j') => {
@@ -3403,19 +3836,33 @@ impl App {
             // `p` then fast-forwards the selected one onto its upstream.
             KeyCode::Char('f') => self.start_fetch(),
             KeyCode::Char('p') => self.start_branch_pull(),
-            KeyCode::Char('n') => self.branch_mode = BranchMode::Create(TextInput::default()),
+            KeyCode::Char('n') => self.push_prompt(
+                "new branch (no worktree)",
+                TextInput::default(),
+                "branch only, from HEAD · Esc cancels",
+                ModalAction::BranchCreate,
+            ),
             KeyCode::Char('R') => {
                 if let Some(name) = self
                     .branches
                     .get(self.branch_selected)
                     .map(|b| b.name.clone())
                 {
-                    self.branch_mode = BranchMode::Rename(TextInput::with_value(name));
+                    self.push_prompt(
+                        "rename branch",
+                        TextInput::with_value(name.clone()),
+                        "new branch name · Esc cancels",
+                        ModalAction::BranchRename { old: name },
+                    );
                 }
             }
             KeyCode::Char('d') => {
-                if !self.branches.is_empty() {
-                    self.branch_mode = BranchMode::ConfirmDelete;
+                if let Some(name) = self
+                    .branches
+                    .get(self.branch_selected)
+                    .map(|b| b.name.clone())
+                {
+                    self.open_branch_delete_modal(name);
                 }
             }
             // Enter drills into the branch's commit history, the entry point
@@ -3453,12 +3900,12 @@ impl App {
         match self.branch_log_lines(&branch) {
             Ok(lines) => {
                 let selected = first_commit_row(&lines);
-                self.view = View::BranchCommits {
+                self.push_screen(View::BranchCommits {
                     branch,
                     marked: vec![false; lines.len()],
                     lines,
                     selected,
-                };
+                });
             }
             Err(e) => self.set_error(e),
         }
@@ -3491,7 +3938,7 @@ impl App {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 // Back to the Branches tab, keeping the branch highlighted.
-                self.view = View::List;
+                self.pop_screen();
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 if let Some(i) = seek_commit_row(lines, *selected, true) {
@@ -3521,8 +3968,12 @@ impl App {
                     marked[i] = !all && line.entry.is_some();
                 }
             }
-            KeyCode::Enter => self.open_cherry_pick(),
-            KeyCode::Char('v') | KeyCode::Right => self.open_commit_diff_from_branch(),
+            // Enter drills into the commit (consistent with the worktree log);
+            // cherry-picking the marked commits is `p` for "pick".
+            KeyCode::Enter | KeyCode::Char('v') | KeyCode::Right => {
+                self.open_commit_diff_from_branch()
+            }
+            KeyCode::Char('p') => self.open_cherry_pick(),
             KeyCode::Char('t') => self.toggle_log_mode(),
             _ => {}
         }
@@ -3533,10 +3984,7 @@ impl App {
     /// branch's commits are shared across the repo regardless of checkout.
     fn open_commit_diff_from_branch(&mut self) {
         let View::BranchCommits {
-            branch,
-            lines,
-            selected,
-            ..
+            lines, selected, ..
         } = &self.view
         else {
             return;
@@ -3555,11 +4003,7 @@ impl App {
             entry.hash.chars().take(9).collect::<String>(),
             entry.subject
         );
-        let back = CommitDiffBack::Branch {
-            branch: branch.clone(),
-            selected: *selected,
-        };
-        self.open_commit_diff(name, hash, label, back);
+        self.open_commit_diff(name, hash, label);
     }
 
     /// Builds the cherry-pick worktree picker from the marked commits (or the
@@ -3608,14 +4052,14 @@ impl App {
             self.message = Some("no worktrees to cherry-pick into".to_string());
             return;
         }
-        self.view = View::CherryPick {
+        self.push_screen(View::CherryPick {
             source_branch,
             commits,
             summaries,
             targets,
             selected: 0,
             mode: None,
-        };
+        });
     }
 
     /// Key handling for the cherry-pick flow: pick a target worktree, then
@@ -3649,7 +4093,7 @@ impl App {
                 }
                 KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
                 KeyCode::Enter => *mode = Some(0),
-                KeyCode::Esc | KeyCode::Char('q') => self.view = View::List,
+                KeyCode::Esc | KeyCode::Char('q') => self.pop_screen(),
                 _ => {}
             },
         }
@@ -3740,11 +4184,11 @@ impl App {
             self.message = Some("no worktrees to merge into".to_string());
             return;
         }
-        self.view = View::MergePick {
+        self.push_screen(View::MergePick {
             source_branch,
             targets,
             selected: 0,
-        };
+        });
     }
 
     /// Key handling for the merge picker: pick a target worktree, then run the
@@ -3764,7 +4208,7 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
             KeyCode::Enter => self.run_merge(),
-            KeyCode::Esc | KeyCode::Char('q') => self.view = View::List,
+            KeyCode::Esc | KeyCode::Char('q') => self.pop_screen(),
             _ => {}
         }
     }
@@ -3830,28 +4274,11 @@ impl App {
         // edits overlap the update. Offer to stash those changes, update, then
         // reapply them (git's --autostash) instead of failing outright.
         if wt.dirty > 0 {
-            self.view = View::ConfirmUpdateStash {
-                name: wt.name.clone(),
-                dirty: wt.dirty,
-                selected: 0,
-            };
+            let (name, dirty) = (wt.name.clone(), wt.dirty);
+            self.open_update_stash_modal(name, dirty);
             return;
         }
         self.run_update(wt.name.clone(), false);
-    }
-
-    /// Acts on the dirty-worktree update prompt: stash+update+reapply, update
-    /// without stashing, or cancel.
-    fn apply_update_stash(&mut self) {
-        let View::ConfirmUpdateStash { name, selected, .. } = &self.view else {
-            return;
-        };
-        let name = name.clone();
-        match selected {
-            0 => self.run_update(name, true),
-            1 => self.run_update(name, false),
-            _ => self.view = View::List,
-        }
     }
 
     /// Merges the default branch into the worktree named `name` in the
@@ -3880,7 +4307,7 @@ impl App {
 
     /// After a merge/update/cherry-pick/stash-pop op settles, opens the resolver
     /// when the target still has conflicts, otherwise shows the op's clean-result
-    /// `msg`. A clean stash pop returns to the stash overlay so the user can keep
+    /// `msg`. A clean stash pop reloads the stash tab so the user can keep
     /// working there.
     fn finish_merge_op(
         &mut self,
@@ -3894,7 +4321,7 @@ impl App {
             Ok(_) => {
                 self.message = Some(msg);
                 if matches!(kind, ops::ResolveKind::StashPop { .. }) {
-                    self.load_stash(target, StashMode::List);
+                    self.reload_stash_tab(target);
                 }
             }
             Err(e) => self.set_error(format!("{e:#}")),
@@ -3920,7 +4347,6 @@ impl App {
             resolved,
             file: 0,
             current: None,
-            confirm_abort: false,
         };
         self.load_resolver_file();
     }
@@ -3955,7 +4381,6 @@ impl App {
                     file: cf,
                     actions: vec![None; hunks],
                     hunk: 0,
-                    edit: None,
                 })
             });
         if let View::ConflictResolver { current, .. } = &mut self.view {
@@ -3965,38 +4390,10 @@ impl App {
 
     /// Key handling for the conflict resolver.
     fn on_resolver_key(&mut self, key: KeyEvent) {
-        // A manual hunk edit captures every key until saved or cancelled.
-        let editing = matches!(
-            &self.view,
-            View::ConflictResolver { current: Some(rf), .. } if rf.edit.is_some()
-        );
-        if editing {
-            self.on_hunk_editor_key(key);
-            return;
-        }
-        // The abort confirmation captures keys until dismissed.
-        if matches!(
-            self.view,
-            View::ConflictResolver {
-                confirm_abort: true,
-                ..
-            }
-        ) {
-            match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => self.abort_resolver(),
-                KeyCode::Esc | KeyCode::Char('n') => {
-                    if let View::ConflictResolver { confirm_abort, .. } = &mut self.view {
-                        *confirm_abort = false;
-                    }
-                }
-                _ => {}
-            }
-            return;
-        }
         match key.code {
             // Leaving keeps the merge in progress so it can be resumed later.
             KeyCode::Esc | KeyCode::Char('q') => {
-                self.view = View::List;
+                self.go_root();
                 self.refresh();
             }
             KeyCode::Left | KeyCode::Char('[') | KeyCode::Char('h') => self.resolver_move_file(-1),
@@ -4013,8 +4410,9 @@ impl App {
             KeyCode::Char('w') | KeyCode::Enter => self.resolver_write_file(),
             KeyCode::Char('c') => self.resolver_complete(),
             KeyCode::Char('x') => {
-                if let View::ConflictResolver { confirm_abort, .. } = &mut self.view {
-                    *confirm_abort = true;
+                if let View::ConflictResolver { target, .. } = &self.view {
+                    let target = target.clone();
+                    self.open_resolver_abort_modal(target);
                 }
             }
             _ => {}
@@ -4093,32 +4491,23 @@ impl App {
                     },
                 );
             if let Some(text) = seed {
-                rf.edit = Some(HunkEditor::new(&text));
+                self.modal = Some(Modal::HunkEditor(HunkEditor::new(&text)));
             }
         }
     }
 
-    /// Key handling while the manual hunk editor is open: Ctrl+S saves the edit
-    /// as a `Manual` resolution, Esc discards it, everything else edits.
+    /// Key handling while the manual hunk editor modal is open: Ctrl+S saves the
+    /// edit as a `Manual` resolution, Esc discards it, everything else edits.
     fn on_hunk_editor_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
             self.resolver_save_manual_edit();
             return;
         }
         if key.code == KeyCode::Esc {
-            if let View::ConflictResolver {
-                current: Some(rf), ..
-            } = &mut self.view
-            {
-                rf.edit = None;
-            }
+            self.modal = None;
             return;
         }
-        if let View::ConflictResolver {
-            current: Some(rf), ..
-        } = &mut self.view
-            && let Some(ed) = &mut rf.edit
-        {
+        if let Some(Modal::HunkEditor(ed)) = &mut self.modal {
             ed.on_key(key);
         }
     }
@@ -4126,15 +4515,17 @@ impl App {
     /// Saves the open manual edit as the current hunk's resolution and closes
     /// the editor.
     fn resolver_save_manual_edit(&mut self) {
+        let text = match &self.modal {
+            Some(Modal::HunkEditor(ed)) => ed.text(),
+            _ => return,
+        };
+        self.modal = None;
         if let View::ConflictResolver {
             current: Some(rf), ..
         } = &mut self.view
-            && let Some(ed) = rf.edit.take()
+            && let Some(slot) = rf.actions.get_mut(rf.hunk)
         {
-            let text = ed.text();
-            if let Some(slot) = rf.actions.get_mut(rf.hunk) {
-                *slot = Some(ResolutionAction::Manual(text));
-            }
+            *slot = Some(ResolutionAction::Manual(text));
         }
     }
 
@@ -4237,12 +4628,17 @@ impl App {
         };
         match ops::complete_resolution(&self.ctx, &target, kind, None) {
             Ok(r) => {
-                self.view = View::List;
+                self.go_root();
                 self.refresh();
                 self.message = Some(match r.commit {
                     Some(commit) => format!("resolved '{}' ({commit})", r.target),
                     None => format!("resolved '{}'", r.target),
                 });
+                // Completing a stash pop drops the stash, so the Stash tab the
+                // resolver was opened from would otherwise still list it.
+                if matches!(kind, ops::ResolveKind::StashPop { .. }) {
+                    self.reload_stash_tab(target);
+                }
             }
             Err(e) => self.set_error(format!("{e:#}")),
         }
@@ -4256,9 +4652,14 @@ impl App {
         };
         match ops::abort_resolution(&self.ctx, &target, kind) {
             Ok(()) => {
-                self.view = View::List;
+                self.go_root();
                 self.refresh();
                 self.message = Some(format!("aborted resolution in '{target}'"));
+                // An aborted stash pop leaves the stash in place; re-read it so
+                // the Stash tab behind the resolver matches.
+                if matches!(kind, ops::ResolveKind::StashPop { .. }) {
+                    self.reload_stash_tab(target);
+                }
             }
             Err(e) => self.set_error(format!("{e:#}")),
         }
@@ -4282,16 +4683,15 @@ impl App {
         match ops::branch_rename(&self.ctx, &old, &new) {
             Ok(r) => {
                 self.message = Some(format!("renamed branch '{}' to '{}'", r.old, r.new));
-                self.branch_mode = BranchMode::List;
                 self.load_branches(self.branch_selected);
             }
             Err(e) => self.set_error(format!("{e:#}")),
         }
     }
 
-    /// Deletes a branch. A refused non-force delete keeps the confirm open so
-    /// the user can retry with `f` (force). Runs synchronously (a fast local
-    /// op) so that retry flow stays intact.
+    /// Deletes a branch. A refused non-force delete reopens the confirm (under
+    /// the error popup) so the user can retry with `f` (force). Runs
+    /// synchronously (a fast local op) so that retry flow stays intact.
     fn branch_delete(&mut self, name: String, force: bool) {
         match ops::branch_delete(&self.ctx, &name, force) {
             Ok(r) => {
@@ -4300,10 +4700,12 @@ impl App {
                     r.name,
                     if r.forced { " (forced)" } else { "" }
                 ));
-                self.branch_mode = BranchMode::List;
                 self.load_branches(self.branch_selected);
             }
-            Err(e) => self.set_error(format!("{e:#} — press f to force")),
+            Err(e) => {
+                self.set_error(format!("{e:#} — press f to force"));
+                self.open_branch_delete_modal(name);
+            }
         }
     }
 
@@ -4334,11 +4736,11 @@ impl App {
         match self.worktree_log_lines(&name) {
             Ok(lines) => {
                 let selected = first_commit_row(&lines);
-                self.view = View::Log {
+                self.push_screen(View::Log {
                     name,
                     lines,
                     selected,
-                }
+                })
             }
             Err(e) => self.set_error(e),
         }
@@ -4362,7 +4764,7 @@ impl App {
             return;
         };
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.view = View::List,
+            KeyCode::Esc | KeyCode::Char('q') => self.pop_screen(),
             // Move the cursor to the next/previous row that holds a commit,
             // skipping the art-only connector rows git draws between them.
             KeyCode::Down | KeyCode::Char('j') => {
@@ -4405,29 +4807,20 @@ impl App {
             entry.hash.chars().take(9).collect::<String>(),
             entry.subject
         );
-        let back = CommitDiffBack::Log {
-            selected: *selected,
-        };
-        self.open_commit_diff(name, hash, label, back);
+        self.open_commit_diff(name, hash, label);
     }
 
     /// Opens the read-only commit browser for `hash`, loading its changed-file
-    /// list and the first file's diff (off-thread).
-    fn open_commit_diff(
-        &mut self,
-        name: String,
-        hash: String,
-        label: String,
-        back: CommitDiffBack,
-    ) {
+    /// list and the first file's diff (off-thread). Pushed onto the navigation
+    /// stack so Esc returns to whichever log opened it (worktree or branch).
+    fn open_commit_diff(&mut self, name: String, hash: String, label: String) {
         match ops::commit_files(&self.ctx, &name, &hash) {
             Ok(files) => {
                 let rows = build_rows(&files, self.file_tree, &self.collapsed_folders);
-                self.view = View::CommitDiff {
+                self.push_screen(View::CommitDiff {
                     name,
                     hash,
                     label,
-                    back,
                     files,
                     rows,
                     selected: 0,
@@ -4437,7 +4830,7 @@ impl App {
                     pending: None,
                     loading_new: false,
                     scroll: 0,
-                };
+                });
                 self.load_commit_diff_content(true);
             }
             Err(e) => self.set_error(format!("{e:#}")),
@@ -4491,46 +4884,10 @@ impl App {
 
     /// Returns from the commit browser to whichever view opened it.
     fn close_commit_diff(&mut self) {
-        let View::CommitDiff { name, back, .. } = &self.view else {
-            return;
-        };
-        let name = name.clone();
-        match back {
-            CommitDiffBack::Log { selected } => {
-                let selected = *selected;
-                match self.worktree_log_lines(&name) {
-                    Ok(lines) => {
-                        self.view = View::Log {
-                            name,
-                            selected: selected.min(lines.len().saturating_sub(1)),
-                            lines,
-                        }
-                    }
-                    Err(e) => {
-                        self.set_error(e);
-                        self.view = View::List;
-                    }
-                }
-            }
-            CommitDiffBack::Branch { branch, selected } => {
-                let branch = branch.clone();
-                let selected = *selected;
-                match self.branch_log_lines(&branch) {
-                    Ok(lines) => {
-                        self.view = View::BranchCommits {
-                            branch,
-                            marked: vec![false; lines.len()],
-                            selected: selected.min(lines.len().saturating_sub(1)),
-                            lines,
-                        }
-                    }
-                    Err(e) => {
-                        self.set_error(e);
-                        self.view = View::List;
-                    }
-                }
-            }
-        }
+        // The log (worktree or branch) that opened this browser is still on the
+        // stack underneath, at the cursor it was left on, so popping returns
+        // there with no back-reference to track.
+        self.pop_screen();
     }
 
     /// Flips the commit browser's file list between tree and flat, keeping the
@@ -4637,7 +4994,7 @@ impl App {
             ..
         } = &mut self.view
         {
-            *pending = Some(rx);
+            *pending = Some(Task::new(rx));
             *loading_new = is_new;
         }
     }
@@ -4655,11 +5012,7 @@ impl App {
             return;
         };
         let token = *load_gen;
-        let mut got = None;
-        while let Ok(msg) = rx.try_recv() {
-            got = Some(msg);
-        }
-        let Some((g, path, content)) = got else {
+        let Some((g, path, content)) = rx.poll_latest() else {
             return;
         };
         if g != token {
@@ -4737,7 +5090,15 @@ impl App {
         std::thread::spawn(move || {
             let _ = tx.send(op(&ctx));
         });
-        self.view = View::Busy { label, rx, then };
+        // The busy overlay and whatever its `then` reopens (the list, the stash
+        // manager, the resolver) always land back at the root, so collapse the
+        // stack rather than orphaning the screen that launched the op.
+        self.stack.clear();
+        self.view = View::Busy {
+            label,
+            rx: Task::new(rx),
+            then,
+        };
     }
 
     /// Pulls the selected worktree (fast-forward only) in the background. When
@@ -4829,7 +5190,7 @@ impl App {
     /// tab asked so its ahead/behind counts reload.
     fn start_fetch(&mut self) {
         let then = match self.tab {
-            Tab::Worktrees => BusyThen::List,
+            Tab::Worktrees | Tab::Changes | Tab::Stash | Tab::Settings => BusyThen::List,
             Tab::Branches => BusyThen::Branch,
         };
         self.start_busy("fetching all remotes…".to_string(), then, move |ctx| {
@@ -4845,63 +5206,24 @@ impl App {
         });
     }
 
-    /// Starts the delete flow from the `ConfirmDelete` prompt. A dirty worktree
-    /// first routes through the Stash / Discard prompt; a clean one proceeds
-    /// straight to removal.
-    fn begin_delete(&mut self) {
-        let View::ConfirmDelete {
-            name,
-            dirty,
-            branch,
-            delete_branch,
-        } = &self.view
-        else {
-            return;
-        };
-        let (name, cached_dirty, branch, delete_branch) =
-            (name.clone(), *dirty, branch.clone(), *delete_branch);
+    /// Starts the delete flow once the delete confirmation resolves. A dirty
+    /// worktree first routes through the Stash / Discard prompt; a clean one
+    /// proceeds straight to removal. `cached_dirty` is the count captured when
+    /// the list loaded, used only as a fallback for the live dirtiness check.
+    fn begin_delete(
+        &mut self,
+        name: String,
+        cached_dirty: usize,
+        branch: Option<String>,
+        delete_branch: bool,
+    ) {
         // Re-check dirtiness live rather than trusting the count captured when
         // the list was loaded, since the worktree may have changed since then.
         let dirty = ops::worktree_is_dirty(&self.ctx, &name).unwrap_or(cached_dirty > 0);
         if dirty {
-            self.view = View::ConfirmDeleteDirty {
-                name,
-                branch,
-                delete_branch,
-                selected: 0,
-            };
+            self.open_delete_dirty_modal(name, branch, delete_branch);
         } else {
             self.do_delete(name, branch, delete_branch, false);
-        }
-    }
-
-    /// Carries out the Stash / Discard / Cancel choice for a dirty worktree.
-    fn apply_delete_dirty(&mut self) {
-        let View::ConfirmDeleteDirty {
-            name,
-            branch,
-            delete_branch,
-            selected,
-        } = &self.view
-        else {
-            return;
-        };
-        let (name, branch, delete_branch, selected) =
-            (name.clone(), branch.clone(), *delete_branch, *selected);
-        match selected {
-            // Stash: keep the work, then remove the now-clean folder.
-            0 => match ops::stash_worktree(&self.ctx, &name) {
-                Ok(()) => self.do_delete(name, branch, delete_branch, false),
-                Err(e) => {
-                    self.set_error(format!("{e:#}"));
-                    self.view = View::List;
-                    self.refresh();
-                }
-            },
-            // Discard: force-remove the folder, throwing the changes away.
-            1 => self.do_delete(name, branch, delete_branch, true),
-            // Cancel.
-            _ => self.view = View::List,
         }
     }
 
@@ -4958,28 +5280,25 @@ impl App {
         match ops::try_delete_branch(&self.ctx, &branch) {
             Ok(ops::DeleteBranchOutcome::Deleted) => {
                 self.message = Some(format!("removed '{name}' and branch '{branch}'"));
-                self.view = View::List;
+                self.go_root();
                 self.refresh();
             }
             Ok(ops::DeleteBranchOutcome::NotMerged) => {
                 // Refresh so the now-removed folder drops from the list behind
                 // the popup.
                 self.refresh();
-                self.view = View::ConfirmForceBranch {
-                    branch,
-                    reason: ForceBranchReason::NotMerged,
-                };
+                self.open_force_branch_modal(branch, ForceBranchReason::NotMerged);
             }
             Ok(ops::DeleteBranchOutcome::CheckedOutElsewhere(other)) => {
                 self.refresh();
-                self.view = View::ConfirmForceBranch {
+                self.open_force_branch_modal(
                     branch,
-                    reason: ForceBranchReason::CheckedOutElsewhere(other),
-                };
+                    ForceBranchReason::CheckedOutElsewhere(other),
+                );
             }
             Err(e) => {
                 self.set_error(format!("{e:#}"));
-                self.view = View::List;
+                self.go_root();
                 self.refresh();
             }
         }
@@ -5086,7 +5405,7 @@ mod tests {
     /// async), so tests can assert on `content` right after navigating.
     fn settle_diff(app: &mut App) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while matches!(app.view, View::Diff { pending: Some(_), .. }) {
+        while app.changes.pending.is_some() {
             app.poll_diff_load();
             assert!(std::time::Instant::now() < deadline, "diff load timed out");
             std::thread::sleep(std::time::Duration::from_millis(2));
@@ -5130,27 +5449,22 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
     }
 
-    /// Moves the diff view's cursor onto the row for the file named `path`,
+    /// Moves the Changes tab's cursor onto the row for the file named `path`,
     /// panicking if it isn't in the list. Skips over folder rows.
     fn select_diff_file(app: &mut App, path: &str) {
+        assert_eq!(app.tab, Tab::Changes, "expected the Changes tab");
         loop {
-            match &app.view {
-                View::Diff {
-                    files,
-                    rows,
-                    selected,
-                    ..
-                } => {
-                    if let Some(i) = current_file_index(rows, *selected)
-                        && files[i].path == path
-                    {
-                        settle_diff(app);
-                        return;
-                    }
-                    assert!(*selected + 1 < rows.len(), "{path} not in the diff list");
-                }
-                _ => panic!("expected diff view"),
+            let c = &app.changes;
+            if let Some(i) = current_file_index(&c.rows, c.selected)
+                && c.files[i].path == path
+            {
+                settle_diff(app);
+                return;
             }
+            assert!(
+                c.selected + 1 < c.rows.len(),
+                "{path} not in the diff list"
+            );
             press(app, KeyCode::Down);
         }
     }
@@ -5443,11 +5757,21 @@ mod tests {
         let (_tmp, mut app) = test_app();
         assert_eq!(app.tab, Tab::Worktrees);
         press(&mut app, KeyCode::Tab);
+        assert_eq!(app.tab, Tab::Changes);
+        press(&mut app, KeyCode::Tab);
         assert_eq!(app.tab, Tab::Branches);
         // Entering the Branches tab loads the branch list.
         assert!(!app.branches.is_empty());
         press(&mut app, KeyCode::Tab);
+        assert_eq!(app.tab, Tab::Stash);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.tab, Tab::Settings);
+        press(&mut app, KeyCode::Tab);
         assert_eq!(app.tab, Tab::Worktrees);
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.tab, Tab::Settings);
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.tab, Tab::Stash);
     }
 
     #[test]
@@ -5473,14 +5797,13 @@ mod tests {
         let (_tmp, mut app) = test_app();
         press(&mut app, KeyCode::Enter);
         // The only change is the untracked `.wtm.toml`, so the cursor sits on a
-        // brand-new file. Revert has nothing to restore to.
-        press(&mut app, KeyCode::Char('R'));
-        match &app.view {
-            View::Diff { confirm_revert, .. } => {
-                assert!(!confirm_revert, "revert must not prompt for a new file")
-            }
-            _ => panic!("expected diff view"),
-        }
+        // brand-new file. Undo has nothing to restore to.
+        press(&mut app, KeyCode::Char('u'));
+        assert!(
+            app.modal.is_none(),
+            "undo must not prompt for a new file"
+        );
+        assert_eq!(app.tab, Tab::Changes);
         let msg = app.message.as_deref().unwrap();
         assert!(msg.contains("new") && msg.contains("delete"), "got: {msg}");
     }
@@ -5491,50 +5814,38 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         // 'd' asks to confirm; 'y' deletes the highlighted file.
         press(&mut app, KeyCode::Char('d'));
-        match &app.view {
-            View::Diff { confirm_delete, .. } => assert!(confirm_delete),
-            _ => panic!("expected diff view"),
-        }
+        assert!(matches!(app.modal, Some(Modal::Confirm { .. })));
+        assert_eq!(app.tab, Tab::Changes);
         press(&mut app, KeyCode::Char('y'));
         assert!(app.message.as_deref().unwrap().contains("deleted"));
-        // After deleting the sole change, the diff view has no files left.
-        match &app.view {
-            View::Diff { files, .. } => assert!(files.is_empty()),
-            _ => panic!("expected diff view"),
-        }
+        // After deleting the sole change, the Changes tab has no files left.
+        assert!(app.changes.files.is_empty());
     }
 
     #[test]
     fn enter_opens_diff_and_scrolls() {
         let (_tmp, mut app) = test_app();
         press(&mut app, KeyCode::Enter);
-        match &app.view {
-            View::Diff { files, .. } => assert!(!files.is_empty(), "the untracked .wtm.toml shows"),
-            _ => panic!("expected diff view"),
-        }
+        assert_eq!(app.tab, Tab::Changes);
+        assert!(
+            !app.changes.files.is_empty(),
+            "the untracked .wtm.toml shows"
+        );
         // Shift+Down scrolls the diff content; each press moves three lines.
         press_shift(&mut app, KeyCode::Down);
         press_shift(&mut app, KeyCode::Down);
-        match &app.view {
-            View::Diff { scroll, .. } => assert_eq!(*scroll, 6),
-            _ => panic!("expected diff view"),
-        }
+        assert_eq!(app.changes.scroll, 6);
         // Capital J/K scroll on terminals that don't report the Shift modifier
         // on arrow keys; the mouse wheel scrolls too.
         press(&mut app, KeyCode::Char('J'));
-        match &app.view {
-            View::Diff { scroll, .. } => assert_eq!(*scroll, 9),
-            _ => panic!("expected diff view"),
-        }
+        assert_eq!(app.changes.scroll, 9);
         scroll_wheel(&mut app, MouseEventKind::ScrollUp);
         press(&mut app, KeyCode::Char('K'));
         press_shift(&mut app, KeyCode::Up);
-        match &app.view {
-            View::Diff { scroll, .. } => assert_eq!(*scroll, 0),
-            _ => panic!("expected diff view"),
-        }
+        assert_eq!(app.changes.scroll, 0);
+        // Changes is a top-level tab now, so Esc quits rather than going back.
         press(&mut app, KeyCode::Esc);
-        assert!(matches!(app.view, View::List));
+        assert!(app.quit);
     }
 
     #[test]
@@ -5550,36 +5861,25 @@ mod tests {
 
         press(&mut app, KeyCode::Enter);
         select_diff_file(&mut app, "f.txt");
-        match &app.view {
-            View::Diff {
-                content, marked, ..
-            } => {
-                assert!(
-                    content.contains("two"),
-                    "shows the file's own diff: {content}"
-                );
-                assert!(marked.iter().all(|m| *m), "everything is marked by default");
-            }
-            _ => panic!("expected diff view"),
-        }
+        assert!(
+            app.changes.content.contains("two"),
+            "shows the file's own diff: {}",
+            app.changes.content
+        );
+        assert!(
+            app.changes.marked.iter().all(|m| *m),
+            "everything is marked by default"
+        );
         // Space unmarks the current file for commit.
         press(&mut app, KeyCode::Char(' '));
-        match &app.view {
-            View::Diff {
-                files,
-                marked,
-                rows,
-                selected,
-                ..
-            } => {
-                let i = files.iter().position(|f| f.path == "f.txt").unwrap();
-                assert_eq!(current_file_index(rows, *selected), Some(i));
-                assert!(!marked[i], "space toggled the mark off");
-            }
-            _ => panic!("expected diff view"),
+        {
+            let c = &app.changes;
+            let i = c.files.iter().position(|f| f.path == "f.txt").unwrap();
+            assert_eq!(current_file_index(&c.rows, c.selected), Some(i));
+            assert!(!c.marked[i], "space toggled the mark off");
         }
-        // Revert discards the change; f.txt returns to its committed content.
-        press(&mut app, KeyCode::Char('R'));
+        // Undo discards the change; f.txt returns to its committed content.
+        press(&mut app, KeyCode::Char('u'));
         press(&mut app, KeyCode::Char('y'));
         assert_eq!(
             std::fs::read_to_string(root.join("f.txt")).unwrap(),
@@ -5658,23 +5958,23 @@ mod tests {
         press(&mut app, KeyCode::Char('n'));
         type_str(&mut app, "spare");
         press(&mut app, KeyCode::Enter);
-        match &app.view {
-            View::ConfirmExisting {
-                existing_name,
+        match &app.modal {
+            Some(Modal::Confirm {
+                options,
                 selected,
+                action: ModalAction::ConfirmExisting { existing_name, .. },
                 ..
-            } => {
+            }) => {
                 assert_eq!(existing_name.as_deref(), Some("spare"));
                 assert_eq!(*selected, 0, "defaults to Open for a real worktree");
+                assert!(options[0].enabled, "open is enabled for a real worktree");
             }
             _ => panic!("expected the existing-directory prompt"),
         }
-        // Enter opens the existing worktree's diff.
+        // Enter opens the existing worktree's changes.
         press(&mut app, KeyCode::Enter);
-        match &app.view {
-            View::Diff { name, .. } => assert_eq!(name, "spare"),
-            _ => panic!("expected the diff view for the existing worktree"),
-        }
+        assert_eq!(app.tab, Tab::Changes);
+        assert_eq!(app.changes.name, "spare");
     }
 
     #[test]
@@ -5722,10 +6022,7 @@ mod tests {
 
         // Both files sit at the repo root, so the rows are two file rows with no
         // folder headers. Publish the geometry the renderer would set.
-        let len = match &app.view {
-            View::Diff { rows, .. } => rows.len(),
-            _ => panic!("expected diff view"),
-        };
+        let len = app.changes.rows.len();
         assert_eq!(len, 2);
         app.row_list = Some(RowList {
             inner: Rect::new(0, 2, 30, 10),
@@ -5737,30 +6034,20 @@ mod tests {
         // Click the second row (y = inner.y + 1).
         click(&mut app, 1, 3);
         settle_diff(&mut app);
-        match &app.view {
-            View::Diff {
-                selected,
-                rows,
-                content,
-                ..
-            } => {
-                assert_eq!(*selected, 1, "cursor moved to the clicked row");
-                let i = current_file_index(rows, *selected).unwrap();
-                assert_eq!(i, 1);
-                assert!(
-                    content.contains("22"),
-                    "clicked file's diff loaded: {content}"
-                );
-            }
-            _ => panic!("expected diff view"),
+        {
+            let c = &app.changes;
+            assert_eq!(c.selected, 1, "cursor moved to the clicked row");
+            assert_eq!(current_file_index(&c.rows, c.selected), Some(1));
+            assert!(
+                c.content.contains("22"),
+                "clicked file's diff loaded: {}",
+                c.content
+            );
         }
 
         // A click outside the list rows leaves the selection untouched.
         click(&mut app, 1, 99);
-        match &app.view {
-            View::Diff { selected, .. } => assert_eq!(*selected, 1),
-            _ => panic!("expected diff view"),
-        }
+        assert_eq!(app.changes.selected, 1);
     }
 
     #[test]
@@ -5799,6 +6086,49 @@ mod tests {
     }
 
     #[test]
+    fn log_click_moves_the_commit_cursor() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        // A couple more commits so a click can move the cursor onto a lower row.
+        for (f, m) in [("a.txt", "one"), ("b.txt", "two")] {
+            std::fs::write(root.join(f), "x\n").unwrap();
+            for args in [vec!["add", f], vec!["commit", "-m", m]] {
+                let out = Command::new("git")
+                    .args(&args)
+                    .current_dir(&root)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success());
+            }
+        }
+        app.selected = 0;
+        press(&mut app, KeyCode::Char('l')); // -> Log
+        let len = match &app.view {
+            View::Log { lines, .. } => lines.len(),
+            _ => panic!("expected the log view"),
+        };
+        assert!(len >= 2, "need at least two commits to test a click");
+        app.row_list = Some(RowList {
+            inner: Rect::new(0, 2, 40, 10),
+            header: 0,
+            offset: 0,
+            len,
+        });
+        // Click the second row (y = inner.y + 1). The history is linear, so every
+        // row is a selectable commit.
+        click(&mut app, 1, 3);
+        match &app.view {
+            View::Log {
+                selected, lines, ..
+            } => {
+                assert_eq!(*selected, 1, "cursor moved to the clicked commit");
+                assert!(lines[*selected].entry.is_some());
+            }
+            _ => panic!("expected the log view"),
+        }
+    }
+
+    #[test]
     fn diff_view_i_adds_pattern_to_gitignore() {
         let (_tmp, mut app) = test_app();
         let root = app.ctx.repo_root.clone();
@@ -5811,14 +6141,15 @@ mod tests {
 
         // `i` opens the ignore prompt with the file and its derived pattern.
         press(&mut app, KeyCode::Char('i'));
-        match &app.view {
-            View::Diff {
-                ignore_prompt: Some(p),
+        match &app.modal {
+            Some(Modal::Confirm {
+                selected,
+                action: ModalAction::IgnorePath { file, pattern },
                 ..
-            } => {
-                assert_eq!(p.file, "debug.log");
-                assert_eq!(p.pattern, "*.log");
-                assert_eq!(p.selected, 0);
+            }) => {
+                assert_eq!(file, "debug.log");
+                assert_eq!(pattern, "*.log");
+                assert_eq!(*selected, 0);
             }
             _ => panic!("expected the ignore prompt to be open"),
         }
@@ -5831,12 +6162,8 @@ mod tests {
             gitignore.lines().any(|l| l == "*.log"),
             "pattern written: {gitignore}"
         );
-        match &app.view {
-            View::Diff { ignore_prompt, .. } => {
-                assert!(ignore_prompt.is_none(), "prompt closed after confirming")
-            }
-            _ => panic!("expected diff view"),
-        }
+        assert!(app.modal.is_none(), "prompt closed after confirming");
+        assert_eq!(app.tab, Tab::Changes);
     }
 
     #[test]
@@ -5854,10 +6181,8 @@ mod tests {
         press(&mut app, KeyCode::Char('i'));
         press(&mut app, KeyCode::Esc);
         assert!(!root.join(".gitignore").exists(), "esc wrote nothing");
-        match &app.view {
-            View::Diff { ignore_prompt, .. } => assert!(ignore_prompt.is_none()),
-            _ => panic!("expected diff view"),
-        }
+        assert!(app.modal.is_none());
+        assert_eq!(app.tab, Tab::Changes);
 
         // Default selection (0) ignores just the file itself.
         select_diff_file(&mut app, "secret.log");
@@ -5868,6 +6193,80 @@ mod tests {
             gitignore.lines().any(|l| l == "secret.log"),
             "exact file written: {gitignore}"
         );
+    }
+
+    #[test]
+    fn commit_from_diff_esc_returns_to_the_changes_tab_it_opened_from() {
+        // Cancelling a commit reached from the Changes tab lands back on that
+        // tab: `push_screen`/`pop_screen` leave `app.tab` alone.
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("change.txt"), "hi\n").unwrap();
+        app.refresh();
+        app.selected = 0;
+
+        press(&mut app, KeyCode::Enter); // Worktrees tab -> Changes tab
+        assert_eq!(app.tab, Tab::Changes);
+        press(&mut app, KeyCode::Char('c')); // Changes -> Commit
+        assert!(matches!(app.view, View::Commit { .. }));
+
+        press(&mut app, KeyCode::Esc); // pop back to the Changes tab
+        assert!(matches!(app.view, View::List));
+        assert_eq!(
+            app.tab,
+            Tab::Changes,
+            "commit cancel returns to the tab it was opened from"
+        );
+        assert!(app.stack.is_empty(), "back at the root with an empty stack");
+    }
+
+    #[test]
+    fn commit_from_list_esc_returns_to_the_list() {
+        // The same Commit screen reached straight from the list returns to the
+        // list, since that is what pushed it.
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("change.txt"), "hi\n").unwrap();
+        app.refresh();
+        app.selected = 0;
+
+        press(&mut app, KeyCode::Char('c')); // List -> Commit
+        assert!(matches!(app.view, View::Commit { .. }));
+        press(&mut app, KeyCode::Esc); // pop -> List
+        assert!(matches!(app.view, View::List));
+        assert!(app.stack.is_empty());
+    }
+
+    #[test]
+    fn commit_browser_esc_returns_to_the_log_then_the_list() {
+        // The read-only commit browser returns to whichever log opened it with
+        // no back-reference: popping the stack reveals the log underneath.
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("file.txt"), "one\n").unwrap();
+        for args in [vec!["add", "file.txt"], vec!["commit", "-m", "add file"]] {
+            let out = Command::new("git")
+                .args(&args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        }
+        app.selected = 0;
+
+        press(&mut app, KeyCode::Char('l')); // List -> Log
+        assert!(matches!(app.view, View::Log { .. }));
+        press(&mut app, KeyCode::Enter); // Log -> CommitDiff
+        assert!(matches!(app.view, View::CommitDiff { .. }));
+
+        press(&mut app, KeyCode::Esc); // pop -> Log
+        assert!(
+            matches!(app.view, View::Log { .. }),
+            "commit browser returns to the log it was opened from"
+        );
+        press(&mut app, KeyCode::Esc); // pop -> List
+        assert!(matches!(app.view, View::List));
+        assert!(app.stack.is_empty());
     }
 
     #[test]
@@ -5890,33 +6289,34 @@ mod tests {
         app.selected = 0; // main worktree
         press(&mut app, KeyCode::Enter);
         select_diff_file(&mut app, "file.txt");
-        match &app.view {
-            View::Diff { content, .. } => assert!(content.contains("two"), "{content}"),
-            _ => panic!("expected diff view"),
-        }
+        assert!(
+            app.changes.content.contains("two"),
+            "{}",
+            app.changes.content
+        );
 
         // A further outside edit is picked up when the user presses `r`.
         std::fs::write(root.join("file.txt"), "three\n").unwrap();
         press(&mut app, KeyCode::Char('r'));
         select_diff_file(&mut app, "file.txt");
-        match &app.view {
-            View::Diff { content, .. } => assert!(content.contains("three"), "{content}"),
-            _ => panic!("expected diff view"),
-        }
+        assert!(
+            app.changes.content.contains("three"),
+            "{}",
+            app.changes.content
+        );
 
         // A further edit is picked up by tick once the throttle window passes.
         std::fs::write(root.join("file.txt"), "four\n").unwrap();
-        if let View::Diff { last_refresh, .. } = &mut app.view {
-            *last_refresh = Instant::now()
-                .checked_sub(DIFF_REFRESH_INTERVAL * 2)
-                .unwrap();
-        }
+        app.changes.last_refresh = Instant::now()
+            .checked_sub(DIFF_REFRESH_INTERVAL * 2)
+            .unwrap();
         app.tick();
         select_diff_file(&mut app, "file.txt");
-        match &app.view {
-            View::Diff { content, .. } => assert!(content.contains("four"), "{content}"),
-            _ => panic!("expected diff view"),
-        }
+        assert!(
+            app.changes.content.contains("four"),
+            "{}",
+            app.changes.content
+        );
     }
 
     #[test]
@@ -5937,40 +6337,33 @@ mod tests {
         // Scroll down, then force the throttled auto-refresh to fire.
         press_shift(&mut app, KeyCode::Down);
         press_shift(&mut app, KeyCode::Down);
-        let before = match &app.view {
-            View::Diff { scroll, .. } => *scroll,
-            _ => panic!("expected diff view"),
-        };
+        let before = app.changes.scroll;
         assert_eq!(before, 6);
-        if let View::Diff { last_refresh, .. } = &mut app.view {
-            *last_refresh = Instant::now()
-                .checked_sub(DIFF_REFRESH_INTERVAL * 2)
-                .unwrap();
-        }
+        app.changes.last_refresh = Instant::now()
+            .checked_sub(DIFF_REFRESH_INTERVAL * 2)
+            .unwrap();
         app.tick();
-        match &app.view {
-            View::Diff { scroll, .. } => {
-                assert_eq!(*scroll, before, "auto-refresh must not reset scroll")
-            }
-            _ => panic!("expected diff view"),
-        }
+        assert_eq!(
+            app.changes.scroll, before,
+            "auto-refresh must not reset scroll"
+        );
     }
 
-    /// Moves the diff view's cursor onto the folder row whose prefix is
+    /// Moves the Changes tab's cursor onto the folder row whose prefix is
     /// `prefix`, panicking if it isn't in the list.
     fn select_diff_folder(app: &mut App, prefix: &str) {
+        assert_eq!(app.tab, Tab::Changes, "expected the Changes tab");
         loop {
-            match &app.view {
-                View::Diff { rows, selected, .. } => {
-                    if let Some(DiffRow::Folder { prefix: p, .. }) = rows.get(*selected)
-                        && p == prefix
-                    {
-                        return;
-                    }
-                    assert!(*selected + 1 < rows.len(), "{prefix} not in the diff list");
-                }
-                _ => panic!("expected diff view"),
+            let c = &app.changes;
+            if let Some(DiffRow::Folder { prefix: p, .. }) = c.rows.get(c.selected)
+                && p == prefix
+            {
+                return;
             }
+            assert!(
+                c.selected + 1 < c.rows.len(),
+                "{prefix} not in the diff list"
+            );
             press(app, KeyCode::Down);
         }
     }
@@ -6029,26 +6422,18 @@ mod tests {
         // while leaving top.txt marked.
         select_diff_folder(&mut app, "pkg/");
         press(&mut app, KeyCode::Char(' '));
-        match &app.view {
-            View::Diff { files, marked, .. } => {
-                for (f, m) in files.iter().zip(marked.iter()) {
-                    if f.path.starts_with("pkg/") {
-                        assert!(!m, "{} should be unmarked", f.path);
-                    } else {
-                        assert!(m, "{} should stay marked", f.path);
-                    }
-                }
+        for (f, m) in app.changes.files.iter().zip(app.changes.marked.iter()) {
+            if f.path.starts_with("pkg/") {
+                assert!(!m, "{} should be unmarked", f.path);
+            } else {
+                assert!(m, "{} should stay marked", f.path);
             }
-            _ => panic!("expected diff view"),
         }
 
         // Space again re-marks the whole folder.
         select_diff_folder(&mut app, "pkg/");
         press(&mut app, KeyCode::Char(' '));
-        match &app.view {
-            View::Diff { marked, .. } => assert!(marked.iter().all(|m| *m)),
-            _ => panic!("expected diff view"),
-        }
+        assert!(app.changes.marked.iter().all(|m| *m));
     }
 
     #[test]
@@ -6064,14 +6449,13 @@ mod tests {
         select_diff_folder(&mut app, "build/");
         // The prompt offers the exact folder path or a bare-name glob.
         press(&mut app, KeyCode::Char('i'));
-        match &app.view {
-            View::Diff {
-                ignore_prompt: Some(p),
+        match &app.modal {
+            Some(Modal::Confirm {
+                action: ModalAction::IgnorePath { file, pattern },
                 ..
-            } => {
-                assert!(p.is_folder);
-                assert_eq!(p.file, "build/");
-                assert_eq!(p.pattern, "build/");
+            }) => {
+                assert_eq!(file, "build/");
+                assert_eq!(pattern, "build/");
             }
             _ => panic!("expected the ignore prompt"),
         }
@@ -6106,16 +6490,11 @@ mod tests {
         press(&mut app, KeyCode::Char('r'));
         // file.txt is clean again and drops out of the list; the reload resets
         // the scroll to the top for whatever file is now selected.
-        match &app.view {
-            View::Diff { files, scroll, .. } => {
-                assert!(
-                    !files.iter().any(|f| f.path == "file.txt"),
-                    "clean file leaves the changes list"
-                );
-                assert_eq!(*scroll, 0, "reload resets the scroll");
-            }
-            _ => panic!("expected diff view"),
-        }
+        assert!(
+            !app.changes.files.iter().any(|f| f.path == "file.txt"),
+            "clean file leaves the changes list"
+        );
+        assert_eq!(app.changes.scroll, 0, "reload resets the scroll");
     }
 
     #[test]
@@ -6377,27 +6756,71 @@ mod tests {
         app.selected = 0;
 
         press(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.tab, Tab::Stash);
         // Stash the current changes with a message.
         press(&mut app, KeyCode::Char('s'));
         type_str(&mut app, "wip");
         press(&mut app, KeyCode::Enter);
         settle(&mut app);
-        match &app.view {
-            View::Stash { entries, .. } => assert_eq!(entries.len(), 1),
-            _ => panic!("expected stash overlay"),
-        }
+        assert_eq!(app.tab, Tab::Stash);
+        assert_eq!(app.stash_entries.len(), 1);
+        assert!(app.stash_entries[0].message.contains("wip"));
         app.refresh();
         assert_eq!(app.worktrees[0].dirty, 0, "stash should clean the tree");
 
         // Pop it back.
         press(&mut app, KeyCode::Char('p'));
         settle(&mut app);
-        match &app.view {
-            View::Stash { entries, .. } => assert!(entries.is_empty()),
-            _ => panic!("expected stash overlay"),
-        }
+        assert_eq!(app.tab, Tab::Stash);
+        assert!(app.stash_entries.is_empty());
         app.refresh();
         assert!(app.worktrees[0].dirty > 0, "pop restores the change");
+    }
+
+    /// A pop that conflicts routes through the resolver, and completing it
+    /// lands back on the Stash tab with the popped entry gone.
+    #[test]
+    fn conflicting_stash_pop_resolves_back_onto_the_stash_tab() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("c.txt"), "one\n").unwrap();
+        git(&root, &["add", "c.txt"]);
+        git(&root, &["commit", "-m", "add c"]);
+        std::fs::write(root.join("c.txt"), "stashed\n").unwrap();
+        app.refresh();
+        app.selected = 0;
+
+        press(&mut app, KeyCode::Char('s'));
+        press(&mut app, KeyCode::Char('s'));
+        press(&mut app, KeyCode::Enter); // stash, no message
+        settle(&mut app);
+        assert_eq!(app.stash_entries.len(), 1);
+
+        // Commit a different edit to the same line so the pop has to merge.
+        std::fs::write(root.join("c.txt"), "committed\n").unwrap();
+        git(&root, &["commit", "-am", "diverge"]);
+
+        press(&mut app, KeyCode::Char('p'));
+        settle(&mut app);
+        assert!(
+            matches!(app.view, View::ConflictResolver { .. }),
+            "conflicting pop opens the resolver"
+        );
+
+        press(&mut app, KeyCode::Char('t')); // take the stashed side
+        press(&mut app, KeyCode::Char('w')); // stage
+        press(&mut app, KeyCode::Char('c')); // complete
+
+        assert!(matches!(app.view, View::List));
+        assert_eq!(app.tab, Tab::Stash, "back on the tab the pop started from");
+        assert!(
+            app.stash_entries.is_empty(),
+            "a completed pop drops the stash"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("c.txt")).unwrap(),
+            "stashed\n"
+        );
     }
 
     #[test]
@@ -6416,24 +6839,23 @@ mod tests {
         settle(&mut app);
         press(&mut app, KeyCode::Char('x')); // arm drop
         assert!(matches!(
-            app.view,
-            View::Stash {
-                mode: StashMode::ConfirmDrop,
+            app.modal,
+            Some(Modal::Confirm {
+                action: ModalAction::StashDrop { .. },
                 ..
-            }
+            })
         ));
+        assert_eq!(app.tab, Tab::Stash, "the tab stays up behind the confirm");
         press(&mut app, KeyCode::Char('y'));
         settle(&mut app);
-        match &app.view {
-            View::Stash { entries, .. } => assert!(entries.is_empty(), "drop removes the entry"),
-            _ => panic!("expected stash overlay"),
-        }
+        assert!(app.stash_entries.is_empty(), "drop removes the entry");
     }
 
     #[test]
     fn branches_tab_creates_and_deletes_branches() {
         let (_tmp, mut app) = test_app();
         // Tab switches from the Worktrees tab to the Branches tab.
+        press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Tab);
         assert_eq!(app.tab, Tab::Branches);
         // Create a new branch "feature".
@@ -6459,17 +6881,25 @@ mod tests {
         let (_tmp, mut app) = test_app();
         // Tab switches from the Worktrees tab to the Branches tab.
         press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
         assert_eq!(app.tab, Tab::Branches);
         // The main branch is listed by default, so `d` has something to target.
         assert!(!app.branches.is_empty());
         press(&mut app, KeyCode::Char('d'));
-        assert!(matches!(app.branch_mode, BranchMode::ConfirmDelete));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Confirm {
+                action: ModalAction::BranchDelete { .. },
+                ..
+            })
+        ));
     }
 
     #[test]
     fn branches_tab_c_opens_prefilled_create() {
         let (_tmp, mut app) = test_app();
         git(&app.ctx.repo_root, &["branch", "spare"]);
+        press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Tab);
         assert_eq!(app.tab, Tab::Branches);
         app.branch_selected = app.branches.iter().position(|b| b.name == "spare").unwrap();
@@ -6491,6 +6921,7 @@ mod tests {
     fn branches_tab_enter_opens_commits_and_marks_for_cherry_pick() {
         let (_tmp, mut app) = test_app();
         press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
         assert_eq!(app.tab, Tab::Branches);
         // Enter on a branch drills into its commit history.
         press(&mut app, KeyCode::Enter);
@@ -6498,10 +6929,11 @@ mod tests {
             View::BranchCommits { lines, .. } => assert!(!lines.is_empty()),
             _ => panic!("expected the branch commits view"),
         }
-        // Space marks the commit under the cursor, and Enter opens the
-        // cherry-pick worktree picker with it selected.
+        // Space marks the commit under the cursor, and `p` opens the
+        // cherry-pick worktree picker with it selected (Enter now drills into
+        // the commit instead).
         press(&mut app, KeyCode::Char(' '));
-        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('p'));
         match &app.view {
             View::CherryPick {
                 commits, targets, ..
@@ -6511,6 +6943,21 @@ mod tests {
             }
             _ => panic!("expected the cherry-pick picker"),
         }
+    }
+
+    #[test]
+    fn branch_commits_enter_browses_the_commit() {
+        // Enter now drills into the highlighted commit (like the worktree log),
+        // returning to the commit list on Esc.
+        let (_tmp, mut app) = test_app();
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter); // Branches -> BranchCommits
+        assert!(matches!(app.view, View::BranchCommits { .. }));
+        press(&mut app, KeyCode::Enter); // -> CommitDiff (browse, not cherry-pick)
+        assert!(matches!(app.view, View::CommitDiff { .. }));
+        press(&mut app, KeyCode::Esc); // pop -> BranchCommits
+        assert!(matches!(app.view, View::BranchCommits { .. }));
     }
 
     /// Builds a main-vs-feature conflict on `shared.txt` and drives the UI into
@@ -6535,6 +6982,7 @@ mod tests {
         git(&feat, &["commit", "-am", "feature edit"]);
         // Merge main into the feature worktree through the UI.
         press(app, KeyCode::Tab);
+        press(app, KeyCode::Tab);
         let idx = app
             .branches
             .iter()
@@ -6557,6 +7005,7 @@ mod tests {
     fn merge_key_opens_picker_with_worktree_targets() {
         let (_tmp, mut app) = test_app();
         add_and_select_worktree(&mut app, "feature");
+        press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Tab);
         assert_eq!(app.tab, Tab::Branches);
         let idx = app.branches.iter().position(|b| b.name == "main").unwrap();
@@ -6618,17 +7067,14 @@ mod tests {
         // `e` opens the manual editor seeded with both sides; inserting a
         // character and Ctrl+S records a Manual resolution for the hunk.
         press(&mut app, KeyCode::Char('e'));
-        assert!(matches!(
-            &app.view,
-            View::ConflictResolver { current: Some(rf), .. } if rf.edit.is_some()
-        ));
+        assert!(matches!(app.modal, Some(Modal::HunkEditor(_))));
         press(&mut app, KeyCode::Char('Z'));
         app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(app.modal.is_none(), "editor closes on save");
         match &app.view {
             View::ConflictResolver {
                 current: Some(rf), ..
             } => {
-                assert!(rf.edit.is_none(), "editor closes on save");
                 assert!(matches!(rf.actions[0], Some(ResolutionAction::Manual(_))));
             }
             _ => panic!("expected the conflict resolver"),
@@ -6655,11 +7101,11 @@ mod tests {
         press(&mut app, KeyCode::Char('Z'));
         press(&mut app, KeyCode::Esc);
         // Esc drops the editor without recording an action.
+        assert!(app.modal.is_none());
         match &app.view {
             View::ConflictResolver {
                 current: Some(rf), ..
             } => {
-                assert!(rf.edit.is_none());
                 assert!(
                     rf.actions[0].is_none(),
                     "discarded edit leaves hunk undecided"
@@ -6779,20 +7225,16 @@ mod tests {
         // `x` arms the confirmation; Esc backs out without aborting.
         press(&mut app, KeyCode::Char('x'));
         assert!(matches!(
-            app.view,
-            View::ConflictResolver {
-                confirm_abort: true,
+            app.modal,
+            Some(Modal::Confirm {
+                action: ModalAction::ResolverAbort,
                 ..
-            }
+            })
         ));
+        assert!(matches!(app.view, View::ConflictResolver { .. }));
         press(&mut app, KeyCode::Esc);
-        assert!(matches!(
-            app.view,
-            View::ConflictResolver {
-                confirm_abort: false,
-                ..
-            }
-        ));
+        assert!(app.modal.is_none());
+        assert!(matches!(app.view, View::ConflictResolver { .. }));
         assert!(crate::git::is_merging(&feat));
 
         // Confirming the abort restores the pre-merge state.
@@ -6885,7 +7327,13 @@ mod tests {
 
         // `u` now asks how to handle the dirty tree instead of updating blindly.
         press(&mut app, KeyCode::Char('u'));
-        assert!(matches!(app.view, View::ConfirmUpdateStash { .. }));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Confirm {
+                action: ModalAction::UpdateStash { .. },
+                ..
+            })
+        ));
         // Default choice (0) is stash+update+reapply.
         press(&mut app, KeyCode::Enter);
         settle(&mut app);
@@ -6968,47 +7416,42 @@ mod tests {
         // ← collapses the folder under the cursor: its files leave the rows.
         press(&mut app, KeyCode::Left);
         assert!(app.collapsed_folders.contains("src/"));
-        match &app.view {
-            View::Diff { rows, selected, .. } => {
-                assert!(matches!(
-                    rows.get(*selected),
-                    Some(DiffRow::Folder {
-                        collapsed: true,
-                        ..
-                    })
-                ));
-                assert!(
-                    !rows
-                        .iter()
-                        .any(|r| matches!(r, DiffRow::File { label, .. } if label == "a.rs"))
-                );
-            }
-            _ => panic!("expected diff view"),
+        {
+            let c = &app.changes;
+            assert!(matches!(
+                c.rows.get(c.selected),
+                Some(DiffRow::Folder {
+                    collapsed: true,
+                    ..
+                })
+            ));
+            assert!(
+                !c.rows
+                    .iter()
+                    .any(|r| matches!(r, DiffRow::File { label, .. } if label == "a.rs"))
+            );
         }
 
         // → expands it again.
         press(&mut app, KeyCode::Right);
         assert!(!app.collapsed_folders.contains("src/"));
-        match &app.view {
-            View::Diff { rows, .. } => assert!(
-                rows.iter()
-                    .any(|r| matches!(r, DiffRow::File { label, .. } if label == "a.rs"))
-            ),
-            _ => panic!("expected diff view"),
-        }
+        assert!(
+            app.changes
+                .rows
+                .iter()
+                .any(|r| matches!(r, DiffRow::File { label, .. } if label == "a.rs"))
+        );
 
         // Enter toggles, and a refresh (`r`) keeps the collapse.
         press(&mut app, KeyCode::Enter);
         assert!(app.collapsed_folders.contains("src/"));
         press(&mut app, KeyCode::Char('r'));
-        match &app.view {
-            View::Diff { rows, .. } => assert!(
-                !rows
-                    .iter()
-                    .any(|r| matches!(r, DiffRow::File { label, .. } if label == "a.rs"))
-            ),
-            _ => panic!("expected diff view"),
-        }
+        assert!(
+            !app.changes
+                .rows
+                .iter()
+                .any(|r| matches!(r, DiffRow::File { label, .. } if label == "a.rs"))
+        );
     }
 
     #[test]
@@ -7022,13 +7465,11 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         select_diff_file(&mut app, "src/a.rs");
         press(&mut app, KeyCode::Left);
-        match &app.view {
-            View::Diff { rows, selected, .. } => assert!(matches!(
-                rows.get(*selected),
-                Some(DiffRow::Folder { prefix, .. }) if prefix == "src/"
-            )),
-            _ => panic!("expected diff view"),
-        }
+        let c = &app.changes;
+        assert!(matches!(
+            c.rows.get(c.selected),
+            Some(DiffRow::Folder { prefix, .. }) if prefix == "src/"
+        ));
     }
 
     #[test]
@@ -7042,10 +7483,7 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         settle_diff(&mut app);
         // Pretend the renderer recorded the file list panel on the left.
-        let len = match &app.view {
-            View::Diff { rows, .. } => rows.len(),
-            _ => panic!("expected diff view"),
-        };
+        let len = app.changes.rows.len();
         app.row_list = Some(RowList {
             inner: Rect::new(0, 1, 36, 20),
             header: 0,
@@ -7063,32 +7501,15 @@ mod tests {
         // Over the list, a notch moves the file cursor and leaves the diff
         // scroll alone.
         wheel(&mut app, MouseEventKind::ScrollDown, 5);
-        match &app.view {
-            View::Diff {
-                selected, scroll, ..
-            } => {
-                assert_eq!(*selected, 1);
-                assert_eq!(*scroll, 0);
-            }
-            _ => panic!("expected diff view"),
-        }
+        assert_eq!(app.changes.selected, 1);
+        assert_eq!(app.changes.scroll, 0);
         // Right of the list (the diff panel), the wheel scrolls the text.
         wheel(&mut app, MouseEventKind::ScrollDown, 60);
-        match &app.view {
-            View::Diff {
-                selected, scroll, ..
-            } => {
-                assert_eq!(*selected, 1, "cursor stays put");
-                assert_eq!(*scroll, 3);
-            }
-            _ => panic!("expected diff view"),
-        }
+        assert_eq!(app.changes.selected, 1, "cursor stays put");
+        assert_eq!(app.changes.scroll, 3);
         // And scrolling up over the list moves the cursor back.
         wheel(&mut app, MouseEventKind::ScrollUp, 5);
-        match &app.view {
-            View::Diff { selected, .. } => assert_eq!(*selected, 0),
-            _ => panic!("expected diff view"),
-        }
+        assert_eq!(app.changes.selected, 0);
     }
 
     #[test]
@@ -7449,6 +7870,7 @@ mod tests {
         // The mode is remembered on the app, so the branch view opens flat too.
         press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Enter);
         match &app.view {
             View::BranchCommits { lines, .. } => {
@@ -7505,6 +7927,7 @@ mod tests {
     fn branch_commits_marks_only_real_commits() {
         let (_tmp, mut app) = test_app();
         press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Enter);
         // Replace the loaded history with one containing a connector row.
         let View::BranchCommits { branch, .. } = &app.view else {
@@ -7545,6 +7968,7 @@ mod tests {
     fn branches_tab_pull_without_upstream_reports_error() {
         let (_tmp, mut app) = test_app();
         press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
         assert_eq!(app.tab, Tab::Branches);
         press(&mut app, KeyCode::Char('p'));
         assert!(matches!(app.view, View::Busy { .. }));
@@ -7556,6 +7980,7 @@ mod tests {
     #[test]
     fn branches_tab_fetch_reloads_the_branch_list() {
         let (_tmp, mut app) = test_app();
+        press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Char('f'));
         assert!(matches!(app.view, View::Busy { .. }));
@@ -7582,6 +8007,7 @@ mod tests {
         assert!(!app.worktrees.is_empty(), "expected the list to reload");
 
         press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
         let selected = app.branches[app.branch_selected].name.clone();
         app.last_auto_refresh = Instant::now() - AUTO_REFRESH_INTERVAL;
         app.tick();
@@ -7603,8 +8029,15 @@ mod tests {
         // So does typing a branch name on the Branches tab.
         app.view = View::List;
         press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Char('n'));
-        assert!(matches!(app.branch_mode, BranchMode::Create(_)));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Prompt {
+                action: ModalAction::BranchCreate,
+                ..
+            })
+        ));
         app.last_auto_refresh = Instant::now() - AUTO_REFRESH_INTERVAL;
         app.branches.clear();
         app.tick();
@@ -7654,13 +8087,13 @@ mod tests {
         let (_tmp, mut app) = test_app();
         add_and_select_worktree(&mut app, "keepme");
         press(&mut app, KeyCode::Char('d'));
-        match &app.view {
-            View::ConfirmDelete {
-                delete_branch,
-                branch,
+        match &app.modal {
+            Some(Modal::Confirm {
+                selected,
+                action: ModalAction::DeleteWorktree { branch, .. },
                 ..
-            } => {
-                assert!(!delete_branch, "folder-only must be the default");
+            }) => {
+                assert_eq!(*selected, 0, "folder-only must be the default");
                 assert_eq!(branch.as_deref(), Some("keepme"));
             }
             _ => panic!("expected delete dialog"),
@@ -7681,8 +8114,8 @@ mod tests {
         add_and_select_worktree(&mut app, "dropme");
         press(&mut app, KeyCode::Char('d'));
         press(&mut app, KeyCode::Down); // toggle to "folder and branch"
-        match &app.view {
-            View::ConfirmDelete { delete_branch, .. } => assert!(delete_branch),
+        match &app.modal {
+            Some(Modal::Confirm { selected, .. }) => assert_eq!(*selected, 1),
             _ => panic!("expected delete dialog"),
         }
         press(&mut app, KeyCode::Char('y'));
@@ -7725,7 +8158,13 @@ mod tests {
         press(&mut app, KeyCode::Char('d'));
         press(&mut app, KeyCode::Enter);
         assert!(
-            matches!(app.view, View::ConfirmDeleteDirty { .. }),
+            matches!(
+                app.modal,
+                Some(Modal::Confirm {
+                    action: ModalAction::DeleteWorktreeDirty { .. },
+                    ..
+                })
+            ),
             "a dirty worktree should open the stash/discard prompt"
         );
         // Move to "discard" (index 1) and confirm.
@@ -7751,17 +8190,22 @@ mod tests {
         press(&mut app, KeyCode::Char('y'));
         settle(&mut app);
         // Folder removed synchronously, branch delete refused -> force prompt.
-        match &app.view {
-            View::ConfirmForceBranch { branch, reason } => {
+        match &app.modal {
+            Some(Modal::Confirm {
+                action: ModalAction::ForceBranch { branch },
+                ..
+            }) => {
                 assert_eq!(branch, "feature");
-                assert!(matches!(reason, ForceBranchReason::NotMerged));
             }
             _ => panic!("expected the force-branch prompt after an unmerged branch delete"),
         }
+        assert!(matches!(app.view, View::List));
         assert!(!app.worktrees.iter().any(|w| w.name == "feature"));
         assert!(crate::git::branch_exists(&app.ctx.repo_root, "feature"));
-        // Force the delete.
-        press(&mut app, KeyCode::Char('f'));
+        // Force the delete. The force option is the Shift-variant so a bare `f`
+        // (fetch elsewhere) can't trigger it.
+        press(&mut app, KeyCode::Char('F'));
+        assert!(app.modal.is_none());
         assert!(matches!(app.view, View::List));
         assert!(!crate::git::branch_exists(&app.ctx.repo_root, "feature"));
     }
@@ -7795,10 +8239,14 @@ mod tests {
 
         press(&mut app, KeyCode::Char('p'));
         settle(&mut app);
-        match &app.view {
-            View::ConfirmPullRebase { name } => assert_eq!(name, "main"),
+        match &app.modal {
+            Some(Modal::Confirm {
+                action: ModalAction::PullRebase { name },
+                ..
+            }) => assert_eq!(name, "main"),
             _ => panic!("expected the rebase prompt after a diverged pull"),
         }
+        assert!(matches!(app.view, View::List));
         assert_eq!(app.error, None, "the raw git error should be suppressed");
 
         // Confirming retries with a rebase: local work ends up on top.
@@ -7815,10 +8263,9 @@ mod tests {
     #[test]
     fn diverged_pull_prompt_can_be_dismissed() {
         let (_tmp, mut app) = test_app();
-        app.view = View::ConfirmPullRebase {
-            name: "main".into(),
-        };
+        app.open_pull_rebase_modal("main".into());
         press(&mut app, KeyCode::Esc);
+        assert!(app.modal.is_none());
         assert!(matches!(app.view, View::List));
     }
 
@@ -7826,7 +8273,7 @@ mod tests {
     fn config_editor_edits_and_saves_settings() {
         let (_tmp, mut app) = test_app();
         press(&mut app, KeyCode::Char('o'));
-        assert!(matches!(app.view, View::Config(_)));
+        assert_eq!(app.tab, Tab::Settings);
 
         // Edit worktree_dir (row 0): clear, type "inside".
         press(&mut app, KeyCode::Enter);
@@ -7843,7 +8290,7 @@ mod tests {
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Enter);
 
-        assert!(matches!(app.view, View::List), "message: {:?}", app.message);
+        assert_eq!(app.tab, Tab::Settings, "saving stays on the tab");
         assert!(app.message.as_deref().unwrap().contains("saved"));
         // The live config reflects the change without a reload.
         assert_eq!(app.ctx.config.worktree_dir.as_deref(), Some("inside"));
@@ -7864,10 +8311,8 @@ mod tests {
 
         press(&mut app, KeyCode::Char('o'));
         // Row 0 (worktree_dir) should load the existing "home".
-        match &app.view {
-            View::Config(editor) => assert_eq!(editor.worktree_dir, "home"),
-            _ => panic!("expected config editor"),
-        }
+        assert_eq!(app.tab, Tab::Settings);
+        assert_eq!(app.settings.worktree_dir, "home");
         // Clear worktree_dir back to empty.
         press(&mut app, KeyCode::Enter);
         for _ in 0..4 {
@@ -7988,8 +8433,8 @@ mod tests {
             draw(&mut app); // help
             press(&mut app, KeyCode::Esc);
             press(&mut app, KeyCode::Enter);
-            draw(&mut app); // diff
-            press(&mut app, KeyCode::Esc);
+            draw(&mut app); // Changes tab
+            press(&mut app, KeyCode::BackTab); // back to the Worktrees tab
             press(&mut app, KeyCode::Char('n'));
             type_str(&mut app, "rend");
             draw(&mut app); // create dialog: new-branch row plus checkout list
@@ -8017,14 +8462,14 @@ mod tests {
             draw(&mut app); // delete dialog, branch option selected
             press(&mut app, KeyCode::Esc);
 
-            // Config editor: navigating and mid-edit.
+            // Settings tab: navigating and mid-edit.
             press(&mut app, KeyCode::Char('o'));
             draw(&mut app);
             press(&mut app, KeyCode::Enter); // edit worktree_dir
             type_str(&mut app, "inside");
             draw(&mut app);
             press(&mut app, KeyCode::Esc); // cancel edit
-            press(&mut app, KeyCode::Esc); // close editor
+            press(&mut app, KeyCode::Tab); // wraps around to the Worktrees tab
 
             // Creating view: while running (with typed input) and when done.
             app.ctx.config.setup.run = vec!["read line".to_string()];
@@ -8051,17 +8496,20 @@ mod tests {
             draw(&mut app); // commit dialog
             press(&mut app, KeyCode::Esc);
 
-            // Stash overlay and its sub-modes.
+            // Stash tab and its sub-modes.
             press(&mut app, KeyCode::Char('s'));
-            draw(&mut app); // stash list (empty)
+            draw(&mut app); // stash table (empty)
             press(&mut app, KeyCode::Char('s'));
             type_str(&mut app, "msg");
             draw(&mut app); // stash message input
             press(&mut app, KeyCode::Enter);
+            settle(&mut app);
+            draw(&mut app); // stash table with an entry
             press(&mut app, KeyCode::Char('x'));
             draw(&mut app); // drop confirm
             press(&mut app, KeyCode::Esc);
-            press(&mut app, KeyCode::Esc);
+            press(&mut app, KeyCode::Tab); // Settings
+            press(&mut app, KeyCode::Tab); // wraps around to Worktrees
 
             // Branches tab and its sub-modes.
             press(&mut app, KeyCode::Tab);

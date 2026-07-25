@@ -99,8 +99,10 @@ impl HelpTab {
             View::List => match tab {
                 Tab::Worktrees => HelpTab::Worktrees,
                 Tab::Branches => HelpTab::Branches,
+                Tab::Changes | Tab::Stash => HelpTab::Changes,
+                Tab::Settings => HelpTab::Basics,
             },
-            View::Diff { .. } | View::Commit { .. } | View::Stash { .. } => HelpTab::Changes,
+            View::Commit { .. } => HelpTab::Changes,
             View::BranchCommits { .. }
             | View::CherryPick { .. }
             | View::Log { .. }
@@ -130,7 +132,7 @@ pub fn sections(tab: HelpTab) -> &'static [Section] {
 // ---------------------------------------------------------------------------
 
 pub const GLOBAL: &[Binding] = &[
-    help_only("⇥ Tab", "switch between the Worktrees and Branches tabs"),
+    help_only("⇥ Tab", "cycle the 5 tabs (⇧Tab to go back)"),
     help_only("?", "help for whatever you're looking at"),
     help_only("F1", "the same help, but works while typing too"),
     help_only("r", "refresh"),
@@ -139,7 +141,7 @@ pub const GLOBAL: &[Binding] = &[
 ];
 
 pub const WORKTREES: &[Binding] = &[
-    both("⇥", "branches", "switch to the Branches tab"),
+    both("⇥", "tabs", "cycle the 5 tabs (⇧Tab to go back)"),
     help_only("↑/↓ or j/k", "select worktree"),
     both(
         "Enter",
@@ -158,9 +160,9 @@ pub const WORKTREES: &[Binding] = &[
         "commit",
         "commit (pick files, all selected by default)",
     ),
-    help_only("o", "edit repo settings"),
+    help_only("o", "settings tab: edit repo settings"),
     help_only("e", "run the open command"),
-    both("s", "stash", "stash manager (stash/pop/apply/drop)"),
+    both("s", "stash", "stash tab (stash/pop/apply/drop)"),
     both("p", "pull", "pull (fast-forward) the worktree"),
     both("⇧P", "push", "push the worktree"),
     both("f", "fetch", "fetch all remotes"),
@@ -181,13 +183,9 @@ pub const WORKTREES: &[Binding] = &[
 ];
 
 pub const BRANCHES: &[Binding] = &[
-    both("⇥", "worktrees", "switch to the Worktrees tab"),
+    both("⇥", "tabs", "cycle the 5 tabs (⇧Tab to go back)"),
     help_only("↑/↓ or j/k", "select branch"),
-    both(
-        "Enter",
-        "commits / cherry-pick",
-        "view the branch's commits (then cherry-pick)",
-    ),
+    both("Enter", "commits", "view the branch's commits"),
     help_only("m", "merge the branch into a worktree of your choosing"),
     both(
         "c",
@@ -205,7 +203,7 @@ pub const BRANCHES: &[Binding] = &[
         "fetch all remotes (refreshes every ahead/behind)",
     ),
     both("p", "pull", "fast-forward the branch onto its upstream"),
-    both("d", "delete", "delete the selected branch (f to force)"),
+    both("d", "delete", "delete the selected branch (F to force)"),
     both("⇧R", "rename", "rename the selected branch"),
     both("?", "help", "show this help"),
     both("q", "quit", "quit"),
@@ -221,16 +219,15 @@ pub const DIFF: &[Binding] = &[
     both("s", "stash file", "stash the highlighted file"),
     both("⇧S", "stash marked", "stash every marked file"),
     both(
-        "⇧R",
-        "revert",
+        "u",
+        "undo changes",
         "revert the file to its last committed state",
     ),
     both("d", "delete", "delete the file from the worktree"),
     both("i", "ignore", "add the file or a glob to .gitignore"),
     both("t", "tree/flat", "toggle folder tree vs. flat file list"),
-    both("Tab", "commit", "jump to the commit dialog"),
     both("?", "help", "show this help"),
-    both("q", "back", "back to the worktree list"),
+    both("q", "quit", "quit"),
 ];
 
 pub const COMMIT_FILES: &[Binding] = &[
@@ -248,7 +245,13 @@ pub const STASH_LIST: &[Binding] = &[
     both("p", "pop", "pop the selected stash (apply, then drop)"),
     both("a", "apply", "apply the selected stash, keeping it"),
     both("x", "drop", "drop the selected stash"),
-    both("Esc", "close", "close the stash manager"),
+    both("q", "quit", "quit"),
+];
+
+pub const SETTINGS: &[Binding] = &[
+    both("↑/↓", "select", "move between settings and the save row"),
+    both("Enter", "edit/save", "edit the selected setting, or save the file"),
+    both("q", "quit", "quit"),
 ];
 
 pub const BRANCH_COMMITS: &[Binding] = &[
@@ -256,14 +259,14 @@ pub const BRANCH_COMMITS: &[Binding] = &[
     both("Space", "mark commit", "mark a commit for cherry-pick"),
     both("a", "all/none", "mark or unmark every commit"),
     both(
-        "Enter",
-        "cherry-pick",
-        "cherry-pick marked commits into a worktree",
-    ),
-    both(
-        "v / →",
+        "Enter / v / →",
         "browse files",
         "view the highlighted commit's changed files and diffs",
+    ),
+    both(
+        "p",
+        "cherry-pick",
+        "cherry-pick marked commits (or the highlighted one) into a worktree",
     ),
     both(
         "t",
@@ -316,6 +319,11 @@ const BASICS_SECTIONS: &[Section] = &[
         notes: &[],
     },
     Section {
+        heading: "settings tab  (o)",
+        bindings: SETTINGS,
+        notes: &["edits the repo's .wtm.toml; leaving the tab discards unsaved changes."],
+    },
+    Section {
         heading: "changes view status codes  (col 1 = staged · col 2 = working tree)",
         bindings: &[],
         notes: &[
@@ -350,9 +358,9 @@ const CHANGES_SECTIONS: &[Section] = &[
         notes: &["while typing the message, F1 opens this help ('?' types a '?')"],
     },
     Section {
-        heading: "stash manager  (s)",
+        heading: "stash tab  (s)",
         bindings: STASH_LIST,
-        notes: &[],
+        notes: &["stashes belong to the worktree highlighted on the Worktrees tab."],
     },
 ];
 
