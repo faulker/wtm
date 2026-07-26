@@ -134,6 +134,10 @@ pub fn sections(tab: HelpTab) -> &'static [Section] {
 pub const GLOBAL: &[Binding] = &[
     help_only("⇥ Tab", "cycle the 5 tabs (⇧Tab to go back)"),
     help_only("?", "help for whatever you're looking at"),
+    help_only(
+        "mouse",
+        "click a tab to switch to it, or a row to select it; the wheel scrolls",
+    ),
     help_only("F1", "the same help, but works while typing too"),
     help_only("r", "refresh"),
     help_only("q", "quit, or step back out of a sub-view"),
@@ -147,6 +151,14 @@ pub const WORKTREES: &[Binding] = &[
         "Enter",
         "changes",
         "browse changes per file (diff, stash, revert)",
+    ),
+    help_only(
+        "⇧↑/⇧↓",
+        "scroll the changed-file list below (or mouse wheel over it)",
+    ),
+    help_only(
+        "click",
+        "a tab switches to it; a changed file opens it on the Changes tab",
     ),
     both("n", "new", "new worktree (new branch or existing branch)"),
     both(

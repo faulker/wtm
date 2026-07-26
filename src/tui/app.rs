@@ -987,6 +987,16 @@ pub struct RowList {
 }
 
 impl RowList {
+    /// Whether (`col`, `row`) is anywhere inside the list's content rect,
+    /// chrome rows included. Used to route the wheel to the panel under the
+    /// pointer, which `hit` is too strict for.
+    fn contains(&self, col: u16, row: u16) -> bool {
+        col >= self.inner.x
+            && col < self.inner.x + self.inner.width
+            && row >= self.inner.y
+            && row < self.inner.y + self.inner.height
+    }
+
     /// Row index at screen position (`col`, `row`), or `None` when the click
     /// falls outside the list's data rows.
     fn hit(&self, col: u16, row: u16) -> Option<usize> {
@@ -1070,6 +1080,12 @@ pub struct App {
     /// Which `selected` index `worktree_preview` currently reflects, so it's
     /// only recomputed on an actual selection change, not every frame.
     pub preview_for: Option<usize>,
+    /// First visible row of the changed-file preview, so a worktree with more
+    /// changes than the panel is tall can be scrolled through in place.
+    pub preview_scroll: usize,
+    /// Geometry of the preview's file rows, recorded by the renderer each frame
+    /// so clicks and the wheel can be resolved against it.
+    pub preview_list: Option<RowList>,
     /// Active top-level tab. Only meaningful while `view` is `View::List`.
     pub tab: Tab,
     /// Content of the Changes tab, populated by `open_changes_tab`.
@@ -1102,6 +1118,10 @@ pub struct App {
     pub modal: Option<Modal>,
     /// Set by the renderer each frame; read by `on_mouse` to resolve clicks.
     pub row_list: Option<RowList>,
+    /// Screen rect of each top-level tab label in the tab bar, recorded by the
+    /// renderer so a click on one selects that tab. Empty when the bar is not
+    /// on screen or something (modal, help, error) covers it.
+    pub tab_hits: Vec<(Rect, Tab)>,
     /// One-line status shown in the header. Auto-clears after a few seconds
     /// so it doesn't linger over the key hints.
     pub message: Option<String>,
@@ -1183,6 +1203,8 @@ impl App {
             selected: 0,
             worktree_preview: Vec::new(),
             preview_for: None,
+            preview_scroll: 0,
+            preview_list: None,
             tab: Tab::Worktrees,
             changes: ChangesTab::default(),
             branches: Vec::new(),
@@ -1198,6 +1220,7 @@ impl App {
             stack: Vec::new(),
             modal: None,
             row_list: None,
+            tab_hits: Vec::new(),
             message: None,
             message_at: None,
             message_shown: None,
@@ -2431,11 +2454,19 @@ impl App {
     /// Cycles to the next (`forward`) or previous top-level tab, then runs
     /// whatever "on entry" loader that tab needs so its content isn't stale.
     fn cycle_tab(&mut self, forward: bool) {
-        self.tab = if forward {
+        let next = if forward {
             self.tab.next()
         } else {
             self.tab.prev()
         };
+        self.select_tab(next);
+    }
+
+    /// Switches to `tab` and runs its "on entry" loader, the same work
+    /// `cycle_tab` does. Re-selecting the active tab still reloads it, matching
+    /// what a click on the current tab implies (refresh what I'm looking at).
+    pub fn select_tab(&mut self, tab: Tab) {
+        self.tab = tab;
         match self.tab {
             Tab::Branches => self.load_branches(0),
             // Landing on Changes shows whichever worktree is highlighted on the
@@ -2459,12 +2490,26 @@ impl App {
     fn on_worktrees_tab_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            // Shift+↑/↓ scrolls the changed-file preview below the table; the
+            // plain arrows still move the worktree cursor.
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.preview_scroll = self.preview_scroll.saturating_sub(1);
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.preview_scroll = self.preview_scroll.saturating_add(1);
+            }
             KeyCode::Down | KeyCode::Char('j') => {
                 if self.selected + 1 < self.worktrees.len() {
                     self.selected += 1;
+                    self.preview_scroll = 0;
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.selected > 0 {
+                    self.selected -= 1;
+                    self.preview_scroll = 0;
+                }
+            }
             KeyCode::Char('r') => {
                 self.refresh();
                 self.message = Some("refreshed".to_string());
@@ -2559,6 +2604,43 @@ impl App {
             }
             Err(e) => self.set_error(format!("{e:#}")),
         }
+    }
+
+    /// Opens the Changes tab for `name` with the cursor on `path`. Used by the
+    /// Worktrees tab's preview: clicking a changed file there jumps straight to
+    /// that file's diff. A path that no longer shows up as changed (the status
+    /// is re-read on the way in) just leaves the cursor at the top.
+    fn open_changes_tab_at(&mut self, name: String, path: &str) {
+        self.open_changes_tab(name);
+        if self.tab != Tab::Changes {
+            return;
+        }
+        let Some(file) = self.changes.files.iter().position(|f| f.path == path) else {
+            return;
+        };
+        // The file may sit inside a collapsed folder, which leaves it with no
+        // row at all. Expand its ancestors so the cursor has somewhere to land.
+        let segments: Vec<&str> = path.split('/').collect();
+        let mut prefix = String::new();
+        let mut expanded = false;
+        for dir in &segments[..segments.len() - 1] {
+            prefix.push_str(dir);
+            prefix.push('/');
+            expanded |= self.collapsed_folders.remove(&prefix);
+        }
+        if expanded {
+            self.changes.rows = build_rows(&self.changes.files, self.file_tree, &self.collapsed_folders);
+        }
+        let Some(row) = self
+            .changes
+            .rows
+            .iter()
+            .position(|r| matches!(r, DiffRow::File { index, .. } if *index == file))
+        else {
+            return;
+        };
+        self.changes.selected = row;
+        self.load_diff_content(true);
     }
 
     /// Loads the diff text for the file under the cursor into the Diff view.
@@ -2671,12 +2753,34 @@ impl App {
         // Whether the pointer sits over the active view's row list (the
         // changed-file panel in the diff views), per the geometry the renderer
         // recorded last frame.
-        let over_list = self.row_list.is_some_and(|rl| {
-            mouse.column >= rl.inner.x
-                && mouse.column < rl.inner.x + rl.inner.width
-                && mouse.row >= rl.inner.y
-                && mouse.row < rl.inner.y + rl.inner.height
-        });
+        let over_list = self
+            .row_list
+            .is_some_and(|rl| rl.contains(mouse.column, mouse.row));
+        // Worktrees tab: the wheel steps the worktree cursor over the table and
+        // scrolls the changed-file preview over the panel below it.
+        if matches!(self.view, View::List) && self.tab == Tab::Worktrees {
+            if self
+                .preview_list
+                .is_some_and(|rl| rl.contains(mouse.column, mouse.row))
+            {
+                self.preview_scroll = if down {
+                    self.preview_scroll.saturating_add(3)
+                } else {
+                    self.preview_scroll.saturating_sub(3)
+                };
+            } else if over_list {
+                if down {
+                    if self.selected + 1 < self.worktrees.len() {
+                        self.selected += 1;
+                        self.preview_scroll = 0;
+                    }
+                } else if self.selected > 0 {
+                    self.selected -= 1;
+                    self.preview_scroll = 0;
+                }
+            }
+            return;
+        }
         // Over the Changes tab's file list: one file-cursor step per wheel
         // notch; anywhere else on that tab the wheel scrolls the diff text.
         if matches!(self.view, View::List) && self.tab == Tab::Changes {
@@ -2724,6 +2828,32 @@ impl App {
     /// view's clickable list. Loads the diff for a newly selected file so a
     /// click behaves exactly like arrowing onto the row.
     fn on_click(&mut self, col: u16, row: u16) {
+        // The tab bar sits above every list, and the renderer only records its
+        // geometry when nothing covers it, so this can be resolved first.
+        if let Some((_, tab)) = self
+            .tab_hits
+            .iter()
+            .find(|(rect, _)| {
+                col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+            })
+            .copied()
+        {
+            self.select_tab(tab);
+            return;
+        }
+        // A click on a changed file in the Worktrees tab's preview opens that
+        // file's diff on the Changes tab, the mouse equivalent of Enter.
+        if let Some(idx) = self.preview_list.and_then(|rl| rl.hit(col, row)) {
+            let target = self
+                .worktree_preview
+                .get(idx)
+                .map(|e| e.path.clone())
+                .zip(self.selected_worktree().map(|w| w.name.clone()));
+            if let Some((path, name)) = target {
+                self.open_changes_tab_at(name, &path);
+            }
+            return;
+        }
         let Some(idx) = self.row_list.and_then(|rl| rl.hit(col, row)) else {
             return;
         };
@@ -2742,8 +2872,9 @@ impl App {
         match self.view {
             View::List => match self.tab {
                 Tab::Worktrees => {
-                    if idx < self.worktrees.len() {
+                    if idx < self.worktrees.len() && self.selected != idx {
                         self.selected = idx;
+                        self.preview_scroll = 0;
                     }
                 }
                 Tab::Branches => {
@@ -8962,5 +9093,211 @@ mod tests {
             )
             .exists()
         );
+    }
+
+    /// Draws the app into an off-screen terminal, which is what records the
+    /// click geometry (`tab_hits`, `preview_list`, `row_list`) the mouse
+    /// handlers read. Tests that click must render first.
+    fn render_app(app: &mut App, width: u16, height: u16) {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::tui::ui::draw(frame, app))
+            .unwrap();
+    }
+
+    /// Writes `count` changed files into `dir`, named so their sorted order is
+    /// predictable.
+    fn write_changed_files(dir: &Path, count: usize) {
+        for i in 0..count {
+            std::fs::write(dir.join(format!("f{i:02}.txt")), format!("{i}\n")).unwrap();
+        }
+    }
+
+    /// The Worktrees tab's preview holds every changed file, not a capped
+    /// slice, and reports the geometry needed to click one.
+    #[test]
+    fn worktree_preview_lists_every_changed_file() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        write_changed_files(&root, 30);
+        app.refresh();
+        app.selected = 0;
+        render_app(&mut app, 100, 30);
+
+        let total = app.worktree_preview.len();
+        assert!(total >= 30, "every change is previewed, got {total}");
+        let rl = app.preview_list.expect("the preview records its geometry");
+        assert_eq!(
+            rl.len, total,
+            "the whole list is clickable, not a capped slice"
+        );
+        assert!(
+            (rl.inner.height as usize) < total,
+            "this terminal is too short to show every row, so scrolling matters"
+        );
+        // Every file is reachable: the last row of the last page is the last file.
+        assert_eq!(rl.offset, 0, "the preview starts at the top");
+    }
+
+    /// The wheel over the preview panel scrolls it, and the renderer clamps the
+    /// offset so the viewport can't run off the end of the list.
+    #[test]
+    fn worktree_preview_scrolls_and_clamps() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        write_changed_files(&root, 30);
+        app.refresh();
+        app.selected = 0;
+        render_app(&mut app, 100, 30);
+        let rl = app.preview_list.expect("preview geometry");
+        let (col, row) = (rl.inner.x + 1, rl.inner.y + 1);
+        let wheel = |app: &mut App, kind| {
+            app.on_mouse(MouseEvent {
+                kind,
+                column: col,
+                row,
+                modifiers: KeyModifiers::empty(),
+            });
+        };
+
+        wheel(&mut app, MouseEventKind::ScrollDown);
+        render_app(&mut app, 100, 30);
+        assert_eq!(app.preview_scroll, 3, "three rows per wheel notch");
+        assert_eq!(
+            app.preview_list.unwrap().offset,
+            3,
+            "the drawn rows start at the scroll offset"
+        );
+
+        // Far past the end: the renderer pins the last row to the bottom of the
+        // panel instead of scrolling into empty space.
+        for _ in 0..50 {
+            press_shift(&mut app, KeyCode::Down);
+        }
+        render_app(&mut app, 100, 30);
+        let visible = app.preview_list.unwrap().inner.height as usize;
+        let last_page = app.worktree_preview.len() - visible;
+        assert_eq!(app.preview_scroll, last_page, "clamped to the last page");
+
+        wheel(&mut app, MouseEventKind::ScrollUp);
+        assert_eq!(app.preview_scroll, last_page - 3, "the wheel scrolls back");
+        for _ in 0..50 {
+            press_shift(&mut app, KeyCode::Up);
+        }
+        assert_eq!(app.preview_scroll, 0, "back at the top");
+    }
+
+    /// Moving to another worktree resets the preview's scroll, so the panel
+    /// isn't showing row 20 of a list that just changed underneath it.
+    #[test]
+    fn selecting_another_worktree_resets_the_preview_scroll() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        write_changed_files(&root, 30);
+        add_and_select_worktree(&mut app, "spare");
+        app.selected = app.worktrees.iter().position(|w| w.is_main).unwrap();
+        render_app(&mut app, 100, 30);
+        app.preview_scroll = 5;
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.preview_scroll, 0);
+    }
+
+    /// Clicking a tab label switches to that tab and runs its entry loader.
+    #[test]
+    fn clicking_a_tab_switches_to_it() {
+        let (_tmp, mut app) = test_app();
+        app.refresh();
+        app.selected = 0;
+        render_app(&mut app, 100, 30);
+
+        let (rect, _) = *app
+            .tab_hits
+            .iter()
+            .find(|(_, t)| *t == Tab::Branches)
+            .expect("the tab bar records a hit box per tab");
+        click(&mut app, rect.x + 1, rect.y);
+        assert_eq!(app.tab, Tab::Branches);
+        assert!(
+            !app.branches.is_empty(),
+            "switching to Branches loads the branch list"
+        );
+
+        render_app(&mut app, 100, 30);
+        let (rect, _) = *app
+            .tab_hits
+            .iter()
+            .find(|(_, t)| *t == Tab::Worktrees)
+            .unwrap();
+        click(&mut app, rect.x + 1, rect.y);
+        assert_eq!(app.tab, Tab::Worktrees);
+    }
+
+    /// A modal covers the tab bar, so a click there belongs to the modal.
+    #[test]
+    fn tab_clicks_are_ignored_while_a_modal_is_up() {
+        let (_tmp, mut app) = test_app();
+        add_and_select_worktree(&mut app, "spare");
+        press(&mut app, KeyCode::Char('d')); // delete confirm modal
+        assert!(app.modal.is_some());
+        render_app(&mut app, 100, 30);
+        assert!(app.tab_hits.is_empty(), "the modal owns every click");
+        click(&mut app, 12, 1);
+        assert_eq!(app.tab, Tab::Worktrees, "the tab did not change");
+    }
+
+    /// Clicking a changed file in the preview opens the Changes tab with the
+    /// cursor already on that file.
+    #[test]
+    fn clicking_a_preview_file_opens_it_on_the_changes_tab() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        write_changed_files(&root, 12);
+        app.refresh();
+        app.selected = 0;
+        render_app(&mut app, 100, 30);
+
+        // Scroll down a page so the click also proves the offset is applied.
+        app.preview_scroll = 4;
+        render_app(&mut app, 100, 30);
+        let rl = app.preview_list.expect("preview geometry");
+        // Third visible row -> the sixth file in the list.
+        let want = app.worktree_preview[rl.offset + 2].path.clone();
+        click(&mut app, rl.inner.x + 1, rl.inner.y + 2);
+        settle_diff(&mut app);
+
+        assert_eq!(app.tab, Tab::Changes);
+        assert_eq!(app.changes.name, app.worktrees[0].name);
+        let idx = current_file_index(&app.changes.rows, app.changes.selected)
+            .expect("the cursor sits on a file row, not a folder");
+        assert_eq!(app.changes.files[idx].path, want);
+    }
+
+    /// A clicked file inside a collapsed folder still gets the cursor: its
+    /// ancestors are expanded so it has a row to land on.
+    #[test]
+    fn clicking_a_preview_file_expands_its_collapsed_folder() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::create_dir_all(root.join("pkg/deep")).unwrap();
+        std::fs::write(root.join("pkg/deep/a.txt"), "a\n").unwrap();
+        app.refresh();
+        app.selected = 0;
+        app.collapsed_folders.insert("pkg/".to_string());
+        render_app(&mut app, 100, 30);
+
+        let rl = app.preview_list.expect("preview geometry");
+        let idx = app
+            .worktree_preview
+            .iter()
+            .position(|e| e.path == "pkg/deep/a.txt")
+            .expect("the new file is previewed");
+        click(&mut app, rl.inner.x + 1, rl.inner.y + idx as u16);
+        settle_diff(&mut app);
+
+        assert_eq!(app.tab, Tab::Changes);
+        let file = current_file_index(&app.changes.rows, app.changes.selected)
+            .expect("the cursor sits on a file row");
+        assert_eq!(app.changes.files[file].path, "pkg/deep/a.txt");
     }
 }

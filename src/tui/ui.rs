@@ -38,6 +38,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     .areas(frame.area());
 
     draw_header(frame, header, app);
+    // Click targets are re-recorded from scratch each frame by whoever draws
+    // them, so last frame's geometry can't outlive what's on screen.
+    app.tab_hits.clear();
+    app.preview_list = None;
     // The full-screen view's clickable list, if any.
     let list_hit = match &app.view {
         View::Log {
@@ -233,12 +237,22 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         app.row_list = matches!(modal, Modal::Confirm { .. }).then_some(modal_hit).flatten();
     }
 
+    // The tab bar and the worktree preview only take clicks when the home view
+    // is what the user is actually looking at: a dialog, overlay, or modal
+    // floats over both, and clicks belong to whatever is on top.
+    if !matches!(app.view, View::List) || app.modal.is_some() {
+        app.tab_hits.clear();
+        app.preview_list = None;
+    }
+
     // The error popup sits on top of absolutely everything, including the
     // help overlay, and suppresses clicks on whatever is behind it. Cloned so
     // drawing it doesn't hold an immutable borrow while `row_list` is reset.
     if let Some(err) = app.error.clone() {
         draw_error_popup(frame, main, &err);
         app.row_list = None;
+        app.tab_hits.clear();
+        app.preview_list = None;
     }
 }
 
@@ -413,10 +427,12 @@ fn draw_worktrees_tab(frame: &mut Frame, area: Rect, app: &mut App) -> Option<Ro
     row_list
 }
 
-/// Read-only glance at the highlighted worktree's changed files (status code
-/// and path, capped rows). No cursor or mark-for-commit state: the worktree
-/// table above still owns all interaction.
-fn draw_worktree_preview(frame: &mut Frame, area: Rect, app: &App) {
+/// Read-only list of the highlighted worktree's changed files (status code and
+/// path). Every changed file gets a row; when there are more than the panel is
+/// tall the list scrolls (wheel or Shift+↑/↓) instead of being truncated. No
+/// cursor or mark-for-commit state: the worktree table above still owns the
+/// keyboard, but a click on a row opens that file on the Changes tab.
+fn draw_worktree_preview(frame: &mut Frame, area: Rect, app: &mut App) {
     let title = match app.worktrees.get(app.selected) {
         Some(wt) => format!("changes · {}", wt.name),
         None => "changes".to_string(),
@@ -424,14 +440,23 @@ fn draw_worktree_preview(frame: &mut Frame, area: Rect, app: &App) {
     if app.worktree_preview.is_empty() {
         let para = Paragraph::new(Line::from("no changes".dim())).block(panel(title));
         frame.render_widget(para, area);
+        app.preview_scroll = 0;
         return;
     }
 
-    const MAX_ROWS: usize = 8;
-    let mut lines: Vec<Line> = app
+    let block = panel(title);
+    let inner = block.inner(area);
+    let total = app.worktree_preview.len();
+    let visible = inner.height as usize;
+    // Keep the viewport on the list: it can be left past the end by a shrinking
+    // status refresh or by holding Shift+↓ (which doesn't know the height).
+    app.preview_scroll = app.preview_scroll.min(total.saturating_sub(visible));
+    let offset = app.preview_scroll;
+    let lines: Vec<Line> = app
         .worktree_preview
         .iter()
-        .take(MAX_ROWS)
+        .skip(offset)
+        .take(visible)
         .map(|entry| {
             Line::from(vec![
                 Span::styled(format!("{:<3}", entry.code), status_style(&entry.code)),
@@ -439,14 +464,28 @@ fn draw_worktree_preview(frame: &mut Frame, area: Rect, app: &App) {
             ])
         })
         .collect();
-    if app.worktree_preview.len() > MAX_ROWS {
-        let more = app.worktree_preview.len() - MAX_ROWS;
-        lines.push(Line::from(
-            format!("+{more} more — Enter for full changes").dim(),
-        ));
-    }
-    let para = Paragraph::new(lines).block(panel(title));
-    frame.render_widget(para, area);
+    // Position readout in the border, so the panel says how much is off-screen
+    // without spending a row on it.
+    let block = if total > visible && visible > 0 {
+        block.title_bottom(
+            Line::from(format!(
+                " {}-{}/{total} ",
+                offset + 1,
+                (offset + visible).min(total)
+            ))
+            .right_aligned()
+            .dim(),
+        )
+    } else {
+        block
+    };
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+    app.preview_list = (visible > 0).then_some(RowList {
+        inner,
+        header: 0,
+        offset,
+        len: total,
+    });
 }
 
 /// Path of the changed file under the cursor row, or "" on a folder row.
@@ -1789,7 +1828,7 @@ fn draw_stash_tab(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
 
 /// Top-of-main tab bar: the active tab in accent, the other dimmed, with a
 /// reminder that Tab switches between them.
-fn draw_tab_bar(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_tab_bar(frame: &mut Frame, area: Rect, app: &mut App) {
     let tab_span = |label: String, active: bool| {
         if active {
             Span::styled(
@@ -1801,17 +1840,32 @@ fn draw_tab_bar(frame: &mut Frame, area: Rect, app: &App) {
         }
     };
     let mut spans = Vec::new();
+    // Walk the labels left to right, recording each one's screen rect so a
+    // click can be mapped back to its tab.
+    let mut x = area.x;
+    let mut hits = Vec::new();
     for tab in Tab::ALL {
         if !spans.is_empty() {
             spans.push(Span::raw(" "));
+            x += 1;
         }
-        spans.push(tab_span(
-            format!("{} {}", tab.glyph(), tab.title()),
-            app.tab == tab,
-        ));
+        let span = tab_span(format!("{} {}", tab.glyph(), tab.title()), app.tab == tab);
+        let width = span.width() as u16;
+        if x < area.x + area.width {
+            let rect = Rect {
+                x,
+                y: area.y,
+                width: width.min(area.x + area.width - x),
+                height: 1,
+            };
+            hits.push((rect, tab));
+        }
+        x += width;
+        spans.push(span);
     }
     spans.push(Span::styled("   ⇥/⇧⇥ switch", Style::new().dim()));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    app.tab_hits = hits;
 }
 
 /// The Branches tab: a full-width table of local branches, with the inline
