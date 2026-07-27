@@ -224,7 +224,17 @@ pub const BRANCHES: &[Binding] = &[
 pub const DIFF: &[Binding] = &[
     help_only("↑/↓ or j/k", "move the file cursor"),
     help_only("⇧↑/⇧↓", "scroll the diff (or mouse wheel)"),
-    help_only("←/→ or h/l", "collapse/expand the folder (Enter toggles)"),
+    help_only("←/→ or h/l", "collapse/expand the folder"),
+    both(
+        "Enter",
+        "open",
+        "open the file in your default app (or toggle the folder)",
+    ),
+    help_only("double-click", "same as Enter on the clicked row"),
+    help_only(
+        "click the path",
+        "copy the diff panel's file path to the clipboard",
+    ),
     both("Space", "mark", "mark a file (or folder) for commit"),
     help_only("a", "mark or unmark every file"),
     both("c", "commit", "commit the marked files"),
@@ -298,7 +308,11 @@ pub const BRANCH_COMMITS: &[Binding] = &[
 ];
 
 pub const COMMIT_DIFF: &[Binding] = &[
-    both("↑/↓ or j/k", "file", "move between the commit's changed files"),
+    both(
+        "↑/↓ or j/k",
+        "file",
+        "move between the commit's changed files",
+    ),
     help_only("⇧↑/⇧↓", "scroll the diff (or mouse wheel)"),
     help_only("←/→ or h/l", "collapse/expand the folder (Enter toggles)"),
     both("t", "tree/flat", "toggle folder tree vs. flat file list"),

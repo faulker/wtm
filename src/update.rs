@@ -550,7 +550,8 @@ mod tests {
         );
         // Tags need not start with `v`.
         assert_eq!(
-            tag_from_release_url("https://github.com/faulker/wtm/releases/tag/2026.07.1").as_deref(),
+            tag_from_release_url("https://github.com/faulker/wtm/releases/tag/2026.07.1")
+                .as_deref(),
             Some("2026.07.1")
         );
     }

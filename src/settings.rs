@@ -82,6 +82,76 @@ impl ConfigDraft {
     }
 }
 
+/// Local config files that git normally ignores, so a fresh worktree won't have
+/// them unless `setup.copy` brings them across. Only the ones actually present
+/// in the repo root are suggested.
+const COPY_CANDIDATES: &[&str] = &[
+    ".env",
+    ".env.local",
+    ".env.development",
+    ".env.development.local",
+    ".dev.vars",
+    ".envrc",
+    ".npmrc",
+    ".tool-versions",
+];
+
+/// Marker file -> install command, checked in order. The first match wins per
+/// ecosystem so a repo with both `package-lock.json` and `yarn.lock` doesn't get
+/// two competing installs suggested.
+const RUN_CANDIDATES: &[(&str, &str)] = &[
+    ("pnpm-lock.yaml", "pnpm install"),
+    ("yarn.lock", "yarn install"),
+    ("bun.lockb", "bun install"),
+    ("bun.lock", "bun install"),
+    ("package-lock.json", "npm install"),
+    ("uv.lock", "uv sync"),
+    ("poetry.lock", "poetry install"),
+    ("Gemfile.lock", "bundle install"),
+    ("composer.lock", "composer install"),
+    ("go.mod", "go mod download"),
+    ("mix.lock", "mix deps.get"),
+];
+
+/// Files in `repo_root` worth copying into new worktrees: the known local-config
+/// names that exist here. Used to pre-fill the setup wizard's answer so the user
+/// edits a sensible list instead of starting from a blank line.
+pub fn suggest_copy_files(repo_root: &Path) -> Vec<String> {
+    COPY_CANDIDATES
+        .iter()
+        .filter(|name| repo_root.join(name).is_file())
+        .map(|name| name.to_string())
+        .collect()
+}
+
+/// Setup commands worth running in new worktrees, inferred from the lockfiles
+/// and manifests in `repo_root`. At most one command per ecosystem.
+pub fn suggest_run_commands(repo_root: &Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (marker, command) in RUN_CANDIDATES {
+        if !repo_root.join(marker).is_file() {
+            continue;
+        }
+        // A repo can legitimately use two ecosystems (say Node and Go), but not
+        // two package managers for the same one; dedupe on the command itself.
+        if !out.iter().any(|c| c == command) {
+            out.push(command.to_string());
+        }
+    }
+    // Node lockfiles are mutually exclusive in practice, so keep only the first.
+    let node = ["pnpm install", "yarn install", "bun install", "npm install"];
+    let mut seen_node = false;
+    out.retain(|cmd| {
+        if !node.contains(&cmd.as_str()) {
+            return true;
+        }
+        let first = !seen_node;
+        seen_node = true;
+        first
+    });
+    out
+}
+
 /// Loads settings to clone from `raw`: a repo directory containing `.wtm.toml`
 /// or a direct path to a TOML file. A leading `~` is expanded.
 pub fn load_clone_source(raw: &str) -> Result<ConfigDraft> {
@@ -767,6 +837,44 @@ mod tests {
             vec![".env", ".env.local"]
         );
         assert!(split_list("  ").is_empty());
+    }
+
+    /// Only the local-config files actually present are suggested, in the order
+    /// the candidate list declares them.
+    #[test]
+    fn suggest_copy_files_lists_what_is_there() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(suggest_copy_files(dir.path()).is_empty());
+
+        std::fs::write(dir.path().join(".env.local"), "").unwrap();
+        std::fs::write(dir.path().join(".env"), "").unwrap();
+        // Not a candidate, and a directory that happens to share a name.
+        std::fs::write(dir.path().join("README.md"), "").unwrap();
+        std::fs::create_dir(dir.path().join(".envrc")).unwrap();
+
+        assert_eq!(suggest_copy_files(dir.path()), vec![".env", ".env.local"]);
+    }
+
+    /// One install command per ecosystem: competing Node lockfiles collapse to
+    /// the most specific one, while a genuinely second ecosystem is kept.
+    #[test]
+    fn suggest_run_commands_picks_one_per_ecosystem() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(suggest_run_commands(dir.path()).is_empty());
+
+        std::fs::write(dir.path().join("package-lock.json"), "").unwrap();
+        assert_eq!(suggest_run_commands(dir.path()), vec!["npm install"]);
+
+        // pnpm outranks npm, and only one Node install is suggested.
+        std::fs::write(dir.path().join("pnpm-lock.yaml"), "").unwrap();
+        assert_eq!(suggest_run_commands(dir.path()), vec!["pnpm install"]);
+
+        // A second ecosystem alongside it is additive.
+        std::fs::write(dir.path().join("go.mod"), "").unwrap();
+        assert_eq!(
+            suggest_run_commands(dir.path()),
+            vec!["pnpm install", "go mod download"]
+        );
     }
 
     #[test]

@@ -126,7 +126,9 @@ struct BranchRenameRequest {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct WorktreeRenameRequest {
-    #[schemars(description = "current worktree name (branch name, or directory name when detached)")]
+    #[schemars(
+        description = "current worktree name (branch name, or directory name when detached)"
+    )]
     name: String,
     #[schemars(description = "new name for the worktree and its branch")]
     new_name: String,
@@ -409,9 +411,13 @@ impl WtmServer {
         &self,
         Parameters(req): Parameters<SwitchRequest>,
     ) -> Result<CallToolResult, ErrorData> {
-        let result =
-            ops::switch_branch(&self.ctx()?, &req.name, &req.branch, req.create.unwrap_or(false))
-                .map_err(internal)?;
+        let result = ops::switch_branch(
+            &self.ctx()?,
+            &req.name,
+            &req.branch,
+            req.create.unwrap_or(false),
+        )
+        .map_err(internal)?;
         json_result(&result)
     }
 

@@ -16,12 +16,12 @@ use super::app::{
     App, CheckoutCandidate, CherryTarget, CommitFocus, ConfirmOption, DiffRow, LogMode, Modal,
     ResolverFile, RowList, Tab, TextInput, View, filtered_candidates,
 };
-use super::config_editor::{
-    CHECK_ROW, ConfigEditor, FIELD_ROWS, FORM_LINES, SAVE_ROW, UPDATE_ROW,
-};
+use super::config_editor::{CHECK_ROW, ConfigEditor, FIELD_ROWS, FORM_LINES, SAVE_ROW, UPDATE_ROW};
 use super::help::{self, Binding, HelpTab};
 use super::highlight;
-use super::setup::{REVIEW_ROWS, SetupWizard, Step, location_preview};
+use super::setup::{
+    REVIEW_ROWS, SetupWizard, Step, WELCOME_OPTIONS, location_label, location_preview,
+};
 use super::theme::{self, ACCENT, BORDER, GRAPH_COLORS, SELECTION_BG};
 use crate::config::{DEFAULT_AUTO_UPDATE_CHECK, DEFAULT_LOCATION, LOCATION_PRESETS};
 use crate::conflict::{ConflictSegment, ResolutionAction};
@@ -42,6 +42,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // them, so last frame's geometry can't outlive what's on screen.
     app.tab_hits.clear();
     app.preview_list = None;
+    app.diff_path_hit = None;
     // The full-screen view's clickable list, if any.
     let list_hit = match &app.view {
         View::Log {
@@ -118,6 +119,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     &app.changes.content,
                     app.changes.loading_new,
                     app.changes.scroll,
+                    &mut app.diff_path_hit,
                 ),
                 Tab::Stash => draw_stash_tab(frame, body, app),
                 Tab::Settings => {
@@ -206,7 +208,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     // A modal overlay (confirm/prompt/hunk editor) floats over the active view.
     // Only Confirm reports its own rows; Prompt/HunkEditor have none.
-    let modal_hit = app.modal.is_some().then(|| draw_modal(frame, main, app)).flatten();
+    let modal_hit = app
+        .modal
+        .is_some()
+        .then(|| draw_modal(frame, main, app))
+        .flatten();
 
     // The help overlay sits on top of whatever view is active, so `?` works
     // everywhere and returns to where it was opened.
@@ -234,7 +240,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // rows (Confirm); other modal kinds (Prompt, HunkEditor) just suppress
     // clicks on whatever is behind them.
     if let Some(modal) = &app.modal {
-        app.row_list = matches!(modal, Modal::Confirm { .. }).then_some(modal_hit).flatten();
+        app.row_list = matches!(modal, Modal::Confirm { .. })
+            .then_some(modal_hit)
+            .flatten();
     }
 
     // The tab bar and the worktree preview only take clicks when the home view
@@ -510,7 +518,12 @@ fn draw_diff(
     content: &str,
     loading_new: bool,
     scroll: u16,
+    // `path_hit` is set to the screen rect of the diff panel's clickable path
+    // title, so a click there can copy the path, or cleared when the cursor
+    // isn't on a file.
+    path_hit: &mut Option<Rect>,
 ) -> Option<RowList> {
+    *path_hit = None;
     if files.is_empty() {
         let para = Paragraph::new(Line::from("no uncommitted changes".dim()))
             .block(panel(format!("changes · {name}")));
@@ -622,7 +635,20 @@ fn draw_diff(
             } else {
                 highlight::diff_lines(path, content)
             };
-            (format!("diff · {path}"), lines)
+            let title = format!("diff · {path}");
+            // The title doubles as a click-to-copy target for the path. `panel`
+            // draws it one cell in from the border with a space either side, so
+            // that is exactly the region to accept clicks in.
+            if !path.is_empty() {
+                *path_hit = Some(Rect {
+                    x: diff_area.x + 1,
+                    y: diff_area.y,
+                    width: (title.chars().count() as u16 + 2)
+                        .min(diff_area.width.saturating_sub(1)),
+                    height: 1,
+                });
+            }
+            (title, lines)
         }
     };
     let total = lines.len();
@@ -771,10 +797,10 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         ],
         View::Creating { .. } => &[hint("Enter", "close")],
         View::Setup(wizard) => match &wizard.step {
-            Step::CloneAsk { .. } => &[
-                hint("←/→", "choose"),
-                hint("Enter", "confirm"),
-                hint("Esc", "quit"),
+            Step::Welcome { .. } => &[
+                hint("↑/↓", "choose"),
+                hint("Enter", "continue"),
+                hint("Esc", "quit wtm"),
             ],
             Step::ClonePath { .. } => &[
                 hint("type", "a path"),
@@ -789,16 +815,17 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 hint("Esc", "back"),
             ],
             Step::Location { .. } => &[
-                hint("↑/↓", "select"),
-                hint("Enter", "confirm"),
+                hint("↑/↓", "choose"),
+                hint("Enter", "continue"),
                 hint("Esc", "back"),
             ],
             Step::LocationCustom { .. } | Step::CopyFiles { .. } => {
-                &[hint("Enter", "confirm"), hint("Esc", "back")]
+                &[hint("Enter", "continue"), hint("Esc", "back")]
             }
             Step::RunCommands { .. } => &[
                 hint("Enter", "add command"),
-                hint("blank Enter", "finish"),
+                hint("blank Enter", "continue"),
+                hint("Backspace", "undo last"),
                 hint("Esc", "back"),
             ],
             Step::Review {
@@ -806,8 +833,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             } => &[hint("Enter", "save"), hint("Esc", "cancel edit")],
             Step::Review { .. } => &[
                 hint("↑/↓", "select"),
-                hint("Enter", "edit/write"),
-                hint("Esc", "start over"),
+                hint("Enter", "edit / write"),
+                hint("Esc", "back"),
             ],
         },
     };
@@ -1088,12 +1115,7 @@ fn draw_run_command(frame: &mut Frame, area: Rect, name: &str, input: &super::ap
 
 /// The worktree rename prompt: a small centered dialog with the new name,
 /// prefilled with the current one.
-fn draw_rename_worktree(
-    frame: &mut Frame,
-    area: Rect,
-    name: &str,
-    input: &super::app::TextInput,
-) {
+fn draw_rename_worktree(frame: &mut Frame, area: Rect, name: &str, input: &super::app::TextInput) {
     let popup = centered(area, 64, 5);
     frame.render_widget(Clear, popup);
     frame.render_widget(panel(format!("rename '{name}'")), popup);
@@ -1257,16 +1279,14 @@ fn draw_error_popup(frame: &mut Frame, area: Rect, msg: &str) {
     frame.render_widget(para, popup);
 }
 
-/// Renders the current step of the first-run setup wizard.
+/// Renders the current screen of the first-run setup wizard. Every screen is a
+/// centered panel titled with its question and a `step N of M` label, and each
+/// question carries a short blurb saying why it is being asked.
 fn draw_setup(frame: &mut Frame, area: Rect, wizard: &SetupWizard) -> Option<RowList> {
-    // The same progress label ("step 2 of 5", …) titles every step so the user
-    // always knows where they are and that Esc steps back.
-    let progress = wizard.step.progress();
+    let progress = wizard.progress();
+    let progress = progress.as_str();
     match &wizard.step {
-        Step::CloneAsk { yes } => {
-            draw_clone_ask(frame, area, *yes, progress);
-            None
-        }
+        Step::Welcome { selected } => draw_welcome(frame, area, wizard, *selected, progress),
         Step::ClonePath { input } => {
             draw_clone_path(frame, area, input, progress);
             None
@@ -1277,10 +1297,14 @@ fn draw_setup(frame: &mut Frame, area: Rect, wizard: &SetupWizard) -> Option<Row
             draw_wizard_input(
                 frame,
                 area,
-                "worktree location · path",
-                input,
-                "absolute, ~/..., or relative to the repo; {repo} = repo name",
+                "Type a worktree location",
                 progress,
+                &[
+                    "An absolute path, a ~/… path, or a path relative to the repo.",
+                    "{repo} is replaced with this repo's folder name.",
+                ],
+                input,
+                "e.g. ~/code/worktrees/{repo}",
             );
             None
         }
@@ -1288,10 +1312,15 @@ fn draw_setup(frame: &mut Frame, area: Rect, wizard: &SetupWizard) -> Option<Row
             draw_wizard_input(
                 frame,
                 area,
-                "files to copy into new worktrees",
-                input,
-                "comma separated, e.g. .env, .env.local (blank for none)",
+                "Which files should be copied in?",
                 progress,
+                &[
+                    "A new worktree is a clean checkout, so anything git ignores",
+                    "(your .env, local credentials) won't be there. wtm copies the",
+                    "files listed here from this repo into every worktree it makes.",
+                ],
+                input,
+                "comma separated · leave blank to copy nothing",
             );
             None
         }
@@ -1305,39 +1334,132 @@ fn draw_setup(frame: &mut Frame, area: Rect, wizard: &SetupWizard) -> Option<Row
     }
 }
 
+/// Width every wizard panel shares, so the screens don't jump around as the
+/// user moves between them. Clamped to the terminal by `centered`.
+const WIZARD_WIDTH: u16 = 84;
+
 /// Joins a step's own title with the shared progress label for its panel.
 fn wizard_title(title: &str, progress: &str) -> String {
     format!("{title}  ·  {progress}")
 }
 
-fn draw_clone_ask(frame: &mut Frame, area: Rect, yes: bool, progress: &str) {
-    let popup = centered(area, 60, 5);
+/// Dim explanatory lines shown above a wizard question.
+fn blurb_lines(blurb: &[&str]) -> Vec<Line<'static>> {
+    blurb
+        .iter()
+        .map(|line| Line::from(line.to_string().dim()))
+        .collect()
+}
+
+/// Lays out a wizard screen: a panel whose inner area is the blurb, a blank
+/// line, then `body_height` rows for the question itself. Returns the body rect
+/// so list-based steps can render into it and report click geometry.
+fn wizard_screen(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    progress: &str,
+    blurb: &[&str],
+    body_height: u16,
+) -> Rect {
+    let blurb_height = blurb.len() as u16;
+    let gap = if blurb.is_empty() { 0 } else { 1 };
+    let popup = centered(area, WIZARD_WIDTH, blurb_height + gap + body_height + 2);
     frame.render_widget(Clear, popup);
-    let selected = Style::new().bg(SELECTION_BG).bold().fg(ACCENT);
-    let plain = Style::new();
-    let lines = vec![
-        Line::from("This repo isn't set up for wtm yet."),
-        Line::from("Clone settings from another repo?"),
-        Line::from(vec![
-            Span::styled(" yes ", if yes { selected } else { plain }),
-            Span::raw("   "),
-            Span::styled(" no ", if yes { plain } else { selected }),
-        ]),
+    let block = panel(wizard_title(title, progress));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    if !blurb.is_empty() {
+        let head = Rect {
+            height: blurb_height.min(inner.height),
+            ..inner
+        };
+        frame.render_widget(Paragraph::new(blurb_lines(blurb)), head);
+    }
+    let used = (blurb_height + gap).min(inner.height);
+    Rect {
+        y: inner.y + used,
+        height: inner.height - used,
+        ..inner
+    }
+}
+
+/// Welcome screen: what wtm does, what setup writes, and the two routes.
+fn draw_welcome(
+    frame: &mut Frame,
+    area: Rect,
+    wizard: &SetupWizard,
+    selected: usize,
+    progress: &str,
+) -> Option<RowList> {
+    let repo = wizard
+        .repo_root
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| wizard.repo_root.display().to_string());
+    let heading = format!("{repo} isn't set up for wtm yet.");
+    let blurb = [
+        heading.as_str(),
+        "",
+        "wtm gives each branch its own folder (a git worktree), so you and any",
+        "agents can work on several branches at once without stashing or",
+        "switching. Creating one is a single keypress once this is set up.",
+        "",
+        "Setup writes one file, .wtm.toml, in the repo root. It records where",
+        "those folders go and how to make a new one usable: which ignored files",
+        "to copy in and which commands to run. Nothing else is touched, and you",
+        "can change any of it later on the Settings tab.",
     ];
-    let para = Paragraph::new(lines).block(panel(wizard_title("wtm setup", progress)));
-    frame.render_widget(para, popup);
+    let body = wizard_screen(
+        frame,
+        area,
+        "Welcome to wtm",
+        progress,
+        &blurb,
+        WELCOME_OPTIONS.len() as u16,
+    );
+    let items: Vec<ListItem> = WELCOME_OPTIONS
+        .iter()
+        .enumerate()
+        .map(|(i, (label, detail))| {
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{}. ", i + 1), Style::new().dim()),
+                Span::styled(label.to_string(), Style::new().bold()),
+                Span::styled(format!("  ·  {detail}"), Style::new().dim()),
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .highlight_style(Style::new().bg(SELECTION_BG).bold())
+        .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
+    let mut state = ListState::default().with_selected(Some(selected));
+    frame.render_stateful_widget(list, body, &mut state);
+    Some(RowList {
+        inner: body,
+        header: 0,
+        offset: state.offset(),
+        len: WELCOME_OPTIONS.len(),
+    })
 }
 
 fn draw_clone_path(frame: &mut Frame, area: Rect, input: &super::app::TextInput, progress: &str) {
-    let popup = centered(area, 70, 5);
-    frame.render_widget(Clear, popup);
+    let body = wizard_screen(
+        frame,
+        area,
+        "Copy settings from where?",
+        progress,
+        &[
+            "Point at a repo that already uses wtm (or straight at a .wtm.toml)",
+            "and its answers become this repo's starting point. You get to review",
+            "and edit them before anything is written.",
+        ],
+        2,
+    );
     let lines = vec![
         prompt_line_at(input.as_str(), input.cursor),
-        Line::from("path to a repo or a .wtm.toml file".dim()),
-        Line::from("Tab opens a file browser".dim()),
+        Line::from("path to a repo or a .wtm.toml file · Tab opens a file browser".dim()),
     ];
-    let para = Paragraph::new(lines).block(panel(wizard_title("clone settings from", progress)));
-    frame.render_widget(para, popup);
+    frame.render_widget(Paragraph::new(lines), body);
 }
 
 fn draw_browser(
@@ -1347,7 +1469,7 @@ fn draw_browser(
     progress: &str,
 ) -> Option<RowList> {
     let height = (browser.entries.len() as u16 + 2).clamp(4, area.height.saturating_sub(2).max(4));
-    let popup = centered(area, 70, height);
+    let popup = centered(area, WIZARD_WIDTH, height);
     frame.render_widget(Clear, popup);
     let items: Vec<ListItem> = if browser.entries.is_empty() {
         vec![ListItem::new(Line::from(
@@ -1370,7 +1492,8 @@ fn draw_browser(
             })
             .collect()
     };
-    let block = panel(wizard_title(&browser.dir.display().to_string(), progress));
+    let block = panel(wizard_title(&browser.dir.display().to_string(), progress))
+        .title_bottom(Line::from(" pick a repo folder or a .wtm.toml ".dim()).right_aligned());
     let inner = block.inner(popup);
     let list = List::new(items)
         .block(block)
@@ -1393,56 +1516,61 @@ fn draw_location(
     selected: usize,
     progress: &str,
 ) -> Option<RowList> {
-    let popup = centered(area, 70, LOCATION_PRESETS.len() as u16 + 3);
-    frame.render_widget(Clear, popup);
+    let body = wizard_screen(
+        frame,
+        area,
+        "Where should worktree folders go?",
+        progress,
+        &[
+            "Each worktree is a real folder on disk holding one branch. Pick where",
+            "wtm should create them; the resolved path is shown for each choice.",
+        ],
+        LOCATION_PRESETS.len() as u16 + 1,
+    );
     let mut items: Vec<ListItem> = LOCATION_PRESETS
         .iter()
         .map(|(name, label)| {
             let preview = location_preview(name, &wizard.repo_root);
             ListItem::new(Line::from(vec![
-                Span::styled(format!("{label}: "), Style::new().bold()),
-                Span::styled(preview, Style::new().dim()),
+                Span::styled(label.to_string(), Style::new().bold()),
+                Span::styled(format!("  ·  {preview}"), Style::new().dim()),
             ]))
         })
         .collect();
-    items.push(ListItem::new(Line::from(Span::styled(
-        "somewhere else: type a path",
-        Style::new().bold(),
-    ))));
+    items.push(ListItem::new(Line::from(vec![
+        Span::styled("somewhere else", Style::new().bold()),
+        Span::styled("  ·  type your own path", Style::new().dim()),
+    ])));
     let len = items.len();
-    let block = panel(wizard_title("where should new worktrees go?", progress));
-    let inner = block.inner(popup);
     let list = List::new(items)
-        .block(block)
         .highlight_style(Style::new().bg(SELECTION_BG).bold())
         .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
     let mut state = ListState::default().with_selected(Some(selected));
-    frame.render_stateful_widget(list, popup, &mut state);
+    frame.render_stateful_widget(list, body, &mut state);
     Some(RowList {
-        inner,
+        inner: body,
         header: 0,
         offset: state.offset(),
         len,
     })
 }
 
-/// A single-line wizard text input with a hint underneath.
+/// A wizard screen whose body is one text input with a hint underneath.
 fn draw_wizard_input(
     frame: &mut Frame,
     area: Rect,
     title: &str,
+    progress: &str,
+    blurb: &[&str],
     input: &super::app::TextInput,
     hint: &str,
-    progress: &str,
 ) {
-    let popup = centered(area, 70, 4);
-    frame.render_widget(Clear, popup);
+    let body = wizard_screen(frame, area, title, progress, blurb, 2);
     let lines = vec![
         prompt_line_at(input.as_str(), input.cursor),
         Line::from(hint.to_string().dim()),
     ];
-    let para = Paragraph::new(lines).block(panel(wizard_title(title, progress)));
-    frame.render_widget(para, popup);
+    frame.render_widget(Paragraph::new(lines), body);
 }
 
 fn draw_run_commands(
@@ -1452,24 +1580,41 @@ fn draw_run_commands(
     input: &super::app::TextInput,
     progress: &str,
 ) {
-    let height = (commands.len() as u16 + 4).clamp(4, area.height.saturating_sub(2).max(4));
-    let popup = centered(area, 70, height);
-    frame.render_widget(Clear, popup);
+    // One row per command already added, the input line, and the hint under it.
+    let body_height = commands.len() as u16 + 2;
+    let body = wizard_screen(
+        frame,
+        area,
+        "What should run in a new worktree?",
+        progress,
+        &[
+            "Commands wtm runs inside each new worktree once it exists, in order,",
+            "so the branch is ready to work on: installing dependencies, building,",
+            "generating clients. Add them one per line.",
+        ],
+        body_height,
+    );
     let mut lines: Vec<Line> = commands
         .iter()
-        .map(|cmd| Line::from(format!("  {cmd}")))
+        .enumerate()
+        .map(|(i, cmd)| {
+            Line::from(vec![
+                Span::styled(format!("{}. ", i + 1), Style::new().dim()),
+                Span::styled(cmd.clone(), Style::new().fg(theme::SUCCESS)),
+            ])
+        })
         .collect();
     lines.push(prompt_line_at(input.as_str(), input.cursor));
+    // The footer carries Backspace-to-undo, so this only needs to explain the
+    // one non-obvious part: a blank line is how you finish.
     lines.push(Line::from(
-        "one command per line, blank Enter to finish".dim(),
+        "one per line · Enter on a blank line moves on".dim(),
     ));
-    let para = Paragraph::new(lines).block(panel(wizard_title(
-        "commands to run in each new worktree",
-        progress,
-    )));
-    frame.render_widget(para, popup);
+    frame.render_widget(Paragraph::new(lines), body);
 }
 
+/// Review screen: the three answers under plain-English labels, then the row
+/// that writes the file. Any answer can still be edited in place.
 fn draw_review(
     frame: &mut Frame,
     area: Rect,
@@ -1478,16 +1623,42 @@ fn draw_review(
     editing: Option<&super::app::TextInput>,
     progress: &str,
 ) -> Option<RowList> {
-    let popup = centered(area, 74, 8);
-    frame.render_widget(Clear, popup);
-    let value = |row: usize| -> String {
-        match row {
-            0 => wizard.draft.worktree_dir.clone(),
-            1 => wizard.draft.copy.join(", "),
-            _ => wizard.draft.run.join(", "),
-        }
-    };
-    let labels = ["worktree_dir", "setup.copy  ", "setup.run   "];
+    let none = "(none)".to_string();
+    let values = [
+        // The preset's label reads better here than the raw `sibling`/`home`
+        // keyword, but an edit still gets the raw value to work on.
+        location_label(&wizard.draft.worktree_dir).to_string(),
+        if wizard.draft.copy.is_empty() {
+            none.clone()
+        } else {
+            wizard.draft.copy.join(", ")
+        },
+        if wizard.draft.run.is_empty() {
+            none
+        } else {
+            wizard.draft.run.join(", ")
+        },
+    ];
+    // A cloned absolute path usually points at the other repo's location, so
+    // it's worth a second look before writing.
+    let warn = wizard.cloned
+        && (wizard.draft.worktree_dir.starts_with('/')
+            || wizard.draft.worktree_dir.starts_with('~'));
+    // Three field rows, a blank separator, the write row, then the resolved
+    // location and (sometimes) the warning: the line layout `on_click` decodes.
+    let body_height = 3 + 1 + 1 + 1 + u16::from(warn);
+    let body = wizard_screen(
+        frame,
+        area,
+        "Ready to write",
+        progress,
+        &[
+            "This is what goes into .wtm.toml. Enter on a row edits it; the last",
+            "row writes the file and opens the repo.",
+        ],
+        body_height,
+    );
+    let labels = ["Worktree folders", "Files to copy   ", "Commands to run "];
     let mut lines: Vec<Line> = Vec::new();
     for (row, label) in labels.iter().enumerate() {
         let highlight = if row == selected {
@@ -1495,12 +1666,12 @@ fn draw_review(
         } else {
             Style::new()
         };
-        let mut spans = vec![Span::styled(format!(" {label} "), highlight.bold())];
+        let mut spans = vec![Span::styled(format!(" {label}  "), highlight.bold())];
         match (row == selected, editing) {
             (true, Some(input)) => {
                 push_cursor_spans(&mut spans, input.as_str(), input.cursor, highlight)
             }
-            _ => spans.push(Span::styled(value(row), highlight)),
+            _ => spans.push(Span::styled(values[row].clone(), highlight)),
         }
         lines.push(Line::from(spans));
     }
@@ -1512,24 +1683,26 @@ fn draw_review(
         Style::new().bold()
     };
     lines.push(Line::from(Span::styled(
-        " [ write .wtm.toml ] ",
+        " [ Write .wtm.toml and start ] ",
         write_style,
     )));
-    // Rows are `labels.len()` field lines, a blank separator, then the write
-    // row: the same line layout `on_click`'s decode logic assumes.
     let row_lines = labels.len() as u16 + 2;
-    // A cloned absolute path usually points at the other repo's location.
-    if wizard.draft.worktree_dir.starts_with('/') || wizard.draft.worktree_dir.starts_with('~') {
-        lines.push(Line::from(
-            "check that this worktree_dir makes sense for this repo".dim(),
-        ));
+    lines.push(Line::from(
+        format!(
+            "new worktrees will land in {}",
+            location_preview(&wizard.draft.worktree_dir, &wizard.repo_root)
+        )
+        .dim(),
+    ));
+    if warn {
+        lines.push(Line::from(Span::styled(
+            "this path came from the other repo; check it suits this one",
+            Style::new().fg(theme::WARNING),
+        )));
     }
-    let block = panel(wizard_title("review settings", progress));
-    let inner = block.inner(popup);
-    let para = Paragraph::new(lines).block(block);
-    frame.render_widget(para, popup);
+    frame.render_widget(Paragraph::new(lines), body);
     Some(RowList {
-        inner,
+        inner: body,
         header: 0,
         offset: 0,
         len: row_lines as usize,
@@ -1585,7 +1758,11 @@ fn draw_settings_tab(
                     "false" => "off".to_string(),
                     _ => format!(
                         "(default: {})",
-                        if DEFAULT_AUTO_UPDATE_CHECK { "on" } else { "off" }
+                        if DEFAULT_AUTO_UPDATE_CHECK {
+                            "on"
+                        } else {
+                            "off"
+                        }
                     ),
                 },
                 highlight,
@@ -1657,8 +1834,7 @@ fn draw_settings_tab(
         Constraint::Min(0),
     ])
     .areas(inner);
-    let [_, form] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(form);
+    let [_, form] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(form);
     frame.render_widget(Paragraph::new(lines), form);
     // The line layout is shared with `config_editor::row_at_line`, which
     // `on_click` uses to turn a clicked line back into a row.
@@ -1779,8 +1955,10 @@ fn draw_stash_tab(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
     let block = panel(format!("stash · {}", app.stash_name));
     let inner = block.inner(area);
     if app.stash_entries.is_empty() {
-        let para = Paragraph::new(Line::from("no stashes — s stashes the current changes".dim()))
-            .block(block);
+        let para = Paragraph::new(Line::from(
+            "no stashes — s stashes the current changes".dim(),
+        ))
+        .block(block);
         frame.render_widget(para, area);
         return None;
     }
@@ -2905,10 +3083,8 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 
 #[cfg(test)]
 mod tests {
+    use super::super::config_editor::{CHECK_LINE, PREVIEW_LINE, SAVE_LINE, VERSION_LINE};
     use super::*;
-    use super::super::config_editor::{
-        CHECK_LINE, PREVIEW_LINE, SAVE_LINE, VERSION_LINE,
-    };
     use crate::git::LogEntry;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;

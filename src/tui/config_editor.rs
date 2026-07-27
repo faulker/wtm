@@ -191,9 +191,7 @@ impl ConfigEditor {
             KeyCode::Enter | KeyCode::Char(' ') if self.selected == UPDATE_ROW => {
                 self.cycle_auto_update_check()
             }
-            KeyCode::Enter => {
-                self.editing = Some(TextInput::with_value(self.field(self.selected)))
-            }
+            KeyCode::Enter => self.editing = Some(TextInput::with_value(self.field(self.selected))),
             _ => {}
         }
         EditorOutcome::Continue
@@ -243,11 +241,17 @@ mod tests {
         ed.selected = UPDATE_ROW;
         press(&mut ed, KeyCode::Enter);
         assert_eq!(ed.fields.auto_update_check, "true");
-        assert!(ed.editing.is_none(), "the toggle must not open a text input");
+        assert!(
+            ed.editing.is_none(),
+            "the toggle must not open a text input"
+        );
         press(&mut ed, KeyCode::Char(' '));
         assert_eq!(ed.fields.auto_update_check, "false");
         press(&mut ed, KeyCode::Enter);
-        assert_eq!(ed.fields.auto_update_check, "", "cycles back to the default");
+        assert_eq!(
+            ed.fields.auto_update_check, "",
+            "cycles back to the default"
+        );
     }
 
     #[test]

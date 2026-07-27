@@ -10,6 +10,7 @@ mod git;
 mod mcp;
 mod ops;
 mod output;
+mod platform;
 mod settings;
 mod tui;
 mod update;

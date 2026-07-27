@@ -1,7 +1,7 @@
 //! Core worktree operations shared by the CLI, TUI, and MCP server.
 
-use std::io::{BufRead, BufReader, Write};
 use std::collections::HashSet;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::mpsc::channel;
@@ -2471,7 +2471,10 @@ mod tests {
         git(&merged_wt, &["add", "f.txt"]);
         git(&merged_wt, &["commit", "-m", "merged work"]);
         // This merge advances main past stale-branch's tip.
-        git(&ctx.repo_root, &["merge", "--no-ff", "-m", "merge", "merged-branch"]);
+        git(
+            &ctx.repo_root,
+            &["merge", "--no-ff", "-m", "merge", "merged-branch"],
+        );
         // A brand-new branch off the advanced main, with no work of its own.
         make_worktree(&ctx, "fresh-branch");
         // A branch with its own commit not in main: not merged.
@@ -2482,7 +2485,10 @@ mod tests {
 
         let infos = list(&ctx).unwrap();
         let merged = |name: &str| infos.iter().find(|i| i.name == name).unwrap().merged;
-        assert!(merged("merged-branch"), "branch merged into main is flagged");
+        assert!(
+            merged("merged-branch"),
+            "branch merged into main is flagged"
+        );
         assert!(!merged("fresh-branch"), "brand-new branch is not merged");
         assert!(
             !merged("stale-branch"),
@@ -2503,11 +2509,21 @@ mod tests {
         std::fs::write(merged_wt.join("f.txt"), "x\n").unwrap();
         git(&merged_wt, &["add", "f.txt"]);
         git(&merged_wt, &["commit", "-m", "merged work"]);
-        git(&ctx.repo_root, &["merge", "--no-ff", "-m", "merge", "merged-branch"]);
+        git(
+            &ctx.repo_root,
+            &["merge", "--no-ff", "-m", "merge", "merged-branch"],
+        );
         make_worktree(&ctx, "fresh-branch");
 
         let result = branch_list(&ctx).unwrap();
-        let merged = |name: &str| result.branches.iter().find(|b| b.name == name).unwrap().merged;
+        let merged = |name: &str| {
+            result
+                .branches
+                .iter()
+                .find(|b| b.name == name)
+                .unwrap()
+                .merged
+        };
         assert!(merged("merged-branch"), "merged branch is flagged");
         assert!(!merged("fresh-branch"), "brand-new branch is not");
         assert!(!merged("main"), "the default branch is never flagged");
@@ -2567,7 +2583,10 @@ mod tests {
         assert!(!git::branch_exists(&ctx.repo_root, "feature"));
         assert!(git::branch_exists(&ctx.repo_root, "renamed"));
         assert!(!old_path.exists(), "old directory moved");
-        assert!(PathBuf::from(&result.new_path).exists(), "new directory present");
+        assert!(
+            PathBuf::from(&result.new_path).exists(),
+            "new directory present"
+        );
 
         // It is addressable by the new name and reports the renamed branch.
         let info = find(&ctx, "renamed").unwrap().unwrap();

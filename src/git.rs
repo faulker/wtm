@@ -173,7 +173,9 @@ pub fn remote_branches(dir: &Path) -> Result<Vec<(String, String)>> {
     Ok(out
         .lines()
         .filter(|l| !l.is_empty() && !l.ends_with("/HEAD"))
-        .filter_map(|full| remote_short_name(full).map(|branch| (branch.to_string(), full.to_string())))
+        .filter_map(|full| {
+            remote_short_name(full).map(|branch| (branch.to_string(), full.to_string()))
+        })
         .collect())
 }
 
@@ -822,7 +824,10 @@ pub fn ref_details(dir: &Path, pattern: &str) -> Result<Vec<BranchDetail>> {
     // Fields are separated by 0x1f so subjects containing spaces stay intact.
     let format = "--format=%(refname:short)\u{1f}%(upstream:short)\u{1f}\
                   %(upstream:track)\u{1f}%(contents:subject)\u{1f}%(committerdate:relative)";
-    let out = run(dir, &["for-each-ref", "--sort=-committerdate", format, pattern])?;
+    let out = run(
+        dir,
+        &["for-each-ref", "--sort=-committerdate", format, pattern],
+    )?;
     Ok(parse_branch_details(&out))
 }
 
@@ -1270,7 +1275,9 @@ mod tests {
         assert!(!repo.join("tracked.txt").exists());
         let status = status(&repo).unwrap();
         assert!(
-            status.iter().any(|e| e.path == "tracked.txt" && e.code.starts_with('D')),
+            status
+                .iter()
+                .any(|e| e.path == "tracked.txt" && e.code.starts_with('D')),
             "expected staged deletion, got {status:?}"
         );
     }

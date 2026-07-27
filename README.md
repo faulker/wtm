@@ -38,7 +38,9 @@ cp target/release/wtm ~/.local/bin/
 Every repo must be initialized before worktree commands work: until a `.wtm.toml` exists in the repo root, `create`, `list`, and friends refuse with a pointer to `wtm init` (MCP tool calls report the same error). There are two ways to initialize:
 
 - **`wtm init`**: a guided wizard in the terminal. It first offers to clone settings from another repo (give a path to the repo or its `.wtm.toml`), otherwise it asks where worktrees should go and what setup each new one needs, then writes `.wtm.toml`.
-- **run `wtm` with no arguments**: in an uninitialized repo the TUI opens straight into a setup wizard. It starts with the same clone question; press `Tab` on the path prompt to pick the source with a file browser instead of typing. Both routes end on a review screen where you can still edit every setting before the file is written.
+- **run `wtm` with no arguments**: in an uninitialized repo the TUI opens straight into a setup wizard. It opens on a welcome screen explaining what worktrees are for and what the one file it writes contains, then offers two routes: answer three questions, or copy the settings from a repo that already uses wtm (press `Tab` on the path prompt to pick the source with a file browser instead of typing).
+
+  The three questions are where worktree folders should live (each choice shows the path it resolves to), which files to copy into them, and what to run once they exist. The last two arrive **pre-filled from your repo**: a `.env` sitting in the root is suggested for copying, and a lockfile (`pnpm-lock.yaml`, `package-lock.json`, `uv.lock`, `Gemfile.lock`, `go.mod`, and friends) suggests the matching install command. Every screen says why it's asking, `Esc` steps back exactly one screen keeping your answers, and both routes end on a review screen where you can still edit everything before the file is written.
 
 ```sh
 wtm init
@@ -198,7 +200,7 @@ Run `wtm` inside a repo. If the repo isn't initialized yet, the setup wizard ope
 
 ![The Changes tab: changed files grouped into a folder tree on the left, the selected file's syntax-highlighted diff on the right with added lines tinted green and removed lines red](docs/images/tui-changes.png)
 
-`Enter` on a worktree opens the Changes tab. Files are grouped under their folders on the left (`[x]`/`[ ]`/`[~]` shows how much of a folder is marked), and the selected file's diff is syntax-highlighted on the right. From here you can mark files with `Space`, commit them with `c`, stash one or all of them, undo a file, or add it to `.gitignore`.
+`Enter` on a worktree opens the Changes tab. Files are grouped under their folders on the left (`[x]`/`[ ]`/`[~]` shows how much of a folder is marked), and the selected file's diff is syntax-highlighted on the right. From here you can mark files with `Space`, commit them with `c`, stash one or all of them, undo a file, or add it to `.gitignore`. `Enter` (or a double click) on a file opens it in whatever app your OS opens that file type with, and clicking the path in the diff panel's title copies it to the clipboard.
 
 ![The commit dialog over the worktree list: a checklist of the five changed files, all ticked, with a typed commit message underneath](docs/images/tui-commit.png)
 
@@ -224,7 +226,7 @@ The Branches tab shows every branch, where each one is checked out, and which ha
 | --- | --- |
 | `↑`/`↓` or `j`/`k` | select worktree (the mouse wheel over the table does the same) |
 | `⇧↑`/`⇧↓` | scroll the changed-file panel below the table, which lists every changed file of the selected worktree. The wheel scrolls it too when the pointer is over it, and clicking a file opens it on the Changes tab |
-| `Enter` | jump to the **Changes tab** for the selected worktree: the left panel groups changed files under their folders (a folder shows `[x]`/`[ ]`/`[~]` for all/none/some of its files marked); pick a file to see its **syntax-highlighted diff** on the right, with added/removed lines tinted green/red. Diffs load in the background, so switching files never freezes the UI. `←`/`→` (or `h`/`l`) **collapse/expand** the folder under the cursor (`Enter` toggles it; `←` on a file jumps to its parent folder). `t` switches the file list between the folder tree and a flat path list. The **mouse wheel** scrolls whichever panel it's over — the file list moves the cursor, the diff panel scrolls the text — and clicking a row selects it. `Space` marks/unmarks the file, or the whole folder when the cursor is on a folder row; `s` stashes just the highlighted file, `⇧S` stashes every marked (`[x]`) file, `u` undoes (reverts) the highlighted file to its last committed state (a brand-new file has no committed version to revert to, so it says so and points you at delete instead), `d` deletes the highlighted file from the worktree, `c` commits the marked files, `i` adds the file or folder to `.gitignore` (choose the exact path or a glob that ignores everything like it), `?` shows help. New files inside brand-new folders are listed too, so you can view their contents. Updates live as files change; `r` refreshes now |
+| `Enter` | jump to the **Changes tab** for the selected worktree: the left panel groups changed files under their folders (a folder shows `[x]`/`[ ]`/`[~]` for all/none/some of its files marked); pick a file to see its **syntax-highlighted diff** on the right, with added/removed lines tinted green/red. Diffs load in the background, so switching files never freezes the UI. `←`/`→` (or `h`/`l`) **collapse/expand** the folder under the cursor (`←` on a file jumps to its parent folder). `Enter` toggles a folder row, and on a file row **opens the file** in the OS default application for its type; **double-clicking** a row does the same. `t` switches the file list between the folder tree and a flat path list. The **mouse wheel** scrolls whichever panel it's over — the file list moves the cursor, the diff panel scrolls the text — and clicking a row selects it. Clicking the **file path in the diff panel's title** copies that path to the clipboard. `Space` marks/unmarks the file, or the whole folder when the cursor is on a folder row; `s` stashes just the highlighted file, `⇧S` stashes every marked (`[x]`) file, `u` undoes (reverts) the highlighted file to its last committed state (a brand-new file has no committed version to revert to, so it says so and points you at delete instead), `d` deletes the highlighted file from the worktree, `c` commits the marked files, `i` adds the file or folder to `.gitignore` (choose the exact path or a glob that ignores everything like it), `?` shows help. New files inside brand-new folders are listed too, so you can view their contents. Updates live as files change; `r` refreshes now |
 | `n` | new **worktree**. The top row creates a **new branch** (named as you type) branched off a base branch — press `Tab` to choose the base (defaults to the main branch). The rows below **check out an existing branch**: local branches plus **remote-only branches** (a teammate's work, shown with their `origin/…` ref) which check out into a local tracking branch. Typing **filters** that list while also naming the new branch, so you can search a long branch list. To make a branch *without* a worktree, use the branch browser (`b`) instead. If the target folder already exists you're asked to open it (when it's already a worktree), replace it, or cancel |
 | `d` | delete the selected worktree: choose folder-only (keeps the branch) or folder + branch. If the worktree has uncommitted changes you're asked to stash them (keeping the work) or discard them. If the branch can't be safely deleted (not fully merged, or checked out in another worktree) you're offered a force delete; forcing a branch that's checked out elsewhere first switches that worktree to the repo's default branch |
 | `c` | commit the selected worktree: tick which changed files to include (all selected by default; `Tab` switches between the file list and the message, `Space` toggles a file), type a message, `Enter` commits |
@@ -313,9 +315,20 @@ src/settings.rs wtm config and wtm init commands
 src/ops.rs      core operations shared by CLI, TUI, and MCP
 src/conflict.rs conflict-marker parsing and hunk resolution (ours/theirs/both)
 src/update.rs   GitHub release check and self-update
+src/platform.rs opening files in the OS default app, system clipboard
 src/cli.rs      clap definitions
 src/output.rs   human vs JSON rendering
 src/tui/        ratatui app (state, rendering, event loop)
 src/mcp.rs      MCP stdio server (rmcp)
 tests/          end-to-end tests against throwaway git repos
 ```
+
+## Releasing
+
+Pushing a `v*` tag (or running the Release workflow with a bump type) builds,
+tests, and publishes all four binaries with a SHA-256 checksum file.
+
+The macOS binaries are codesigned, and notarized, when the Apple secrets are
+configured on the repository; without them the release still goes out, just
+unsigned. See [docs/macos-signing.md](docs/macos-signing.md) for which
+certificate to get and which secrets to set.

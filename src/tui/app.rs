@@ -14,11 +14,12 @@ use ratatui::text::{Line, Span};
 
 use super::config_editor::{self, ConfigEditor, EditorOutcome};
 use super::help::HelpTab;
-use super::theme;
 use super::setup::{self, SetupWizard, WizardOutcome};
+use super::theme;
 use crate::conflict::{self, ConflictSegment, ResolutionAction};
 use crate::git::{self, GraphLine, LogEntry, StashEntry, StatusEntry};
 use crate::ops::{self, BranchListItem, ConflictFile, Ctx, SetupControl, WorktreeInfo};
+use crate::platform;
 use crate::settings::ConfigDraft;
 use crate::update::{self, CheckOutcome, Release};
 
@@ -338,8 +339,13 @@ impl ConfirmOption {
     /// This is enforced here rather than at each call site so a new destructive
     /// option can't reintroduce the collision by forgetting to uppercase.
     pub fn shortcut(&self) -> Option<char> {
-        self.key
-            .map(|c| if self.destructive { c.to_ascii_uppercase() } else { c })
+        self.key.map(|c| {
+            if self.destructive {
+                c.to_ascii_uppercase()
+            } else {
+                c
+            }
+        })
     }
 }
 
@@ -830,8 +836,8 @@ pub fn build_diff_rows(files: &[StatusEntry], collapsed: &HashSet<String>) -> Ve
         stack.truncate(common);
         // True once any folder on the stack is collapsed: everything deeper
         // (subfolders and files) stays hidden until the stack pops above it.
-        let mut hidden = (1..=stack.len())
-            .any(|k| collapsed.contains(&format!("{}/", stack[..k].join("/"))));
+        let mut hidden =
+            (1..=stack.len()).any(|k| collapsed.contains(&format!("{}/", stack[..k].join("/"))));
         for d in &dirs[common..] {
             stack.push((*d).to_string());
             if hidden {
@@ -986,6 +992,13 @@ pub struct RowList {
     pub len: usize,
 }
 
+/// Whether a click at `col`/`row` landed inside `rect`. Used for the click
+/// targets the renderer records as bare rects (tab labels, the diff panel's path
+/// title) rather than as a `RowList`.
+fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
+    col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+}
+
 impl RowList {
     /// Whether (`col`, `row`) is anywhere inside the list's content rect,
     /// chrome rows included. Used to route the wheel to the panel under the
@@ -1122,6 +1135,14 @@ pub struct App {
     /// renderer so a click on one selects that tab. Empty when the bar is not
     /// on screen or something (modal, help, error) covers it.
     pub tab_hits: Vec<(Rect, Tab)>,
+    /// Screen rect of the Changes tab's diff-panel path title, recorded by the
+    /// renderer so a click there copies the path. `None` unless a file's diff is
+    /// on screen.
+    pub diff_path_hit: Option<Rect>,
+    /// Column, row and time of the last left click, so a second click on the
+    /// same cell soon after counts as a double click. Cleared once consumed, so
+    /// three clicks are one double click plus a single, not two doubles.
+    last_click: Option<(u16, u16, Instant)>,
     /// One-line status shown in the header. Auto-clears after a few seconds
     /// so it doesn't linger over the key hints.
     pub message: Option<String>,
@@ -1221,6 +1242,8 @@ impl App {
             modal: None,
             row_list: None,
             tab_hits: Vec::new(),
+            diff_path_hit: None,
+            last_click: None,
             message: None,
             message_at: None,
             message_shown: None,
@@ -1895,8 +1918,7 @@ impl App {
                     None
                 }
                 KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                    if let Some(next) =
-                        (*selected + 1..options.len()).find(|&i| options[i].enabled)
+                    if let Some(next) = (*selected + 1..options.len()).find(|&i| options[i].enabled)
                     {
                         *selected = next;
                     } else if key.code == KeyCode::Tab {
@@ -1962,9 +1984,7 @@ impl App {
                     // Open the existing worktree.
                     0 => match existing_name {
                         Some(name) => self.open_changes_tab(name),
-                        None => {
-                            self.message = Some("that directory is not a worktree".to_string())
-                        }
+                        None => self.message = Some("that directory is not a worktree".to_string()),
                     },
                     // Replace: only stop to confirm when it holds real work.
                     1 => match ops::target_has_changes(&self.ctx, Path::new(&path)) {
@@ -2121,10 +2141,7 @@ impl App {
         } else {
             ("just this file", "all files like it")
         };
-        let body = vec![
-            Line::from("add to .gitignore:"),
-            Line::from(""),
-        ];
+        let body = vec![Line::from("add to .gitignore:"), Line::from("")];
         let options = vec![
             ConfirmOption::new(format!("{exact}: {file}")),
             ConfirmOption::new(format!("{glob}: {pattern}")),
@@ -2179,12 +2196,7 @@ impl App {
     }
 
     /// Confirmation shown when replacing a directory would discard real work.
-    fn open_confirm_replace_changes(
-        &mut self,
-        branch: String,
-        base: Option<String>,
-        path: String,
-    ) {
+    fn open_confirm_replace_changes(&mut self, branch: String, base: Option<String>, path: String) {
         let body = vec![
             Line::from(vec![
                 Span::raw("the worktree at "),
@@ -2531,8 +2543,7 @@ impl App {
                     if wt.is_main {
                         self.message = Some("cannot remove the main worktree".to_string());
                     } else {
-                        let (name, dirty, branch) =
-                            (wt.name.clone(), wt.dirty, wt.branch.clone());
+                        let (name, dirty, branch) = (wt.name.clone(), wt.dirty, wt.branch.clone());
                         self.open_delete_modal(name, dirty, branch);
                     }
                 }
@@ -2574,11 +2585,7 @@ impl App {
                     r.old_name, r.new_name
                 ));
                 self.refresh();
-                if let Some(idx) = self
-                    .worktrees
-                    .iter()
-                    .position(|w| w.name == r.new_name)
-                {
+                if let Some(idx) = self.worktrees.iter().position(|w| w.name == r.new_name) {
                     self.selected = idx;
                 }
             }
@@ -2629,7 +2636,8 @@ impl App {
             expanded |= self.collapsed_folders.remove(&prefix);
         }
         if expanded {
-            self.changes.rows = build_rows(&self.changes.files, self.file_tree, &self.collapsed_folders);
+            self.changes.rows =
+                build_rows(&self.changes.files, self.file_tree, &self.collapsed_folders);
         }
         let Some(row) = self
             .changes
@@ -2729,7 +2737,13 @@ impl App {
         // must not move that view's cursor.
         if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
             if !self.show_help {
+                let double = self.take_double_click(mouse.column, mouse.row);
                 self.on_click(mouse.column, mouse.row);
+                // The first click of the pair has already moved the cursor onto
+                // the row, so the second one acts on whatever is selected now.
+                if double {
+                    self.on_double_click();
+                }
             }
             return;
         }
@@ -2824,6 +2838,88 @@ impl App {
         }
     }
 
+    /// How close together two clicks on the same cell have to be to count as a
+    /// double click. Generous enough for a deliberate double click without
+    /// turning two unrelated clicks on one row into one.
+    const DOUBLE_CLICK: Duration = Duration::from_millis(450);
+
+    /// Whether this click completes a double click on the same cell, consuming
+    /// the pair so a third click starts over.
+    fn take_double_click(&mut self, col: u16, row: u16) -> bool {
+        let now = Instant::now();
+        let double = self
+            .last_click
+            .is_some_and(|(c, r, at)| c == col && r == row && now - at < Self::DOUBLE_CLICK);
+        self.last_click = if double { None } else { Some((col, row, now)) };
+        double
+    }
+
+    /// A double click activates whatever the cursor now sits on: on the Changes
+    /// tab that opens the file (or expands the folder), matching Enter.
+    fn on_double_click(&mut self) {
+        if matches!(self.view, View::List) && self.tab == Tab::Changes {
+            self.activate_changes_row();
+        }
+    }
+
+    /// Enter (or a double click) on a Changes-tab row: a folder row toggles
+    /// open/closed, a file row hands the file to the OS's default application.
+    fn activate_changes_row(&mut self) {
+        let c = &self.changes;
+        if matches!(c.rows.get(c.selected), Some(DiffRow::Folder { .. })) {
+            self.tree_nav(KeyCode::Enter);
+            return;
+        }
+        self.open_selected_file();
+    }
+
+    /// Opens the changed file under the cursor with the OS default application
+    /// for its type. The worktree's own copy is opened, not the main repo's.
+    fn open_selected_file(&mut self) {
+        let c = &self.changes;
+        let Some(rel) = current_file_index(&c.rows, c.selected)
+            .and_then(|i| c.files.get(i))
+            .map(|f| f.path.clone())
+        else {
+            return;
+        };
+        let name = c.name.clone();
+        let root = match ops::path(&self.ctx, &name) {
+            Ok(root) => root,
+            Err(e) => {
+                self.set_error(format!("{e:#}"));
+                return;
+            }
+        };
+        let full = Path::new(&root).join(&rel);
+        // A deleted file has nothing left to open; say so rather than letting the
+        // OS handler fail with its own wording.
+        if !full.exists() {
+            self.message = Some(format!("'{rel}' no longer exists in the worktree"));
+            return;
+        }
+        match platform::open_path(&full) {
+            Ok(()) => self.message = Some(format!("opened '{rel}'")),
+            Err(e) => self.set_error(format!("cannot open '{rel}': {e:#}")),
+        }
+    }
+
+    /// Copies the path shown in the diff panel's title to the system clipboard.
+    /// Relative to the worktree root, which is what a path is useful as here.
+    fn copy_diff_path(&mut self) {
+        let c = &self.changes;
+        let Some(path) = current_file_index(&c.rows, c.selected)
+            .and_then(|i| c.files.get(i))
+            .map(|f| f.path.clone())
+        else {
+            return;
+        };
+        match platform::copy_to_clipboard(&path) {
+            Ok(()) => self.message = Some(format!("copied '{path}' to the clipboard")),
+            Err(e) => self.set_error(format!("cannot copy to the clipboard: {e:#}")),
+        }
+    }
+
     /// Selects the list row under a left click, if one landed on the active
     /// view's clickable list. Loads the diff for a newly selected file so a
     /// click behaves exactly like arrowing onto the row.
@@ -2833,12 +2929,22 @@ impl App {
         if let Some((_, tab)) = self
             .tab_hits
             .iter()
-            .find(|(rect, _)| {
-                col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
-            })
+            .find(|(rect, _)| rect_contains(*rect, col, row))
             .copied()
         {
             self.select_tab(tab);
+            return;
+        }
+        // The diff panel's path title is click-to-copy. Resolved before the row
+        // lists because it sits on a panel border, not in any of them.
+        if self
+            .diff_path_hit
+            .is_some_and(|rect| rect_contains(rect, col, row))
+        {
+            self.copy_diff_path();
+            // Don't let the same click also register as half of a double click on
+            // the title, which would then try to open the file.
+            self.last_click = None;
             return;
         }
         // A click on a changed file in the Worktrees tab's preview opens that
@@ -2985,6 +3091,11 @@ impl App {
             // depends on which step (and, for Review, whether it's mid-edit)
             // is currently on screen.
             View::Setup(ref mut wizard) => match &mut wizard.step {
+                setup::Step::Welcome { selected } => {
+                    if idx < setup::WELCOME_OPTIONS.len() {
+                        *selected = idx;
+                    }
+                }
                 setup::Step::Location { selected } => *selected = idx,
                 setup::Step::CloneBrowse { browser, .. } => {
                     if idx < browser.entries.len() {
@@ -3053,12 +3164,9 @@ impl App {
             KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
                 self.tree_nav(key.code)
             }
-            KeyCode::Enter => {
-                // Enter toggles a folder; on a file row it does nothing.
-                if matches!(rows.get(*selected), Some(DiffRow::Folder { .. })) {
-                    self.tree_nav(key.code);
-                }
-            }
+            // Enter toggles a folder and opens a file with the OS default
+            // application, the same as double-clicking the row.
+            KeyCode::Enter => self.activate_changes_row(),
             KeyCode::Char(' ') => match rows.get(*selected) {
                 // On a file row, toggle just that file.
                 Some(DiffRow::File { index, .. }) => {
@@ -3102,8 +3210,7 @@ impl App {
             // `u` undoes local changes to the file. `R` is reserved for rename
             // everywhere, so revert is not bound to it here.
             KeyCode::Char('u') => {
-                let entry =
-                    current_file_index(rows, *selected).and_then(|i| files.get(i).cloned());
+                let entry = current_file_index(rows, *selected).and_then(|i| files.get(i).cloned());
                 match entry {
                     // A newly added file has no committed version to restore, so
                     // revert can't do anything; point the user at delete instead.
@@ -3118,8 +3225,8 @@ impl App {
                 }
             }
             KeyCode::Char('d') => {
-                let path =
-                    current_file_index(rows, *selected).and_then(|i| files.get(i).map(|f| f.path.clone()));
+                let path = current_file_index(rows, *selected)
+                    .and_then(|i| files.get(i).map(|f| f.path.clone()));
                 if let Some(path) = path {
                     self.open_delete_file_modal(path);
                 }
@@ -3160,8 +3267,9 @@ impl App {
         *rows = build_rows(files, tree, &self.collapsed_folders);
         *selected = path
             .and_then(|p| {
-                rows.iter()
-                    .position(|r| matches!(r, DiffRow::File { index, .. } if files[*index].path == p))
+                rows.iter().position(
+                    |r| matches!(r, DiffRow::File { index, .. } if files[*index].path == p),
+                )
             })
             .unwrap_or(0);
         self.load_diff_content(true);
@@ -3221,9 +3329,12 @@ impl App {
                     collapsed: false, ..
                 }),
             ) => Nav::Into,
-            (KeyCode::Enter, Some(DiffRow::Folder {
-                prefix, collapsed, ..
-            })) => {
+            (
+                KeyCode::Enter,
+                Some(DiffRow::Folder {
+                    prefix, collapsed, ..
+                }),
+            ) => {
                 if *collapsed {
                     Nav::Expand(prefix.clone())
                 } else {
@@ -3241,9 +3352,7 @@ impl App {
                 // Keep the cursor on the folder that was toggled.
                 *selected = rows
                     .iter()
-                    .position(
-                        |r| matches!(r, DiffRow::Folder { prefix: p, .. } if *p == prefix),
-                    )
+                    .position(|r| matches!(r, DiffRow::Folder { prefix: p, .. } if *p == prefix))
                     .unwrap_or(0);
             }
             // ← on a file or collapsed folder: jump to the nearest folder row
@@ -3661,13 +3770,11 @@ impl App {
         let name = wt.name.clone();
         match self.ctx.config.open_command.clone() {
             Some(cmd) if !cmd.trim().is_empty() => self.spawn_in_dir(cmd.trim(), &path, &name),
-            _ => {
-                self.push_screen(View::RunCommand {
-                    name,
-                    path,
-                    input: TextInput::default(),
-                })
-            }
+            _ => self.push_screen(View::RunCommand {
+                name,
+                path,
+                input: TextInput::default(),
+            }),
         }
     }
 
@@ -5142,10 +5249,7 @@ impl App {
     /// Key handling for the read-only commit browser: navigate files, scroll the
     /// diff, toggle tree/flat, or go back to where it was opened from.
     fn on_commit_diff_key(&mut self, key: KeyEvent) {
-        let View::CommitDiff {
-            rows, selected, ..
-        } = &mut self.view
-        else {
+        let View::CommitDiff { rows, selected, .. } = &mut self.view else {
             return;
         };
         // Scroll the diff pane (same modifiers as the changes view).
@@ -5208,9 +5312,9 @@ impl App {
             *rows = build_rows(files, tree, &self.collapsed_folders);
             *selected = path
                 .and_then(|p| {
-                    rows.iter().position(|r| {
-                        matches!(r, DiffRow::File { index, .. } if files[*index].path == p)
-                    })
+                    rows.iter().position(
+                        |r| matches!(r, DiffRow::File { index, .. } if files[*index].path == p),
+                    )
                 })
                 .unwrap_or(0);
         }
@@ -5593,10 +5697,7 @@ impl App {
             }
             Ok(ops::DeleteBranchOutcome::CheckedOutElsewhere(other)) => {
                 self.refresh();
-                self.open_force_branch_modal(
-                    branch,
-                    ForceBranchReason::CheckedOutElsewhere(other),
-                );
+                self.open_force_branch_modal(branch, ForceBranchReason::CheckedOutElsewhere(other));
             }
             Err(e) => {
                 self.set_error(format!("{e:#}"));
@@ -5767,10 +5868,7 @@ mod tests {
                 settle_diff(app);
                 return;
             }
-            assert!(
-                c.selected + 1 < c.rows.len(),
-                "{path} not in the diff list"
-            );
+            assert!(c.selected + 1 < c.rows.len(), "{path} not in the diff list");
             press(app, KeyCode::Down);
         }
     }
@@ -6105,10 +6203,7 @@ mod tests {
         // The only change is the untracked `.wtm.toml`, so the cursor sits on a
         // brand-new file. Undo has nothing to restore to.
         press(&mut app, KeyCode::Char('u'));
-        assert!(
-            app.modal.is_none(),
-            "undo must not prompt for a new file"
-        );
+        assert!(app.modal.is_none(), "undo must not prompt for a new file");
         assert_eq!(app.tab, Tab::Changes);
         let msg = app.message.as_deref().unwrap();
         assert!(msg.contains("new") && msg.contains("delete"), "got: {msg}");
@@ -6810,8 +6905,9 @@ mod tests {
             View::Setup(wizard) => {
                 assert!(matches!(
                     wizard.step,
-                    super::setup::Step::CloneAsk { yes: false }
+                    super::setup::Step::Welcome { selected: 0 }
                 ));
+                assert_eq!(wizard.progress(), "welcome");
             }
             _ => panic!("expected the setup wizard"),
         }
@@ -6822,11 +6918,13 @@ mod tests {
     #[test]
     fn setup_manual_flow_writes_config_and_enters_list() {
         let (_tmp, mut app) = test_app_uninitialized();
-        // Decline cloning, pick "inside" (second preset), copy .env, no
-        // commands, then confirm on the review screen.
-        press(&mut app, KeyCode::Char('n'));
+        // Take the "set up this repo" route, pick "inside" (second preset), copy
+        // .env, no commands, then confirm on the review screen.
+        press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Enter);
+        // The copy question arrives pre-filled from the repo (nothing detected in
+        // the test repo), so the answer is typed from scratch.
         type_str(&mut app, ".env");
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Enter); // blank command list -> review
@@ -6835,6 +6933,7 @@ mod tests {
                 assert!(matches!(wizard.step, super::setup::Step::Review { .. }));
                 assert_eq!(wizard.draft.worktree_dir, "inside");
                 assert_eq!(wizard.draft.copy, vec![".env"]);
+                assert_eq!(wizard.progress(), "step 4 of 4");
             }
             _ => panic!("expected the review step"),
         }
@@ -6861,8 +6960,8 @@ mod tests {
         )
         .unwrap();
 
-        // yes -> type the source repo path -> review shows the cloned draft.
-        press(&mut app, KeyCode::Char('y'));
+        // Clone route -> type the source repo path -> review shows the draft.
+        press(&mut app, KeyCode::Char('2'));
         type_str(&mut app, source.to_str().unwrap());
         press(&mut app, KeyCode::Enter);
         match &app.view {
@@ -6870,6 +6969,9 @@ mod tests {
                 assert!(matches!(wizard.step, super::setup::Step::Review { .. }));
                 assert_eq!(wizard.draft.worktree_dir, "home");
                 assert_eq!(wizard.draft.copy, vec![".env"]);
+                // The clone route is two screens, not four.
+                assert!(wizard.cloned);
+                assert_eq!(wizard.progress(), "step 2 of 2");
             }
             _ => panic!("expected the review step, message: {:?}", app.message),
         }
@@ -6892,10 +6994,187 @@ mod tests {
         assert!(text.contains(".env"), "{text}");
     }
 
+    /// The questions arrive pre-answered from what's in the repo: a `.env` on
+    /// disk for the copy list, `package-lock.json` for the setup command. Both
+    /// are just pre-filled text the user can edit or clear.
+    #[test]
+    fn setup_prefills_answers_detected_in_the_repo() {
+        let (_tmp, mut app) = test_app_uninitialized();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join(".env"), "TOKEN=1\n").unwrap();
+        std::fs::write(root.join("package-lock.json"), "{}\n").unwrap();
+
+        press(&mut app, KeyCode::Enter); // set this repo up
+        press(&mut app, KeyCode::Enter); // first location preset
+        match &app.view {
+            View::Setup(wizard) => match &wizard.step {
+                super::setup::Step::CopyFiles { input } => assert_eq!(input.as_str(), ".env"),
+                _ => panic!("expected the copy-files question"),
+            },
+            _ => panic!("expected the wizard"),
+        }
+        press(&mut app, KeyCode::Enter); // accept the detected copy list
+        match &app.view {
+            View::Setup(wizard) => match &wizard.step {
+                super::setup::Step::RunCommands { commands, input } => {
+                    assert!(commands.is_empty(), "the only suggestion sits in the input");
+                    assert_eq!(input.as_str(), "npm install");
+                }
+                _ => panic!("expected the commands question"),
+            },
+            _ => panic!("expected the wizard"),
+        }
+        press(&mut app, KeyCode::Enter); // accept `npm install`
+        press(&mut app, KeyCode::Enter); // blank line -> review
+        match &app.view {
+            View::Setup(wizard) => {
+                assert_eq!(wizard.draft.copy, vec![".env"]);
+                assert_eq!(wizard.draft.run, vec!["npm install"]);
+            }
+            _ => panic!("expected the review step"),
+        }
+    }
+
+    /// Backspace on a blank command line takes the previous command back into
+    /// the input, so a typo is fixable without leaving the screen.
+    #[test]
+    fn setup_backspace_takes_back_the_last_command() {
+        let (_tmp, mut app) = test_app_uninitialized();
+        press(&mut app, KeyCode::Enter); // set this repo up
+        press(&mut app, KeyCode::Enter); // first location preset
+        press(&mut app, KeyCode::Enter); // no files to copy
+        type_str(&mut app, "make buidl");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Backspace);
+        match &app.view {
+            View::Setup(wizard) => match &wizard.step {
+                super::setup::Step::RunCommands { commands, input } => {
+                    assert!(commands.is_empty());
+                    assert_eq!(input.as_str(), "make buidl");
+                }
+                _ => panic!("expected the commands question"),
+            },
+            _ => panic!("expected the wizard"),
+        }
+        // Backspace with nothing left is harmless.
+        for _ in 0..20 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        match &app.view {
+            View::Setup(wizard) => assert!(matches!(
+                wizard.step,
+                super::setup::Step::RunCommands { .. }
+            )),
+            _ => panic!("expected the wizard"),
+        }
+    }
+
+    /// Esc steps back one screen the whole way through, keeping the answers
+    /// already given rather than restarting the wizard.
+    #[test]
+    fn setup_esc_walks_back_through_the_questions() {
+        let (_tmp, mut app) = test_app_uninitialized();
+        press(&mut app, KeyCode::Enter); // set this repo up
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter); // "inside"
+        type_str(&mut app, ".env");
+        press(&mut app, KeyCode::Enter);
+        type_str(&mut app, "make");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter); // blank line -> review
+
+        // Review -> commands, with the answer intact.
+        press(&mut app, KeyCode::Esc);
+        match &app.view {
+            View::Setup(wizard) => match &wizard.step {
+                super::setup::Step::RunCommands { commands, input } => {
+                    assert_eq!(commands, &vec!["make".to_string()]);
+                    assert_eq!(input.as_str(), "", "no suggestion is re-added");
+                }
+                other => panic!("expected the commands question, got {:?}", other.name()),
+            },
+            _ => panic!("expected the wizard"),
+        }
+        // Commands -> copy files, still holding what was typed.
+        press(&mut app, KeyCode::Esc);
+        match &app.view {
+            View::Setup(wizard) => match &wizard.step {
+                super::setup::Step::CopyFiles { input } => assert_eq!(input.as_str(), ".env"),
+                other => panic!("expected the copy question, got {:?}", other.name()),
+            },
+            _ => panic!("expected the wizard"),
+        }
+        // Copy files -> location -> welcome, where Esc quits.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+        match &app.view {
+            View::Setup(wizard) => {
+                assert!(matches!(wizard.step, super::setup::Step::Welcome { .. }))
+            }
+            _ => panic!("expected the wizard"),
+        }
+        press(&mut app, KeyCode::Esc);
+        assert!(app.quit);
+    }
+
+    /// An emptied copy list stays empty when stepping back onto the question;
+    /// the repo's suggestions only fill a question that hasn't been answered.
+    #[test]
+    fn setup_does_not_re_suggest_a_cleared_answer() {
+        let (_tmp, mut app) = test_app_uninitialized();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join(".env"), "TOKEN=1\n").unwrap();
+
+        press(&mut app, KeyCode::Enter); // set this repo up
+        press(&mut app, KeyCode::Enter); // first location preset
+        // Clear the suggested ".env" and move on with nothing.
+        for _ in 0..8 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc); // back onto the copy question
+        match &app.view {
+            View::Setup(wizard) => match &wizard.step {
+                super::setup::Step::CopyFiles { input } => {
+                    assert_eq!(input.as_str(), "", "the cleared answer is respected")
+                }
+                _ => panic!("expected the copy question"),
+            },
+            _ => panic!("expected the wizard"),
+        }
+    }
+
+    /// Clicking a welcome option selects it, and the clone route can be reached
+    /// entirely by mouse.
+    #[test]
+    fn setup_welcome_options_are_clickable() {
+        let (_tmp, mut app) = test_app_uninitialized();
+        render_app(&mut app, 100, 30);
+        let rl = app.row_list.expect("the welcome menu records its geometry");
+        click(&mut app, rl.inner.x + 1, rl.inner.y + 1);
+        match &app.view {
+            View::Setup(wizard) => {
+                assert!(matches!(
+                    wizard.step,
+                    super::setup::Step::Welcome { selected: 1 }
+                ));
+            }
+            _ => panic!("expected the wizard"),
+        }
+        press(&mut app, KeyCode::Enter);
+        match &app.view {
+            View::Setup(wizard) => {
+                assert!(matches!(wizard.step, super::setup::Step::ClonePath { .. }));
+                assert_eq!(wizard.progress(), "step 1 of 2");
+            }
+            _ => panic!("expected the clone path input"),
+        }
+    }
+
     #[test]
     fn setup_bad_clone_path_stays_on_input_with_error() {
         let (_tmp, mut app) = test_app_uninitialized();
-        press(&mut app, KeyCode::Char('y')); // yes
+        press(&mut app, KeyCode::Char('2')); // clone route
         type_str(&mut app, "/definitely/not/there");
         press(&mut app, KeyCode::Enter);
         match &app.view {
@@ -6914,7 +7193,7 @@ mod tests {
         std::fs::create_dir(&source).unwrap();
         std::fs::write(source.join(".wtm.toml"), "worktree_dir = \"home\"\n").unwrap();
 
-        press(&mut app, KeyCode::Char('y')); // yes -> path input
+        press(&mut app, KeyCode::Char('2')); // clone route -> path input
         press(&mut app, KeyCode::Tab); // open the browser at tmp (repo parent)
         // Entries: dirs first alphabetically -> "other" before "proj".
         press(&mut app, KeyCode::Enter); // descend into other/
@@ -7870,7 +8149,10 @@ mod tests {
         }
         // Typing narrows the filtered set (case-insensitive substring match).
         type_str(&mut app, "FEATURE");
-        assert_eq!(switch_matches(&app), vec!["feature-auth", "feature-billing"]);
+        assert_eq!(
+            switch_matches(&app),
+            vec!["feature-auth", "feature-billing"]
+        );
         // Narrowing further to a single match, Enter switches to that match
         // (not to an index into the full, unfiltered branch list).
         type_str(&mut app, "-billing");
@@ -8038,7 +8320,13 @@ mod tests {
         press(&mut app, KeyCode::Char('l'));
         press(&mut app, KeyCode::Enter);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while matches!(app.view, View::CommitDiff { pending: Some(_), .. }) {
+        while matches!(
+            app.view,
+            View::CommitDiff {
+                pending: Some(_),
+                ..
+            }
+        ) {
             app.poll_commit_diff_load();
             assert!(std::time::Instant::now() < deadline, "diff load timed out");
             std::thread::sleep(std::time::Duration::from_millis(2));
@@ -8049,12 +8337,7 @@ mod tests {
             .unwrap();
         let buf = terminal.backend().buffer().clone();
         let screen: String = (0..24)
-            .map(|y| {
-                (0..100)
-                    .map(|x| buf[(x, y)].symbol())
-                    .collect::<String>()
-                    + "\n"
-            })
+            .map(|y| (0..100).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
             .collect();
         assert!(screen.contains("greet.txt"), "file listed:\n{screen}");
         assert!(screen.contains("howdy"), "diff shown:\n{screen}");
@@ -8076,7 +8359,13 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         // Settle the async diff load.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while matches!(app.view, View::CommitDiff { pending: Some(_), .. }) {
+        while matches!(
+            app.view,
+            View::CommitDiff {
+                pending: Some(_),
+                ..
+            }
+        ) {
             app.poll_commit_diff_load();
             assert!(std::time::Instant::now() < deadline, "diff load timed out");
             std::thread::sleep(std::time::Duration::from_millis(2));
@@ -8084,7 +8373,10 @@ mod tests {
         match &app.view {
             View::CommitDiff { files, content, .. } => {
                 assert!(files.iter().any(|f| f.path == "hello.txt"), "{files:?}");
-                assert!(content.contains("hi"), "diff shows the added line: {content}");
+                assert!(
+                    content.contains("hi"),
+                    "diff shows the added line: {content}"
+                );
             }
             _ => panic!("expected the commit browser"),
         }
@@ -8792,7 +9084,8 @@ mod tests {
         // Asking explicitly must offer it again rather than staying silent.
         app.start_update_check(true);
         let (tx, rx) = channel();
-        tx.send(Ok(CheckOutcome::Available(newer_release()))).unwrap();
+        tx.send(Ok(CheckOutcome::Available(newer_release())))
+            .unwrap();
         app.update_check = Some(Task::new(rx));
         app.tick();
         assert!(app.modal.is_some(), "check-now re-offers the update");
@@ -9299,5 +9592,181 @@ mod tests {
         let file = current_file_index(&app.changes.rows, app.changes.selected)
             .expect("the cursor sits on a file row");
         assert_eq!(app.changes.files[file].path, "pkg/deep/a.txt");
+    }
+
+    /// Opens the Changes tab on the main worktree with one changed file, cursor
+    /// already on it, and the frame drawn so click geometry is recorded.
+    fn changes_tab_with_one_file(app: &mut App) -> String {
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("hello.txt"), "hi\n").unwrap();
+        app.refresh();
+        app.selected = app.worktrees.iter().position(|w| w.is_main).unwrap();
+        app.select_tab(Tab::Changes);
+        settle_diff(app);
+        let idx = current_file_index(&app.changes.rows, app.changes.selected)
+            .expect("the cursor sits on the changed file");
+        let path = app.changes.files[idx].path.clone();
+        render_app(app, 100, 30);
+        path
+    }
+
+    /// Enter on a file row hands the worktree's copy of the file to the OS.
+    #[test]
+    fn enter_on_a_changed_file_opens_it_with_the_default_app() {
+        let (_tmp, mut app) = test_app();
+        let path = changes_tab_with_one_file(&mut app);
+        let root = ops::path(&app.ctx, &app.changes.name).unwrap();
+        platform::take_recorded();
+
+        press(&mut app, KeyCode::Enter);
+        let want = format!("open {}", Path::new(&root).join(&path).display());
+        assert_eq!(platform::take_recorded(), vec![want]);
+        assert_eq!(app.message.as_deref(), Some(&*format!("opened '{path}'")));
+    }
+
+    /// Enter on a folder row still toggles it instead of opening anything.
+    #[test]
+    fn enter_on_a_folder_row_toggles_it_and_opens_nothing() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg/a.txt"), "a\n").unwrap();
+        app.refresh();
+        app.selected = app.worktrees.iter().position(|w| w.is_main).unwrap();
+        app.select_tab(Tab::Changes);
+        settle_diff(&mut app);
+        // Put the cursor on the "pkg/" folder row.
+        app.changes.selected = app
+            .changes
+            .rows
+            .iter()
+            .position(|r| matches!(r, DiffRow::Folder { .. }))
+            .expect("a folder row exists");
+        platform::take_recorded();
+
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            app.collapsed_folders.contains("pkg/"),
+            "Enter collapsed the folder"
+        );
+        assert!(
+            platform::take_recorded().is_empty(),
+            "a folder is not handed to the OS"
+        );
+    }
+
+    /// A deleted file has nothing to open, and says so instead of failing.
+    #[test]
+    fn opening_a_deleted_file_reports_it_is_gone() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("gone.txt"), "x\n").unwrap();
+        // Commit it, then delete it so it shows up as a deleted change.
+        Command::new("git")
+            .args(["add", "gone.txt"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "add gone.txt"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::remove_file(root.join("gone.txt")).unwrap();
+        app.refresh();
+        app.selected = app.worktrees.iter().position(|w| w.is_main).unwrap();
+        app.select_tab(Tab::Changes);
+        settle_diff(&mut app);
+        app.changes.selected = app
+            .changes
+            .rows
+            .iter()
+            .position(|r| match r {
+                DiffRow::File { index, .. } => app.changes.files[*index].path == "gone.txt",
+                DiffRow::Folder { .. } => false,
+            })
+            .expect("the deleted file has a row");
+        platform::take_recorded();
+
+        press(&mut app, KeyCode::Enter);
+        assert!(platform::take_recorded().is_empty(), "nothing was opened");
+        assert_eq!(
+            app.message.as_deref(),
+            Some("'gone.txt' no longer exists in the worktree")
+        );
+    }
+
+    /// Two quick clicks on the same file row open it; a single click only moves
+    /// the cursor, and a slow pair is two singles.
+    #[test]
+    fn double_clicking_a_changed_file_opens_it() {
+        let (_tmp, mut app) = test_app();
+        let path = changes_tab_with_one_file(&mut app);
+        let rl = app.row_list.expect("the file list records its geometry");
+        let (col, row) = (rl.inner.x + 1, rl.inner.y);
+        platform::take_recorded();
+
+        click(&mut app, col, row);
+        assert!(
+            platform::take_recorded().is_empty(),
+            "one click only moves the cursor"
+        );
+        click(&mut app, col, row);
+        assert_eq!(platform::take_recorded().len(), 1, "the pair opened it");
+        assert_eq!(app.message.as_deref(), Some(&*format!("opened '{path}'")));
+
+        // A third click starts a new pair rather than firing again.
+        click(&mut app, col, row);
+        assert!(
+            platform::take_recorded().is_empty(),
+            "the pair was consumed"
+        );
+        // A click on a different cell doesn't pair with the one before it.
+        click(&mut app, col + 1, row);
+        assert!(platform::take_recorded().is_empty(), "different cell");
+    }
+
+    /// Clicking the diff panel's path title copies the path, and doesn't count
+    /// towards a double click that would also open the file.
+    #[test]
+    fn clicking_the_diff_path_copies_it() {
+        let (_tmp, mut app) = test_app();
+        let path = changes_tab_with_one_file(&mut app);
+        let hit = app
+            .diff_path_hit
+            .expect("the diff panel records its path title");
+        platform::take_recorded();
+
+        click(&mut app, hit.x + 1, hit.y);
+        assert_eq!(platform::take_recorded(), vec![format!("copy {path}")]);
+        assert_eq!(
+            app.message.as_deref(),
+            Some(&*format!("copied '{path}' to the clipboard"))
+        );
+
+        // Twice in a row copies twice and never opens the file.
+        click(&mut app, hit.x + 1, hit.y);
+        assert_eq!(platform::take_recorded(), vec![format!("copy {path}")]);
+    }
+
+    /// A folder row has no file path, so the title is not a copy target.
+    #[test]
+    fn the_diff_path_is_not_clickable_on_a_folder_row() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg/a.txt"), "a\n").unwrap();
+        app.refresh();
+        app.selected = app.worktrees.iter().position(|w| w.is_main).unwrap();
+        app.select_tab(Tab::Changes);
+        settle_diff(&mut app);
+        app.changes.selected = app
+            .changes
+            .rows
+            .iter()
+            .position(|r| matches!(r, DiffRow::Folder { .. }))
+            .expect("a folder row exists");
+        render_app(&mut app, 100, 30);
+        assert!(app.diff_path_hit.is_none());
     }
 }

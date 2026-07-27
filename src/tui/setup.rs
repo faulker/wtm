@@ -1,9 +1,13 @@
 //! First-run setup wizard shown when the repo has no `.wtm.toml` yet.
 //!
-//! The wizard first offers to clone settings from another repo (typed path or
-//! file browser), then walks the same questions as `wtm init`. Both routes end
-//! on a review screen where every setting can still be edited before the
-//! config file is written.
+//! A welcome screen explains what setup is for and offers two routes: answer
+//! three questions (where worktrees go, which local files to copy into them,
+//! what to run once they exist), or copy the answers wholesale from another repo
+//! that already uses wtm. Both routes end on a review screen where every
+//! setting can still be edited before `.wtm.toml` is written.
+//!
+//! Every question screen carries a short "why this matters" blurb and a
+//! `step N of M` label, and Esc always steps back exactly one screen.
 
 use std::path::{Path, PathBuf};
 
@@ -20,13 +24,22 @@ pub struct SetupWizard {
     pub step: Step,
     /// Accumulated answers; written as `.wtm.toml` when the wizard finishes.
     pub draft: ConfigDraft,
+    /// True once the draft came from another repo's config. Only affects the
+    /// step counter (the clone route is shorter) and the review screen's note.
+    pub cloned: bool,
+    /// Raw text the user last entered for the copy-files question. Stepping back
+    /// restores exactly what they typed, so an answer they deliberately cleared
+    /// isn't replaced by the repo's suggestions again.
+    copy_answer: Option<String>,
+    /// Whether the commands question has been answered, for the same reason.
+    run_answered: bool,
 }
 
-/// Which wizard question is on screen.
+/// Which wizard screen is showing.
 pub enum Step {
-    /// Yes/no: clone settings from another location?
-    CloneAsk { yes: bool },
-    /// Typed path to a repo or `.wtm.toml` to clone from.
+    /// What wtm does, what setup writes, and which of the two routes to take.
+    Welcome { selected: usize },
+    /// Typed path to a repo or `.wtm.toml` to copy settings from.
     ClonePath { input: TextInput },
     /// File browser alternative to typing the path; `prior_input` restores
     /// the typed path when the browser is cancelled.
@@ -52,24 +65,34 @@ pub enum Step {
     },
 }
 
-/// Rows on the review screen, in order.
-pub const REVIEW_ROWS: usize = 4;
-
 impl Step {
-    /// A short "where am I" label for the wizard header. The two routes have
-    /// different lengths (cloning skips the location/copy/run questions), so the
-    /// total adapts to the branch the user took. Esc always steps back one.
-    pub fn progress(&self) -> &'static str {
+    /// Identifies the step in test failure messages.
+    #[cfg(test)]
+    pub fn name(&self) -> &'static str {
         match self {
-            Step::CloneAsk { .. } => "step 1 · start",
-            Step::ClonePath { .. } | Step::CloneBrowse { .. } => "step 2 of 3 · clone route",
-            Step::Location { .. } | Step::LocationCustom { .. } => "step 2 of 5",
-            Step::CopyFiles { .. } => "step 3 of 5",
-            Step::RunCommands { .. } => "step 4 of 5",
-            Step::Review { .. } => "final step · review & write",
+            Step::Welcome { .. } => "welcome",
+            Step::ClonePath { .. } => "clone path",
+            Step::CloneBrowse { .. } => "clone browser",
+            Step::Location { .. } => "location",
+            Step::LocationCustom { .. } => "location path",
+            Step::CopyFiles { .. } => "copy files",
+            Step::RunCommands { .. } => "run commands",
+            Step::Review { .. } => "review",
         }
     }
 }
+
+/// Rows on the review screen, in order.
+pub const REVIEW_ROWS: usize = 4;
+
+/// The two routes offered on the welcome screen, in order.
+pub const WELCOME_OPTIONS: &[(&str, &str)] = &[
+    ("Set this repo up now", "three quick questions"),
+    (
+        "Copy settings from another repo",
+        "reuse another repo's .wtm.toml",
+    ),
+];
 
 /// What a key press did, for the app to act on.
 pub enum WizardOutcome {
@@ -80,24 +103,94 @@ pub enum WizardOutcome {
 }
 
 impl SetupWizard {
-    /// Starts the wizard at the clone question.
+    /// Starts the wizard on the welcome screen.
     pub fn new(repo_root: PathBuf) -> SetupWizard {
         SetupWizard {
             repo_root,
-            // Default to "no": most repos are set up fresh, not cloned.
-            step: Step::CloneAsk { yes: false },
+            // Default to setting the repo up here: most repos are the first.
+            step: Step::Welcome { selected: 0 },
             draft: ConfigDraft::default(),
+            cloned: false,
+            copy_answer: None,
+            run_answered: false,
         }
+    }
+
+    /// A `step N of M` label for the panel title, so the user can tell how much
+    /// is left. The clone route is shorter than answering the questions, so the
+    /// total depends on which route was taken.
+    pub fn progress(&self) -> String {
+        let (n, of) = match self.step {
+            Step::Welcome { .. } => return "welcome".to_string(),
+            Step::ClonePath { .. } | Step::CloneBrowse { .. } => (1, 2),
+            Step::Location { .. } | Step::LocationCustom { .. } => (1, 4),
+            Step::CopyFiles { .. } => (2, 4),
+            Step::RunCommands { .. } => (3, 4),
+            Step::Review { .. } if self.cloned => (2, 2),
+            Step::Review { .. } => (4, 4),
+        };
+        format!("step {n} of {of}")
     }
 
     /// Handles one key press. Errors (bad clone path, unreadable directory)
     /// land in `message` and keep the current step on screen.
     pub fn on_key(&mut self, key: KeyEvent, message: &mut Option<String>) -> WizardOutcome {
         // Take the step by value so transitions can move state between steps.
-        let step = std::mem::replace(&mut self.step, Step::CloneAsk { yes: true });
+        let step = std::mem::replace(&mut self.step, Step::Welcome { selected: 0 });
         let (next, outcome) = self.handle(step, key, message);
         self.step = next;
         outcome
+    }
+
+    /// The location question. Entered from the welcome screen and from Esc on
+    /// the next step, always with the first preset highlighted.
+    fn location_step() -> Step {
+        Step::Location { selected: 0 }
+    }
+
+    /// The copy-files question, pre-filled with the local config files found in
+    /// the repo root (or whatever the user already answered).
+    fn copy_files_step(&self) -> Step {
+        let value = match &self.copy_answer {
+            Some(answer) => answer.clone(),
+            None => settings::suggest_copy_files(&self.repo_root).join(", "),
+        };
+        Step::CopyFiles {
+            input: TextInput::with_value(value),
+        }
+    }
+
+    /// The setup-commands question. The first line is pre-filled with the
+    /// install command inferred from the repo's lockfiles, and any commands
+    /// already answered are listed above it.
+    fn run_commands_step(&self) -> Step {
+        let mut commands = self.draft.run.clone();
+        // Only guess when the user hasn't answered this yet; coming back from
+        // Review must not re-add a suggestion they deliberately removed.
+        let suggested = if self.run_answered {
+            Vec::new()
+        } else {
+            settings::suggest_run_commands(&self.repo_root)
+        };
+        // Everything but the last suggestion goes into the list; the last one
+        // sits in the input so it is obvious it can be edited or cleared.
+        let mut input = String::new();
+        if let Some((last, rest)) = suggested.split_last() {
+            commands.extend(rest.iter().cloned());
+            input = last.clone();
+        }
+        Step::RunCommands {
+            commands,
+            input: TextInput::with_value(input),
+        }
+    }
+
+    /// The review screen, reached from either route.
+    fn review_step() -> Step {
+        Step::Review {
+            selected: 0,
+            editing: None,
+        }
     }
 
     fn handle(
@@ -108,32 +201,47 @@ impl SetupWizard {
     ) -> (Step, WizardOutcome) {
         use WizardOutcome::Continue;
         match step {
-            Step::CloneAsk { yes } => match key.code {
-                KeyCode::Left
+            // The welcome screen is a two-item menu: arrows (or 1/2) choose,
+            // Enter commits. Esc quits, since there is nothing behind it.
+            Step::Welcome { selected } => match key.code {
+                KeyCode::Down
                 | KeyCode::Right
                 | KeyCode::Tab
-                | KeyCode::Char('h')
-                | KeyCode::Char('l') => (Step::CloneAsk { yes: !yes }, Continue),
-                KeyCode::Char('y') => (
+                | KeyCode::Char('j')
+                | KeyCode::Char('l') => (
+                    Step::Welcome {
+                        selected: (selected + 1).min(WELCOME_OPTIONS.len() - 1),
+                    },
+                    Continue,
+                ),
+                KeyCode::Up | KeyCode::Left | KeyCode::Char('k') | KeyCode::Char('h') => (
+                    Step::Welcome {
+                        selected: selected.saturating_sub(1),
+                    },
+                    Continue,
+                ),
+                KeyCode::Char('1') => (Self::location_step(), Continue),
+                KeyCode::Char('2') => (
                     Step::ClonePath {
                         input: TextInput::default(),
                     },
                     Continue,
                 ),
-                KeyCode::Char('n') => (Step::Location { selected: 0 }, Continue),
-                KeyCode::Enter if yes => (
+                KeyCode::Enter if selected == 0 => (Self::location_step(), Continue),
+                KeyCode::Enter => (
                     Step::ClonePath {
                         input: TextInput::default(),
                     },
                     Continue,
                 ),
-                KeyCode::Enter => (Step::Location { selected: 0 }, Continue),
-                KeyCode::Esc | KeyCode::Char('q') => (Step::CloneAsk { yes }, WizardOutcome::Quit),
-                _ => (Step::CloneAsk { yes }, Continue),
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    (Step::Welcome { selected }, WizardOutcome::Quit)
+                }
+                _ => (Step::Welcome { selected }, Continue),
             },
 
             Step::ClonePath { mut input } => match key.code {
-                KeyCode::Esc => (Step::CloneAsk { yes: false }, Continue),
+                KeyCode::Esc => (Step::Welcome { selected: 1 }, Continue),
                 KeyCode::Tab => {
                     // Sibling repos are the usual clone source, so start the
                     // browser one level up from this repo.
@@ -159,13 +267,8 @@ impl SetupWizard {
                 KeyCode::Enter => match settings::load_clone_source(input.as_str()) {
                     Ok(draft) => {
                         self.draft = draft;
-                        (
-                            Step::Review {
-                                selected: 0,
-                                editing: None,
-                            },
-                            Continue,
-                        )
+                        self.cloned = true;
+                        (Self::review_step(), Continue)
                     }
                     Err(e) => {
                         *message = Some(format!("error: {e:#}"));
@@ -244,13 +347,8 @@ impl SetupWizard {
                     match settings::load_clone_source(&entry.path.to_string_lossy()) {
                         Ok(draft) => {
                             self.draft = draft;
-                            (
-                                Step::Review {
-                                    selected: 0,
-                                    editing: None,
-                                },
-                                Continue,
-                            )
+                            self.cloned = true;
+                            (Self::review_step(), Continue)
                         }
                         Err(e) => {
                             *message = Some(format!("error: {e:#}"));
@@ -274,7 +372,7 @@ impl SetupWizard {
             },
 
             Step::Location { selected } => match key.code {
-                KeyCode::Esc => (Step::CloneAsk { yes: false }, Continue),
+                KeyCode::Esc => (Step::Welcome { selected: 0 }, Continue),
                 KeyCode::Down | KeyCode::Char('j') => (
                     Step::Location {
                         selected: (selected + 1).min(LOCATION_PRESETS.len()),
@@ -290,16 +388,11 @@ impl SetupWizard {
                 KeyCode::Enter => {
                     if selected < LOCATION_PRESETS.len() {
                         self.draft.worktree_dir = LOCATION_PRESETS[selected].0.to_string();
-                        (
-                            Step::CopyFiles {
-                                input: TextInput::default(),
-                            },
-                            Continue,
-                        )
+                        (self.copy_files_step(), Continue)
                     } else {
                         (
                             Step::LocationCustom {
-                                input: TextInput::default(),
+                                input: TextInput::with_value(self.draft.worktree_dir.clone()),
                             },
                             Continue,
                         )
@@ -322,12 +415,7 @@ impl SetupWizard {
                     } else {
                         path
                     };
-                    (
-                        Step::CopyFiles {
-                            input: TextInput::default(),
-                        },
-                        Continue,
-                    )
+                    (self.copy_files_step(), Continue)
                 }
                 _ => {
                     input.on_key(key);
@@ -336,16 +424,11 @@ impl SetupWizard {
             },
 
             Step::CopyFiles { mut input } => match key.code {
-                KeyCode::Esc => (Step::Location { selected: 0 }, Continue),
+                KeyCode::Esc => (Self::location_step(), Continue),
                 KeyCode::Enter => {
                     self.draft.copy = settings::split_list(input.as_str());
-                    (
-                        Step::RunCommands {
-                            commands: Vec::new(),
-                            input: TextInput::default(),
-                        },
-                        Continue,
-                    )
+                    self.copy_answer = Some(input.as_str().to_string());
+                    (self.run_commands_step(), Continue)
                 }
                 _ => {
                     input.on_key(key);
@@ -357,23 +440,25 @@ impl SetupWizard {
                 mut commands,
                 mut input,
             } => match key.code {
-                KeyCode::Esc => (
-                    Step::CopyFiles {
-                        input: TextInput::with_value(self.draft.copy.join(", ")),
-                    },
-                    Continue,
-                ),
+                KeyCode::Esc => (self.copy_files_step(), Continue),
+                // Backspace on an empty line takes back the command above it, so
+                // a typo can be fixed without leaving the screen.
+                KeyCode::Backspace if input.as_str().is_empty() => {
+                    let restored = commands.pop().unwrap_or_default();
+                    (
+                        Step::RunCommands {
+                            commands,
+                            input: TextInput::with_value(restored),
+                        },
+                        Continue,
+                    )
+                }
                 KeyCode::Enter => {
                     let cmd = input.trimmed();
                     if cmd.is_empty() {
                         self.draft.run = commands;
-                        (
-                            Step::Review {
-                                selected: 0,
-                                editing: None,
-                            },
-                            Continue,
-                        )
+                        self.run_answered = true;
+                        (Self::review_step(), Continue)
                     } else {
                         commands.push(cmd);
                         (
@@ -428,7 +513,16 @@ impl SetupWizard {
                 selected,
                 editing: None,
             } => match key.code {
-                KeyCode::Esc => (Step::CloneAsk { yes: false }, Continue),
+                // Esc steps back one screen like everywhere else in the wizard:
+                // to the clone path on the clone route, or to the last question
+                // on the other, keeping the answers already given.
+                KeyCode::Esc if self.cloned => (
+                    Step::ClonePath {
+                        input: TextInput::default(),
+                    },
+                    Continue,
+                ),
+                KeyCode::Esc => (self.run_commands_step(), Continue),
                 KeyCode::Down | KeyCode::Char('j') => (
                     Step::Review {
                         selected: (selected + 1).min(REVIEW_ROWS - 1),
@@ -475,7 +569,9 @@ impl SetupWizard {
         }
     }
 
-    /// Stores an edited review row back into the draft.
+    /// Stores an edited review row back into the draft. Edits here also count as
+    /// answering the matching question, so stepping back doesn't overwrite them
+    /// with the repo's suggestions.
     fn commit_review_edit(&mut self, row: usize, buf: &str) {
         match row {
             0 => {
@@ -486,8 +582,14 @@ impl SetupWizard {
                     value.to_string()
                 };
             }
-            1 => self.draft.copy = settings::split_list(buf),
-            2 => self.draft.run = settings::split_list(buf),
+            1 => {
+                self.draft.copy = settings::split_list(buf);
+                self.copy_answer = Some(buf.to_string());
+            }
+            2 => {
+                self.draft.run = settings::split_list(buf);
+                self.run_answered = true;
+            }
             _ => {}
         }
     }
@@ -572,11 +674,40 @@ pub fn is_initialized(repo_root: &Path) -> bool {
     repo_root.join(CONFIG_FILE).exists()
 }
 
+/// How a `worktree_dir` value reads on the review screen: the preset's plain
+/// label where there is one, otherwise the path as typed.
+pub fn location_label(value: &str) -> &str {
+    LOCATION_PRESETS
+        .iter()
+        .find(|(name, _)| *name == value)
+        .map(|(_, label)| *label)
+        .unwrap_or(value)
+}
+
 /// Preview text for a location choice: the resolved directory, or the error.
+/// `..` segments are folded away first, since the `sibling` preset resolves to
+/// `<repo>/../<repo>-worktrees` and showing that literally is just noise.
 pub fn location_preview(name: &str, repo_root: &Path) -> String {
     config::resolve_worktree_dir(name, repo_root)
-        .map(|p| p.display().to_string())
+        .map(|p| tidy_path(&p))
         .unwrap_or_else(|_| "(needs HOME set)".to_string())
+}
+
+/// Lexically removes `x/..` pairs from a path for display. Purely textual (the
+/// directory doesn't exist yet, so it can't be canonicalized) and never leaves
+/// the path shorter than its root.
+fn tidy_path(path: &Path) -> String {
+    use std::path::Component;
+    let mut parts: Vec<Component> = Vec::new();
+    for part in path.components() {
+        match part {
+            Component::ParentDir if matches!(parts.last(), Some(Component::Normal(_))) => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.iter().collect::<PathBuf>().display().to_string()
 }
 
 #[cfg(test)]
@@ -616,6 +747,26 @@ mod tests {
         assert_eq!(browser.dir, sub);
         browser.parent().unwrap();
         assert_eq!(browser.dir, tmp.path());
+    }
+
+    /// The `sibling` preset resolves through a `..`, which the preview folds
+    /// away so the wizard shows a path a person would recognise.
+    #[test]
+    fn location_preview_folds_away_parent_segments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("proj");
+        std::fs::create_dir(&repo).unwrap();
+        let preview = location_preview("sibling", &repo);
+        assert_eq!(
+            preview,
+            tmp.path().join("proj-worktrees").display().to_string()
+        );
+        assert!(!preview.contains(".."), "{preview}");
+        // Paths with nothing to fold pass through, and a leading `..` (nothing
+        // above it to cancel) is kept rather than dropped.
+        assert_eq!(tidy_path(Path::new("/a/b/c")), "/a/b/c");
+        assert_eq!(tidy_path(Path::new("../x")), "../x");
+        assert_eq!(tidy_path(Path::new("/a/b/../../c")), "/c");
     }
 
     #[test]
