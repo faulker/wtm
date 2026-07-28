@@ -369,9 +369,19 @@ pub enum ModalAction {
     RevertFile,
     /// Delete the file under the Diff cursor from the worktree.
     DeleteFile,
+    /// Discard every uncommitted change in the Changes tab's worktree.
+    DiscardAllChanges,
     /// Add to `.gitignore`: option 0 ignores the exact `file`, option 1 the
     /// derived `pattern`.
     IgnorePath { file: String, pattern: String },
+    /// The branch a create would start from (`base`, or `branch` itself when
+    /// checking out an existing local branch) is behind its upstream: option 0
+    /// pulls it first, 1 creates without pulling.
+    ConfirmPullBase {
+        branch: String,
+        base: Option<String>,
+        target: String,
+    },
     /// The new-worktree target directory already exists: option 0 opens it (a
     /// worktree), 1 replaces it, 2 cancels.
     ConfirmExisting {
@@ -1103,10 +1113,19 @@ pub struct App {
     pub tab: Tab,
     /// Content of the Changes tab, populated by `open_changes_tab`.
     pub changes: ChangesTab,
-    /// Branches shown on the Branches tab, loaded by `load_branches`.
+    /// Branches shown on the Branches tab, loaded by `load_branches`. Kept
+    /// on screen (stale) while a background reload is in flight, so
+    /// switching back into the tab is instant instead of flashing empty.
     pub branches: Vec<BranchListItem>,
     /// Cursor into `branches` on the Branches tab.
     pub branch_selected: usize,
+    /// A `load_branches` reload running on a background thread, so the
+    /// (potentially many git invocations behind) branch list never blocks
+    /// the tab switch. Drained by `poll_branches_load` each tick.
+    branches_pending: Option<Task<Result<ops::BranchListResult, String>>>,
+    /// The selection `poll_branches_load` should clamp and apply once the
+    /// in-flight `branches_pending` load lands.
+    branches_want_selected: usize,
     /// Worktree the Stash tab's entries belong to. Empty before the tab has
     /// been opened.
     pub stash_name: String,
@@ -1230,6 +1249,8 @@ impl App {
             changes: ChangesTab::default(),
             branches: Vec::new(),
             branch_selected: 0,
+            branches_pending: None,
+            branches_want_selected: 0,
             stash_name: String::new(),
             stash_entries: Vec::new(),
             stash_selected: 0,
@@ -1491,6 +1512,10 @@ impl App {
         // come back to the list.
         self.poll_update_check();
         self.maybe_prompt_update();
+        // Also view-independent: a branch list kicked off by `load_branches`
+        // should land even if the user has since drilled into a branch's
+        // commit history or another screen.
+        self.poll_branches_load();
         if let View::Busy { rx, .. } = &self.view {
             if let Some(result) = rx.poll_latest() {
                 // Pull the follow-up out of the view so we can mutate self, then
@@ -1965,11 +1990,33 @@ impl App {
                     self.delete_file(e);
                 }
             }
+            ModalAction::DiscardAllChanges => {
+                if let ModalResult::Confirmed(_) = result {
+                    self.discard_all_changes();
+                }
+            }
             ModalAction::IgnorePath { file, pattern } => {
                 if let ModalResult::Confirmed(idx) = result {
                     let p = if idx == 0 { file } else { pattern };
                     self.add_ignore(&p);
                 }
+            }
+            ModalAction::ConfirmPullBase {
+                branch,
+                base,
+                target,
+            } => {
+                let ModalResult::Confirmed(idx) = result else {
+                    return;
+                };
+                if idx == 0 {
+                    if let Err(e) = ops::update_branch(&self.ctx, &target) {
+                        self.set_error(format!("{e:#}"));
+                        return;
+                    }
+                    self.message = Some(format!("updated '{target}'"));
+                }
+                self.request_create_checked(branch, base);
             }
             ModalAction::ConfirmExisting {
                 branch,
@@ -2132,6 +2179,17 @@ impl App {
         let body = vec![Line::from(format!("delete '{path}' from the worktree?"))];
         let options = vec![ConfirmOption::new("delete file").destructive()];
         self.push_confirm("delete file", body, options, ModalAction::DeleteFile);
+    }
+
+    /// Confirmation for discarding every uncommitted change in the Changes
+    /// tab's worktree (tracked changes reset, untracked files removed).
+    fn open_discard_all_modal(&mut self) {
+        let name = self.changes.name.clone();
+        let body = vec![Line::from(format!(
+            "discard ALL uncommitted changes in '{name}'? this resets tracked files to HEAD and removes untracked files."
+        ))];
+        let options = vec![ConfirmOption::new("discard all changes").destructive()];
+        self.push_confirm("discard all changes", body, options, ModalAction::DiscardAllChanges);
     }
 
     /// Prompt for adding a file or folder to `.gitignore`.
@@ -3231,6 +3289,11 @@ impl App {
                     self.open_delete_file_modal(path);
                 }
             }
+            KeyCode::Char('U') => {
+                if !files.is_empty() {
+                    self.open_discard_all_modal();
+                }
+            }
             KeyCode::Char('i') => {
                 let target = match rows.get(*selected) {
                     Some(DiffRow::File { index, .. }) => files
@@ -3503,6 +3566,18 @@ impl App {
         self.refresh();
     }
 
+    /// Discards every uncommitted change in the Changes tab's worktree, then
+    /// reloads it.
+    fn discard_all_changes(&mut self) {
+        let name = self.changes.name.clone();
+        match ops::discard_all_changes(&self.ctx, &name) {
+            Ok(_) => self.message = Some(format!("discarded all changes in '{name}'")),
+            Err(e) => self.set_error(format!("{e:#}")),
+        }
+        self.refresh_diff();
+        self.refresh();
+    }
+
     /// Deletes a single file from the Changes tab, then reloads it.
     fn delete_file(&mut self, entry: StatusEntry) {
         let name = self.changes.name.clone();
@@ -3704,10 +3779,53 @@ impl App {
         }
     }
 
-    /// Starts a create for `branch` (new branch when `base` is `Some`), first
-    /// checking whether the target directory already exists and, if so, asking
-    /// the user what to do about it.
+    /// Starts a create for `branch` (new branch when `base` is `Some`). First
+    /// checks whether the branch it would start from (`base`, or `branch`
+    /// itself when checking out an existing local branch) is behind its
+    /// upstream and, if so, offers to pull it first.
     fn request_create(&mut self, branch: String, base: Option<String>) {
+        let target = base.clone().unwrap_or_else(|| branch.clone());
+        match ops::branch_ahead_behind(&self.ctx, &target) {
+            Ok(Some(ab)) if ab.behind > 0 && ab.ahead == 0 => {
+                self.open_confirm_pull_base_modal(branch, base, target, ab.behind);
+            }
+            _ => self.request_create_checked(branch, base),
+        }
+    }
+
+    /// Confirmation for pulling `target` (behind its upstream by `behind`
+    /// commits) before starting the create.
+    fn open_confirm_pull_base_modal(
+        &mut self,
+        branch: String,
+        base: Option<String>,
+        target: String,
+        behind: u32,
+    ) {
+        let commits = if behind == 1 { "commit" } else { "commits" };
+        let body = vec![Line::from(format!(
+            "'{target}' is {behind} {commits} behind its upstream. pull it first?"
+        ))];
+        let options = vec![
+            ConfirmOption::new("pull, then create"),
+            ConfirmOption::new("create without pulling"),
+        ];
+        self.push_confirm(
+            "branch is behind",
+            body,
+            options,
+            ModalAction::ConfirmPullBase {
+                branch,
+                base,
+                target,
+            },
+        );
+    }
+
+    /// Continues a create for `branch` (new branch when `base` is `Some`)
+    /// after the behind-upstream check: checks whether the target directory
+    /// already exists and, if so, asks the user what to do about it.
+    fn request_create_checked(&mut self, branch: String, base: Option<String>) {
         match ops::existing_target(&self.ctx, &branch) {
             Ok(Some(target)) => {
                 let path = target.path.to_string_lossy().to_string();
@@ -4209,19 +4327,62 @@ impl App {
         );
     }
 
-    /// (Re)loads all local branches for the Branches tab, clamping the cursor.
-    /// Bounces back to the Worktrees tab on error.
+    /// Kicks off a (re)load of all local branches for the Branches tab on a
+    /// background thread — building the list runs a git invocation per
+    /// branch, so doing it on the UI thread would freeze the tab switch.
+    /// `branches` is left as-is (stale) until the result lands in
+    /// `poll_branches_load`, so re-entering the tab shows the previous list
+    /// immediately instead of flashing empty.
     fn load_branches(&mut self, selected: usize) {
-        match ops::branch_list(&self.ctx) {
+        self.branches_want_selected = selected;
+        let (tx, rx) = channel();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let result = ops::branch_list(&ctx).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+        });
+        self.branches_pending = Some(Task::new(rx));
+    }
+
+    /// Applies a finished background `load_branches` result, if one has
+    /// landed. Called each tick so the branch list fills in (or refreshes)
+    /// without blocking navigation. Bounces back to the Worktrees tab on
+    /// error.
+    fn poll_branches_load(&mut self) {
+        let Some(task) = &self.branches_pending else {
+            return;
+        };
+        let Some(result) = task.poll_latest() else {
+            return;
+        };
+        self.branches_pending = None;
+        match result {
             Ok(r) => {
-                self.branch_selected = selected.min(r.branches.len().saturating_sub(1));
+                self.branch_selected = self
+                    .branches_want_selected
+                    .min(r.branches.len().saturating_sub(1));
                 self.branches = r.branches;
             }
             Err(e) => {
-                self.set_error(format!("{e:#}"));
+                self.set_error(e);
                 self.tab = Tab::Worktrees;
             }
         }
+    }
+
+    /// Whether the Branches tab is showing its very first load: no cached
+    /// branches yet and a load is in flight. Used to draw a loading state
+    /// instead of an empty list; a background refresh of an already-cached
+    /// list doesn't trigger this.
+    pub fn branches_first_load(&self) -> bool {
+        self.branches_pending.is_some() && self.branches.is_empty()
+    }
+
+    /// Whether a `load_branches` reload is running in the background, cached
+    /// list or not. Used to show a subtle "refreshing" hint alongside a
+    /// still-visible stale list.
+    pub fn branches_loading(&self) -> bool {
+        self.branches_pending.is_some()
     }
 
     /// Key handling for the Branches tab (active when `view` is `List` and
@@ -5793,6 +5954,18 @@ mod tests {
         app.on_key(KeyEvent::from(code));
     }
 
+    /// Waits out an in-flight background branch-list load (item 4 made
+    /// `load_branches` async), so tests can assert on `app.branches` right
+    /// after switching to the Branches tab.
+    fn settle_branches(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.branches_loading() {
+            app.poll_branches_load();
+            assert!(std::time::Instant::now() < deadline, "branch load timed out");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
     /// Drains an in-flight `View::Busy` op the way the event loop does, so tests
     /// can assert on the settled state after a backgrounded action.
     fn settle(app: &mut App) {
@@ -6050,6 +6223,113 @@ mod tests {
         assert!(matches!(app.view, View::List));
     }
 
+    /// Sets up `root` (already the checked-out main worktree of `app`) with a
+    /// bare `origin` one commit ahead of local `main`: an independent clone
+    /// makes and pushes a commit that `root` never fetched. `root`'s `main`
+    /// ends up behind its upstream by one commit with nothing of its own
+    /// ahead, so it's a clean fast-forward candidate.
+    fn make_root_behind_upstream(tmp: &tempfile::TempDir, root: &Path) -> String {
+        let bare = tmp.path().join("origin.git");
+        git(
+            tmp.path(),
+            &["init", "--bare", "-b", "main", bare.to_str().unwrap()],
+        );
+        git(root, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git(root, &["push", "-u", "origin", "main"]);
+        let clone = tmp.path().join("clone");
+        git(
+            tmp.path(),
+            &["clone", bare.to_str().unwrap(), clone.to_str().unwrap()],
+        );
+        git(&clone, &["config", "user.email", "t@e.st"]);
+        git(&clone, &["config", "user.name", "t"]);
+        git(&clone, &["commit", "--allow-empty", "-m", "remote-work"]);
+        git(&clone, &["push", "origin", "main"]);
+        // Ahead/behind is computed against the last-known remote-tracking ref
+        // (the same as `git status`), so fetch to pick up the new commit —
+        // just as a user would before wtm reports the base as behind.
+        git(root, &["fetch"]);
+        crate::git::run(&clone, &["log", "-1", "--format=%H"]).unwrap()
+    }
+
+    /// Creating a new branch off a base that's behind its upstream opens a
+    /// prompt; confirming "pull, then create" fast-forwards the base first,
+    /// so the new branch starts from the up-to-date tip.
+    #[test]
+    fn create_dialog_prompts_to_pull_a_behind_base_and_pulls() {
+        let (tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        let remote_head = make_root_behind_upstream(&tmp, &root);
+        app.refresh();
+
+        press(&mut app, KeyCode::Char('n'));
+        type_str(&mut app, "feature");
+        press(&mut app, KeyCode::Enter);
+        match &app.modal {
+            Some(Modal::Confirm {
+                action: ModalAction::ConfirmPullBase { branch, target, .. },
+                ..
+            }) => {
+                assert_eq!(branch, "feature");
+                assert_eq!(target, "main");
+            }
+            _ => panic!("expected a prompt to pull the behind base"),
+        }
+        press(&mut app, KeyCode::Enter); // "pull, then create"
+        assert_eq!(
+            crate::git::run(&root, &["rev-parse", "main"]).unwrap(),
+            remote_head,
+            "main should be fast-forwarded to the remote tip"
+        );
+        wait_creating(&mut app, |_, done| done);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.worktrees.iter().any(|w| w.name == "feature"));
+        let feature_path = app
+            .worktrees
+            .iter()
+            .find(|w| w.name == "feature")
+            .unwrap()
+            .path
+            .clone();
+        assert_eq!(
+            crate::git::run(Path::new(&feature_path), &["rev-parse", "HEAD"]).unwrap(),
+            remote_head,
+            "the new branch should start from the pulled-in commit"
+        );
+    }
+
+    /// Choosing "create without pulling" on the behind-base prompt leaves the
+    /// base untouched and branches off it as-is.
+    #[test]
+    fn create_dialog_can_skip_pulling_a_behind_base() {
+        let (tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        make_root_behind_upstream(&tmp, &root);
+        let local_head = crate::git::run(&root, &["rev-parse", "main"]).unwrap();
+        app.refresh();
+
+        press(&mut app, KeyCode::Char('n'));
+        type_str(&mut app, "feature");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Confirm {
+                action: ModalAction::ConfirmPullBase { .. },
+                ..
+            })
+        ));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter); // "create without pulling"
+        assert_eq!(
+            crate::git::run(&root, &["rev-parse", "main"]).unwrap(),
+            local_head,
+            "main should be untouched"
+        );
+        wait_creating(&mut app, |_, done| done);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.worktrees.iter().any(|w| w.name == "feature"));
+    }
+
     #[test]
     fn create_dialog_offers_existing_branches() {
         let (_tmp, mut app) = test_app();
@@ -6164,7 +6444,8 @@ mod tests {
         assert_eq!(app.tab, Tab::Changes);
         press(&mut app, KeyCode::Tab);
         assert_eq!(app.tab, Tab::Branches);
-        // Entering the Branches tab loads the branch list.
+        // Entering the Branches tab loads the branch list in the background.
+        settle_branches(&mut app);
         assert!(!app.branches.is_empty());
         press(&mut app, KeyCode::Tab);
         assert_eq!(app.tab, Tab::Stash);
@@ -6176,6 +6457,45 @@ mod tests {
         assert_eq!(app.tab, Tab::Settings);
         press(&mut app, KeyCode::BackTab);
         assert_eq!(app.tab, Tab::Stash);
+    }
+
+    /// Switching to the Branches tab renders immediately (never blocks on the
+    /// per-branch git invocations behind `load_branches`): the first visit
+    /// shows a loading state until the background load lands, and a later
+    /// visit keeps the previously loaded list on screen while a fresh load
+    /// runs behind it, rather than flashing back to empty.
+    #[test]
+    fn switching_to_branches_tab_is_instant_with_loading_indicator() {
+        let (_tmp, mut app) = test_app();
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.tab, Tab::Branches);
+        assert!(
+            app.branches_first_load(),
+            "no cached branches yet on the first visit"
+        );
+        settle_branches(&mut app);
+        assert!(!app.branches_first_load());
+        assert!(!app.branches.is_empty());
+
+        // Leave and come back: a reload is kicked off again, but the cached
+        // list from the last visit is still there to show immediately.
+        press(&mut app, KeyCode::BackTab);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.tab, Tab::Branches);
+        assert!(
+            app.branches_loading(),
+            "re-entering the tab refreshes the list"
+        );
+        assert!(
+            !app.branches.is_empty(),
+            "the cached list stays visible while the refresh runs"
+        );
+        assert!(
+            !app.branches_first_load(),
+            "a refresh with cached data isn't a first load"
+        );
+        settle_branches(&mut app);
     }
 
     #[test]
@@ -7443,11 +7763,13 @@ mod tests {
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Tab);
         assert_eq!(app.tab, Tab::Branches);
+        settle_branches(&mut app);
         // Create a new branch "feature".
         press(&mut app, KeyCode::Char('n'));
         type_str(&mut app, "feature");
         press(&mut app, KeyCode::Enter);
         settle(&mut app);
+        settle_branches(&mut app);
         assert!(crate::git::branch_exists(&app.ctx.repo_root, "feature"));
         assert!(app.branches.iter().any(|b| b.name == "feature"));
         // Select "feature" and delete it (main is not deletable while checked out).
@@ -7468,6 +7790,7 @@ mod tests {
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Tab);
         assert_eq!(app.tab, Tab::Branches);
+        settle_branches(&mut app);
         // The main branch is listed by default, so `d` has something to target.
         assert!(!app.branches.is_empty());
         press(&mut app, KeyCode::Char('d'));
@@ -7487,6 +7810,7 @@ mod tests {
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Tab);
         assert_eq!(app.tab, Tab::Branches);
+        settle_branches(&mut app);
         app.branch_selected = app.branches.iter().position(|b| b.name == "spare").unwrap();
         // `c` checks out an existing branch, so the create dialog opens with
         // that branch selected in the checkout list.
@@ -7508,6 +7832,7 @@ mod tests {
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Tab);
         assert_eq!(app.tab, Tab::Branches);
+        settle_branches(&mut app);
         // Enter on a branch drills into its commit history.
         press(&mut app, KeyCode::Enter);
         match &app.view {
@@ -7537,6 +7862,7 @@ mod tests {
         let (_tmp, mut app) = test_app();
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Tab);
+        settle_branches(&mut app);
         press(&mut app, KeyCode::Enter); // Branches -> BranchCommits
         assert!(matches!(app.view, View::BranchCommits { .. }));
         press(&mut app, KeyCode::Enter); // -> CommitDiff (browse, not cherry-pick)
@@ -7568,6 +7894,7 @@ mod tests {
         // Merge main into the feature worktree through the UI.
         press(app, KeyCode::Tab);
         press(app, KeyCode::Tab);
+        settle_branches(app);
         let idx = app
             .branches
             .iter()
@@ -7593,6 +7920,7 @@ mod tests {
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Tab);
         assert_eq!(app.tab, Tab::Branches);
+        settle_branches(&mut app);
         let idx = app.branches.iter().position(|b| b.name == "main").unwrap();
         app.branch_selected = idx;
         press(&mut app, KeyCode::Char('m'));
@@ -8469,6 +8797,7 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Tab);
+        settle_branches(&mut app);
         press(&mut app, KeyCode::Enter);
         match &app.view {
             View::BranchCommits { lines, .. } => {
@@ -8526,6 +8855,7 @@ mod tests {
         let (_tmp, mut app) = test_app();
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Tab);
+        settle_branches(&mut app);
         press(&mut app, KeyCode::Enter);
         // Replace the loaded history with one containing a connector row.
         let View::BranchCommits { branch, .. } = &app.view else {
@@ -8568,6 +8898,7 @@ mod tests {
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Tab);
         assert_eq!(app.tab, Tab::Branches);
+        settle_branches(&mut app);
         press(&mut app, KeyCode::Char('p'));
         assert!(matches!(app.view, View::Busy { .. }));
         settle_busy(&mut app);
@@ -8583,6 +8914,7 @@ mod tests {
         press(&mut app, KeyCode::Char('f'));
         assert!(matches!(app.view, View::Busy { .. }));
         settle_busy(&mut app);
+        settle_branches(&mut app);
         // A repo with no remotes fetches nothing, and lands back on the tab.
         assert!(app.error.is_none(), "unexpected error: {:?}", app.error);
         assert_eq!(app.tab, Tab::Branches);
@@ -8606,6 +8938,7 @@ mod tests {
 
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Tab);
+        settle_branches(&mut app);
         let selected = app.branches[app.branch_selected].name.clone();
         app.last_auto_refresh = Instant::now() - AUTO_REFRESH_INTERVAL;
         app.tick();
@@ -9512,6 +9845,11 @@ mod tests {
         click(&mut app, rect.x + 1, rect.y);
         assert_eq!(app.tab, Tab::Branches);
         assert!(
+            app.branches_loading(),
+            "switching to Branches kicks off a background branch-list load"
+        );
+        settle_branches(&mut app);
+        assert!(
             !app.branches.is_empty(),
             "switching to Branches loads the branch list"
         );
@@ -9608,6 +9946,48 @@ mod tests {
         let path = app.changes.files[idx].path.clone();
         render_app(app, 100, 30);
         path
+    }
+
+    /// Shift+U discards every uncommitted change in the worktree: tracked
+    /// files reset to HEAD, untracked files removed, after confirming.
+    #[test]
+    fn shift_u_discards_all_changes_after_confirm() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("tracked.txt"), "original\n").unwrap();
+        Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "add tracked"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::write(root.join("tracked.txt"), "modified\n").unwrap();
+        std::fs::write(root.join("new.txt"), "untracked\n").unwrap();
+        app.refresh();
+        app.selected = app.worktrees.iter().position(|w| w.is_main).unwrap();
+        app.select_tab(Tab::Changes);
+        settle_diff(&mut app);
+
+        press(&mut app, KeyCode::Char('U'));
+        assert!(
+            matches!(app.modal, Some(Modal::Confirm { .. })),
+            "expected a confirmation before discarding everything"
+        );
+        press(&mut app, KeyCode::Char('y'));
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("tracked.txt")).unwrap(),
+            "original\n"
+        );
+        assert!(!root.join("new.txt").exists());
+        assert_eq!(
+            app.message.as_deref(),
+            Some(&*format!("discarded all changes in '{}'", app.changes.name))
+        );
     }
 
     /// Enter on a file row hands the worktree's copy of the file to the OS.

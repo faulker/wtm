@@ -335,9 +335,21 @@ pub fn parse_status_porcelain(out: &str) -> Vec<StatusEntry> {
 
 /// Ahead/behind counts vs upstream; `None` when the branch has no upstream.
 pub fn ahead_behind(dir: &Path) -> Result<Option<AheadBehind>> {
+    branch_ahead_behind(dir, "HEAD")
+}
+
+/// Ahead/behind counts of local branch `branch` vs its upstream, without
+/// requiring it to be checked out anywhere; `dir` just needs to be inside the
+/// repo. `None` when the branch has no upstream configured.
+pub fn branch_ahead_behind(dir: &Path, branch: &str) -> Result<Option<AheadBehind>> {
     match run(
         dir,
-        &["rev-list", "--left-right", "--count", "@{upstream}...HEAD"],
+        &[
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("{branch}@{{upstream}}...{branch}"),
+        ],
     ) {
         Ok(out) => {
             let mut parts = out.split_whitespace();
@@ -349,6 +361,23 @@ pub fn ahead_behind(dir: &Path) -> Result<Option<AheadBehind>> {
         Err(GitError::Command { .. }) => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// Fast-forwards local branch `branch` (not checked out in any worktree) to
+/// match its upstream: fetches, then moves the branch ref directly. Only
+/// call this when the branch has no commits of its own ahead of upstream, so
+/// the move is always a fast-forward.
+pub fn fetch_branch_ff(repo_root: &Path, branch: &str) -> Result<()> {
+    run(repo_root, &["fetch"])?;
+    run(
+        repo_root,
+        &[
+            "update-ref",
+            &format!("refs/heads/{branch}"),
+            &format!("{branch}@{{upstream}}"),
+        ],
+    )?;
+    Ok(())
 }
 
 /// Unified diff of all uncommitted changes (staged + unstaged) in `dir`.
@@ -961,6 +990,15 @@ pub fn reset_hard(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Discards every uncommitted change in the working tree: tracked
+/// modifications reset to HEAD, plus untracked (but not gitignored) files and
+/// directories removed via `git clean`.
+pub fn discard_all(dir: &Path) -> Result<()> {
+    reset_hard(dir)?;
+    run(dir, &["clean", "-fd"])?;
+    Ok(())
+}
+
 /// Outcome of a `git merge` invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeStatus {
@@ -1280,6 +1318,26 @@ mod tests {
                 .any(|e| e.path == "tracked.txt" && e.code.starts_with('D')),
             "expected staged deletion, got {status:?}"
         );
+    }
+
+    #[test]
+    fn discard_all_resets_tracked_and_removes_untracked() {
+        let (_tmp, repo) = temp_repo();
+        std::fs::write(repo.join("tracked.txt"), "original").unwrap();
+        run(&repo, &["add", "tracked.txt"]).unwrap();
+        run(&repo, &["commit", "-m", "add tracked"]).unwrap();
+
+        std::fs::write(repo.join("tracked.txt"), "modified").unwrap();
+        std::fs::write(repo.join("new.txt"), "untracked").unwrap();
+
+        discard_all(&repo).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(repo.join("tracked.txt")).unwrap(),
+            "original"
+        );
+        assert!(!repo.join("new.txt").exists());
+        assert!(status(&repo).unwrap().is_empty());
     }
 
     #[test]

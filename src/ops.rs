@@ -641,6 +641,13 @@ pub fn delete_file(ctx: &Ctx, name: &str, path: &str, untracked: bool) -> Result
     git::delete_file(Path::new(&info.path), path, untracked).map_err(Into::into)
 }
 
+/// Discards every uncommitted change in the worktree named `name`: tracked
+/// changes reset to HEAD, untracked files removed.
+pub fn discard_all_changes(ctx: &Ctx, name: &str) -> Result<()> {
+    let info = find(ctx, name)?.ok_or_else(|| not_found(ctx, name))?;
+    git::discard_all(Path::new(&info.path)).map_err(Into::into)
+}
+
 /// Derives a `.gitignore` glob from a file path: `*.ext` when the file has an
 /// extension, otherwise the bare file name (which git ignores at any depth).
 pub fn ignore_pattern(path: &str) -> String {
@@ -1039,6 +1046,30 @@ pub fn pull(ctx: &Ctx, name: &str, rebase: bool) -> Result<PullResult> {
         already_up_to_date,
         ahead_behind,
     })
+}
+
+/// Ahead/behind counts of local branch `branch` vs its upstream, without
+/// requiring it to be checked out anywhere. `None` when `branch` isn't a
+/// local branch or has no upstream configured.
+pub fn branch_ahead_behind(ctx: &Ctx, branch: &str) -> Result<Option<git::AheadBehind>> {
+    if !git::branch_exists(&ctx.repo_root, branch) {
+        return Ok(None);
+    }
+    git::branch_ahead_behind(&ctx.repo_root, branch).map_err(Into::into)
+}
+
+/// Fast-forwards local branch `branch` to match its upstream: pulls in place
+/// if it's checked out in a worktree, otherwise moves the ref directly via
+/// fetch. Only safe to call when the branch has no local commits ahead of
+/// its upstream.
+pub fn update_branch(ctx: &Ctx, branch: &str) -> Result<()> {
+    match find(ctx, branch)? {
+        Some(info) => {
+            pull(ctx, &info.name, false)?;
+        }
+        None => git::fetch_branch_ff(&ctx.repo_root, branch)?,
+    }
+    Ok(())
 }
 
 /// Pushes the worktree named `name`. When the branch has no upstream it is

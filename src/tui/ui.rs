@@ -2050,8 +2050,24 @@ fn draw_tab_bar(frame: &mut Frame, area: Rect, app: &mut App) {
 /// new-branch and confirm-delete popups floating on top. Returns the clickable
 /// row list (suppressed while a popup is up).
 fn draw_branches(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
-    let block = panel("branches");
+    let title = if app.branches_loading() && !app.branches.is_empty() {
+        "branches · refreshing…".to_string()
+    } else {
+        "branches".to_string()
+    };
+    let block = panel(title);
     let inner = block.inner(area);
+    // The very first load has no cached list to fall back on, so show a
+    // placeholder instead of an empty table while it fetches in the
+    // background.
+    if app.branches_first_load() {
+        frame.render_widget(
+            Paragraph::new(Line::from("loading branches…".dim())),
+            block.inner(area),
+        );
+        frame.render_widget(block, area);
+        return None;
+    }
     let rows: Vec<Row> = app
         .branches
         .iter()
