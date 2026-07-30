@@ -282,7 +282,7 @@ To turn the automatic check off:
 wtm config set --global auto_update_check false
 ```
 
-Or set `WTM_NO_UPDATE_CHECK` in the environment, which skips the check without touching any config file (useful in CI or offline). Explicit `wtm upgrade` runs and the Settings tab's check-now row always check regardless. Updates need `curl`, `tar`, and `shasum` or `sha256sum` on your PATH.
+Or set `WTM_NO_UPDATE_CHECK` in the environment, which skips the check without touching any config file (useful in CI or offline). Debug builds and anything launched by `cargo run` also skip the automatic check, so local development does not get update prompts against a published release. Explicit `wtm upgrade` runs and the Settings tab's check-now row always check regardless. Updates need `curl`, `tar`, and `shasum` or `sha256sum` on your PATH.
 
 ## MCP server
 

@@ -111,21 +111,49 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # Stamp the release version into Cargo.toml before building so
+      # CARGO_PKG_VERSION matches the tag. Do not commit here: the release
+      # job persists the bump only after every target builds successfully.
+      #
+      # Use a portable in-place sed. BSD sed (macOS) does not honor GNU's
+      # `0,/pattern/` range, which previously left macOS binaries on the
+      # previous version while Linux stamped correctly.
       - name: Set version in Cargo.toml
         run: |
+          set -euo pipefail
           VERSION="${RELEASE_TAG#v}"
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            sed -i '' -e '0,/^version = ".*"/s//version = "'"${VERSION}"'"/' Cargo.toml
-          else
-            sed -i -e '0,/^version = ".*"/s//version = "'"${VERSION}"'"/' Cargo.toml
+          if [ -z "$VERSION" ] || [ "$VERSION" = "$RELEASE_TAG" ]; then
+            echo "RELEASE_TAG must look like vX.Y.Z, got: ${RELEASE_TAG:-<empty>}"
+            exit 1
           fi
-          echo "Building ${RELEASE_TAG} (Cargo.toml version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1))"
+          sed -i.bak 's/^version = ".*"/version = "'"${VERSION}"'"/' Cargo.toml
+          rm -f Cargo.toml.bak
+          STAMPED="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          if [ "$STAMPED" != "$VERSION" ]; then
+            echo "Failed to stamp Cargo.toml: wanted ${VERSION}, got ${STAMPED}"
+            exit 1
+          fi
+          echo "Building ${RELEASE_TAG} (Cargo.toml version=${STAMPED})"
 
       - name: Run tests
         run: cargo test --target ${{ matrix.target }}
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
+
+      # Catch a silent stamp failure before packaging/signing: upgrade and
+      # `wtm --version` both read CARGO_PKG_VERSION from the binary.
+      - name: Verify embedded version
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          BIN="target/${{ matrix.target }}/release/wtm"
+          REPORTED="$("$BIN" --version)"
+          echo "Binary reports: ${REPORTED}"
+          if [ "$REPORTED" != "wtm ${VERSION}" ]; then
+            echo "Binary version mismatch: expected 'wtm ${VERSION}', got '${REPORTED}'"
+            exit 1
+          fi
 
       # Signing happens between build and packaging, so the archive (and the
       # checksums computed from it in the release job) covers the signed binary.
@@ -261,7 +289,15 @@ jobs:
           set -euo pipefail
           git fetch --tags --force
           VERSION="${NEW_TAG#v}"
-          sed -i '0,/^version = ".*"/s//version = "'"${VERSION}"'"/' Cargo.toml
+          # Same portable stamp as the build job (GNU sed on ubuntu, but
+          # keep one pattern so the two sites cannot drift apart again).
+          sed -i.bak 's/^version = ".*"/version = "'"${VERSION}"'"/' Cargo.toml
+          rm -f Cargo.toml.bak
+          STAMPED="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          if [ "$STAMPED" != "$VERSION" ]; then
+            echo "Failed to stamp Cargo.toml: wanted ${VERSION}, got ${STAMPED}"
+            exit 1
+          fi
           cargo generate-lockfile
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"

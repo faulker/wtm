@@ -91,11 +91,30 @@ pub enum CheckOutcome {
 /// any config, for CI and offline use.
 pub const DISABLE_ENV: &str = "WTM_NO_UPDATE_CHECK";
 
+/// Whether this process looks like a local development binary rather than an
+/// installed release. True for debug builds (`cargo run`, `./target/debug/…`)
+/// and whenever Cargo itself launched us (`cargo run --release`, `cargo test`).
+/// Those should not phone home for updates: the embedded version is whatever
+/// is in Cargo.toml right now, not a published release.
+pub fn is_dev_build() -> bool {
+    cfg!(debug_assertions) || std::env::var_os("CARGO").is_some()
+}
+
 /// Whether the start-up check should run: the `auto_update_check` setting,
-/// unless [`DISABLE_ENV`] is set. An explicit `wtm upgrade` or the Settings
-/// tab's check-now row ignores both and always checks.
+/// unless this is a dev build or [`DISABLE_ENV`] is set. An explicit
+/// `wtm upgrade` or the Settings tab's check-now row ignores all three and
+/// always checks.
 pub fn auto_check_enabled(config: &crate::config::Config) -> bool {
-    std::env::var_os(DISABLE_ENV).is_none() && config.auto_update_check()
+    auto_check_enabled_for(config, is_dev_build(), std::env::var_os(DISABLE_ENV).is_some())
+}
+
+/// Pure form of [`auto_check_enabled`], so tests can pin the ambient inputs.
+fn auto_check_enabled_for(
+    config: &crate::config::Config,
+    is_dev: bool,
+    disable_env_set: bool,
+) -> bool {
+    !is_dev && !disable_env_set && config.auto_update_check()
 }
 
 /// Fetches the latest release and reports whether it is newer than the running
@@ -608,5 +627,33 @@ ccc333  ./nested/wtm-v1.0.0-aarch64-unknown-linux-gnu.tar.gz
             dir.path.clone()
         };
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn auto_check_skips_dev_builds_even_when_config_allows() {
+        let cfg = crate::config::Config::default();
+        assert!(cfg.auto_update_check());
+        assert!(!auto_check_enabled_for(&cfg, true, false));
+        assert!(!auto_check_enabled_for(&cfg, false, true));
+        assert!(!auto_check_enabled_for(&cfg, true, true));
+    }
+
+    #[test]
+    fn auto_check_runs_for_installed_release_builds() {
+        let cfg = crate::config::Config::default();
+        assert!(auto_check_enabled_for(&cfg, false, false));
+
+        let mut off = crate::config::Config::default();
+        off.auto_update_check = Some(false);
+        assert!(!auto_check_enabled_for(&off, false, false));
+    }
+
+    #[test]
+    fn cargo_run_and_debug_builds_count_as_dev() {
+        // This suite itself runs under cargo (CARGO set) as a debug binary, so
+        // a local `cargo run` looks the same from here.
+        assert!(is_dev_build());
+        assert!(cfg!(debug_assertions));
+        assert!(std::env::var_os("CARGO").is_some());
     }
 }
