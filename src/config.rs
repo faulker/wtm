@@ -23,6 +23,10 @@ pub const DEFAULT_LOCATION: &str = "sibling";
 /// and a stale worktree manager is worth telling the user about.
 pub const DEFAULT_AUTO_UPDATE_CHECK: bool = true;
 
+/// Default short id for the diff syntax-highlight theme when `diff_theme`
+/// isn't set. Kept in sync with `tui::highlight::DEFAULT_DIFF_THEME`.
+pub const DEFAULT_DIFF_THEME: &str = "eighties";
+
 /// Predefined location rules accepted by `worktree_dir`, with a short
 /// human-readable label for each.
 pub const LOCATION_PRESETS: &[(&str, &str)] = &[
@@ -63,6 +67,9 @@ pub struct FileConfig {
     /// Whether the TUI checks GitHub for a newer wtm on start. Unset means
     /// [`DEFAULT_AUTO_UPDATE_CHECK`].
     pub auto_update_check: Option<bool>,
+    /// Diff syntax-highlight theme short id (e.g. `eighties`, `ocean`). Unset
+    /// means [`DEFAULT_DIFF_THEME`].
+    pub diff_theme: Option<String>,
     pub setup: Option<FileSetup>,
 }
 
@@ -102,6 +109,9 @@ pub struct Config {
     /// [`DEFAULT_AUTO_UPDATE_CHECK`].
     pub auto_update_check: Option<bool>,
     pub auto_update_check_source: Source,
+    /// Raw `diff_theme` setting; `None` means [`DEFAULT_DIFF_THEME`].
+    pub diff_theme: Option<String>,
+    pub diff_theme_source: Source,
     pub setup: Setup,
     pub copy_source: Source,
     pub run_source: Source,
@@ -125,6 +135,8 @@ impl Default for Config {
             open_command_source: Source::Default,
             auto_update_check: None,
             auto_update_check_source: Source::Default,
+            diff_theme: None,
+            diff_theme_source: Source::Default,
             setup: Setup::default(),
             copy_source: Source::Default,
             run_source: Source::Default,
@@ -156,6 +168,7 @@ impl Config {
         let (open_command, open_command_source) = pick(global.open_command, repo.open_command);
         let (auto_update_check, auto_update_check_source) =
             pick(global.auto_update_check, repo.auto_update_check);
+        let (diff_theme, diff_theme_source) = pick(global.diff_theme, repo.diff_theme);
         let global_setup = global.setup.unwrap_or_default();
         let repo_setup = repo.setup.unwrap_or_default();
         let (copy, copy_source) = pick(global_setup.copy, repo_setup.copy);
@@ -167,6 +180,8 @@ impl Config {
             open_command_source,
             auto_update_check,
             auto_update_check_source,
+            diff_theme,
+            diff_theme_source,
             setup: Setup {
                 copy: copy.unwrap_or_default(),
                 run: run.unwrap_or_default(),
@@ -179,6 +194,14 @@ impl Config {
     /// Whether the TUI should check GitHub for a newer wtm on start.
     pub fn auto_update_check(&self) -> bool {
         self.auto_update_check.unwrap_or(DEFAULT_AUTO_UPDATE_CHECK)
+    }
+
+    /// Diff syntax-highlight theme short id (e.g. `eighties`).
+    pub fn diff_theme(&self) -> &str {
+        self.diff_theme
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(DEFAULT_DIFF_THEME)
     }
 
     /// Absolute directory new worktrees are created under for a repo rooted
@@ -356,6 +379,19 @@ mod tests {
         let cfg = Config::merge(global, repo);
         assert!(cfg.auto_update_check());
         assert_eq!(cfg.auto_update_check_source, Source::Repo);
+    }
+
+    #[test]
+    fn diff_theme_defaults_to_eighties_and_merges() {
+        assert_eq!(Config::default().diff_theme(), DEFAULT_DIFF_THEME);
+        let global: FileConfig = toml::from_str("diff_theme = \"ocean\"").unwrap();
+        let cfg = Config::merge(global.clone(), FileConfig::default());
+        assert_eq!(cfg.diff_theme(), "ocean");
+        assert_eq!(cfg.diff_theme_source, Source::Global);
+        let repo: FileConfig = toml::from_str("diff_theme = \"mocha\"").unwrap();
+        let cfg = Config::merge(global, repo);
+        assert_eq!(cfg.diff_theme(), "mocha");
+        assert_eq!(cfg.diff_theme_source, Source::Repo);
     }
 
     #[test]

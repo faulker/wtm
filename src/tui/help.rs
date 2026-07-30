@@ -106,7 +106,8 @@ impl HelpTab {
             View::BranchCommits { .. }
             | View::CherryPick { .. }
             | View::Log { .. }
-            | View::CommitDiff { .. } => HelpTab::Commits,
+            | View::CommitDiff { .. }
+            | View::StashDiff { .. } => HelpTab::Commits,
             View::MergePick { .. } => HelpTab::Branches,
             View::MoveChanges { .. } => HelpTab::Worktrees,
             View::StashTarget { .. } => HelpTab::Changes,
@@ -233,7 +234,8 @@ pub const BRANCHES: &[Binding] = &[
 
 pub const DIFF: &[Binding] = &[
     help_only("↑/↓ or j/k", "move the file cursor"),
-    help_only("⇧↑/⇧↓", "scroll the diff (or mouse wheel)"),
+    help_only("⇧↑/⇧↓ or J/K", "scroll the diff vertically (or mouse wheel)"),
+    help_only("⇧←/⇧→ or H/L", "scroll the diff horizontally"),
     help_only("←/→ or h/l", "collapse/expand the folder"),
     both(
         "Enter",
@@ -248,6 +250,8 @@ pub const DIFF: &[Binding] = &[
     both("Space", "mark", "mark a file (or folder) for commit"),
     help_only("a", "mark or unmark every file"),
     both("c", "commit", "commit the marked files"),
+    both("p", "pull", "pull (fast-forward) this worktree"),
+    both("⇧P", "push", "push this worktree"),
     both("s", "stash file", "stash the highlighted file"),
     both("⇧S", "stash marked", "stash every marked file"),
     both(
@@ -278,6 +282,7 @@ pub const COMMIT_FILES: &[Binding] = &[
 
 pub const STASH_LIST: &[Binding] = &[
     both("↑/↓", "select", "select a stash entry"),
+    both("Enter", "browse", "browse the files and diffs in the selected stash"),
     both("s", "stash", "stash the worktree's current changes"),
     both(
         "p",
@@ -298,11 +303,11 @@ pub const SETTINGS: &[Binding] = &[
     both(
         "Enter",
         "edit/run",
-        "edit the selected setting, toggle auto_update_check, save, or check for updates",
+        "edit the selected setting, cycle auto_update_check or diff_theme, save, or check for updates",
     ),
     help_only(
         "Space",
-        "toggle auto_update_check between on, off, and the default",
+        "cycle auto_update_check or diff_theme on those rows",
     ),
     both("q", "quit", "quit"),
 ];
@@ -336,7 +341,8 @@ pub const COMMIT_DIFF: &[Binding] = &[
         "file",
         "move between the commit's changed files",
     ),
-    help_only("⇧↑/⇧↓", "scroll the diff (or mouse wheel)"),
+    help_only("⇧↑/⇧↓ or J/K", "scroll the diff vertically (or mouse wheel)"),
+    help_only("⇧←/⇧→ or H/L", "scroll the diff horizontally"),
     help_only("←/→ or h/l", "collapse/expand the folder (Enter toggles)"),
     both("t", "tree/flat", "toggle folder tree vs. flat file list"),
     both("?", "help", "show this help"),

@@ -627,6 +627,19 @@ pub fn commit_file_diff(ctx: &Ctx, name: &str, hash: &str, path: &str) -> Result
     git::commit_file_diff(Path::new(&info.path), hash, path).map_err(Into::into)
 }
 
+/// Files changed by stash entry `index`, viewed from the worktree named `name`
+/// (stashes are repo-global; the worktree only supplies a git directory).
+pub fn stash_files(ctx: &Ctx, name: &str, index: u32) -> Result<Vec<StatusEntry>> {
+    let info = find(ctx, name)?.ok_or_else(|| not_found(ctx, name))?;
+    git::stash_files(Path::new(&info.path), index).map_err(Into::into)
+}
+
+/// Unified diff of a single `path` as changed by stash entry `index`.
+pub fn stash_file_diff(ctx: &Ctx, name: &str, index: u32, path: &str) -> Result<String> {
+    let info = find(ctx, name)?.ok_or_else(|| not_found(ctx, name))?;
+    git::stash_file_diff(Path::new(&info.path), index, path).map_err(Into::into)
+}
+
 /// Discards uncommitted changes to `path` in the worktree named `name`,
 /// restoring it to HEAD (or removing it if it was untracked).
 pub fn revert_file(ctx: &Ctx, name: &str, path: &str, untracked: bool) -> Result<()> {

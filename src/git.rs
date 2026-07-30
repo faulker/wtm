@@ -423,26 +423,7 @@ pub fn commit_files(dir: &Path, hash: &str) -> Result<Vec<StatusEntry>> {
             hash,
         ],
     )?;
-    let mut seen = std::collections::HashSet::new();
-    let mut files = Vec::new();
-    for line in out.lines().filter(|l| !l.trim().is_empty()) {
-        let mut parts = line.split('\t');
-        let Some(status) = parts.next() else { continue };
-        // Renames/copies list the old path then the new; the new path is what
-        // exists in this commit, so take the last tab-separated field.
-        let Some(path) = parts.next_back() else {
-            continue;
-        };
-        // `R100`/`C075` carry a similarity score; keep just the first letter.
-        let code = status.chars().next().unwrap_or(' ');
-        if seen.insert(path.to_string()) {
-            files.push(StatusEntry {
-                code: format!("{code} "),
-                path: path.to_string(),
-            });
-        }
-    }
-    Ok(files)
+    Ok(parse_name_status(&out))
 }
 
 /// Unified diff of a single `path` as changed by commit `hash` (against its
@@ -673,6 +654,86 @@ pub fn stash_apply(dir: &Path, index: Option<u32>) -> Result<String> {
 /// Drops a stash entry (`git stash drop`).
 pub fn stash_drop(dir: &Path, index: Option<u32>) -> Result<String> {
     stash_op(dir, "drop", index)
+}
+
+/// Files changed by stash entry `index`, as porcelain-style `StatusEntry`s.
+/// Includes untracked files that were stashed with `-u`/`--include-untracked`.
+pub fn stash_files(dir: &Path, index: u32) -> Result<Vec<StatusEntry>> {
+    let selector = format!("stash@{{{index}}}");
+    let out = run(
+        dir,
+        &[
+            "stash",
+            "show",
+            "--name-status",
+            "--include-untracked",
+            &selector,
+        ],
+    )?;
+    Ok(parse_name_status(&out))
+}
+
+/// Unified diff of a single `path` as changed by stash entry `index`.
+/// Tracked changes come from the stash WIP commit vs its first parent; files
+/// that only exist as untracked content fall out of the stash's third parent.
+pub fn stash_file_diff(dir: &Path, index: u32, path: &str) -> Result<String> {
+    let selector = format!("stash@{{{index}}}");
+    let parent = format!("{selector}^1");
+    let tracked = run(dir, &["diff", &parent, &selector, "--", path])?;
+    if !tracked.trim().is_empty() {
+        return Ok(tracked);
+    }
+    // Untracked-only: the third parent holds the untracked tree when the stash
+    // was created with `-u`. Missing ^3 (or a missing path) means nothing to show.
+    let blob = format!("{selector}^3:{path}");
+    match run(dir, &["show", &blob]) {
+        Ok(content) => Ok(synthetic_added_diff(path, &content)),
+        Err(_) => Ok(String::new()),
+    }
+}
+
+/// Parses `git … --name-status` lines into `StatusEntry`s. Shared by commit and
+/// stash browsers so both surfaces colour and label files the same way.
+fn parse_name_status(out: &str) -> Vec<StatusEntry> {
+    let mut seen = std::collections::HashSet::new();
+    let mut files = Vec::new();
+    for line in out.lines().filter(|l| !l.trim().is_empty()) {
+        let mut parts = line.split('\t');
+        let Some(status) = parts.next() else { continue };
+        let Some(path) = parts.next_back() else {
+            continue;
+        };
+        let code = status.chars().next().unwrap_or(' ');
+        if seen.insert(path.to_string()) {
+            files.push(StatusEntry {
+                code: format!("{code} "),
+                path: path.to_string(),
+            });
+        }
+    }
+    files
+}
+
+/// Builds a unified-diff addition for an untracked stash blob so the diff
+/// viewer can render it like any other new file.
+fn synthetic_added_diff(path: &str, content: &str) -> String {
+    let line_count = content.lines().count();
+    let mut out = format!(
+        "diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{line_count} @@\n"
+    );
+    if line_count == 0 {
+        // Empty untracked file: still emit a hunk so the panel isn't blank.
+        out = format!(
+            "diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n+\n"
+        );
+        return out;
+    }
+    for line in content.lines() {
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// True when HEAD has an upstream tracking branch configured.
@@ -1423,6 +1484,27 @@ mod tests {
         assert_eq!(entries[0].message, "WIP on main: 1a2b3c4 fix parser");
         assert_eq!(entries[1].index, 1);
         assert_eq!(entries[1].branch, "feature/login");
+    }
+
+    #[test]
+    fn parse_name_status_keeps_rename_target_and_dedupes() {
+        let out = "M\tsrc/a.rs\nR100\told.rs\tnew.rs\nA\tadded.txt\n";
+        let files = parse_name_status(out);
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0].code, "M ");
+        assert_eq!(files[0].path, "src/a.rs");
+        assert_eq!(files[1].code, "R ");
+        assert_eq!(files[1].path, "new.rs");
+        assert_eq!(files[2].code, "A ");
+        assert_eq!(files[2].path, "added.txt");
+    }
+
+    #[test]
+    fn synthetic_added_diff_prefixes_every_line() {
+        let diff = synthetic_added_diff("notes.md", "alpha\nbeta\n");
+        assert!(diff.contains("+++ b/notes.md"));
+        assert!(diff.contains("+alpha\n"));
+        assert!(diff.contains("+beta\n"));
     }
 
     #[test]

@@ -16,14 +16,16 @@ use super::app::{
     App, CheckoutCandidate, CherryTarget, CommitFocus, ConfirmOption, DiffRow, LogMode, Modal,
     ResolverFile, RowList, Tab, TextInput, View, filtered_candidates,
 };
-use super::config_editor::{CHECK_ROW, ConfigEditor, FIELD_ROWS, FORM_LINES, SAVE_ROW, UPDATE_ROW};
+use super::config_editor::{
+    CHECK_ROW, ConfigEditor, FIELD_ROWS, FORM_LINES, SAVE_ROW, THEME_ROW, UPDATE_ROW,
+};
 use super::help::{self, Binding, HelpTab};
 use super::highlight;
 use super::setup::{
     REVIEW_ROWS, SetupWizard, Step, WELCOME_OPTIONS, location_label, location_preview,
 };
 use super::theme::{self, ACCENT, BORDER, GRAPH_COLORS, SELECTION_BG};
-use crate::config::{DEFAULT_AUTO_UPDATE_CHECK, DEFAULT_LOCATION, LOCATION_PRESETS};
+use crate::config::{DEFAULT_AUTO_UPDATE_CHECK, DEFAULT_DIFF_THEME, DEFAULT_LOCATION, LOCATION_PRESETS};
 use crate::conflict::{ConflictSegment, ResolutionAction};
 use crate::git::{GraphLine, StatusEntry};
 use crate::ops::ResolveKind;
@@ -58,6 +60,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             content,
             loading_new,
             scroll,
+            h_scroll,
             ..
         } => draw_commit_diff(
             frame,
@@ -69,6 +72,29 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             content,
             *loading_new,
             *scroll,
+            *h_scroll,
+        ),
+        View::StashDiff {
+            label,
+            rows,
+            files,
+            selected,
+            content,
+            loading_new,
+            scroll,
+            h_scroll,
+            ..
+        } => draw_commit_diff(
+            frame,
+            main,
+            label,
+            files,
+            rows,
+            *selected,
+            content,
+            *loading_new,
+            *scroll,
+            *h_scroll,
         ),
         View::BranchCommits {
             branch,
@@ -119,6 +145,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     &app.changes.content,
                     app.changes.loading_new,
                     app.changes.scroll,
+                    app.changes.h_scroll,
                     &mut app.diff_path_hit,
                 ),
                 Tab::Stash => draw_stash_tab(frame, body, app),
@@ -238,6 +265,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.row_list = match &app.view {
         View::List
         | View::CommitDiff { .. }
+        | View::StashDiff { .. }
         | View::Log { .. }
         | View::BranchCommits { .. }
         | View::ConflictResolver { .. } => list_hit,
@@ -534,6 +562,7 @@ fn draw_diff(
     content: &str,
     loading_new: bool,
     scroll: u16,
+    h_scroll: u16,
     // `path_hit` is set to the screen rect of the diff panel's clickable path
     // title, so a click there can copy the path, or cleared when the cursor
     // isn't on a file.
@@ -670,7 +699,7 @@ fn draw_diff(
     let total = lines.len();
     let para = Paragraph::new(lines)
         .block(panel(title))
-        .scroll((scroll, 0));
+        .scroll((scroll, h_scroll));
     frame.render_widget(para, diff_area);
     let mut sb_state = ScrollbarState::new(total.saturating_sub(diff_area.height as usize))
         .position(scroll as usize);
@@ -731,9 +760,10 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             hint("t", "tree/flat"),
             hint("q", "back"),
         ],
-        View::CommitDiff { .. } => &[
+        View::CommitDiff { .. } | View::StashDiff { .. } => &[
             hint("↑/↓", "file"),
-            hint("⇧↑/⇧↓", "scroll diff"),
+            hint("⇧↑/⇧↓", "scroll"),
+            hint("⇧←/⇧→", "h-scroll"),
             hint("t", "tree/flat"),
             hint("q", "back"),
         ],
@@ -1745,9 +1775,10 @@ fn draw_review(
 }
 
 /// The Settings tab: editable rows for the repo settings, the update-check
-/// toggle, a live resolved-location preview, the running version, a save row,
-/// and a check-for-updates row. The form keeps a fixed width inside the
-/// full-height panel so long paths don't stretch it.
+/// toggle, a live resolved-location preview, a live diff-theme colour sample,
+/// the running version, a save row, and a check-for-updates row. The form
+/// keeps a fixed width inside the full-height panel so long paths don't
+/// stretch it.
 fn draw_settings_tab(
     frame: &mut Frame,
     area: Rect,
@@ -1760,6 +1791,7 @@ fn draw_settings_tab(
         "setup.copy       ",
         "setup.run        ",
         "auto_update_check",
+        "diff_theme       ",
     ];
     let hints = [
         "sibling · inside · home · or a path ({repo} = repo name)",
@@ -1767,6 +1799,7 @@ fn draw_settings_tab(
         "files copied into each new worktree, comma separated",
         "commands run in each new worktree, comma separated",
         "check GitHub for a newer wtm on start · saved for all repos",
+        "syntax colours in the diff pane · Enter cycles · saved for all repos",
     ];
     let mut lines: Vec<Line> = Vec::new();
     for row in 0..FIELD_ROWS {
@@ -1802,6 +1835,17 @@ fn draw_settings_tab(
                 },
                 highlight,
             )),
+            _ if row == THEME_ROW => spans.push(Span::styled(
+                if editor.fields.diff_theme.is_empty() {
+                    format!(
+                        "(default: {})",
+                        highlight::theme_label(DEFAULT_DIFF_THEME)
+                    )
+                } else {
+                    highlight::theme_label(&editor.fields.diff_theme).to_string()
+                },
+                highlight,
+            )),
             _ if editor.field(row).is_empty() => {
                 spans.push(Span::styled("(default)".to_string(), highlight.dim()))
             }
@@ -1827,6 +1871,27 @@ fn draw_settings_tab(
         format!(" → new worktrees go in {resolved}"),
         Style::new().fg(Color::Green),
     )));
+
+    // Live colour sample for the selected diff theme, so cycling the row
+    // shows the palette before the user saves.
+    let theme_id = if editor.fields.diff_theme.is_empty() {
+        DEFAULT_DIFF_THEME
+    } else {
+        editor.fields.diff_theme.as_str()
+    };
+    lines.push(Line::from(Span::styled(
+        format!(
+            " → diff colours look like ({})",
+            highlight::theme_label(theme_id)
+        ),
+        Style::new().fg(Color::Green),
+    )));
+    for sample in highlight::theme_preview_lines(theme_id) {
+        // Indent under the arrow so the sample reads as part of the preview.
+        let mut spans = vec![Span::raw("   ")];
+        spans.extend(sample.spans);
+        lines.push(Line::from(spans));
+    }
 
     // Running version, plus whatever the last update check turned up.
     let mut version = vec![Span::styled(
@@ -2378,6 +2443,7 @@ fn draw_commit_diff(
     content: &str,
     loading_new: bool,
     scroll: u16,
+    h_scroll: u16,
 ) -> Option<RowList> {
     if files.is_empty() {
         let para = Paragraph::new(Line::from("this commit changed no files".dim()))
@@ -2470,7 +2536,7 @@ fn draw_commit_diff(
     let total = lines.len();
     let para = Paragraph::new(lines)
         .block(panel(title))
-        .scroll((scroll, 0));
+        .scroll((scroll, h_scroll));
     frame.render_widget(para, diff_area);
     let mut sb_state = ScrollbarState::new(total.saturating_sub(diff_area.height as usize))
         .position(scroll as usize);
@@ -3255,7 +3321,10 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use super::super::config_editor::{CHECK_LINE, PREVIEW_LINE, SAVE_LINE, VERSION_LINE};
+    use super::super::config_editor::{
+        CHECK_LINE, PREVIEW_LINE, SAVE_LINE, THEME_PREVIEW_LABEL_LINE, THEME_PREVIEW_LINE,
+        THEME_ROW, UPDATE_ROW, VERSION_LINE,
+    };
     use super::*;
     use crate::git::LogEntry;
     use ratatui::Terminal;
@@ -3433,7 +3502,7 @@ mod tests {
     #[test]
     fn settings_tab_draws_rows_where_the_click_decoder_expects_them() {
         let editor = settings_editor("false");
-        let out = render(90, 26, |frame, area| {
+        let out = render(90, 30, |frame, area| {
             draw_settings_tab(frame, area, &editor, None);
         });
         // The form starts after the panel border and one blank spacer line.
@@ -3446,6 +3515,7 @@ mod tests {
             (2, "setup.copy"),
             (3, "setup.run"),
             (UPDATE_ROW, "auto_update_check"),
+            (THEME_ROW, "diff_theme"),
         ] {
             assert!(
                 line(row * 2).contains(label),
@@ -3453,18 +3523,63 @@ mod tests {
                 line(row * 2)
             );
         }
-        assert!(line(UPDATE_ROW * 2).contains("off"), "{:?}", line(8));
+        assert!(line(UPDATE_ROW * 2).contains("off"), "{:?}", line(UPDATE_ROW * 2));
+        assert!(
+            line(THEME_ROW * 2).contains("default"),
+            "{:?}",
+            line(THEME_ROW * 2)
+        );
         assert!(line(PREVIEW_LINE).contains("new worktrees go in"));
+        assert!(
+            line(THEME_PREVIEW_LABEL_LINE).contains("diff colours look like"),
+            "{:?}",
+            line(THEME_PREVIEW_LABEL_LINE)
+        );
+        assert!(
+            line(THEME_PREVIEW_LABEL_LINE).contains("Eighties"),
+            "default theme label should appear: {:?}",
+            line(THEME_PREVIEW_LABEL_LINE)
+        );
+        assert!(
+            line(THEME_PREVIEW_LINE).contains("@@"),
+            "sample hunk header missing: {:?}",
+            line(THEME_PREVIEW_LINE)
+        );
+        assert!(
+            line(THEME_PREVIEW_LINE + 1).contains("fn greet"),
+            "sample removal missing: {:?}",
+            line(THEME_PREVIEW_LINE + 1)
+        );
+        assert!(
+            line(THEME_PREVIEW_LINE + 2).contains("fn greet"),
+            "sample addition missing: {:?}",
+            line(THEME_PREVIEW_LINE + 2)
+        );
         assert!(line(VERSION_LINE).contains(CURRENT_VERSION));
         assert!(line(SAVE_LINE).contains("save settings"));
         assert!(line(CHECK_LINE).contains("check for updates"));
     }
 
     #[test]
+    fn settings_tab_theme_preview_follows_the_selected_theme() {
+        let mut editor = settings_editor("");
+        editor.fields.diff_theme = "ocean".to_string();
+        let out = render(90, 30, |frame, area| {
+            draw_settings_tab(frame, area, &editor, None);
+        });
+        let label = &out[2 + THEME_PREVIEW_LABEL_LINE];
+        assert!(label.contains("Ocean"), "{label}");
+        assert!(
+            out[2 + THEME_PREVIEW_LINE + 1].contains("fn greet"),
+            "{out:#?}"
+        );
+    }
+
+    #[test]
     fn settings_tab_shows_the_version_and_any_update() {
         let editor = settings_editor("");
         // With nothing newer found, the version line says so.
-        let out = render(90, 26, |frame, area| {
+        let out = render(90, 30, |frame, area| {
             draw_settings_tab(frame, area, &editor, None);
         });
         let version_line = &out[2 + VERSION_LINE];
@@ -3479,7 +3594,7 @@ mod tests {
             version: "9.9.9".to_string(),
             url: String::new(),
         };
-        let out = render(90, 26, |frame, area| {
+        let out = render(90, 30, |frame, area| {
             draw_settings_tab(frame, area, &editor, Some(&release));
         });
         let version_line = &out[2 + VERSION_LINE];

@@ -14,6 +14,7 @@ use ratatui::text::{Line, Span};
 
 use super::config_editor::{self, ConfigEditor, EditorOutcome};
 use super::help::HelpTab;
+use super::highlight;
 use super::setup::{self, SetupWizard, WizardOutcome};
 use super::theme;
 use crate::conflict::{self, ConflictSegment, ResolutionAction};
@@ -551,6 +552,28 @@ pub enum View {
         pending: Option<Task<(u64, String, String)>>,
         loading_new: bool,
         scroll: u16,
+        /// Horizontal offset into the diff pane (Shift+←/→ or H/L).
+        h_scroll: u16,
+    },
+    /// Read-only browser for the files inside a stash entry. Same layout and
+    /// keys as [`View::CommitDiff`]; reached with Enter from the Stash tab.
+    StashDiff {
+        /// Worktree supplying the git directory (stashes are repo-global).
+        name: String,
+        /// Stash index (`stash@{index}`).
+        index: u32,
+        /// Title shown in the panel (`stash@{n}: subject`).
+        label: String,
+        files: Vec<StatusEntry>,
+        rows: Vec<DiffRow>,
+        selected: usize,
+        content: String,
+        content_path: Option<String>,
+        load_gen: u64,
+        pending: Option<Task<(u64, String, String)>>,
+        loading_new: bool,
+        scroll: u16,
+        h_scroll: u16,
     },
     /// Commit history of a branch on the Branches tab, with multi-select for
     /// cherry-picking. `marked` is parallel with `lines`; art-only rows are
@@ -1098,6 +1121,8 @@ pub struct ChangesTab {
     /// "loading…" instead of the previous file's stale diff.
     pub loading_new: bool,
     pub scroll: u16,
+    /// Horizontal offset into the diff pane (Shift+←/→ or H/L).
+    pub h_scroll: u16,
     /// When the diff was last recomputed, used to throttle auto-refresh.
     pub last_refresh: Instant,
 }
@@ -1116,6 +1141,7 @@ impl Default for ChangesTab {
             pending: None,
             loading_new: false,
             scroll: 0,
+            h_scroll: 0,
             last_refresh: Instant::now(),
         }
     }
@@ -1322,6 +1348,9 @@ impl App {
         if initialized {
             app.refresh();
         }
+        // Apply the configured diff theme before the first frame so Settings and
+        // the highlighter agree without waiting for a save.
+        highlight::set_theme(app.ctx.config.diff_theme());
         // Fire and forget: the check runs on its own thread and its result is
         // drained by `tick`, so a slow or offline network never delays the
         // first frame. Never in unit tests, which must not reach the network.
@@ -1603,9 +1632,15 @@ impl App {
                         self.message = Some(m);
                         self.refresh();
                         match then {
-                            BusyThen::List
-                            | BusyThen::Pull { .. }
-                            | BusyThen::DeleteBranch { .. }
+                            // A pull or push started from the Changes tab moves
+                            // the working tree under it, so re-read the file
+                            // list and diff rather than showing a stale one.
+                            BusyThen::List | BusyThen::Pull { .. } => {
+                                if self.tab == Tab::Changes {
+                                    self.refresh_diff();
+                                }
+                            }
+                            BusyThen::DeleteBranch { .. }
                             | BusyThen::Resolve { .. }
                             | BusyThen::Restart { .. } => {}
                             BusyThen::Stash(name) => self.reload_stash_tab(name),
@@ -1638,8 +1673,8 @@ impl App {
             }
             return;
         }
-        if matches!(self.view, View::CommitDiff { .. }) {
-            self.poll_commit_diff_load();
+        if matches!(self.view, View::CommitDiff { .. } | View::StashDiff { .. }) {
+            self.poll_file_browser_diff_load();
             return;
         }
         let View::Creating {
@@ -1918,7 +1953,7 @@ impl App {
             View::Commit { .. } => self.on_commit_key(key),
             View::Switch { .. } => self.on_switch_key(key),
             View::Log { .. } => self.on_log_key(key),
-            View::CommitDiff { .. } => self.on_commit_diff_key(key),
+            View::CommitDiff { .. } | View::StashDiff { .. } => self.on_file_browser_key(key),
             View::BranchCommits { .. } => self.on_branch_commits_key(key),
             View::CherryPick { .. } => self.on_cherry_pick_key(key),
             View::MergePick { .. } => self.on_merge_pick_key(key),
@@ -2784,6 +2819,7 @@ impl App {
             c.loading_new = false;
             if reset_scroll {
                 c.scroll = 0;
+                c.h_scroll = 0;
             }
             return;
         };
@@ -2797,6 +2833,7 @@ impl App {
         let is_new = c.content_path.as_deref() != Some(path.as_str());
         if reset_scroll {
             c.scroll = 0;
+            c.h_scroll = 0;
         }
         // Compute the diff off the UI thread; the result is picked up in `tick`
         // via `poll_diff_load` and applied only if its generation still matches.
@@ -2838,6 +2875,13 @@ impl App {
         // Don't let a shrunken diff leave the viewport past the last line.
         let max = c.content.lines().count().saturating_sub(1) as u16;
         c.scroll = c.scroll.min(max);
+        let max_h = c
+            .content
+            .lines()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(0) as u16;
+        c.h_scroll = c.h_scroll.min(max_h);
     }
 
     /// Handles mouse input. The scroll wheel moves the help, diff, or log
@@ -2928,17 +2972,21 @@ impl App {
             return;
         }
         match &mut self.view {
-            View::CommitDiff { rows, selected, .. } if over_list => {
+            View::CommitDiff { rows, selected, .. } | View::StashDiff { rows, selected, .. }
+                if over_list =>
+            {
                 let moved = if down {
                     (*selected + 1 < rows.len()).then(|| *selected += 1)
                 } else {
                     (*selected > 0).then(|| *selected -= 1)
                 };
                 if moved.is_some() {
-                    self.load_commit_diff_content(true);
+                    self.load_file_browser_diff_content(true);
                 }
             }
-            View::CommitDiff { scroll, .. } => *scroll = delta(*scroll),
+            View::CommitDiff { scroll, .. } | View::StashDiff { scroll, .. } => {
+                *scroll = delta(*scroll)
+            }
             // The log has no free scroll offset any more; the wheel steps the
             // commit cursor instead, matching the arrow keys.
             View::Log {
@@ -3125,14 +3173,16 @@ impl App {
                 }
                 Tab::Settings => {}
             },
-            View::CommitDiff { .. } => {
-                if let View::CommitDiff { selected, rows, .. } = &mut self.view {
+            View::CommitDiff { .. } | View::StashDiff { .. } => {
+                if let View::CommitDiff { selected, rows, .. }
+                | View::StashDiff { selected, rows, .. } = &mut self.view
+                {
                     if idx >= rows.len() || *selected == idx {
                         return;
                     }
                     *selected = idx;
                 }
-                self.load_commit_diff_content(true);
+                self.load_file_browser_diff_content(true);
             }
             View::Commit { .. } => {
                 if let View::Commit {
@@ -3258,6 +3308,18 @@ impl App {
             self.scroll_diff(|s| s.saturating_sub(3));
             return;
         }
+        // Horizontal scroll: Shift+←/→ or H/L (plain h/l still tree-navigate).
+        let shift_right =
+            key.code == KeyCode::Right && key.modifiers.contains(KeyModifiers::SHIFT);
+        let shift_left = key.code == KeyCode::Left && key.modifiers.contains(KeyModifiers::SHIFT);
+        if shift_right || key.code == KeyCode::Char('L') {
+            self.scroll_diff_h(|s| s.saturating_add(8));
+            return;
+        }
+        if shift_left || key.code == KeyCode::Char('H') {
+            self.scroll_diff_h(|s| s.saturating_sub(8));
+            return;
+        }
         match key.code {
             // Every top-level tab quits on Esc/q; only drill-ins go "back".
             KeyCode::Esc | KeyCode::Char('q') => self.quit = true,
@@ -3274,7 +3336,10 @@ impl App {
                     self.load_diff_content(true);
                 }
             }
-            KeyCode::Home | KeyCode::Char('g') => self.scroll_diff(|_| 0),
+            KeyCode::Home | KeyCode::Char('g') => {
+                self.scroll_diff(|_| 0);
+                self.scroll_diff_h(|_| 0);
+            }
             KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
                 self.tree_nav(key.code)
             }
@@ -3321,6 +3386,8 @@ impl App {
                 }
             }
             KeyCode::Char('S') => self.stash_marked(),
+            KeyCode::Char('p') => self.start_pull(),
+            KeyCode::Char('P') => self.start_push(),
             // `u` undoes local changes to the file. `R` is reserved for rename
             // everywhere, so revert is not bound to it here.
             KeyCode::Char('u') => {
@@ -3402,9 +3469,15 @@ impl App {
         if !self.file_tree {
             return;
         }
-        let is_commit = matches!(self.view, View::CommitDiff { .. });
+        let is_browser = matches!(self.view, View::CommitDiff { .. } | View::StashDiff { .. });
         let (files, rows, selected) = match &mut self.view {
             View::CommitDiff {
+                files,
+                rows,
+                selected,
+                ..
+            }
+            | View::StashDiff {
                 files,
                 rows,
                 selected,
@@ -3497,8 +3570,8 @@ impl App {
                 *selected += 1;
             }
         }
-        if is_commit {
-            self.load_commit_diff_content(true);
+        if is_browser {
+            self.load_file_browser_diff_content(true);
         } else {
             self.load_diff_content(true);
         }
@@ -3519,6 +3592,19 @@ impl App {
     /// Applies `f` to the Changes tab's diff scroll offset.
     fn scroll_diff(&mut self, f: impl FnOnce(u16) -> u16) {
         self.changes.scroll = f(self.changes.scroll);
+    }
+
+    /// Applies `f` to the Changes tab's horizontal diff scroll, clamped to the
+    /// longest line in the current content.
+    fn scroll_diff_h(&mut self, f: impl FnOnce(u16) -> u16) {
+        let max = self
+            .changes
+            .content
+            .lines()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(0) as u16;
+        self.changes.h_scroll = f(self.changes.h_scroll).min(max);
     }
 
     /// Rebuilds the changed-file list and the selected file's diff in place,
@@ -4187,6 +4273,14 @@ impl App {
             KeyCode::Char('x') => {
                 if !self.stash_entries.is_empty() {
                     self.open_stash_drop_modal(name, index);
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(entry) = self.stash_entries.get(self.stash_selected) {
+                    let label = format!("stash@{{{}}}: {}", entry.index, entry.message);
+                    let index = entry.index;
+                    let name = self.stash_name.clone();
+                    self.open_stash_diff(name, index, label);
                 }
             }
             _ => {}
@@ -5696,123 +5790,222 @@ impl App {
                     pending: None,
                     loading_new: false,
                     scroll: 0,
+                    h_scroll: 0,
                 });
-                self.load_commit_diff_content(true);
+                self.load_file_browser_diff_content(true);
             }
             Err(e) => self.set_error(format!("{e:#}")),
         }
     }
 
-    /// Key handling for the read-only commit browser: navigate files, scroll the
-    /// diff, toggle tree/flat, or go back to where it was opened from.
-    fn on_commit_diff_key(&mut self, key: KeyEvent) {
-        let View::CommitDiff { rows, selected, .. } = &mut self.view else {
-            return;
+    /// Key handling for the read-only commit/stash file browser: navigate files,
+    /// scroll the diff (including horizontally), toggle tree/flat, or go back.
+    fn on_file_browser_key(&mut self, key: KeyEvent) {
+        let (rows_len, selected) = match &self.view {
+            View::CommitDiff { rows, selected, .. } | View::StashDiff { rows, selected, .. } => {
+                (rows.len(), *selected)
+            }
+            _ => return,
         };
-        // Scroll the diff pane (same modifiers as the changes view).
+        // Vertical scroll (Shift+↑/↓ or J/K).
         let shift_down = key.code == KeyCode::Down && key.modifiers.contains(KeyModifiers::SHIFT);
         let shift_up = key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::SHIFT);
         if shift_down || key.code == KeyCode::Char('J') {
-            self.scroll_commit_diff(|s| s.saturating_add(3));
+            self.scroll_file_browser_v(|s| s.saturating_add(3));
             return;
         }
         if shift_up || key.code == KeyCode::Char('K') {
-            self.scroll_commit_diff(|s| s.saturating_sub(3));
+            self.scroll_file_browser_v(|s| s.saturating_sub(3));
+            return;
+        }
+        // Horizontal scroll (Shift+←/→ or H/L). Plain h/l still tree-navigate.
+        let shift_right =
+            key.code == KeyCode::Right && key.modifiers.contains(KeyModifiers::SHIFT);
+        let shift_left = key.code == KeyCode::Left && key.modifiers.contains(KeyModifiers::SHIFT);
+        if shift_right || key.code == KeyCode::Char('L') {
+            self.scroll_file_browser_h(|s| s.saturating_add(8));
+            return;
+        }
+        if shift_left || key.code == KeyCode::Char('H') {
+            self.scroll_file_browser_h(|s| s.saturating_sub(8));
             return;
         }
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.close_commit_diff(),
+            KeyCode::Esc | KeyCode::Char('q') => self.pop_screen(),
             KeyCode::Down | KeyCode::Char('j') => {
-                if *selected + 1 < rows.len() {
-                    *selected += 1;
-                    self.load_commit_diff_content(true);
+                if selected + 1 < rows_len {
+                    if let View::CommitDiff { selected, .. } | View::StashDiff { selected, .. } =
+                        &mut self.view
+                    {
+                        *selected += 1;
+                    }
+                    self.load_file_browser_diff_content(true);
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if *selected > 0 {
-                    *selected -= 1;
-                    self.load_commit_diff_content(true);
+                if selected > 0 {
+                    if let View::CommitDiff { selected, .. } | View::StashDiff { selected, .. } =
+                        &mut self.view
+                    {
+                        *selected -= 1;
+                    }
+                    self.load_file_browser_diff_content(true);
                 }
             }
-            KeyCode::Home | KeyCode::Char('g') => self.scroll_commit_diff(|_| 0),
+            KeyCode::Home | KeyCode::Char('g') => {
+                self.scroll_file_browser_v(|_| 0);
+                self.scroll_file_browser_h(|_| 0);
+            }
             KeyCode::Left
             | KeyCode::Right
             | KeyCode::Char('h')
             | KeyCode::Char('l')
             | KeyCode::Enter => self.tree_nav(key.code),
-            KeyCode::Char('t') => self.toggle_commit_diff_layout(),
+            KeyCode::Char('t') => self.toggle_file_browser_layout(),
             _ => {}
         }
     }
 
-    /// Returns from the commit browser to whichever view opened it.
-    fn close_commit_diff(&mut self) {
-        // The log (worktree or branch) that opened this browser is still on the
-        // stack underneath, at the cursor it was left on, so popping returns
-        // there with no back-reference to track.
-        self.pop_screen();
+    /// Opens a stash entry's file browser (files + per-file diffs).
+    fn open_stash_diff(&mut self, name: String, index: u32, label: String) {
+        match ops::stash_files(&self.ctx, &name, index) {
+            Ok(files) => {
+                let rows = build_rows(&files, self.file_tree, &self.collapsed_folders);
+                self.push_screen(View::StashDiff {
+                    name,
+                    index,
+                    label,
+                    files,
+                    rows,
+                    selected: 0,
+                    content: String::new(),
+                    content_path: None,
+                    load_gen: 0,
+                    pending: None,
+                    loading_new: false,
+                    scroll: 0,
+                    h_scroll: 0,
+                });
+                self.load_file_browser_diff_content(true);
+            }
+            Err(e) => self.set_error(format!("{e:#}")),
+        }
     }
 
-    /// Flips the commit browser's file list between tree and flat, keeping the
-    /// cursor on the same file, then reloads its diff.
-    fn toggle_commit_diff_layout(&mut self) {
+    /// Flips the commit/stash browser's file list between tree and flat.
+    fn toggle_file_browser_layout(&mut self) {
         self.file_tree = !self.file_tree;
         let tree = self.file_tree;
-        if let View::CommitDiff {
-            files,
-            rows,
-            selected,
-            ..
-        } = &mut self.view
-        {
-            let path = current_file_index(rows, *selected).map(|i| files[i].path.clone());
-            *rows = build_rows(files, tree, &self.collapsed_folders);
-            *selected = path
-                .and_then(|p| {
-                    rows.iter().position(
-                        |r| matches!(r, DiffRow::File { index, .. } if files[*index].path == p),
-                    )
-                })
-                .unwrap_or(0);
-        }
-        self.load_commit_diff_content(true);
-    }
-
-    /// Applies `f` to the commit browser's diff scroll offset.
-    fn scroll_commit_diff(&mut self, f: impl FnOnce(u16) -> u16) {
-        if let View::CommitDiff { scroll, .. } = &mut self.view {
-            *scroll = f(*scroll);
-        }
-    }
-
-    /// Loads the diff for the file under the commit browser's cursor off the UI
-    /// thread, mirroring `load_diff_content`. `reset_scroll` sends the viewport
-    /// to the top when the selected file changes.
-    fn load_commit_diff_content(&mut self, reset_scroll: bool) {
-        let View::CommitDiff {
-            name,
-            hash,
-            rows,
-            files,
-            selected,
-            ..
-        } = &self.view
-        else {
-            return;
+        let (files, rows, selected) = match &mut self.view {
+            View::CommitDiff {
+                files,
+                rows,
+                selected,
+                ..
+            }
+            | View::StashDiff {
+                files,
+                rows,
+                selected,
+                ..
+            } => (files, rows, selected),
+            _ => return,
         };
-        let entry = current_file_index(rows, *selected).and_then(|i| files.get(i).cloned());
-        let name = name.clone();
-        let hash = hash.clone();
-        // Folder / empty row: clear synchronously and cancel any in-flight load.
-        let Some(e) = entry else {
+        let path = current_file_index(rows, *selected).map(|i| files[i].path.clone());
+        *rows = build_rows(files, tree, &self.collapsed_folders);
+        *selected = path
+            .and_then(|p| {
+                rows.iter().position(
+                    |r| matches!(r, DiffRow::File { index, .. } if files[*index].path == p),
+                )
+            })
+            .unwrap_or(0);
+        self.load_file_browser_diff_content(true);
+    }
+
+    /// Applies `f` to the commit/stash browser's vertical scroll offset.
+    fn scroll_file_browser_v(&mut self, f: impl FnOnce(u16) -> u16) {
+        match &mut self.view {
+            View::CommitDiff { scroll, .. } | View::StashDiff { scroll, .. } => {
+                *scroll = f(*scroll);
+            }
+            _ => {}
+        }
+    }
+
+    /// Applies `f` to the commit/stash browser's horizontal scroll offset.
+    fn scroll_file_browser_h(&mut self, f: impl FnOnce(u16) -> u16) {
+        match &mut self.view {
+            View::CommitDiff { h_scroll, content, .. }
+            | View::StashDiff { h_scroll, content, .. } => {
+                let max = content
+                    .lines()
+                    .map(|l| l.chars().count())
+                    .max()
+                    .unwrap_or(0) as u16;
+                *h_scroll = f(*h_scroll).min(max);
+            }
+            _ => {}
+        }
+    }
+
+    /// Loads the diff for the file under the commit/stash browser's cursor.
+    /// `reset_scroll` sends the viewport to the top-left when the file changes.
+    fn load_file_browser_diff_content(&mut self, reset_scroll: bool) {
+        enum Source {
+            Commit { name: String, hash: String },
+            Stash { name: String, index: u32 },
+        }
+        let (source, entry) = match &self.view {
+            View::CommitDiff {
+                name,
+                hash,
+                rows,
+                files,
+                selected,
+                ..
+            } => (
+                Source::Commit {
+                    name: name.clone(),
+                    hash: hash.clone(),
+                },
+                current_file_index(rows, *selected).and_then(|i| files.get(i).cloned()),
+            ),
+            View::StashDiff {
+                name,
+                index,
+                rows,
+                files,
+                selected,
+                ..
+            } => (
+                Source::Stash {
+                    name: name.clone(),
+                    index: *index,
+                },
+                current_file_index(rows, *selected).and_then(|i| files.get(i).cloned()),
+            ),
+            _ => return,
+        };
+        let clear = |view: &mut View, reset_scroll: bool| {
             if let View::CommitDiff {
                 content,
                 content_path,
                 pending,
                 loading_new,
                 scroll,
+                h_scroll,
                 ..
-            } = &mut self.view
+            }
+            | View::StashDiff {
+                content,
+                content_path,
+                pending,
+                loading_new,
+                scroll,
+                h_scroll,
+                ..
+            } = view
             {
                 content.clear();
                 *content_path = None;
@@ -5820,38 +6013,64 @@ impl App {
                 *loading_new = false;
                 if reset_scroll {
                     *scroll = 0;
+                    *h_scroll = 0;
                 }
             }
+        };
+        let Some(e) = entry else {
+            clear(&mut self.view, reset_scroll);
             return;
         };
         let path = e.path.clone();
-        let (token, is_new) = if let View::CommitDiff {
-            load_gen,
-            content_path,
-            scroll,
-            ..
-        } = &mut self.view
-        {
-            *load_gen = load_gen.wrapping_add(1);
-            let is_new = content_path.as_deref() != Some(path.as_str());
-            if reset_scroll {
-                *scroll = 0;
+        let (token, is_new) = match &mut self.view {
+            View::CommitDiff {
+                load_gen,
+                content_path,
+                scroll,
+                h_scroll,
+                ..
             }
-            (*load_gen, is_new)
-        } else {
-            return;
+            | View::StashDiff {
+                load_gen,
+                content_path,
+                scroll,
+                h_scroll,
+                ..
+            } => {
+                *load_gen = load_gen.wrapping_add(1);
+                let is_new = content_path.as_deref() != Some(path.as_str());
+                if reset_scroll {
+                    *scroll = 0;
+                    *h_scroll = 0;
+                }
+                (*load_gen, is_new)
+            }
+            _ => return,
         };
         let (tx, rx) = channel();
         let ctx = self.ctx.clone();
         let path_for_thread = path.clone();
         std::thread::spawn(move || {
-            let content = match ops::commit_file_diff(&ctx, &name, &hash, &path_for_thread) {
+            let content = match source {
+                Source::Commit { name, hash } => {
+                    ops::commit_file_diff(&ctx, &name, &hash, &path_for_thread)
+                }
+                Source::Stash { name, index } => {
+                    ops::stash_file_diff(&ctx, &name, index, &path_for_thread)
+                }
+            };
+            let content = match content {
                 Ok(c) => c,
                 Err(err) => format!("error: {err:#}"),
             };
             let _ = tx.send((token, path_for_thread, content));
         });
         if let View::CommitDiff {
+            pending,
+            loading_new,
+            ..
+        }
+        | View::StashDiff {
             pending,
             loading_new,
             ..
@@ -5862,23 +6081,25 @@ impl App {
         }
     }
 
-    /// Applies the newest background commit-diff result, if it still matches the
-    /// current generation. Mirrors `poll_diff_load` for the commit browser.
-    fn poll_commit_diff_load(&mut self) {
-        let View::CommitDiff {
-            pending, load_gen, ..
-        } = &self.view
-        else {
-            return;
+    /// Applies the newest background commit/stash-diff result when it still
+    /// matches the current generation.
+    fn poll_file_browser_diff_load(&mut self) {
+        let (pending, load_gen) = match &self.view {
+            View::CommitDiff {
+                pending, load_gen, ..
+            }
+            | View::StashDiff {
+                pending, load_gen, ..
+            } => (pending, *load_gen),
+            _ => return,
         };
         let Some(rx) = pending else {
             return;
         };
-        let token = *load_gen;
         let Some((g, path, content)) = rx.poll_latest() else {
             return;
         };
-        if g != token {
+        if g != load_gen {
             return;
         }
         if let View::CommitDiff {
@@ -5887,6 +6108,16 @@ impl App {
             pending,
             loading_new,
             scroll,
+            h_scroll,
+            ..
+        }
+        | View::StashDiff {
+            content: slot,
+            content_path,
+            pending,
+            loading_new,
+            scroll,
+            h_scroll,
             ..
         } = &mut self.view
         {
@@ -5894,8 +6125,14 @@ impl App {
             *content_path = Some(path);
             *pending = None;
             *loading_new = false;
-            let max = slot.lines().count().saturating_sub(1) as u16;
-            *scroll = (*scroll).min(max);
+            let max_v = slot.lines().count().saturating_sub(1) as u16;
+            *scroll = (*scroll).min(max_v);
+            let max_h = slot
+                .lines()
+                .map(|l| l.chars().count())
+                .max()
+                .unwrap_or(0) as u16;
+            *h_scroll = (*h_scroll).min(max_h);
         }
     }
 
@@ -5966,12 +6203,13 @@ impl App {
 
     /// Pulls the selected worktree (fast-forward only) in the background. When
     /// the pull is refused because the branch has diverged, tick() opens the
-    /// `ConfirmPullRebase` prompt instead of showing the error.
+    /// `ConfirmPullRebase` prompt instead of showing the error. On the Changes
+    /// tab the worktree is the one whose diffs are open, not the Worktrees-tab
+    /// cursor.
     fn start_pull(&mut self) {
-        let Some(wt) = self.selected_worktree() else {
+        let Some(name) = self.active_worktree_name() else {
             return;
         };
-        let name = wt.name.clone();
         let then = BusyThen::Pull { name: name.clone() };
         self.start_busy(format!("pulling {name}…"), then, move |ctx| {
             ops::pull(ctx, &name, false)
@@ -6001,11 +6239,11 @@ impl App {
     }
 
     /// Pushes the selected worktree (auto-publishing when it has no upstream).
+    /// On the Changes tab this is the worktree whose diffs are open.
     fn start_push(&mut self) {
-        let Some(wt) = self.selected_worktree() else {
+        let Some(name) = self.active_worktree_name() else {
             return;
         };
-        let name = wt.name.clone();
         self.start_busy(format!("pushing {name}…"), BusyThen::List, move |ctx| {
             ops::push(ctx, &name, false)
                 .map(|r| {
@@ -6022,6 +6260,15 @@ impl App {
                 })
                 .map_err(|e| format!("{e:#}"))
         });
+    }
+
+    /// Worktree name for pull/push: Changes-tab target when that tab is open,
+    /// otherwise the Worktrees-tab selection.
+    fn active_worktree_name(&self) -> Option<String> {
+        if self.tab == Tab::Changes && !self.changes.name.is_empty() {
+            return Some(self.changes.name.clone());
+        }
+        self.selected_worktree().map(|w| w.name.clone())
     }
 
     /// Fast-forwards the branch selected on the Branches tab to its upstream.
@@ -6304,6 +6551,26 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while app.changes.pending.is_some() {
             app.poll_diff_load();
+            assert!(std::time::Instant::now() < deadline, "diff load timed out");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// Waits out an in-flight diff load in the commit/stash file browser, so
+    /// tests can assert on the `content` the background thread produced.
+    fn settle_browser_diff(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while matches!(
+            app.view,
+            View::CommitDiff {
+                pending: Some(_),
+                ..
+            } | View::StashDiff {
+                pending: Some(_),
+                ..
+            }
+        ) {
+            app.poll_file_browser_diff_load();
             assert!(std::time::Instant::now() < deadline, "diff load timed out");
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
@@ -9114,7 +9381,7 @@ mod tests {
                 ..
             }
         ) {
-            app.poll_commit_diff_load();
+            app.poll_file_browser_diff_load();
             assert!(std::time::Instant::now() < deadline, "diff load timed out");
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
@@ -9153,7 +9420,7 @@ mod tests {
                 ..
             }
         ) {
-            app.poll_commit_diff_load();
+            app.poll_file_browser_diff_load();
             assert!(std::time::Instant::now() < deadline, "diff load timed out");
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
@@ -9913,7 +10180,11 @@ mod tests {
         press(&mut app, KeyCode::Enter); // default -> on
         press(&mut app, KeyCode::Enter); // on -> off
         assert_eq!(app.settings.fields.auto_update_check, "false");
-        press(&mut app, KeyCode::Down); // save row
+        // Skip the diff_theme cycle row that sits between the update toggle and
+        // the save action.
+        while app.settings.selected < config_editor::SAVE_ROW {
+            press(&mut app, KeyCode::Down);
+        }
         press(&mut app, KeyCode::Enter);
 
         let text = std::fs::read_to_string(&global).unwrap();
@@ -10672,5 +10943,125 @@ mod tests {
             .expect("a folder row exists");
         render_app(&mut app, 100, 30);
         assert!(app.diff_path_hit.is_none());
+    }
+
+    /// Shift+←/→ (and H/L, which arrive as plain capitals on terminals that
+    /// drop the modifier) pan the Changes-tab diff sideways, and switching
+    /// files sends the offset back to the left edge.
+    #[test]
+    fn shift_arrows_scroll_the_changes_diff_horizontally() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("narrow.txt"), "hi\n").unwrap();
+        // A long line so the offset has somewhere to go: it is clamped to the
+        // longest line in the diff on screen.
+        std::fs::write(root.join("wide.txt"), format!("{}\n", "x".repeat(200))).unwrap();
+        app.refresh();
+        app.selected = app.worktrees.iter().position(|w| w.is_main).unwrap();
+        app.select_tab(Tab::Changes);
+        select_diff_file(&mut app, "wide.txt");
+        assert_eq!(app.changes.h_scroll, 0);
+
+        press_shift(&mut app, KeyCode::Right);
+        assert_eq!(app.changes.h_scroll, 8);
+        press(&mut app, KeyCode::Char('L'));
+        assert_eq!(app.changes.h_scroll, 16);
+        press_shift(&mut app, KeyCode::Left);
+        assert_eq!(app.changes.h_scroll, 8);
+        press(&mut app, KeyCode::Char('H'));
+        assert_eq!(app.changes.h_scroll, 0);
+
+        press(&mut app, KeyCode::Char('L'));
+        assert_eq!(app.changes.h_scroll, 8);
+        let row = app.changes.selected;
+        press(&mut app, KeyCode::Up);
+        assert_ne!(app.changes.selected, row, "the cursor moved off wide.txt");
+        settle_diff(&mut app);
+        assert_eq!(app.changes.h_scroll, 0, "a file switch resets the offset");
+    }
+
+    /// Enter on the Stash tab opens a read-only browser for the entry's files,
+    /// loading each stashed diff off-thread like the commit browser does.
+    #[test]
+    fn stash_enter_browses_the_stashed_files() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("f.txt"), "one\n").unwrap();
+        // Commit everything, `.wtm.toml` included: stashing sweeps up untracked
+        // files, and an extra entry would sort ahead of f.txt in the browser.
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-m", "add f"]);
+        // A long replacement line, so the browser's horizontal offset has room.
+        std::fs::write(root.join("f.txt"), format!("{}\n", "y".repeat(200))).unwrap();
+        app.refresh();
+        app.selected = app.worktrees.iter().position(|w| w.is_main).unwrap();
+
+        press(&mut app, KeyCode::Char('s')); // the Stash tab
+        press(&mut app, KeyCode::Char('s')); // stash the change
+        press(&mut app, KeyCode::Enter); // no message
+        settle(&mut app);
+        assert_eq!(app.stash_entries.len(), 1);
+
+        press(&mut app, KeyCode::Enter);
+        settle_browser_diff(&mut app);
+        match &app.view {
+            View::StashDiff {
+                index,
+                label,
+                files,
+                content,
+                ..
+            } => {
+                assert_eq!(*index, 0);
+                assert!(label.starts_with("stash@{0}"), "{label}");
+                assert!(files.iter().any(|f| f.path == "f.txt"), "{files:?}");
+                assert!(content.contains("yyy"), "the stashed diff: {content}");
+            }
+            _ => panic!("expected the stash browser"),
+        }
+
+        press_shift(&mut app, KeyCode::Right);
+        match &app.view {
+            View::StashDiff { h_scroll, .. } => assert_eq!(*h_scroll, 8),
+            _ => panic!("expected the stash browser"),
+        }
+
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.view, View::List));
+        assert_eq!(app.tab, Tab::Stash, "back on the tab it was opened from");
+    }
+
+    /// p/P on the Changes tab act on the worktree whose diffs are open, which
+    /// need not be the one the Worktrees tab has under its cursor.
+    #[test]
+    fn changes_tab_pull_and_push_use_the_open_worktree() {
+        let (_tmp, mut app) = test_app();
+        add_and_select_worktree(&mut app, "feature");
+        app.select_tab(Tab::Changes);
+        assert_eq!(app.changes.name, "feature");
+        // Park the Worktrees-tab cursor elsewhere: it must not be consulted.
+        app.selected = app.worktrees.iter().position(|w| w.is_main).unwrap();
+
+        press(&mut app, KeyCode::Char('p'));
+        match &app.view {
+            View::Busy { label, then, .. } => {
+                assert_eq!(label, "pulling feature…");
+                assert!(matches!(then, BusyThen::Pull { name } if name == "feature"));
+            }
+            _ => panic!("expected the busy overlay"),
+        }
+        settle(&mut app);
+        // No upstream in a test repo, so the pull reports an error; clear it or
+        // the next key press would only dismiss the popup.
+        app.error = None;
+        assert_eq!(app.tab, Tab::Changes);
+        assert_eq!(app.changes.name, "feature");
+
+        press(&mut app, KeyCode::Char('P'));
+        match &app.view {
+            View::Busy { label, .. } => assert_eq!(label, "pushing feature…"),
+            _ => panic!("expected the busy overlay"),
+        }
+        settle(&mut app);
     }
 }

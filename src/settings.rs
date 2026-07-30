@@ -33,6 +33,10 @@ const KEYS: &[(&str, &str)] = &[
         "check GitHub for a newer wtm when the TUI starts (true/false)",
     ),
     (
+        "diff_theme",
+        "diff syntax-highlight theme: eighties, mocha, ocean, solarized, github",
+    ),
+    (
         "setup.copy",
         "files copied into each new worktree, comma separated",
     ),
@@ -188,9 +192,10 @@ pub fn write_draft(repo_root: &Path, draft: &ConfigDraft) -> Result<PathBuf> {
 /// strings for the TUI config editor. Unset keys come back empty; `copy` and
 /// `run` are comma-joined.
 ///
-/// `auto_update_check` is the exception: it governs wtm itself rather than one
-/// repo, so it is read from `global_config` (the caller's resolved global
-/// config path, or `None` when there isn't one) instead of the repo file.
+/// `auto_update_check` and `diff_theme` are the exceptions: they govern wtm
+/// itself rather than one repo, so they are read from `global_config` (the
+/// caller's resolved global config path, or `None` when there isn't one)
+/// instead of the repo file.
 pub fn repo_config_fields(
     repo_root: &Path,
     global_config: Option<&Path>,
@@ -209,6 +214,7 @@ pub fn repo_config_fields(
         worktree_dir: cfg.worktree_dir.unwrap_or_default(),
         open_command: cfg.open_command.unwrap_or_default(),
         auto_update_check: global_auto_update_check(global_config),
+        diff_theme: global_diff_theme(global_config),
         copy,
         run,
     })
@@ -225,6 +231,14 @@ fn global_auto_update_check(global_config: Option<&Path>) -> String {
         .unwrap_or_default()
 }
 
+/// The global config's `diff_theme` as an editor string: `""` when unset.
+fn global_diff_theme(global_config: Option<&Path>) -> String {
+    global_config
+        .and_then(|path| FileConfig::load(path).ok())
+        .and_then(|cfg| cfg.diff_theme)
+        .unwrap_or_default()
+}
+
 /// The settings the TUI config editor shows, each empty when unset.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RepoConfigFields {
@@ -232,6 +246,8 @@ pub struct RepoConfigFields {
     pub open_command: String,
     /// `""`, `"true"`, or `"false"`; lives in the global config.
     pub auto_update_check: String,
+    /// Diff theme short id, or `""` for the default; lives in the global config.
+    pub diff_theme: String,
     pub copy: String,
     pub run: String,
 }
@@ -240,8 +256,9 @@ pub struct RepoConfigFields {
 /// surrounding TOML. An empty value unsets the key so the default (or global
 /// value) applies again. Returns the repo file's path.
 ///
-/// Repo settings go to the repo's `.wtm.toml`; `auto_update_check` goes to
-/// `global_config`, since it is about wtm rather than about this repository.
+/// Repo settings go to the repo's `.wtm.toml`; `auto_update_check` and
+/// `diff_theme` go to `global_config`, since they are about wtm rather than
+/// about this repository.
 pub fn save_config_edits(
     repo_root: &Path,
     global_config: Option<&Path>,
@@ -256,6 +273,7 @@ pub fn save_config_edits(
     save_doc(&file, &doc)?;
     if let Some(path) = global_config {
         save_global_auto_update_check(path, &fields.auto_update_check)?;
+        save_global_diff_theme(path, &fields.diff_theme)?;
     }
     Ok(file)
 }
@@ -268,6 +286,21 @@ fn save_global_auto_update_check(path: &Path, raw: &str) -> Result<()> {
         apply_unset(&mut doc, "auto_update_check")?
     } else {
         apply_set(&mut doc, "auto_update_check", raw)?;
+        true
+    };
+    if changed {
+        save_doc(path, &doc)?;
+    }
+    Ok(())
+}
+
+/// Writes (or clears) `diff_theme` in the global config at `path`.
+fn save_global_diff_theme(path: &Path, raw: &str) -> Result<()> {
+    let mut doc = load_doc(path)?;
+    let changed = if raw.trim().is_empty() {
+        apply_unset(&mut doc, "diff_theme")?
+    } else {
+        apply_set(&mut doc, "diff_theme", raw)?;
         true
     };
     if changed {
@@ -324,6 +357,10 @@ fn show(cwd: &Path, json: bool) -> Result<()> {
                 "value": cfg.auto_update_check(),
                 "source": cfg.auto_update_check_source,
             },
+            "diff_theme": {
+                "value": cfg.diff_theme(),
+                "source": cfg.diff_theme_source,
+            },
             "version": crate::update::CURRENT_VERSION,
             "setup": {
                 "copy": { "value": cfg.setup.copy, "source": cfg.copy_source },
@@ -352,6 +389,11 @@ fn show(cwd: &Path, json: bool) -> Result<()> {
         "  auto_update_check = {}   ({})",
         cfg.auto_update_check(),
         cfg.auto_update_check_source
+    );
+    println!(
+        "  diff_theme = {:?}   ({})",
+        cfg.diff_theme(),
+        cfg.diff_theme_source
     );
     println!(
         "  setup.copy   = {:?}   ({})",
@@ -388,6 +430,7 @@ fn get(cwd: &Path, key: &str, json: bool) -> Result<()> {
         ),
         "open_command" => json!(cfg.open_command.clone().unwrap_or_default()),
         "auto_update_check" => json!(cfg.auto_update_check()),
+        "diff_theme" => json!(cfg.diff_theme()),
         "setup.copy" => json!(cfg.setup.copy),
         "setup.run" => json!(cfg.setup.run),
         _ => unreachable!("known_key checked"),
@@ -699,6 +742,9 @@ fn apply_set(doc: &mut DocumentMut, key: &str, raw: &str) -> Result<()> {
         "auto_update_check" => {
             doc["auto_update_check"] = toml_value(parse_bool(raw)?);
         }
+        "diff_theme" => {
+            doc["diff_theme"] = toml_value(parse_diff_theme(raw)?);
+        }
         "setup.copy" | "setup.run" => {
             let sub = key.strip_prefix("setup.").unwrap();
             let setup = doc
@@ -719,6 +765,7 @@ fn apply_unset(doc: &mut DocumentMut, key: &str) -> Result<bool> {
         "worktree_dir" => doc.remove("worktree_dir").is_some(),
         "open_command" => doc.remove("open_command").is_some(),
         "auto_update_check" => doc.remove("auto_update_check").is_some(),
+        "diff_theme" => doc.remove("diff_theme").is_some(),
         "setup.copy" | "setup.run" => {
             let sub = key.strip_prefix("setup.").unwrap();
             let removed = doc
@@ -760,6 +807,19 @@ pub(crate) fn parse_bool(raw: &str) -> Result<bool> {
         "false" | "no" | "n" | "off" | "0" => Ok(false),
         other => bail!("expected true or false, got {other:?}"),
     }
+}
+
+/// Accepts a known diff-theme short id (case-insensitive).
+fn parse_diff_theme(raw: &str) -> Result<&str> {
+    const KNOWN: &[&str] = &["eighties", "mocha", "ocean", "solarized", "github"];
+    let trimmed = raw.trim();
+    if let Some(id) = KNOWN.iter().find(|id| trimmed.eq_ignore_ascii_case(id)) {
+        return Ok(*id);
+    }
+    bail!(
+        "unknown diff theme {trimmed:?}; choose one of: {}",
+        KNOWN.join(", ")
+    )
 }
 
 /// Splits a comma-separated value into trimmed, non-empty items.
@@ -1036,6 +1096,7 @@ mod tests {
             worktree_dir: worktree_dir.to_string(),
             open_command: open_command.to_string(),
             auto_update_check: String::new(),
+            diff_theme: String::new(),
             copy: copy.to_string(),
             run: run.to_string(),
         }

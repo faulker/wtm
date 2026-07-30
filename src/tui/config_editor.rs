@@ -2,15 +2,17 @@
 //! settings can be changed without editing the file by hand.
 //!
 //! It shows the repo-level settings as editable rows, the update-check toggle,
-//! a save row, and a "check for updates now" row. Saving preserves comments and
-//! only writes the keys the repo actually sets; a cleared field unsets that key
-//! so the default (or global value) applies again.
+//! the diff-theme cycle (with a live colour sample), a save row, and a
+//! "check for updates now" row. Saving preserves comments and only writes the
+//! keys the repo actually sets; a cleared field unsets that key so the default
+//! (or global value) applies again.
 
 use std::path::PathBuf;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
 use super::app::TextInput;
+use super::highlight::{self, DIFF_THEMES};
 use crate::config;
 use crate::settings::{self, RepoConfigFields};
 
@@ -19,8 +21,10 @@ use crate::settings::{self, RepoConfigFields};
 pub const TEXT_ROWS: usize = 4;
 /// Index of the update-check toggle, which Enter cycles rather than edits.
 pub const UPDATE_ROW: usize = TEXT_ROWS;
-/// Number of setting rows, text fields plus the update-check toggle.
-pub const FIELD_ROWS: usize = TEXT_ROWS + 1;
+/// Index of the diff-theme cycle row.
+pub const THEME_ROW: usize = TEXT_ROWS + 1;
+/// Number of setting rows, text fields plus the two cycle toggles.
+pub const FIELD_ROWS: usize = TEXT_ROWS + 2;
 /// Index of the save row.
 pub const SAVE_ROW: usize = FIELD_ROWS;
 /// Index of the "check for updates now" row.
@@ -30,19 +34,27 @@ pub const ROWS: usize = FIELD_ROWS + 2;
 
 // Line offsets within the Settings tab's rendered form, so the renderer and
 // the click handler cannot drift apart. Each setting row draws a value line
-// followed by a dim hint line, filling `FIELD_ROWS * 2` lines, and the
-// unselectable preview and version lines follow before the two action rows.
+// followed by a dim hint line, filling `FIELD_ROWS * 2` lines. After that:
+// the worktree-location preview, a labelled theme-colour sample, the version
+// line, then the two action rows.
 /// Line showing where worktrees will actually be created.
 pub const PREVIEW_LINE: usize = FIELD_ROWS * 2;
+/// Label line above the theme colour sample ("diff colours look like").
+pub const THEME_PREVIEW_LABEL_LINE: usize = PREVIEW_LINE + 1;
+/// Number of sample lines drawn under [`THEME_PREVIEW_LABEL_LINE`].
+/// Kept in sync with `highlight::THEME_PREVIEW_SAMPLE`'s line count.
+pub const THEME_PREVIEW_SAMPLE_LINES: usize = 3;
+/// First sample line of the theme colour preview.
+pub const THEME_PREVIEW_LINE: usize = THEME_PREVIEW_LABEL_LINE + 1;
 /// Line showing the running version and any update found.
-pub const VERSION_LINE: usize = PREVIEW_LINE + 1;
+pub const VERSION_LINE: usize = THEME_PREVIEW_LINE + THEME_PREVIEW_SAMPLE_LINES;
 pub const SAVE_LINE: usize = VERSION_LINE + 1;
 pub const CHECK_LINE: usize = SAVE_LINE + 1;
 /// Total lines the form occupies.
 pub const FORM_LINES: usize = CHECK_LINE + 1;
 
 /// The row a click on form line `line` selects, or `None` for the hint,
-/// preview, and version lines, which are not selectable.
+/// preview, theme sample, and version lines, which are not selectable.
 pub fn row_at_line(line: usize) -> Option<usize> {
     match line {
         SAVE_LINE => Some(SAVE_ROW),
@@ -57,9 +69,9 @@ pub fn row_at_line(line: usize) -> Option<usize> {
 /// State of the Settings tab's editor.
 pub struct ConfigEditor {
     pub repo_root: PathBuf,
-    /// The global config file `auto_update_check` is read from and written to,
-    /// resolved once at load so a save cannot land somewhere else. `None` on a
-    /// system with no locatable global config.
+    /// The global config file `auto_update_check` / `diff_theme` are read from
+    /// and written to, resolved once at load so a save cannot land somewhere
+    /// else. `None` on a system with no locatable global config.
     pub global_config: Option<PathBuf>,
     /// The setting values as shown, each empty when unset.
     pub fields: RepoConfigFields,
@@ -124,7 +136,8 @@ impl ConfigEditor {
             1 => &self.fields.open_command,
             2 => &self.fields.copy,
             3 => &self.fields.run,
-            _ => &self.fields.auto_update_check,
+            UPDATE_ROW => &self.fields.auto_update_check,
+            _ => &self.fields.diff_theme,
         }
     }
 
@@ -134,7 +147,8 @@ impl ConfigEditor {
             1 => self.fields.open_command = value,
             2 => self.fields.copy = value,
             3 => self.fields.run = value,
-            _ => self.fields.auto_update_check = value,
+            UPDATE_ROW => self.fields.auto_update_check = value,
+            _ => self.fields.diff_theme = value,
         }
     }
 
@@ -146,6 +160,25 @@ impl ConfigEditor {
             "false" => String::new(),
             _ => "true".to_string(),
         };
+    }
+
+    /// Cycles the diff theme through the catalog, then back to the default
+    /// (empty string) so the inherited default stays reachable.
+    fn cycle_diff_theme(&mut self) {
+        let current = self.fields.diff_theme.as_str();
+        if current.is_empty() {
+            self.fields.diff_theme = DIFF_THEMES[0].0.to_string();
+            return;
+        }
+        let idx = DIFF_THEMES
+            .iter()
+            .position(|(id, _, _)| *id == current)
+            .unwrap_or(0);
+        if idx + 1 >= DIFF_THEMES.len() {
+            self.fields.diff_theme.clear();
+        } else {
+            self.fields.diff_theme = DIFF_THEMES[idx + 1].0.to_string();
+        }
     }
 
     /// Handles one key press. Save errors land in `message` and keep the
@@ -182,16 +215,31 @@ impl ConfigEditor {
                     self.global_config.as_deref(),
                     &self.fields,
                 ) {
-                    Ok(path) => return EditorOutcome::Saved(path),
+                    Ok(path) => {
+                        // Apply the theme immediately so the next diff draw
+                        // uses it without requiring a restart.
+                        let theme = if self.fields.diff_theme.is_empty() {
+                            config::DEFAULT_DIFF_THEME
+                        } else {
+                            self.fields.diff_theme.as_str()
+                        };
+                        highlight::set_theme(theme);
+                        return EditorOutcome::Saved(path);
+                    }
                     Err(e) => *message = Some(format!("error: {e:#}")),
                 }
             }
-            // The toggle has no free text to type, so Enter and Space both flip
-            // it instead of opening an input.
+            // The toggles have no free text to type, so Enter and Space both
+            // flip them instead of opening an input.
             KeyCode::Enter | KeyCode::Char(' ') if self.selected == UPDATE_ROW => {
                 self.cycle_auto_update_check()
             }
-            KeyCode::Enter => self.editing = Some(TextInput::with_value(self.field(self.selected))),
+            KeyCode::Enter | KeyCode::Char(' ') if self.selected == THEME_ROW => {
+                self.cycle_diff_theme()
+            }
+            KeyCode::Enter if self.selected < TEXT_ROWS => {
+                self.editing = Some(TextInput::with_value(self.field(self.selected)))
+            }
             _ => {}
         }
         EditorOutcome::Continue
@@ -250,30 +298,37 @@ mod tests {
         press(&mut ed, KeyCode::Enter);
         assert_eq!(
             ed.fields.auto_update_check, "",
-            "cycles back to the default"
+            "third press returns to the inherited default"
         );
     }
 
     #[test]
-    fn check_now_row_asks_the_app_to_check() {
+    fn theme_row_cycles_through_catalog_then_default() {
         let mut ed = editor();
-        ed.selected = CHECK_ROW;
-        assert!(matches!(
-            press(&mut ed, KeyCode::Enter),
-            EditorOutcome::CheckForUpdates
-        ));
+        ed.selected = THEME_ROW;
+        press(&mut ed, KeyCode::Enter);
+        assert_eq!(ed.fields.diff_theme, DIFF_THEMES[0].0);
+        for _ in 0..DIFF_THEMES.len() - 1 {
+            press(&mut ed, KeyCode::Enter);
+        }
+        assert_eq!(ed.fields.diff_theme, DIFF_THEMES[DIFF_THEMES.len() - 1].0);
+        press(&mut ed, KeyCode::Enter);
+        assert_eq!(ed.fields.diff_theme, "", "wraps back to the default");
     }
 
     #[test]
-    fn navigation_stops_at_the_check_row() {
-        let mut ed = editor();
-        for _ in 0..20 {
-            press(&mut ed, KeyCode::Down);
-        }
-        assert_eq!(ed.selected, CHECK_ROW);
-        for _ in 0..20 {
-            press(&mut ed, KeyCode::Up);
-        }
-        assert_eq!(ed.selected, 0);
+    fn save_and_check_rows_are_past_the_fields() {
+        assert_eq!(SAVE_ROW, FIELD_ROWS);
+        assert_eq!(CHECK_ROW, FIELD_ROWS + 1);
+        assert_eq!(row_at_line(SAVE_LINE), Some(SAVE_ROW));
+        assert_eq!(row_at_line(CHECK_LINE), Some(CHECK_ROW));
+        assert_eq!(row_at_line(PREVIEW_LINE), None);
+        assert_eq!(row_at_line(THEME_PREVIEW_LABEL_LINE), None);
+        assert_eq!(row_at_line(THEME_PREVIEW_LINE), None);
+        assert_eq!(
+            THEME_PREVIEW_SAMPLE_LINES,
+            highlight::THEME_PREVIEW_SAMPLE.lines().count(),
+            "sample line count must match the rendered snippet"
+        );
     }
 }

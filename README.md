@@ -48,7 +48,7 @@ wtm init
 
 ![The Settings tab: worktree_dir, open_command, setup.copy, and setup.run, each with a hint line, plus a live preview of where worktrees will land](docs/images/tui-settings.png)
 
-The Settings tab (`o` in the TUI) edits the same fields, with a hint under each one and a live preview of where new worktrees will land. `Enter` edits the selected row, and the `[ save settings ]` row writes the file, comments and all. Below the preview it shows the running version and whether an update is waiting, with a `[ check for updates now ]` row.
+The Settings tab (`o` in the TUI) edits the same fields, with a hint under each one and a live preview of where new worktrees will land. `Enter` edits the selected row, and the `[ save settings ]` row writes the file, comments and all. Below the location preview it shows a sample of the selected `diff_theme` (so cycling the row previews the palette before you save), then the running version and whether an update is waiting, with a `[ check for updates now ]` row. The `diff_theme` row cycles the syntax-highlight palette used in the diff pane (Eighties, Mocha, Ocean, Solarized, GitHub) and is saved globally like `auto_update_check`.
 
 To view or change settings later, no TOML editing required:
 
@@ -59,6 +59,7 @@ wtm config set worktree_dir inside
 wtm config set open_command "cursor ."
 wtm config set setup.copy ".env, .env.local"
 wtm config set --global auto_update_check false   # stop checking for new releases
+wtm config set --global diff_theme ocean          # Eighties (default), Mocha, Ocean, Solarized, GitHub
 wtm config unset setup.copy      # back to the default (or the global value)
 wtm config path                  # where the config files live
 ```
@@ -94,6 +95,8 @@ worktree_dir = "sibling"
 open_command = "cursor ."
 # Check GitHub for a newer wtm when the TUI starts. Usually set globally.
 auto_update_check = true
+# Diff syntax-highlight palette: eighties (default), mocha, ocean, solarized, github.
+diff_theme = "eighties"
 
 [setup]
 # Files copied from the main worktree into the new one (if they exist).
@@ -203,7 +206,7 @@ Run `wtm` inside a repo. If the repo isn't initialized yet, the setup wizard ope
 
 ![The Changes tab: changed files grouped into a folder tree on the left, the selected file's syntax-highlighted diff on the right with added lines tinted green and removed lines red](docs/images/tui-changes.png)
 
-`Enter` on a worktree opens the Changes tab. Files are grouped under their folders on the left (`[x]`/`[ ]`/`[~]` shows how much of a folder is marked), and the selected file's diff is syntax-highlighted on the right. From here you can mark files with `Space`, commit them with `c`, stash one or all of them, undo a file, or add it to `.gitignore`. `Enter` (or a double click) on a file opens it in whatever app your OS opens that file type with, and clicking the path in the diff panel's title copies it to the clipboard.
+`Enter` on a worktree opens the Changes tab. Files are grouped under their folders on the left (`[x]`/`[ ]`/`[~]` shows how much of a folder is marked), and the selected file's diff is syntax-highlighted on the right (`⇧←`/`⇧→` or `H`/`L` scroll it horizontally; `⇧↑`/`⇧↓` or `J`/`K` scroll vertically). From here you can mark files with `Space`, commit them with `c`, pull/push with `p`/`⇧P`, stash one or all of them, undo a file, or add it to `.gitignore`. `Enter` (or a double click) on a file opens it in whatever app your OS opens that file type with, and clicking the path in the diff panel's title copies it to the clipboard.
 
 ![The commit dialog over the worktree list: a checklist of the five changed files, all ticked, with a typed commit message underneath](docs/images/tui-commit.png)
 
@@ -223,7 +226,7 @@ The Branches tab shows every branch, where each one is checked out, and which ha
 
 ![The Stash tab listing two stash entries for a worktree, each with its message and branch](docs/images/tui-stash.png)
 
-`s` opens the Stash tab: stash the selected worktree's current changes, then pop, apply, or drop any entry. Stashes are shared across the whole repo, so popping or applying one asks which worktree to put it into.
+`s` opens the Stash tab: stash the selected worktree's current changes, then pop, apply, or drop any entry. `Enter` on an entry browses the files it changed (same tree + diff layout as a commit). Stashes are shared across the whole repo, so popping or applying one asks which worktree to put it into.
 
 | Key | Action |
 | --- | --- |
@@ -254,7 +257,7 @@ When a merge, update, cherry-pick, or stash pop hits a conflict, the **conflict 
 
 Every text field (the new-branch name, the commit message, stash and branch names, and the settings and setup-wizard inputs) supports cursor editing: `←`/`→` move, `Home`/`End` jump, and `Backspace`/`Delete` remove characters mid-string.
 
-Pressing `o` opens an editor for the repo's `.wtm.toml`: pick a row with `↑`/`↓`, press `Enter` to edit it, and select the `[ save settings ]` row to write. It shows a live preview of where worktrees will land, preserves any comments in the file, and clearing a field unsets it so the default (or global value) applies again. The `auto_update_check` row is a toggle rather than a text field (`Enter` or `Space` cycles it through on, off, and the inherited default), and it is saved in the global config since it applies to wtm rather than to one repo.
+Pressing `o` opens an editor for the repo's `.wtm.toml`: pick a row with `↑`/`↓`, press `Enter` to edit it, and select the `[ save settings ]` row to write. It shows a live preview of where worktrees will land and a colour sample for the selected `diff_theme`, preserves any comments in the file, and clearing a field unsets it so the default (or global value) applies again. The `auto_update_check` and `diff_theme` rows cycle rather than edit free text (`Enter` or `Space`), and both are saved in the global config since they apply to wtm rather than to one repo.
 
 While setup runs, its output streams into the progress window. Type a line and press `Enter` to answer a prompting command; press `Ctrl+C` twice to kill a stuck setup.
 
