@@ -129,6 +129,7 @@ Everyday git, addressed by worktree name:
 wtm commit <name> -m <msg> [--paths a,b]   # stage (everything, or just --paths) and commit
 wtm stash push <name> [-m <msg>]           # stash changes, untracked files included
 wtm stash list|pop|apply|drop <name> [--index N]
+wtm move-changes <from> <to>               # move uncommitted changes into another worktree (destination must be clean)
 wtm pull <name> [--rebase]                 # fast-forward only unless --rebase
 wtm push <name> [--force-with-lease]       # publishes with -u origin when no upstream yet
 wtm switch <name> <branch> [--create]      # check a different branch out in the worktree; a remote-only
@@ -143,15 +144,16 @@ wtm branch log <name> [-n <count>]         # a branch's commits without checking
 wtm log <name> [-n <count>]                # recent commits (default 20)
 wtm cherry-pick --into <name> <commit>...  # apply commits into a worktree (--no-commit to load only)
 wtm merge <source> --into <name> [--no-ff] # merge a branch into a worktree's branch
-wtm update <name>                          # merge the repo's default branch into a worktree
+wtm update <name>                          # refresh default from upstream, then merge into a worktree
 ```
 
 Merging, updating, and resolving conflicts:
 
 ```sh
 wtm merge <source> --into <name>           # merge; on conflict, leaves the tree mid-merge to resolve
-wtm update <name> [--autostash]            # "update from main": merge the default branch in
-                                           #   (--autostash stashes local edits first, reapplies after)
+wtm update <name> [--autostash]            # refresh default from upstream, then merge it in
+                                           #   (fast-forwards in place when already on default;
+                                           #   --autostash stashes local edits first, reapplies after)
 wtm conflicts <name>                       # list conflicted files in the worktree
 wtm conflicts <name> <file>                # inspect one file's conflict hunks (ours/theirs, --json)
 wtm resolve <name> <file> --ours           # take our side of the whole file
@@ -176,6 +178,7 @@ wtm push <name> [--force-with-lease]       # push; publishes to origin with -u i
 wtm stash push <name> [-m <msg>]           # stash changes, including untracked files
 wtm stash list <name>                      # list stash entries
 wtm stash pop|apply|drop <name> [--index N]
+wtm move-changes <from> <to>               # move uncommitted changes from one worktree into another
 ```
 
 Repo-wide commands (not tied to a single worktree):
@@ -220,7 +223,7 @@ The Branches tab shows every branch, where each one is checked out, and which ha
 
 ![The Stash tab listing two stash entries for a worktree, each with its message and branch](docs/images/tui-stash.png)
 
-`s` opens the Stash tab for the selected worktree: stash the current changes, then pop, apply, or drop any entry.
+`s` opens the Stash tab: stash the selected worktree's current changes, then pop, apply, or drop any entry. Stashes are shared across the whole repo, so popping or applying one asks which worktree to put it into.
 
 | Key | Action |
 | --- | --- |
@@ -232,8 +235,9 @@ The Branches tab shows every branch, where each one is checked out, and which ha
 | `c` | commit the selected worktree: tick which changed files to include (all selected by default; `Tab` switches between the file list and the message, `Space` toggles a file), type a message, `Enter` commits |
 | `o` | **Settings tab**: edit this repo's settings (`worktree_dir`, `open_command`, `setup.copy`, `setup.run`) without touching the file. `↑`/`↓` pick a row, `Enter` edits it (`Esc` cancels that edit) and saves from the bottom row; leaving the tab discards unsaved edits |
 | `e` | run the `open_command` in the selected worktree's directory (e.g. `cursor .`); prompts for a command when `open_command` isn't set |
-| `u` | update the selected worktree: merge the repo's default branch into it. If the worktree has uncommitted changes you're offered to stash them first and reapply them after the merge (so the update doesn't refuse on the dirty tree). On conflict, opens the conflict resolver |
-| `s` | **Stash tab** for the selected worktree: `s` stash current changes (with an optional message), `p` pop, `a` apply, `x` drop the selected entry. A pop that conflicts opens the conflict resolver |
+| `u` | update the selected worktree: refresh the default branch from its upstream, then merge it in (or fast-forward in place when already on the default). If the worktree has uncommitted changes you're offered to stash them first and reapply them after the merge (so the update doesn't refuse on the dirty tree). On conflict, opens the conflict resolver |
+| `s` | **Stash tab**: stashes are shared across the whole repo, not tied to one worktree. `s` stashes the selected worktree's current changes (with an optional message); `p`/`a` pick a destination worktree to pop/apply the selected entry into (defaulting to the worktree the tab was opened from), and `x` drops it. A pop that conflicts opens the conflict resolver |
+| `m` | **move changes**: move the selected worktree's uncommitted changes into another worktree you pick (stash, then apply); refuses if the destination isn't clean |
 | `p` | pull the selected worktree (fast-forward only). When the pull is refused because the branch has diverged from its upstream, offers to retry the pull with a rebase |
 | `⇧P` | push the selected worktree; publishes with `-u` when there's no upstream |
 | `f` | fetch all remotes and refresh |
@@ -286,7 +290,7 @@ Or set `WTM_NO_UPDATE_CHECK` in the environment, which skips the check without t
 | Worktrees | `list_worktrees`, `create_worktree`, `remove_worktree`, `worktree_status`, `worktree_diff` |
 | Commits | `commit_changes`, `worktree_log`, `cherry_pick` |
 | Merge/conflicts | `merge`, `update`, `list_conflicts`, `read_conflict`, `resolve_file`, `complete_merge`, `abort_merge` |
-| Stashes | `stash_push`, `stash_list`, `stash_pop`, `stash_apply`, `stash_drop` |
+| Stashes | `stash_push`, `stash_list`, `stash_pop`, `stash_apply`, `stash_drop`, `move_changes` |
 | Remotes | `pull_worktree`, `push_worktree`, `fetch_remotes` |
 | Branches | `list_branches`, `create_branch`, `delete_branch`, `rename_branch`, `branch_log` |
 

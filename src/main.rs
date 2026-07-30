@@ -169,6 +169,15 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Command::MoveChanges { from, to } => {
+            let ctx = Ctx::discover_initialized(&cwd)?;
+            let result = ops::move_changes(&ctx, &from, &to)?;
+            if cli.json {
+                output::print_json(&result)?;
+            } else {
+                output::print_move_changes(&result);
+            }
+        }
         Command::Pull { name, rebase } => {
             let ctx = Ctx::discover_initialized(&cwd)?;
             let result = ops::pull(&ctx, &name, rebase)?;

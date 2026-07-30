@@ -985,6 +985,58 @@ fn stash_index_selects_a_specific_entry() {
 }
 
 #[test]
+fn move_changes_moves_uncommitted_work_between_worktrees() {
+    let (_tmp, repo) = setup_repo();
+    let feat = stdout_json(&wtm(&repo, &["create", "feat", "--json"]));
+    let feat_path = PathBuf::from(feat["path"].as_str().unwrap());
+    let other = stdout_json(&wtm(&repo, &["create", "other", "--json"]));
+    let other_path = PathBuf::from(other["path"].as_str().unwrap());
+
+    std::fs::write(feat_path.join("README.md"), "changed\n").unwrap();
+    std::fs::write(feat_path.join("scratch.txt"), "untracked\n").unwrap();
+
+    let result = stdout_json(&wtm(&repo, &["move-changes", "feat", "other", "--json"]));
+    assert_eq!(result["from"], "feat");
+    assert_eq!(result["to"], "other");
+    assert_eq!(result["files"], 2);
+
+    let feat_status = stdout_json(&wtm(&repo, &["status", "feat", "--json"]));
+    assert_eq!(feat_status["changes"].as_array().unwrap().len(), 0);
+
+    let other_status = stdout_json(&wtm(&repo, &["status", "other", "--json"]));
+    assert_eq!(other_status["changes"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        std::fs::read_to_string(other_path.join("README.md")).unwrap(),
+        "changed\n"
+    );
+    assert!(other_path.join("scratch.txt").exists());
+
+    // No stash left behind.
+    let list = stdout_json(&wtm(&repo, &["stash", "list", "feat", "--json"]));
+    assert_eq!(list["entries"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn move_changes_refuses_when_destination_is_dirty() {
+    let (_tmp, repo) = setup_repo();
+    let feat = stdout_json(&wtm(&repo, &["create", "feat", "--json"]));
+    let feat_path = PathBuf::from(feat["path"].as_str().unwrap());
+    let other = stdout_json(&wtm(&repo, &["create", "other", "--json"]));
+    let other_path = PathBuf::from(other["path"].as_str().unwrap());
+
+    std::fs::write(feat_path.join("a.txt"), "a\n").unwrap();
+    std::fs::write(other_path.join("b.txt"), "b\n").unwrap();
+
+    let out = wtm(&repo, &["move-changes", "feat", "other"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("uncommitted changes of its own"));
+
+    // feat's changes are untouched.
+    let feat_status = stdout_json(&wtm(&repo, &["status", "feat", "--json"]));
+    assert_eq!(feat_status["changes"].as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn push_with_no_upstream_publishes_to_origin() {
     let (tmp, repo) = setup_repo();
     let bare = bare_repo(tmp.path());
@@ -1377,6 +1429,65 @@ fn merge_merges_a_branch_cleanly() {
         &["merge", "feature", "--into", "target", "--json"],
     ));
     assert_eq!(again["status"], "up_to_date");
+}
+
+#[test]
+fn update_refreshes_default_then_merges_into_feature() {
+    let (tmp, repo) = setup_repo();
+    let bare = bare_repo(tmp.path());
+    git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    git(&repo, &["push", "-u", "origin", "main"]);
+
+    let feat = stdout_json(&wtm(&repo, &["create", "feature", "--json"]));
+    let feat_path = PathBuf::from(feat["path"].as_str().unwrap());
+
+    // Advance origin/main from an independent clone so local main is behind.
+    let second = tmp.path().join("second");
+    git(
+        tmp.path(),
+        &["clone", bare.to_str().unwrap(), second.to_str().unwrap()],
+    );
+    git(&second, &["config", "user.email", "test@example.com"]);
+    git(&second, &["config", "user.name", "Test"]);
+    std::fs::write(second.join("upstream.txt"), "from remote\n").unwrap();
+    git(&second, &["add", "."]);
+    git(&second, &["commit", "-m", "remote advance"]);
+    git(&second, &["push"]);
+
+    // Update on feature: refresh main from origin, then merge into feature.
+    let updated = stdout_json(&wtm(&repo, &["update", "feature", "--json"]));
+    assert_eq!(updated["status"], "clean");
+    assert!(feat_path.join("upstream.txt").exists());
+    assert!(repo.join("upstream.txt").exists());
+
+    // Update on main (already at upstream after the refresh above): up to date.
+    let on_main = stdout_json(&wtm(&repo, &["update", "main", "--json"]));
+    assert_eq!(on_main["status"], "up_to_date");
+}
+
+#[test]
+fn update_on_main_fast_forwards_from_upstream() {
+    let (tmp, repo) = setup_repo();
+    let bare = bare_repo(tmp.path());
+    git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    git(&repo, &["push", "-u", "origin", "main"]);
+
+    let second = tmp.path().join("second");
+    git(
+        tmp.path(),
+        &["clone", bare.to_str().unwrap(), second.to_str().unwrap()],
+    );
+    git(&second, &["config", "user.email", "test@example.com"]);
+    git(&second, &["config", "user.name", "Test"]);
+    std::fs::write(second.join("upstream.txt"), "from remote\n").unwrap();
+    git(&second, &["add", "."]);
+    git(&second, &["commit", "-m", "remote advance"]);
+    git(&second, &["push"]);
+
+    let updated = stdout_json(&wtm(&repo, &["update", "main", "--json"]));
+    assert_eq!(updated["status"], "fast_forwarded");
+    assert!(!updated["commit"].as_str().unwrap().is_empty());
+    assert!(repo.join("upstream.txt").exists());
 }
 
 #[test]

@@ -592,6 +592,34 @@ pub enum View {
         /// Cursor into `targets`.
         selected: usize,
     },
+    /// Move-changes picker: choose which worktree to move the selected
+    /// worktree's uncommitted changes into. Reached from the Worktrees tab's
+    /// `m` key; runs `ops::move_changes` in the background.
+    MoveChanges {
+        /// Worktree the changes are moved out of.
+        from: String,
+        /// Worktrees the changes can be moved into (every other worktree).
+        targets: Vec<CherryTarget>,
+        /// Cursor into `targets`.
+        selected: usize,
+    },
+    /// Destination picker for a stash apply/pop: stashes are repo-global, not
+    /// tied to the worktree the Stash tab happens to be showing, so applying
+    /// one asks which worktree to apply it into. Defaults the cursor to the
+    /// worktree the tab was opened from. Reached from the Stash tab's `a`/`p`
+    /// keys.
+    StashTarget {
+        /// True for pop (apply then drop); false for apply (keeps the entry).
+        pop: bool,
+        /// Stash entry being applied/popped (`None` means the most recent).
+        index: Option<u32>,
+        /// Short label for the entry, e.g. "stash@{0}", for the picker title.
+        label: String,
+        /// Worktrees the stash can be applied into.
+        targets: Vec<CherryTarget>,
+        /// Cursor into `targets`.
+        selected: usize,
+    },
     /// Friendly conflict resolver for a worktree left mid-merge. Lists the
     /// conflicted files, and for the selected file shows each hunk's OURS vs
     /// THEIRS sides so a resolution can be picked per hunk (or the whole file
@@ -1103,6 +1131,11 @@ pub struct App {
     /// Which `selected` index `worktree_preview` currently reflects, so it's
     /// only recomputed on an actual selection change, not every frame.
     pub preview_for: Option<usize>,
+    /// Background `ops::status` for the Worktrees tab preview. The usize is the
+    /// `selected` index the result belongs to; `poll_preview_load` drops
+    /// results that no longer match so fast navigation never applies a stale
+    /// list. Drained each tick, mirroring `branches_pending`.
+    preview_pending: Option<(usize, Task<Vec<StatusEntry>>)>,
     /// First visible row of the changed-file preview, so a worktree with more
     /// changes than the panel is tall can be scrolled through in place.
     pub preview_scroll: usize,
@@ -1243,6 +1276,7 @@ impl App {
             selected: 0,
             worktree_preview: Vec::new(),
             preview_for: None,
+            preview_pending: None,
             preview_scroll: 0,
             preview_list: None,
             tab: Tab::Worktrees,
@@ -1443,7 +1477,10 @@ impl App {
             }
             Err(e) => self.set_error(format!("{e:#}")),
         }
+        // Drop any in-flight preview so a result for the old list can't land
+        // after this refresh; the next draw will kick off a fresh load.
         self.preview_for = None;
+        self.preview_pending = None;
     }
 
     /// Reloads the visible lists on a timer, so work done outside the app (an
@@ -1474,6 +1511,10 @@ impl App {
                 .and_then(|name| self.worktrees.iter().position(|w| w.name == name))
                 .unwrap_or(self.selected)
                 .min(self.worktrees.len().saturating_sub(1));
+            // Worktree paths/names may have shifted; invalidate the preview so
+            // the next draw reloads status for the (possibly new) selection.
+            self.preview_for = None;
+            self.preview_pending = None;
         }
         if self.tab == Tab::Branches
             && let Ok(r) = ops::branch_list(&self.ctx)
@@ -1516,6 +1557,9 @@ impl App {
         // should land even if the user has since drilled into a branch's
         // commit history or another screen.
         self.poll_branches_load();
+        // Same for the Worktrees tab's changed-file preview: status is loaded
+        // off-thread so selection changes stay responsive.
+        self.poll_preview_load();
         if let View::Busy { rx, .. } = &self.view {
             if let Some(result) = rx.poll_latest() {
                 // Pull the follow-up out of the view so we can mutate self, then
@@ -1618,11 +1662,14 @@ impl App {
                             lines.push(format!("       {detail}"));
                         }
                     }
+                    // A separator plus an unambiguous ✓/✗ line make it obvious the
+                    // run is over, not just paused between steps.
+                    lines.push("── done ──".to_string());
                     lines.push(if result.setup_ok {
-                        format!("worktree ready: {}", result.path)
+                        format!("✓ worktree created and set up: {}", result.path)
                     } else {
                         format!(
-                            "worktree kept at {} but some setup steps failed",
+                            "✗ worktree kept at {} but some setup steps failed",
                             result.path
                         )
                     });
@@ -1630,7 +1677,8 @@ impl App {
                     *done = true;
                 }
                 CreateMsg::Done(Err(e)) => {
-                    lines.push(format!("error: {e}"));
+                    lines.push("── done ──".to_string());
+                    lines.push(format!("✗ worktree creation failed: {e}"));
                     lines.push("press Enter to continue".to_string());
                     *done = true;
                 }
@@ -1874,6 +1922,8 @@ impl App {
             View::BranchCommits { .. } => self.on_branch_commits_key(key),
             View::CherryPick { .. } => self.on_cherry_pick_key(key),
             View::MergePick { .. } => self.on_merge_pick_key(key),
+            View::MoveChanges { .. } => self.on_move_changes_key(key),
+            View::StashTarget { .. } => self.on_stash_target_key(key),
             View::ConflictResolver { .. } => self.on_resolver_key(key),
             // A background op owns the screen until tick() drains its result.
             View::Busy { .. } => {}
@@ -2189,7 +2239,12 @@ impl App {
             "discard ALL uncommitted changes in '{name}'? this resets tracked files to HEAD and removes untracked files."
         ))];
         let options = vec![ConfirmOption::new("discard all changes").destructive()];
-        self.push_confirm("discard all changes", body, options, ModalAction::DiscardAllChanges);
+        self.push_confirm(
+            "discard all changes",
+            body,
+            options,
+            ModalAction::DiscardAllChanges,
+        );
     }
 
     /// Prompt for adding a file or folder to `.gitignore`.
@@ -2589,6 +2644,7 @@ impl App {
             KeyCode::Char('o') => self.open_settings_tab(),
             KeyCode::Char('e') => self.run_open_command(),
             KeyCode::Char('s') => self.open_stash_tab(),
+            KeyCode::Char('m') => self.open_move_changes_pick(),
             KeyCode::Char('p') => self.start_pull(),
             KeyCode::Char('P') => self.start_push(),
             KeyCode::Char('f') => self.start_fetch(),
@@ -4126,14 +4182,94 @@ impl App {
                 "blank Enter stashes without a message",
                 ModalAction::StashPush { name },
             ),
-            KeyCode::Char('p') => self.stash_pop(name, index),
-            KeyCode::Char('a') => self.stash_action("apply", name, index),
+            KeyCode::Char('p') => self.open_stash_target_pick(true),
+            KeyCode::Char('a') => self.open_stash_target_pick(false),
             KeyCode::Char('x') => {
                 if !self.stash_entries.is_empty() {
                     self.open_stash_drop_modal(name, index);
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Opens the destination picker for applying/popping the selected stash
+    /// entry. Stashes are repo-global, so any worktree is a valid target; the
+    /// cursor defaults to the worktree the tab was opened from.
+    fn open_stash_target_pick(&mut self, pop: bool) {
+        let index = self.stash_entries.get(self.stash_selected).map(|e| e.index);
+        let label = match index {
+            Some(i) => format!("stash@{{{i}}}"),
+            None => "the most recent stash".to_string(),
+        };
+        let targets: Vec<CherryTarget> = self
+            .worktrees
+            .iter()
+            .map(|w| CherryTarget {
+                name: w.name.clone(),
+                branch: w.branch.clone(),
+            })
+            .collect();
+        if targets.is_empty() {
+            self.message = Some("no worktrees to apply into".to_string());
+            return;
+        }
+        let selected = targets
+            .iter()
+            .position(|t| t.name == self.stash_name)
+            .unwrap_or(0);
+        self.push_screen(View::StashTarget {
+            pop,
+            index,
+            label,
+            targets,
+            selected,
+        });
+    }
+
+    /// Key handling for the stash target picker: pick a worktree, then apply
+    /// or pop the stash into it.
+    fn on_stash_target_key(&mut self, key: KeyEvent) {
+        let View::StashTarget {
+            targets, selected, ..
+        } = &mut self.view
+        else {
+            return;
+        };
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                if *selected + 1 < targets.len() {
+                    *selected += 1;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+            KeyCode::Enter => self.run_stash_target(),
+            KeyCode::Esc | KeyCode::Char('q') => self.pop_screen(),
+            _ => {}
+        }
+    }
+
+    /// Applies or pops the picked stash entry into the chosen worktree.
+    fn run_stash_target(&mut self) {
+        let picked = match &self.view {
+            View::StashTarget {
+                pop,
+                index,
+                targets,
+                selected,
+                ..
+            } => targets
+                .get(*selected)
+                .map(|t| (*pop, *index, t.name.clone())),
+            _ => None,
+        };
+        let Some((pop, index, name)) = picked else {
+            return;
+        };
+        if pop {
+            self.stash_pop(name, index);
+        } else {
+            self.stash_action("apply", name, index);
         }
     }
 
@@ -4325,6 +4461,76 @@ impl App {
                     .map_err(|e| format!("{e:#}"))
             },
         );
+    }
+
+    /// Starts a background `ops::status` for the highlighted worktree when the
+    /// cached preview belongs to a different row (or was invalidated). Safe to
+    /// call every frame: a load already in flight for `selected` is left alone,
+    /// so the draw path never spawns unbounded threads.
+    pub fn ensure_worktree_preview(&mut self) {
+        if self.preview_for == Some(self.selected) {
+            return;
+        }
+        if self
+            .preview_pending
+            .as_ref()
+            .is_some_and(|(idx, _)| *idx == self.selected)
+        {
+            return;
+        }
+        self.load_worktree_preview(self.selected);
+    }
+
+    /// Spawns `ops::status` for `selected` on a background thread. The UI keeps
+    /// drawing; `poll_preview_load` applies the files once they land.
+    fn load_worktree_preview(&mut self, selected: usize) {
+        let Some(name) = self.worktrees.get(selected).map(|w| w.name.clone()) else {
+            self.worktree_preview.clear();
+            self.preview_for = Some(selected);
+            self.preview_pending = None;
+            return;
+        };
+        let (tx, rx) = channel();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let files = ops::status(&ctx, &name)
+                .map(|(_, files)| files)
+                .unwrap_or_default();
+            let _ = tx.send(files);
+        });
+        self.preview_pending = Some((selected, Task::new(rx)));
+    }
+
+    /// Applies a finished background preview load when it matches the current
+    /// selection. Called each tick (and from tests) so status never blocks
+    /// the render thread.
+    fn poll_preview_load(&mut self) {
+        let Some((idx, task)) = &self.preview_pending else {
+            return;
+        };
+        let idx = *idx;
+        let Some(files) = task.poll_latest() else {
+            return;
+        };
+        self.preview_pending = None;
+        // Selection moved while the thread ran; drop the stale list. The next
+        // `ensure_worktree_preview` will fetch for the new row.
+        if idx != self.selected {
+            return;
+        }
+        self.worktree_preview = files;
+        self.preview_for = Some(idx);
+    }
+
+    /// Whether the Worktrees tab preview is waiting on status for the current
+    /// selection (no cached rows for that index yet). Used to draw "loading…"
+    /// instead of another worktree's stale file list.
+    pub fn preview_loading(&self) -> bool {
+        self.preview_for != Some(self.selected)
+            && self
+                .preview_pending
+                .as_ref()
+                .is_some_and(|(idx, _)| *idx == self.selected)
     }
 
     /// Kicks off a (re)load of all local branches for the Branches tab on a
@@ -4822,6 +5028,9 @@ impl App {
                         ops::MergeOutcome::Clean { commit } => {
                             format!("merged '{src}' into '{tn}' ({commit})")
                         }
+                        ops::MergeOutcome::FastForwarded { commit } => {
+                            format!("fast-forwarded '{tn}' ({commit})")
+                        }
                         // The message is unused on conflict; the resolver opens.
                         ops::MergeOutcome::Conflicted { .. } => "conflicts to resolve".to_string(),
                     })
@@ -4830,16 +5039,100 @@ impl App {
         );
     }
 
-    /// Merges the repo's default branch into the selected worktree ("update
-    /// from main") on a background thread, routing conflicts into the resolver.
+    /// Opens the move-changes picker for the selected worktree, listing every
+    /// other worktree as a possible destination.
+    fn open_move_changes_pick(&mut self) {
+        let Some(wt) = self.selected_worktree() else {
+            return;
+        };
+        if wt.dirty == 0 {
+            self.message = Some(format!("'{}' has no changes to move", wt.name));
+            return;
+        }
+        let from = wt.name.clone();
+        let targets: Vec<CherryTarget> = self
+            .worktrees
+            .iter()
+            .filter(|w| w.name != from)
+            .map(|w| CherryTarget {
+                name: w.name.clone(),
+                branch: w.branch.clone(),
+            })
+            .collect();
+        if targets.is_empty() {
+            self.message = Some("no other worktree to move changes into".to_string());
+            return;
+        }
+        self.push_screen(View::MoveChanges {
+            from,
+            targets,
+            selected: 0,
+        });
+    }
+
+    /// Key handling for the move-changes picker: pick a target worktree, then
+    /// run the move in the background.
+    fn on_move_changes_key(&mut self, key: KeyEvent) {
+        let View::MoveChanges {
+            targets, selected, ..
+        } = &mut self.view
+        else {
+            return;
+        };
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                if *selected + 1 < targets.len() {
+                    *selected += 1;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+            KeyCode::Enter => self.run_move_changes(),
+            KeyCode::Esc | KeyCode::Char('q') => self.pop_screen(),
+            _ => {}
+        }
+    }
+
+    /// Moves the selected worktree's uncommitted changes into the chosen
+    /// worktree on a background thread (stash push + apply, see
+    /// `ops::move_changes`).
+    fn run_move_changes(&mut self) {
+        let picked = match &self.view {
+            View::MoveChanges {
+                from,
+                targets,
+                selected,
+            } => targets
+                .get(*selected)
+                .map(|t| (from.clone(), t.name.clone())),
+            _ => None,
+        };
+        let Some((from, to)) = picked else {
+            return;
+        };
+        self.start_busy(
+            format!("moving changes from '{from}' into '{to}'…"),
+            BusyThen::List,
+            move |ctx| {
+                ops::move_changes(ctx, &from, &to)
+                    .map(|r| {
+                        format!(
+                            "moved {} change(s) from '{}' to '{}'",
+                            r.files, r.from, r.to
+                        )
+                    })
+                    .map_err(|e| format!("{e:#}"))
+            },
+        );
+    }
+
+    /// Refreshes the default branch from its upstream, then merges it into the
+    /// selected worktree ("update from main"), or fast-forwards in place when
+    /// the selection is already on the default branch. Conflicts route into
+    /// the resolver.
     fn start_update(&mut self) {
         let Some(wt) = self.selected_worktree() else {
             return;
         };
-        if wt.is_main {
-            self.message = Some("the main worktree is already on the default branch".to_string());
-            return;
-        }
         // A dirty worktree can't be merged into cleanly: git refuses when local
         // edits overlap the update. Offer to stash those changes, update, then
         // reapply them (git's --autostash) instead of failing outright.
@@ -4851,9 +5144,9 @@ impl App {
         self.run_update(wt.name.clone(), false);
     }
 
-    /// Merges the default branch into the worktree named `name` in the
-    /// background. With `autostash`, local changes are stashed first and
-    /// re-applied after the merge (including after resolving any conflicts).
+    /// Updates the worktree named `name` in the background (refresh default,
+    /// then merge or fast-forward). With `autostash`, local changes are stashed
+    /// before a merge and re-applied after (including after resolving conflicts).
     fn run_update(&mut self, name: String, autostash: bool) {
         let n = name.clone();
         self.start_busy(
@@ -4868,6 +5161,9 @@ impl App {
                     .map(|outcome| match outcome {
                         ops::MergeOutcome::UpToDate => format!("'{n}' already up to date"),
                         ops::MergeOutcome::Clean { commit } => format!("updated '{n}' ({commit})"),
+                        ops::MergeOutcome::FastForwarded { commit } => {
+                            format!("fast-forwarded '{n}' ({commit})")
+                        }
                         ops::MergeOutcome::Conflicted { .. } => "conflicts to resolve".to_string(),
                     })
                     .map_err(|e| format!("{e:#}"))
@@ -5961,7 +6257,28 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while app.branches_loading() {
             app.poll_branches_load();
-            assert!(std::time::Instant::now() < deadline, "branch load timed out");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "branch load timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// Waits out an in-flight Worktrees-tab preview status load so tests can
+    /// assert on `app.worktree_preview` after a selection change or refresh.
+    fn settle_preview(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            app.ensure_worktree_preview();
+            app.poll_preview_load();
+            if app.preview_for == Some(app.selected) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worktree preview load timed out"
+            );
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
     }
@@ -7673,13 +7990,83 @@ mod tests {
         app.refresh();
         assert_eq!(app.worktrees[0].dirty, 0, "stash should clean the tree");
 
-        // Pop it back.
+        // Pop it back: 'p' opens the destination picker (stashes are
+        // repo-global), defaulting to the worktree the tab was opened from.
         press(&mut app, KeyCode::Char('p'));
+        assert!(matches!(app.view, View::StashTarget { pop: true, .. }));
+        press(&mut app, KeyCode::Enter);
         settle(&mut app);
         assert_eq!(app.tab, Tab::Stash);
         assert!(app.stash_entries.is_empty());
         app.refresh();
         assert!(app.worktrees[0].dirty > 0, "pop restores the change");
+    }
+
+    /// `a` opens a destination picker (stashes are repo-global, not tied to
+    /// one worktree) rather than applying straight into the tab's worktree;
+    /// picking a target still applies the stash there.
+    #[test]
+    fn stash_apply_key_opens_target_picker_and_applies() {
+        let (_tmp, mut app) = test_app();
+        // Commit f.txt before branching "feature" off it, so both worktrees
+        // share the same base and the stash can apply cleanly to either.
+        std::fs::write(app.ctx.repo_root.join("f.txt"), "one\n").unwrap();
+        git(&app.ctx.repo_root, &["add", "f.txt"]);
+        git(&app.ctx.repo_root, &["commit", "-m", "add f"]);
+        add_and_select_worktree(&mut app, "feature");
+        std::fs::write(app.ctx.repo_root.join("f.txt"), "two\n").unwrap();
+        app.refresh();
+        app.selected = app.worktrees.iter().position(|w| w.is_main).unwrap();
+
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.tab, Tab::Stash);
+        press(&mut app, KeyCode::Char('s'));
+        press(&mut app, KeyCode::Enter); // stash, no message
+        settle(&mut app);
+        assert_eq!(app.stash_entries.len(), 1);
+
+        press(&mut app, KeyCode::Char('a'));
+        match &app.view {
+            View::StashTarget {
+                pop,
+                targets,
+                selected,
+                ..
+            } => {
+                assert!(!pop, "apply should not drop the entry");
+                // Defaults to the worktree the tab was opened from (main).
+                assert!(targets[*selected].branch.as_deref() != Some("feature"));
+            }
+            _ => panic!("expected the stash target picker"),
+        }
+        // Pick the other worktree ("feature") as the apply destination.
+        if let View::StashTarget {
+            selected, targets, ..
+        } = &mut app.view
+        {
+            *selected = targets.iter().position(|t| t.name == "feature").unwrap();
+        }
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+
+        assert_eq!(
+            app.stash_entries.len(),
+            1,
+            "apply keeps the entry (unlike pop)"
+        );
+        let feature_path = PathBuf::from(
+            app.worktrees
+                .iter()
+                .find(|w| w.name == "feature")
+                .unwrap()
+                .path
+                .clone(),
+        );
+        assert_eq!(
+            std::fs::read_to_string(feature_path.join("f.txt")).unwrap(),
+            "two\n",
+            "the stash should have applied into 'feature', not main"
+        );
     }
 
     /// A pop that conflicts routes through the resolver, and completing it
@@ -7706,6 +8093,8 @@ mod tests {
         git(&root, &["commit", "-am", "diverge"]);
 
         press(&mut app, KeyCode::Char('p'));
+        assert!(matches!(app.view, View::StashTarget { pop: true, .. }));
+        press(&mut app, KeyCode::Enter);
         settle(&mut app);
         assert!(
             matches!(app.view, View::ConflictResolver { .. }),
@@ -7935,6 +8324,76 @@ mod tests {
             }
             _ => panic!("expected the merge picker"),
         }
+    }
+
+    #[test]
+    fn move_changes_key_opens_picker_and_moves_changes() {
+        let (_tmp, mut app) = test_app();
+        // The main worktree carries an untracked `.wtm.toml` in this fixture,
+        // so use two fresh worktrees as clean source/destination instead.
+        add_and_select_worktree(&mut app, "feature");
+        add_and_select_worktree(&mut app, "other");
+        let feat_path = PathBuf::from(
+            app.worktrees
+                .iter()
+                .find(|w| w.name == "feature")
+                .unwrap()
+                .path
+                .clone(),
+        );
+        std::fs::write(feat_path.join("a.txt"), "a\n").unwrap();
+        app.refresh();
+        app.selected = app
+            .worktrees
+            .iter()
+            .position(|w| w.name == "feature")
+            .unwrap();
+
+        press(&mut app, KeyCode::Char('m'));
+        match &app.view {
+            View::MoveChanges { from, targets, .. } => {
+                assert_eq!(from, "feature");
+                assert!(targets.iter().any(|t| t.name == "other"));
+                assert!(
+                    !targets.iter().any(|t| t.name == "feature"),
+                    "can't move into itself"
+                );
+            }
+            _ => panic!("expected the move-changes picker"),
+        }
+        if let View::MoveChanges {
+            selected, targets, ..
+        } = &mut app.view
+        {
+            *selected = targets.iter().position(|t| t.name == "other").unwrap();
+        }
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+
+        assert!(
+            app.message.as_deref().unwrap_or("").contains("moved"),
+            "message: {:?}, error: {:?}",
+            app.message,
+            app.error
+        );
+        app.refresh();
+        let feature = app.worktrees.iter().find(|w| w.name == "feature").unwrap();
+        assert_eq!(feature.dirty, 0, "changes moved out of feature");
+        let other = app.worktrees.iter().find(|w| w.name == "other").unwrap();
+        assert!(other.dirty > 0, "changes landed in other");
+        assert_eq!(
+            std::fs::read_to_string(PathBuf::from(&other.path).join("a.txt")).unwrap(),
+            "a\n"
+        );
+    }
+
+    #[test]
+    fn move_changes_key_with_no_changes_shows_a_message() {
+        let (_tmp, mut app) = test_app();
+        add_and_select_worktree(&mut app, "feature");
+        press(&mut app, KeyCode::Char('m'));
+        assert!(matches!(app.view, View::List));
+        assert!(app.message.as_deref().unwrap().contains("no changes"));
     }
 
     #[test]
@@ -9750,6 +10209,8 @@ mod tests {
         app.refresh();
         app.selected = 0;
         render_app(&mut app, 100, 30);
+        settle_preview(&mut app);
+        render_app(&mut app, 100, 30);
 
         let total = app.worktree_preview.len();
         assert!(total >= 30, "every change is previewed, got {total}");
@@ -9775,6 +10236,8 @@ mod tests {
         write_changed_files(&root, 30);
         app.refresh();
         app.selected = 0;
+        render_app(&mut app, 100, 30);
+        settle_preview(&mut app);
         render_app(&mut app, 100, 30);
         let rl = app.preview_list.expect("preview geometry");
         let (col, row) = (rl.inner.x + 1, rl.inner.y + 1);
@@ -9824,9 +10287,66 @@ mod tests {
         add_and_select_worktree(&mut app, "spare");
         app.selected = app.worktrees.iter().position(|w| w.is_main).unwrap();
         render_app(&mut app, 100, 30);
+        settle_preview(&mut app);
         app.preview_scroll = 5;
         press(&mut app, KeyCode::Down);
         assert_eq!(app.preview_scroll, 0);
+    }
+
+    /// Selection change kicks off a background status load instead of blocking
+    /// the UI thread; a result whose index no longer matches is dropped.
+    #[test]
+    fn worktree_preview_loads_async_and_ignores_stale() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        write_changed_files(&root, 5);
+        add_and_select_worktree(&mut app, "spare");
+        let main = app.worktrees.iter().position(|w| w.is_main).unwrap();
+        let spare = app
+            .worktrees
+            .iter()
+            .position(|w| w.name == "spare")
+            .unwrap();
+
+        app.selected = main;
+        app.ensure_worktree_preview();
+        assert!(
+            app.preview_loading(),
+            "first ensure starts a background load"
+        );
+        settle_preview(&mut app);
+        assert_eq!(app.preview_for, Some(main));
+        let main_count = app.worktree_preview.len();
+        assert!(main_count >= 5, "main worktree's changes land");
+
+        // Start a load for spare, then jump back to main before it lands.
+        app.selected = spare;
+        app.ensure_worktree_preview();
+        assert!(app.preview_loading(), "spare load is in flight");
+        app.selected = main;
+        app.ensure_worktree_preview();
+        assert!(
+            !app.preview_loading(),
+            "cached main preview is shown again immediately"
+        );
+        assert_eq!(app.preview_for, Some(main));
+
+        // Drain the orphaned spare result; it must not replace main's cache.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.preview_pending.is_some() {
+            app.poll_preview_load();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "orphaned preview load timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(app.preview_for, Some(main));
+        assert_eq!(
+            app.worktree_preview.len(),
+            main_count,
+            "stale spare status was ignored"
+        );
     }
 
     /// Clicking a tab label switches to that tab and runs its entry loader.
@@ -9887,6 +10407,8 @@ mod tests {
         app.refresh();
         app.selected = 0;
         render_app(&mut app, 100, 30);
+        settle_preview(&mut app);
+        render_app(&mut app, 100, 30);
 
         // Scroll down a page so the click also proves the offset is applied.
         app.preview_scroll = 4;
@@ -9915,6 +10437,8 @@ mod tests {
         app.refresh();
         app.selected = 0;
         app.collapsed_folders.insert("pkg/".to_string());
+        render_app(&mut app, 100, 30);
+        settle_preview(&mut app);
         render_app(&mut app, 100, 30);
 
         let rl = app.preview_list.expect("preview geometry");

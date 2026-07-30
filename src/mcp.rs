@@ -67,6 +67,16 @@ struct StashIndexRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct MoveChangesRequest {
+    #[schemars(description = "worktree to take the uncommitted changes from")]
+    from: String,
+    #[schemars(
+        description = "worktree to move the changes into; must have no uncommitted changes of its own"
+    )]
+    to: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct PullRequest {
     #[schemars(description = "worktree name (branch name, or directory name when detached)")]
     name: String,
@@ -370,6 +380,17 @@ impl WtmServer {
     }
 
     #[tool(
+        description = "Move uncommitted changes (including untracked files) from one worktree into another: stashes everything in `from` and applies it in `to`, then drops the stash. Refuses if `from` has no changes or `to` isn't clean; if applying at the destination fails, the changes are restored to `from` instead of being lost"
+    )]
+    fn move_changes(
+        &self,
+        Parameters(req): Parameters<MoveChangesRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let result = ops::move_changes(&self.ctx()?, &req.from, &req.to).map_err(internal)?;
+        json_result(&result)
+    }
+
+    #[tool(
         description = "Pull the latest changes for a worktree's branch from its upstream (fast-forward only by default; set rebase to rebase local commits onto the upstream instead). Errors if the branch has no upstream configured"
     )]
     fn pull_worktree(
@@ -514,7 +535,7 @@ impl WtmServer {
     }
 
     #[tool(
-        description = "Merge the repository's default branch into a worktree, bringing it up to date with the mainline. Same result shape as merge"
+        description = "Refresh the default branch from its upstream, then merge it into a worktree (or fast-forward in place when that worktree is already on the default). Same result shape as merge, plus status fast_forwarded when the default was updated in place"
     )]
     fn update(
         &self,

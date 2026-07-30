@@ -71,6 +71,14 @@ pub enum Command {
         #[command(subcommand)]
         action: StashAction,
     },
+    /// Move uncommitted changes from one worktree into another (stash, then
+    /// apply). Refuses if the destination has uncommitted changes of its own.
+    MoveChanges {
+        /// Worktree to take the uncommitted changes from.
+        from: String,
+        /// Worktree to move the changes into (must be clean).
+        to: String,
+    },
     /// Pull the latest changes for a worktree (fast-forward only by default).
     Pull {
         /// Worktree name.
@@ -144,8 +152,9 @@ pub enum Command {
         #[arg(long, short = 'm')]
         message: Option<String>,
     },
-    /// Merge the repository's default branch into a worktree, bringing it up
-    /// to date with the mainline.
+    /// Refresh the default branch from its upstream, then merge it into a
+    /// worktree (or fast-forward in place when that worktree is already on the
+    /// default branch).
     Update {
         /// Worktree name.
         name: String,
@@ -230,17 +239,21 @@ pub enum StashAction {
         /// Worktree name.
         name: String,
     },
-    /// Apply and drop a stash entry (default: most recent).
+    /// Apply and drop a stash entry (default: most recent). Stashes are
+    /// repo-wide, so this can pop into any worktree, not just the one that
+    /// pushed it.
     Pop {
-        /// Worktree name.
+        /// Worktree to apply the stash into.
         name: String,
         /// Stash entry index (default 0, the most recent).
         #[arg(long)]
         index: Option<u32>,
     },
     /// Apply a stash entry without dropping it (default: most recent).
+    /// Stashes are repo-wide, so this can apply into any worktree, not just
+    /// the one that pushed it.
     Apply {
-        /// Worktree name.
+        /// Worktree to apply the stash into.
         name: String,
         /// Stash entry index (default 0, the most recent).
         #[arg(long)]

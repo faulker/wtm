@@ -108,6 +108,8 @@ impl HelpTab {
             | View::Log { .. }
             | View::CommitDiff { .. } => HelpTab::Commits,
             View::MergePick { .. } => HelpTab::Branches,
+            View::MoveChanges { .. } => HelpTab::Worktrees,
+            View::StashTarget { .. } => HelpTab::Changes,
             View::ConflictResolver { .. } => HelpTab::Conflicts,
             _ => HelpTab::Basics,
         }
@@ -166,7 +168,10 @@ pub const WORKTREES: &[Binding] = &[
         "switch branch",
         "switch the selected worktree to another branch (local or remote), or type a new name to create one",
     ),
-    help_only("u", "update: merge the default branch into the worktree"),
+    help_only(
+        "u",
+        "update: refresh the default branch, then merge it in (or fast-forward if already on it)",
+    ),
     both(
         "c",
         "commit",
@@ -175,6 +180,11 @@ pub const WORKTREES: &[Binding] = &[
     help_only("o", "settings tab: edit repo settings"),
     help_only("e", "run the open command"),
     both("s", "stash", "stash tab (stash/pop/apply/drop)"),
+    both(
+        "m",
+        "move changes",
+        "move the worktree's uncommitted changes into another worktree",
+    ),
     both("p", "pull", "pull (fast-forward) the worktree"),
     both("⇧P", "push", "push the worktree"),
     both("f", "fetch", "fetch all remotes"),
@@ -269,8 +279,16 @@ pub const COMMIT_FILES: &[Binding] = &[
 pub const STASH_LIST: &[Binding] = &[
     both("↑/↓", "select", "select a stash entry"),
     both("s", "stash", "stash the worktree's current changes"),
-    both("p", "pop", "pop the selected stash (apply, then drop)"),
-    both("a", "apply", "apply the selected stash, keeping it"),
+    both(
+        "p",
+        "pop",
+        "pick a worktree to pop the selected stash into (apply, then drop)",
+    ),
+    both(
+        "a",
+        "apply",
+        "pick a worktree to apply the selected stash into, keeping it",
+    ),
     both("x", "drop", "drop the selected stash"),
     both("q", "quit", "quit"),
 ];
@@ -402,7 +420,10 @@ const CHANGES_SECTIONS: &[Section] = &[
     Section {
         heading: "stash tab  (s)",
         bindings: STASH_LIST,
-        notes: &["stashes belong to the worktree highlighted on the Worktrees tab."],
+        notes: &[
+            "stashes are shared across the whole repo, not tied to one worktree;",
+            "apply/pop always ask which worktree to apply into.",
+        ],
     },
 ];
 

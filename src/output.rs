@@ -9,8 +9,9 @@ use crate::git::StatusEntry;
 use crate::ops::{
     BranchCreateResult, BranchDeleteResult, BranchListResult, BranchRenameResult,
     CherryPickOutcome, CommitResult, CompleteResolutionResult, ConflictFile, CreateResult,
-    FetchResult, LogResult, MergeOutcome, PullResult, PushResult, StashListResult, StashPopOutcome,
-    StashResult, SwitchResult, WorktreeInfo, WorktreeRenameResult,
+    FetchResult, LogResult, MergeOutcome, MoveChangesResult, PullResult, PushResult,
+    StashListResult, StashPopOutcome, StashResult, SwitchResult, WorktreeInfo,
+    WorktreeRenameResult,
 };
 
 /// Serializes `value` as pretty JSON to stdout.
@@ -57,7 +58,8 @@ pub fn print_list(infos: &[WorktreeInfo]) {
     }
 }
 
-/// Human-readable create report, including each setup step's outcome.
+/// Human-readable create report, including each setup step's outcome, ending
+/// in an unambiguous final line so scripts and humans alike see completion.
 pub fn print_create(result: &CreateResult) {
     let action = if result.created_branch {
         "created branch"
@@ -78,8 +80,14 @@ pub fn print_create(result: &CreateResult) {
             None => println!("  [{mark}] {}", step.step),
         }
     }
-    if !result.setup_ok {
-        println!("warning: some setup steps failed; the worktree was kept");
+    println!("── done ──");
+    if result.setup_ok {
+        println!("✓ worktree created and set up: {}", result.path);
+    } else {
+        println!(
+            "✗ worktree created but some setup steps failed: {}",
+            result.path
+        );
     }
 }
 
@@ -140,6 +148,14 @@ pub fn print_stash_list(result: &StashListResult) {
             entry.index, entry.branch, entry.message
         );
     }
+}
+
+/// Human-readable move-changes confirmation.
+pub fn print_move_changes(result: &MoveChangesResult) {
+    println!(
+        "moved {} change(s) from '{}' to '{}'",
+        result.files, result.from, result.to
+    );
 }
 
 /// Human-readable pull result.
@@ -308,6 +324,9 @@ pub fn print_merge_outcome(target: &str, result: &MergeOutcome) {
     match result {
         MergeOutcome::UpToDate => println!("{target}: already up to date"),
         MergeOutcome::Clean { commit } => println!("{target}: merged ({commit})"),
+        MergeOutcome::FastForwarded { commit } => {
+            println!("{target}: fast-forwarded ({commit})")
+        }
         MergeOutcome::Conflicted { files } => {
             println!(
                 "{target}: merge stopped on {} conflicted file(s):",

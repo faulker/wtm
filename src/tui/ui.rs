@@ -26,7 +26,7 @@ use super::theme::{self, ACCENT, BORDER, GRAPH_COLORS, SELECTION_BG};
 use crate::config::{DEFAULT_AUTO_UPDATE_CHECK, DEFAULT_LOCATION, LOCATION_PRESETS};
 use crate::conflict::{ConflictSegment, ResolutionAction};
 use crate::git::{GraphLine, StatusEntry};
-use crate::ops::{self, ResolveKind};
+use crate::ops::ResolveKind;
 use crate::update::{CURRENT_VERSION, Release};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -203,6 +203,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             targets,
             selected,
         } => overlay_hit = draw_merge_pick(frame, main, source_branch, targets, *selected),
+        View::MoveChanges {
+            from,
+            targets,
+            selected,
+        } => overlay_hit = draw_move_changes_pick(frame, main, from, targets, *selected),
+        View::StashTarget {
+            pop,
+            label,
+            targets,
+            selected,
+            ..
+        } => overlay_hit = draw_stash_target_pick(frame, main, *pop, label, targets, *selected),
         _ => {}
     }
 
@@ -233,6 +245,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         | View::Switch { .. }
         | View::CherryPick { .. }
         | View::MergePick { .. }
+        | View::MoveChanges { .. }
+        | View::StashTarget { .. }
         | View::Setup(_) => overlay_hit,
         _ => None,
     };
@@ -422,15 +436,8 @@ fn draw_worktrees_tab(frame: &mut Frame, area: Rect, app: &mut App) -> Option<Ro
     let [list_area, preview_area] =
         Layout::vertical([Constraint::Percentage(62), Constraint::Percentage(38)]).areas(area);
     let row_list = draw_list(frame, list_area, app);
-    if app.preview_for != Some(app.selected) {
-        app.worktree_preview = app
-            .worktrees
-            .get(app.selected)
-            .and_then(|wt| ops::status(&app.ctx, &wt.name).ok())
-            .map(|(_, files)| files)
-            .unwrap_or_default();
-        app.preview_for = Some(app.selected);
-    }
+    // Status runs off-thread; never call `ops::status` on the render path.
+    app.ensure_worktree_preview();
     draw_worktree_preview(frame, preview_area, app);
     row_list
 }
@@ -445,10 +452,19 @@ fn draw_worktree_preview(frame: &mut Frame, area: Rect, app: &mut App) {
         Some(wt) => format!("changes · {}", wt.name),
         None => "changes".to_string(),
     };
+    // Selection moved (or refresh invalidated the cache) and status is still
+    // in flight: show a placeholder rather than another worktree's files.
+    if app.preview_loading() {
+        let para = Paragraph::new(Line::from("loading…".dim())).block(panel(title));
+        frame.render_widget(para, area);
+        app.preview_list = None;
+        return;
+    }
     if app.worktree_preview.is_empty() {
         let para = Paragraph::new(Line::from("no changes".dim())).block(panel(title));
         frame.render_widget(para, area);
         app.preview_scroll = 0;
+        app.preview_list = None;
         return;
     }
 
@@ -737,6 +753,16 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             hint("Enter", "merge"),
             hint("Esc", "cancel"),
         ],
+        View::MoveChanges { .. } => &[
+            hint("↑/↓", "pick worktree"),
+            hint("Enter", "move changes"),
+            hint("Esc", "cancel"),
+        ],
+        View::StashTarget { .. } => &[
+            hint("↑/↓", "pick worktree"),
+            hint("Enter", "apply"),
+            hint("Esc", "cancel"),
+        ],
         View::ConflictResolver { .. } => help::RESOLVER,
         View::Commit { focus, .. } => match focus {
             CommitFocus::Files => help::COMMIT_FILES,
@@ -795,7 +821,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             hint("type + Enter", "answer a prompt"),
             hint("Ctrl+C ×2", "kill setup"),
         ],
-        View::Creating { .. } => &[hint("Enter", "close")],
+        View::Creating { .. } => &[hint("Enter", "continue")],
         View::Setup(wizard) => match &wizard.step {
             Step::Welcome { .. } => &[
                 hint("↑/↓", "choose"),
@@ -1068,7 +1094,14 @@ fn draw_creating(
     let popup = centered(area, 76, height);
     frame.render_widget(Clear, popup);
     let title = if done {
-        format!("creating {branch} · finished")
+        // The final ✓/✗ line (pushed right before "press Enter to continue")
+        // says which; the title mirrors it so it's visible even scrolled off.
+        let failed = lines.iter().any(|l| l.starts_with('✗'));
+        if failed {
+            format!("creating {branch} · failed")
+        } else {
+            format!("creating {branch} · ready")
+        }
     } else {
         format!("creating {branch} · running…")
     };
@@ -1138,10 +1171,12 @@ fn draw_rename_worktree(frame: &mut Frame, area: Rect, name: &str, input: &super
 /// Styles one line of setup output: step results and errors stand out,
 /// echoed user input shows its prompt, plain command output stays dim.
 fn output_line(line: &str) -> Line<'_> {
-    let style = if line.starts_with("[ok]") {
-        Style::new().fg(theme::SUCCESS)
-    } else if line.starts_with("[FAILED]") || line.starts_with("error") {
-        Style::new().fg(theme::DANGER)
+    let style = if line.starts_with("[ok]") || line.starts_with('✓') {
+        Style::new().fg(theme::SUCCESS).bold()
+    } else if line.starts_with("[FAILED]") || line.starts_with("error") || line.starts_with('✗') {
+        Style::new().fg(theme::DANGER).bold()
+    } else if line.starts_with("──") {
+        Style::new().fg(ACCENT).dim()
     } else if line.starts_with("❯ ") {
         Style::new().fg(ACCENT)
     } else if line.starts_with("creating ")
@@ -1949,10 +1984,11 @@ fn status_style(code: &str) -> Style {
     }
 }
 
-/// The Stash tab: a full-width table of the selected worktree's stash entries.
-/// The message/drop prompts are modals drawn over it.
+/// The Stash tab: a full-width table of the repo's stash entries (stashes are
+/// repo-global, not tied to one worktree). The message/drop prompts are
+/// modals drawn over it; apply/pop open a destination picker first.
 fn draw_stash_tab(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
-    let block = panel(format!("stash · {}", app.stash_name));
+    let block = panel(format!("stash · shared · apply into {}", app.stash_name));
     let inner = block.inner(area);
     if app.stash_entries.is_empty() {
         let para = Paragraph::new(Line::from(
@@ -2660,6 +2696,126 @@ fn draw_merge_pick(
     })
 }
 
+/// The move-changes picker overlay: choose which worktree to move the
+/// selected worktree's uncommitted changes into. Mirrors the merge picker.
+fn draw_move_changes_pick(
+    frame: &mut Frame,
+    area: Rect,
+    from: &str,
+    targets: &[CherryTarget],
+    selected: usize,
+) -> Option<RowList> {
+    let rows = targets.len().clamp(1, 12) as u16;
+    let popup = centered(area, 60, rows + 5);
+    frame.render_widget(Clear, popup);
+    let block = panel(format!("move changes from '{from}' into…"));
+    frame.render_widget(&block, popup);
+    let inner = block.inner(popup);
+    let [head_area, list_area, hint_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from("into which worktree?".dim())),
+        head_area,
+    );
+    let items: Vec<ListItem> = targets
+        .iter()
+        .map(|t| {
+            let branch = match &t.branch {
+                Some(b) => format!(" ({b})"),
+                None => " (detached)".to_string(),
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled("● ", Style::new().fg(Color::Green)),
+                Span::raw(t.name.clone()),
+                Span::styled(branch, Style::new().dim()),
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .highlight_style(Style::new().bg(SELECTION_BG).bold())
+        .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
+    let mut state =
+        ListState::default().with_selected(Some(selected.min(targets.len().max(1) - 1)));
+    frame.render_stateful_widget(list, list_area, &mut state);
+    frame.render_widget(
+        Paragraph::new(Line::from(
+            "↑/↓ pick · Enter move changes · Esc cancel".dim(),
+        )),
+        hint_area,
+    );
+    (!targets.is_empty()).then_some(RowList {
+        inner: list_area,
+        header: 0,
+        offset: state.offset(),
+        len: targets.len(),
+    })
+}
+
+/// The stash apply/pop destination picker: stashes are repo-global, so
+/// choosing where to apply one is a worktree picker like cherry-pick/merge.
+fn draw_stash_target_pick(
+    frame: &mut Frame,
+    area: Rect,
+    pop: bool,
+    label: &str,
+    targets: &[CherryTarget],
+    selected: usize,
+) -> Option<RowList> {
+    let verb = if pop { "pop" } else { "apply" };
+    let rows = targets.len().clamp(1, 12) as u16;
+    let popup = centered(area, 60, rows + 5);
+    frame.render_widget(Clear, popup);
+    let block = panel(format!("{verb} {label} into…"));
+    frame.render_widget(&block, popup);
+    let inner = block.inner(popup);
+    let [head_area, list_area, hint_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from("into which worktree?".dim())),
+        head_area,
+    );
+    let items: Vec<ListItem> = targets
+        .iter()
+        .map(|t| {
+            let branch = match &t.branch {
+                Some(b) => format!(" ({b})"),
+                None => " (detached)".to_string(),
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled("● ", Style::new().fg(Color::Green)),
+                Span::raw(t.name.clone()),
+                Span::styled(branch, Style::new().dim()),
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .highlight_style(Style::new().bg(SELECTION_BG).bold())
+        .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
+    let mut state =
+        ListState::default().with_selected(Some(selected.min(targets.len().max(1) - 1)));
+    frame.render_stateful_widget(list, list_area, &mut state);
+    frame.render_widget(
+        Paragraph::new(Line::from(
+            format!("↑/↓ pick · Enter {verb} · Esc cancel").dim(),
+        )),
+        hint_area,
+    );
+    (!targets.is_empty()).then_some(RowList {
+        inner: list_area,
+        header: 0,
+        offset: state.offset(),
+        len: targets.len(),
+    })
+}
+
 /// Short label and color for a hunk's chosen resolution action.
 fn action_label(action: Option<&ResolutionAction>) -> (&'static str, Color) {
     match action {
@@ -3172,7 +3328,8 @@ mod tests {
         assert_eq!(
             line,
             "⇥ tabs  Enter changes  n new  b switch branch  c commit  s stash  \
-             p pull  ⇧P push  f fetch  l log  d delete  ⇧R rename  ? help  q quit"
+             m move changes  p pull  ⇧P push  f fetch  l log  d delete  ⇧R rename  \
+             ? help  q quit"
         );
         // `u`, `o`, `e` and the cursor keys are documented in help but have no
         // footer label, so they are absent above.

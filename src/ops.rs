@@ -715,6 +715,15 @@ pub struct StashListResult {
     pub entries: Vec<git::StashEntry>,
 }
 
+/// Result of `move_changes`.
+#[derive(Debug, Clone, Serialize)]
+pub struct MoveChangesResult {
+    pub from: String,
+    pub to: String,
+    /// Number of files whose changes were moved.
+    pub files: usize,
+}
+
 /// Result of `pull`.
 #[derive(Debug, Clone, Serialize)]
 pub struct PullResult {
@@ -863,10 +872,17 @@ pub enum StashPopOutcome {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum MergeOutcome {
-    /// The target branch already contained the source; nothing changed.
+    /// The target branch already contained the source (merge), or the default
+    /// branch was already at its upstream (`update` when the target is on the
+    /// default branch); nothing changed.
     UpToDate,
     /// The merge completed; `commit` is the short hash of the target's new HEAD.
     Clean { commit: String },
+    /// `update` fast-forwarded the default branch in place because the target
+    /// already had it checked out. `commit` is the short hash of the new HEAD.
+    /// Distinct from [`Self::Clean`] so CLI/TUI can say "fast-forwarded" rather
+    /// than "merged".
+    FastForwarded { commit: String },
     /// The merge stopped on conflicts; the target worktree is left mid-merge
     /// so the listed files can be resolved there.
     Conflicted { files: Vec<String> },
@@ -1010,6 +1026,52 @@ fn stash_action(
         name: info.name,
         action: action.to_string(),
         output,
+    })
+}
+
+/// Moves uncommitted changes (including untracked files) from the worktree
+/// named `from` into the worktree named `to`: stashes everything in `from`,
+/// applies it in `to`, then drops the stash. Refuses when `from` has nothing
+/// to move or `to` isn't clean, so a move never has to untangle the
+/// destination's own edits from the incoming ones. If applying at the
+/// destination fails (e.g. the changes don't apply there), the stash is
+/// re-applied to `from` instead of being left stranded.
+pub fn move_changes(ctx: &Ctx, from: &str, to: &str) -> Result<MoveChangesResult> {
+    let from_info = find(ctx, from)?.ok_or_else(|| not_found(ctx, from))?;
+    let to_info = find(ctx, to)?.ok_or_else(|| not_found(ctx, to))?;
+    if from_info.path == to_info.path {
+        bail!("'{from}' and '{to}' are the same worktree");
+    }
+    let from_dir = Path::new(&from_info.path);
+    let to_dir = Path::new(&to_info.path);
+    let files = git::status(from_dir)?.len();
+    if files == 0 {
+        bail!(
+            "worktree '{}' has no uncommitted changes to move",
+            from_info.name
+        );
+    }
+    if !git::status(to_dir)?.is_empty() {
+        bail!(
+            "worktree '{}' has uncommitted changes of its own; commit or stash them first",
+            to_info.name
+        );
+    }
+    git::stash_push(from_dir, Some(&format!("moved to '{}'", to_info.name)))?;
+    if let Err(e) = git::stash_apply(to_dir, None) {
+        // Applying at the destination failed; restore the change to where it
+        // came from rather than leaving it stranded only in the stash list.
+        git::stash_pop(from_dir, None).ok();
+        return Err(e).context(format!(
+            "could not apply changes into '{}'; restored them to '{}'",
+            to_info.name, from_info.name
+        ));
+    }
+    git::stash_drop(from_dir, None)?;
+    Ok(MoveChangesResult {
+        from: from_info.name,
+        to: to_info.name,
+        files,
     })
 }
 
@@ -1416,22 +1478,48 @@ pub fn merge(
     }
 }
 
-/// Merges the repository's default branch into the worktree named `target`,
-/// bringing its branch up to date with the mainline. Errors when the target
-/// already has the default branch checked out.
-/// When `autostash` is set, uncommitted local changes are stashed before the
-/// merge and re-applied after it finishes (git's `--autostash`), so a dirty
-/// worktree can be updated without committing or losing the in-progress work.
+/// Brings the worktree named `target` up to date with the repository's default
+/// branch.
+///
+/// 1. When the default branch has an upstream, refresh it first via
+///    [`update_branch`] (pull in place if checked out somewhere, otherwise
+///    fetch + fast-forward the ref). When it has no upstream, that step is
+///    skipped for feature targets (local-only merge of whatever `main` is);
+///    for a target already on the default branch, returns a clear error.
+/// 2. If `target` already has the default branch checked out, stop after the
+///    refresh: [`MergeOutcome::FastForwarded`] when HEAD moved,
+///    [`MergeOutcome::UpToDate`] when it was already current.
+/// 3. Otherwise merge the (possibly refreshed) default into the target via
+///    [`merge`]. When `autostash` is set, uncommitted local changes are stashed
+///    before that merge and re-applied after (git's `--autostash`).
 pub fn update(ctx: &Ctx, target: &str, autostash: bool) -> Result<MergeOutcome> {
     let info = find(ctx, target)?.ok_or_else(|| not_found(ctx, target))?;
     let default = git::default_branch(&ctx.repo_root)?;
-    if info.branch.as_deref() == Some(default.as_str()) {
+    let on_default = info.branch.as_deref() == Some(default.as_str());
+    let has_upstream = git::branch_upstream(&ctx.repo_root, &default)?.is_some();
+
+    if has_upstream {
+        if on_default {
+            let dir = Path::new(&info.path);
+            let before = git::short_hash(dir)?;
+            update_branch(ctx, &default)?;
+            let after = git::short_hash(dir)?;
+            return if before == after {
+                Ok(MergeOutcome::UpToDate)
+            } else {
+                Ok(MergeOutcome::FastForwarded { commit: after })
+            };
+        }
+        update_branch(ctx, &default)?;
+    } else if on_default {
         bail!(
-            "worktree '{}' has the default branch '{default}' checked out; \
-             there is nothing to update it from",
+            "worktree '{}' has the default branch '{default}' checked out, but \
+             '{default}' has no upstream configured; push it first or set one \
+             with `git branch --set-upstream-to`",
             info.name
         );
     }
+
     merge(ctx, target, &default, false, autostash)
 }
 
@@ -2376,19 +2464,76 @@ mod tests {
     }
 
     #[test]
-    fn update_merges_default_branch_and_refuses_on_default() {
+    fn update_merges_default_branch_locally_without_upstream() {
         let (_tmp, ctx) = temp_ctx();
         let path = make_worktree(&ctx, "feature");
         std::fs::write(ctx.repo_root.join("new.txt"), "x\n").unwrap();
         git(&ctx.repo_root, &["add", "."]);
         git(&ctx.repo_root, &["commit", "-m", "advance main"]);
 
+        // No remote: still merges the local default into the feature worktree.
         let outcome = update(&ctx, "feature", false).unwrap();
         assert!(matches!(outcome, MergeOutcome::Clean { .. }), "{outcome:?}");
         assert!(path.join("new.txt").exists());
 
-        // The main worktree has the default branch itself: nothing to update.
-        assert!(update(&ctx, "main", false).is_err());
+        // On the default branch with no upstream: clear error, not a silent no-op.
+        let err = update(&ctx, "main", false).unwrap_err().to_string();
+        assert!(
+            err.contains("no upstream"),
+            "expected no-upstream error, got: {err}"
+        );
+    }
+
+    /// When the target is on the default branch and that branch tracks a remote,
+    /// update refreshes it in place (fetch + fast-forward) instead of refusing.
+    #[test]
+    fn update_on_default_fast_forwards_from_upstream() {
+        let (tmp, ctx) = temp_ctx();
+        let bare = with_origin(tmp.path(), &ctx);
+        advance_remote(tmp.path(), &bare, "main", "remote-work");
+
+        let before = git::run(&ctx.repo_root, &["rev-parse", "main"]).unwrap();
+        let outcome = update(&ctx, "main", false).unwrap();
+        let MergeOutcome::FastForwarded { commit } = outcome else {
+            panic!("expected FastForwarded, got {outcome:?}");
+        };
+        let after = git::run(&ctx.repo_root, &["rev-parse", "main"]).unwrap();
+        assert_ne!(before, after, "main should have moved");
+        assert_eq!(commit, git::short_hash(&ctx.repo_root).unwrap());
+        assert_eq!(
+            git::run(&ctx.repo_root, &["log", "-1", "--format=%s", "main"]).unwrap(),
+            "remote-work"
+        );
+
+        // A second update finds nothing new.
+        let again = update(&ctx, "main", false).unwrap();
+        assert!(matches!(again, MergeOutcome::UpToDate), "{again:?}");
+    }
+
+    /// Updating a feature worktree refreshes the default from its upstream
+    /// first, then merges that tip into the feature branch.
+    #[test]
+    fn update_on_feature_refreshes_default_then_merges() {
+        let (tmp, ctx) = temp_ctx();
+        let bare = with_origin(tmp.path(), &ctx);
+        let path = make_worktree(&ctx, "feature");
+        advance_remote(tmp.path(), &bare, "main", "remote-work");
+
+        let main_before = git::run(&ctx.repo_root, &["rev-parse", "main"]).unwrap();
+        let outcome = update(&ctx, "feature", false).unwrap();
+        assert!(matches!(outcome, MergeOutcome::Clean { .. }), "{outcome:?}");
+        let main_after = git::run(&ctx.repo_root, &["rev-parse", "main"]).unwrap();
+        assert_ne!(main_before, main_after, "main should have been refreshed");
+        assert_eq!(
+            git::run(&path, &["log", "-1", "--format=%s", "main"]).unwrap(),
+            "remote-work"
+        );
+        // Feature's history now includes the remote commit (via merge of main).
+        let feature_log = git::run(&path, &["log", "--oneline"]).unwrap();
+        assert!(
+            feature_log.contains("remote-work"),
+            "feature should contain remote-work after update: {feature_log}"
+        );
     }
 
     #[test]
@@ -2880,6 +3025,72 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(path.join("shared.txt")).unwrap(),
             "resolved\n"
+        );
+    }
+
+    #[test]
+    fn move_changes_moves_uncommitted_work_between_worktrees() {
+        let (_tmp, ctx) = temp_ctx();
+        let from_path = make_worktree(&ctx, "feature");
+        let to_path = make_worktree(&ctx, "other");
+        std::fs::write(from_path.join("a.txt"), "a\n").unwrap();
+        std::fs::write(from_path.join("b.txt"), "b\n").unwrap();
+
+        let result = move_changes(&ctx, "feature", "other").unwrap();
+        assert_eq!(result.from, "feature");
+        assert_eq!(result.to, "other");
+        assert_eq!(result.files, 2);
+
+        assert!(git::status(&from_path).unwrap().is_empty());
+        assert_eq!(git::status(&to_path).unwrap().len(), 2);
+        assert_eq!(
+            std::fs::read_to_string(to_path.join("a.txt")).unwrap(),
+            "a\n"
+        );
+        // No stash left behind on either side.
+        assert!(git::stash_list(&from_path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn move_changes_errors_when_source_is_clean() {
+        let (_tmp, ctx) = temp_ctx();
+        make_worktree(&ctx, "feature");
+        make_worktree(&ctx, "other");
+
+        let err = move_changes(&ctx, "feature", "other").unwrap_err();
+        assert!(
+            err.to_string().contains("no uncommitted changes"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn move_changes_errors_when_destination_is_dirty() {
+        let (_tmp, ctx) = temp_ctx();
+        let from_path = make_worktree(&ctx, "feature");
+        let to_path = make_worktree(&ctx, "other");
+        std::fs::write(from_path.join("a.txt"), "a\n").unwrap();
+        std::fs::write(to_path.join("b.txt"), "b\n").unwrap();
+
+        let err = move_changes(&ctx, "feature", "other").unwrap_err();
+        assert!(
+            err.to_string().contains("uncommitted changes of its own"),
+            "unexpected error: {err:#}"
+        );
+        // Nothing was stashed; the source is untouched.
+        assert_eq!(git::status(&from_path).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn move_changes_rejects_moving_into_itself() {
+        let (_tmp, ctx) = temp_ctx();
+        let path = make_worktree(&ctx, "feature");
+        std::fs::write(path.join("a.txt"), "a\n").unwrap();
+
+        let err = move_changes(&ctx, "feature", "feature").unwrap_err();
+        assert!(
+            err.to_string().contains("same worktree"),
+            "unexpected error: {err:#}"
         );
     }
 
