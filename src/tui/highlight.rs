@@ -9,7 +9,7 @@
 
 use std::cell::RefCell;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -55,9 +55,15 @@ fn theme_set() -> &'static ThemeSet {
 }
 
 /// Currently selected theme id (one of [`DIFF_THEMES`]'s short ids).
-fn current_theme_id() -> &'static Mutex<String> {
-    static ID: OnceLock<Mutex<String>> = OnceLock::new();
-    ID.get_or_init(|| Mutex::new(DEFAULT_DIFF_THEME.to_string()))
+///
+/// Thread-local so parallel `cargo test` workers cannot clobber each other, and
+/// so it stays paired with the per-thread render [`CACHE`]. The TUI only reads
+/// and writes this from the UI thread.
+fn with_theme_id<R>(f: impl FnOnce(&mut String) -> R) -> R {
+    thread_local! {
+        static ID: RefCell<String> = RefCell::new(DEFAULT_DIFF_THEME.to_string());
+    }
+    ID.with(|cell| f(&mut cell.borrow_mut()))
 }
 
 /// Resolves a config value (short id or syntect name) to a known short id.
@@ -96,23 +102,24 @@ fn syntect_name_for(id: &str) -> &'static str {
 
 /// The short id of the theme currently used for highlighting.
 pub fn active_theme_id() -> String {
-    current_theme_id()
-        .lock()
-        .map(|g| g.clone())
-        .unwrap_or_else(|_| DEFAULT_DIFF_THEME.to_string())
+    with_theme_id(|id| id.clone())
 }
 
 /// Switches the diff highlighter to `raw` (a short id or syntect name) and
 /// clears the render cache so the next frame uses the new colours.
 pub fn set_theme(raw: &str) {
     let id = normalize_theme_id(raw).to_string();
-    if let Ok(mut guard) = current_theme_id().lock() {
-        if *guard == id {
-            return;
+    let changed = with_theme_id(|current| {
+        if *current == id {
+            false
+        } else {
+            *current = id;
+            true
         }
-        *guard = id;
+    });
+    if changed {
+        clear_cache();
     }
-    clear_cache();
 }
 
 /// Cycles to the next theme in [`DIFF_THEMES`], returning the new short id.

@@ -19,6 +19,9 @@ permissions:
   contents: write
 
 jobs:
+  # Figure the release tag only. Do not commit or tag yet: a failed build
+  # must leave main untouched. The build job stamps this version into
+  # Cargo.toml via sed so the binary still embeds the right version.
   resolve-version:
     name: Resolve Version
     runs-on: ubuntu-latest
@@ -29,7 +32,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Calculate next version
         id: bump
@@ -55,37 +57,12 @@ jobs:
           esac
 
           NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+          if git rev-parse "$NEW_TAG" >/dev/null 2>&1; then
+            echo "Tag $NEW_TAG already exists; refuse to reuse it"
+            exit 1
+          fi
           echo "new_tag=$NEW_TAG" >> "$GITHUB_OUTPUT"
           echo "Bumping $LATEST_TAG -> $NEW_TAG ($BUMP_TYPE)"
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Update Cargo.toml version and lockfile
-        env:
-          NEW_TAG: ${{ steps.bump.outputs.new_tag }}
-        run: |
-          set -e
-          VERSION="${NEW_TAG#v}"
-          sed -i '0,/^version = ".*"/s//version = "'"${VERSION}"'"/' Cargo.toml
-          cargo generate-lockfile
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock
-          git commit -m "chore: bump version to ${VERSION}"
-          git push origin HEAD:main
-
-      - name: Create and push tag
-        env:
-          NEW_TAG: ${{ steps.bump.outputs.new_tag }}
-        run: |
-          set -e
-          if git rev-parse "$NEW_TAG" >/dev/null 2>&1; then
-            echo "Tag $NEW_TAG already exists, skipping creation"
-            exit 0
-          fi
-          git tag "$NEW_TAG"
-          git push origin "$NEW_TAG"
 
   build:
     name: Build ${{ matrix.name }}
@@ -120,9 +97,9 @@ jobs:
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
     steps:
+      # Checkout the triggering commit, not RELEASE_TAG: on workflow_dispatch the
+      # tag is only created after a successful build. Version is stamped below.
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ env.RELEASE_TAG }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -142,6 +119,7 @@ jobs:
           else
             sed -i -e '0,/^version = ".*"/s//version = "'"${VERSION}"'"/' Cargo.toml
           fi
+          echo "Building ${RELEASE_TAG} (Cargo.toml version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1))"
 
       - name: Run tests
         run: cargo test --target ${{ matrix.target }}
@@ -260,6 +238,49 @@ jobs:
     env:
       RELEASE_TAG: ${{ needs.resolve-version.outputs.new_tag || github.ref_name }}
     steps:
+      # On workflow_dispatch only: persist the version that the build already
+      # embedded, then tag that commit. Tag-push releases skip this; the tag
+      # already points at the intended commit.
+      - name: Checkout release commit
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+          token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        if: github.event_name == 'workflow_dispatch'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Commit version bump and push tag
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          NEW_TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          VERSION="${NEW_TAG#v}"
+          sed -i '0,/^version = ".*"/s//version = "'"${VERSION}"'"/' Cargo.toml
+          cargo generate-lockfile
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          if git diff --staged --quiet; then
+            echo "Cargo.toml already at ${VERSION}; tagging current commit"
+          else
+            git commit -m "chore: bump version to ${VERSION}"
+          fi
+          # Fast-forward only: if main moved during the build, fail rather than
+          # force-push or release from a divergent history.
+          git push origin HEAD:main
+          if git rev-parse "$NEW_TAG" >/dev/null 2>&1; then
+            echo "Tag $NEW_TAG already exists, refusing to move it"
+            exit 1
+          fi
+          git tag "$NEW_TAG"
+          git push origin "$NEW_TAG"
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
