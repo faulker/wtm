@@ -16,9 +16,13 @@ use super::highlight::{self, DIFF_THEMES};
 use crate::config;
 use crate::settings::{self, RepoConfigFields};
 
-/// Rows holding a free-text value (worktree_dir, open_command, setup.copy,
-/// setup.run). Enter on one of these opens the text input.
+/// Rows holding an editable value (worktree_dir, open_command, setup.copy,
+/// setup.run). Enter on one of these opens the text input, except
+/// [`OPEN_COMMAND_ROW`], which opens the list editor.
 pub const TEXT_ROWS: usize = 4;
+/// Index of the `open_command` row, whose value is a list of commands the
+/// Worktrees-tab `o` key can run rather than one string.
+pub const OPEN_COMMAND_ROW: usize = 1;
 /// Index of the update-check toggle, which Enter cycles rather than edits.
 pub const UPDATE_ROW: usize = TEXT_ROWS;
 /// Index of the diff-theme cycle row.
@@ -81,6 +85,125 @@ pub struct ConfigEditor {
     /// navigating. Shares `TextInput` with the other prompts so `←/→`,
     /// Home/End, and mid-string edits work here too.
     pub editing: Option<TextInput>,
+    /// The `open_command` list editor while it is open, working on a copy of
+    /// the list so cancelling discards its edits.
+    pub open_list: Option<OpenCommandEditor>,
+}
+
+/// The `open_command` list editor: a modal over the Settings tab for adding,
+/// editing, and removing individual commands. It works on a copy of the list
+/// and only hands it back when the user confirms.
+///
+/// Rows are the commands, then an "add" row, then a "done" row, so every
+/// action is reachable by arrow keys as well as by its shortcut.
+pub struct OpenCommandEditor {
+    /// Working copy of the list, one shell template per entry.
+    pub commands: Vec<String>,
+    /// Cursor over the rows: `0..commands.len()`, then add, then done.
+    pub selected: usize,
+    /// Buffer while typing a command; `None` while navigating.
+    pub input: Option<TextInput>,
+    /// Which entry `input` is rewriting, or `None` when it is a new one.
+    pub editing_index: Option<usize>,
+}
+
+/// What a key press did to the list editor.
+enum ListOutcome {
+    Continue,
+    /// The user confirmed; the caller copies `commands` back into the fields.
+    Done,
+    /// The user cancelled; the working copy is dropped.
+    Cancel,
+}
+
+impl OpenCommandEditor {
+    /// Opens the editor on a copy of `commands`, with the first row selected.
+    pub fn new(commands: Vec<String>) -> OpenCommandEditor {
+        OpenCommandEditor {
+            commands,
+            selected: 0,
+            input: None,
+            editing_index: None,
+        }
+    }
+
+    /// Index of the "add a command" row, just past the commands.
+    pub fn add_row(&self) -> usize {
+        self.commands.len()
+    }
+
+    /// Index of the "done" row, the last one.
+    pub fn done_row(&self) -> usize {
+        self.commands.len() + 1
+    }
+
+    /// Total selectable rows: the commands plus add and done.
+    pub fn rows(&self) -> usize {
+        self.commands.len() + 2
+    }
+
+    /// Starts typing a new command, appended when committed.
+    fn start_add(&mut self) {
+        self.selected = self.add_row();
+        self.editing_index = None;
+        self.input = Some(TextInput::default());
+    }
+
+    /// Starts rewriting the command at `index`.
+    fn start_edit(&mut self, index: usize) {
+        self.editing_index = Some(index);
+        self.input = Some(TextInput::with_value(&self.commands[index]));
+    }
+
+    /// Drops the command at `index`, keeping the cursor on a valid row.
+    fn remove(&mut self, index: usize) {
+        self.commands.remove(index);
+        self.selected = self.selected.min(self.rows() - 1);
+    }
+
+    /// Handles one key press, whether typing a command or navigating rows.
+    fn on_key(&mut self, key: KeyEvent) -> ListOutcome {
+        // Typing takes every key: Esc abandons the entry, Enter commits it,
+        // and a blank entry is treated as "never mind" rather than an empty
+        // command, since an empty command has nothing to run.
+        if let Some(mut input) = self.input.take() {
+            match key.code {
+                KeyCode::Esc => self.editing_index = None,
+                KeyCode::Enter => {
+                    let value = input.trimmed();
+                    match (self.editing_index.take(), value.is_empty()) {
+                        (Some(index), false) => self.commands[index] = value,
+                        (None, false) => {
+                            self.commands.push(value);
+                            self.selected = self.commands.len() - 1;
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {
+                    input.on_key(key);
+                    self.input = Some(input);
+                }
+            }
+            return ListOutcome::Continue;
+        }
+        match key.code {
+            KeyCode::Esc => return ListOutcome::Cancel,
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.selected = (self.selected + 1).min(self.rows() - 1)
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
+            KeyCode::Enter if self.selected == self.done_row() => return ListOutcome::Done,
+            KeyCode::Enter if self.selected == self.add_row() => self.start_add(),
+            KeyCode::Enter => self.start_edit(self.selected),
+            KeyCode::Char('a') => self.start_add(),
+            KeyCode::Char('d') | KeyCode::Delete if self.selected < self.commands.len() => {
+                self.remove(self.selected)
+            }
+            _ => {}
+        }
+        ListOutcome::Continue
+    }
 }
 
 /// What a key press did, for the app to act on.
@@ -104,6 +227,7 @@ impl ConfigEditor {
             fields,
             selected: 0,
             editing: None,
+            open_list: None,
         })
     }
 
@@ -114,6 +238,7 @@ impl ConfigEditor {
         self.fields = settings::repo_config_fields(&self.repo_root, self.global_config.as_deref())?;
         self.selected = 0;
         self.editing = None;
+        self.open_list = None;
         Ok(())
     }
 
@@ -126,14 +251,17 @@ impl ConfigEditor {
             fields: RepoConfigFields::default(),
             selected: 0,
             editing: None,
+            open_list: None,
         }
     }
 
-    /// Current text of a setting row.
+    /// Current text of a single-value setting row. [`OPEN_COMMAND_ROW`] holds
+    /// a list rather than one value, so it reads as empty here; the renderer
+    /// uses [`ConfigEditor::open_command_summary`] for it instead.
     pub fn field(&self, row: usize) -> &str {
         match row {
             0 => &self.fields.worktree_dir,
-            1 => &self.fields.open_command,
+            OPEN_COMMAND_ROW => "",
             2 => &self.fields.copy,
             3 => &self.fields.run,
             UPDATE_ROW => &self.fields.auto_update_check,
@@ -141,14 +269,32 @@ impl ConfigEditor {
         }
     }
 
+    /// The `open_command` row's value as one line: the command itself when
+    /// there is one, otherwise a count followed by the commands. Empty when
+    /// nothing is configured, so the row falls back to "(default)".
+    pub fn open_command_summary(&self) -> String {
+        match self.fields.open_command.len() {
+            0 => String::new(),
+            1 => self.fields.open_command[0].clone(),
+            n => format!("{n} commands: {}", self.fields.open_command.join(" · ")),
+        }
+    }
+
+    /// Whether a text buffer is open, so the app knows to route printable keys
+    /// here instead of treating them as shortcuts.
+    pub fn is_typing(&self) -> bool {
+        self.editing.is_some() || self.open_list.as_ref().is_some_and(|l| l.input.is_some())
+    }
+
     fn set_field(&mut self, row: usize, value: String) {
         match row {
             0 => self.fields.worktree_dir = value,
-            1 => self.fields.open_command = value,
             2 => self.fields.copy = value,
             3 => self.fields.run = value,
             UPDATE_ROW => self.fields.auto_update_check = value,
-            _ => self.fields.diff_theme = value,
+            THEME_ROW => self.fields.diff_theme = value,
+            // `open_command` is edited as a list, never as one text value.
+            _ => {}
         }
     }
 
@@ -181,9 +327,53 @@ impl ConfigEditor {
         }
     }
 
+    /// Writes every field to disk and applies the chosen diff theme. Shared by
+    /// the save row and by finishing the open_command list editor.
+    fn save_fields(&mut self, message: &mut Option<String>) -> EditorOutcome {
+        match settings::save_config_edits(
+            &self.repo_root,
+            self.global_config.as_deref(),
+            &self.fields,
+        ) {
+            Ok(path) => {
+                // Apply the theme immediately so the next diff draw uses it
+                // without requiring a restart.
+                let theme = if self.fields.diff_theme.is_empty() {
+                    config::DEFAULT_DIFF_THEME
+                } else {
+                    self.fields.diff_theme.as_str()
+                };
+                highlight::set_theme(theme);
+                EditorOutcome::Saved(path)
+            }
+            Err(e) => {
+                *message = Some(format!("error: {e:#}"));
+                EditorOutcome::Continue
+            }
+        }
+    }
+
     /// Handles one key press. Save errors land in `message` and keep the
     /// editor open.
     pub fn on_key(&mut self, key: KeyEvent, message: &mut Option<String>) -> EditorOutcome {
+        // The open_command list editor is modal over the rest of the form, so
+        // it sees every key until it is confirmed (list copied back) or
+        // cancelled (working copy dropped).
+        if let Some(mut list) = self.open_list.take() {
+            match list.on_key(key) {
+                ListOutcome::Continue => {
+                    self.open_list = Some(list);
+                    return EditorOutcome::Continue;
+                }
+                // Persist immediately: leaving Settings reloads from disk, so a
+                // list that only lived in memory would vanish on the next visit.
+                ListOutcome::Done => {
+                    self.fields.open_command = list.commands;
+                    return self.save_fields(message);
+                }
+                ListOutcome::Cancel => return EditorOutcome::Continue,
+            }
+        }
         // While editing, work on the buffer taken out of `self`; Esc and Enter
         // leave it out (cancel / commit), other keys drive the text input and
         // put the edited buffer back.
@@ -210,24 +400,7 @@ impl ConfigEditor {
                 return EditorOutcome::CheckForUpdates;
             }
             KeyCode::Enter if self.selected == SAVE_ROW => {
-                match settings::save_config_edits(
-                    &self.repo_root,
-                    self.global_config.as_deref(),
-                    &self.fields,
-                ) {
-                    Ok(path) => {
-                        // Apply the theme immediately so the next diff draw
-                        // uses it without requiring a restart.
-                        let theme = if self.fields.diff_theme.is_empty() {
-                            config::DEFAULT_DIFF_THEME
-                        } else {
-                            self.fields.diff_theme.as_str()
-                        };
-                        highlight::set_theme(theme);
-                        return EditorOutcome::Saved(path);
-                    }
-                    Err(e) => *message = Some(format!("error: {e:#}")),
-                }
+                return self.save_fields(message);
             }
             // The toggles have no free text to type, so Enter and Space both
             // flip them instead of opening an input.
@@ -236,6 +409,11 @@ impl ConfigEditor {
             }
             KeyCode::Enter | KeyCode::Char(' ') if self.selected == THEME_ROW => {
                 self.cycle_diff_theme()
+            }
+            // The list row opens its own editor rather than a text input, so
+            // a command containing a comma stays one entry.
+            KeyCode::Enter if self.selected == OPEN_COMMAND_ROW => {
+                self.open_list = Some(OpenCommandEditor::new(self.fields.open_command.clone()))
             }
             KeyCode::Enter if self.selected < TEXT_ROWS => {
                 self.editing = Some(TextInput::with_value(self.field(self.selected)))
@@ -261,6 +439,7 @@ mod tests {
             },
             selected: 0,
             editing: None,
+            open_list: None,
         }
     }
 
@@ -314,6 +493,168 @@ mod tests {
         assert_eq!(ed.fields.diff_theme, DIFF_THEMES[DIFF_THEMES.len() - 1].0);
         press(&mut ed, KeyCode::Enter);
         assert_eq!(ed.fields.diff_theme, "", "wraps back to the default");
+    }
+
+    /// Types `text` into whatever input is open, one key at a time.
+    fn type_str(ed: &mut ConfigEditor, text: &str) {
+        for ch in text.chars() {
+            press(ed, KeyCode::Char(ch));
+        }
+    }
+
+    /// The editor sitting on the open_command row with `commands` configured.
+    fn list_editor(commands: &[&str]) -> ConfigEditor {
+        let mut ed = editor();
+        ed.fields.open_command = commands.iter().map(|c| c.to_string()).collect();
+        ed.selected = OPEN_COMMAND_ROW;
+        ed
+    }
+
+    /// List editor backed by a real config file, so `[ done ]` can persist.
+    fn list_editor_on_disk(commands: &[&str]) -> (tempfile::TempDir, ConfigEditor) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(config::CONFIG_FILE), "").unwrap();
+        let fields = RepoConfigFields {
+            open_command: commands.iter().map(|c| c.to_string()).collect(),
+            ..RepoConfigFields::default()
+        };
+        settings::save_config_edits(dir.path(), None, &fields).unwrap();
+        let ed = ConfigEditor {
+            repo_root: dir.path().to_path_buf(),
+            global_config: None,
+            fields,
+            selected: OPEN_COMMAND_ROW,
+            editing: None,
+            open_list: None,
+        };
+        (dir, ed)
+    }
+
+    /// Moves to `[ done ]` and confirms, returning the outcome.
+    fn finish_list(ed: &mut ConfigEditor) -> EditorOutcome {
+        let list = ed.open_list.as_ref().expect("list editor open");
+        for _ in list.selected..list.done_row() {
+            press(ed, KeyCode::Down);
+        }
+        press(ed, KeyCode::Enter)
+    }
+
+    #[test]
+    fn open_command_row_opens_the_list_editor_not_a_text_input() {
+        let mut ed = list_editor(&["cursor {path}"]);
+        press(&mut ed, KeyCode::Enter);
+        assert!(ed.editing.is_none(), "the list row has no single value");
+        let list = ed.open_list.as_ref().expect("list editor open");
+        assert_eq!(list.commands, ["cursor {path}"]);
+        assert_eq!(list.add_row(), 1);
+        assert_eq!(list.done_row(), 2);
+    }
+
+    #[test]
+    fn open_command_list_adds_a_command() {
+        let (_dir, mut ed) = list_editor_on_disk(&["cursor {path}"]);
+        press(&mut ed, KeyCode::Enter); // open the list editor
+        press(&mut ed, KeyCode::Char('a')); // start a new entry
+        type_str(&mut ed, "open {path}");
+        press(&mut ed, KeyCode::Enter); // commit the entry
+        let outcome = finish_list(&mut ed);
+        assert!(matches!(outcome, EditorOutcome::Saved(_)));
+        assert!(ed.open_list.is_none());
+        assert_eq!(ed.fields.open_command, ["cursor {path}", "open {path}"]);
+    }
+
+    #[test]
+    fn open_command_list_edits_an_existing_command() {
+        let (_dir, mut ed) = list_editor_on_disk(&["cursor {path}", "open {path}"]);
+        press(&mut ed, KeyCode::Enter);
+        press(&mut ed, KeyCode::Down); // select the second command
+        press(&mut ed, KeyCode::Enter); // edit it
+        press(&mut ed, KeyCode::End);
+        type_str(&mut ed, " -a Finder");
+        press(&mut ed, KeyCode::Enter); // commit the entry
+        let outcome = finish_list(&mut ed);
+        assert!(matches!(outcome, EditorOutcome::Saved(_)));
+        assert_eq!(
+            ed.fields.open_command,
+            ["cursor {path}", "open {path} -a Finder"]
+        );
+    }
+
+    #[test]
+    fn open_command_list_removes_a_command() {
+        let (_dir, mut ed) = list_editor_on_disk(&["cursor {path}", "open {path}"]);
+        press(&mut ed, KeyCode::Enter);
+        press(&mut ed, KeyCode::Char('d')); // remove the first command
+        let outcome = finish_list(&mut ed);
+        assert!(matches!(outcome, EditorOutcome::Saved(_)));
+        assert_eq!(ed.fields.open_command, ["open {path}"]);
+    }
+
+    #[test]
+    fn open_command_list_keeps_commas_inside_one_entry() {
+        let (_dir, mut ed) = list_editor_on_disk(&[]);
+        press(&mut ed, KeyCode::Enter); // open on the (empty) list
+        press(&mut ed, KeyCode::Enter); // the add row is row 0 when empty
+        type_str(&mut ed, "sh -c 'cd {path}, npm start'");
+        press(&mut ed, KeyCode::Enter);
+        let outcome = finish_list(&mut ed);
+        assert!(matches!(outcome, EditorOutcome::Saved(_)));
+        assert_eq!(
+            ed.fields.open_command,
+            ["sh -c 'cd {path}, npm start'"],
+            "a comma inside a command must not split it"
+        );
+    }
+
+    #[test]
+    fn escaping_the_list_editor_discards_its_edits() {
+        let mut ed = list_editor(&["cursor {path}"]);
+        press(&mut ed, KeyCode::Enter);
+        press(&mut ed, KeyCode::Char('d')); // remove the only command
+        press(&mut ed, KeyCode::Char('a')); // and start another
+        type_str(&mut ed, "open {path}");
+        press(&mut ed, KeyCode::Enter);
+        press(&mut ed, KeyCode::Esc); // discard the whole session
+        assert!(ed.open_list.is_none());
+        assert_eq!(
+            ed.fields.open_command,
+            ["cursor {path}"],
+            "Esc leaves the saved list untouched"
+        );
+    }
+
+    #[test]
+    fn escaping_an_entry_leaves_the_list_open_and_unchanged() {
+        let mut ed = list_editor(&["cursor {path}"]);
+        press(&mut ed, KeyCode::Enter);
+        press(&mut ed, KeyCode::Enter); // edit the first command
+        type_str(&mut ed, "xx");
+        press(&mut ed, KeyCode::Esc); // abandon just this entry
+        let list = ed.open_list.as_ref().expect("still open");
+        assert!(list.input.is_none());
+        assert_eq!(list.commands, ["cursor {path}"]);
+    }
+
+    #[test]
+    fn a_blank_entry_adds_nothing() {
+        let mut ed = list_editor(&[]);
+        press(&mut ed, KeyCode::Enter);
+        press(&mut ed, KeyCode::Char('a'));
+        press(&mut ed, KeyCode::Enter); // commit an empty buffer
+        let list = ed.open_list.as_ref().expect("still open");
+        assert!(list.commands.is_empty());
+    }
+
+    #[test]
+    fn open_command_summary_counts_multiple_commands() {
+        let ed = list_editor(&["cursor {path}"]);
+        assert_eq!(ed.open_command_summary(), "cursor {path}");
+        let ed = list_editor(&["cursor {path}", "open {path}"]);
+        assert_eq!(
+            ed.open_command_summary(),
+            "2 commands: cursor {path} · open {path}"
+        );
+        assert_eq!(list_editor(&[]).open_command_summary(), "");
     }
 
     #[test]

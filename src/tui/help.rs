@@ -110,6 +110,7 @@ impl HelpTab {
             | View::StashDiff { .. } => HelpTab::Commits,
             View::MergePick { .. } => HelpTab::Branches,
             View::MoveChanges { .. } => HelpTab::Worktrees,
+            View::OpenCommand { .. } => HelpTab::Worktrees,
             View::StashTarget { .. } => HelpTab::Changes,
             View::ConflictResolver { .. } => HelpTab::Conflicts,
             _ => HelpTab::Basics,
@@ -178,26 +179,28 @@ pub const WORKTREES: &[Binding] = &[
         "commit",
         "commit (pick files, all selected by default)",
     ),
-    help_only("o", "settings tab: edit repo settings"),
-    help_only("e", "run the open command"),
-    both("s", "stash", "stash tab (stash/pop/apply/drop)"),
     both(
+        "o",
+        "open",
+        "pick a configured open_command to run for the selected worktree; the picker previews each command with {path}, {name}, {branch}, and {status} filled in, and prompts for a one-off when none is set",
+    ),
+    help_only("e", "same as o: run a configured open_command"),
+    both("s", "stash", "stash tab (stash/pop/apply/drop)"),
+    help_only(
         "m",
-        "move changes",
         "move the worktree's uncommitted changes into another worktree",
     ),
     both("p", "pull", "pull (fast-forward) the worktree"),
     both("⇧P", "push", "push the worktree"),
-    both("f", "fetch", "fetch all remotes"),
+    help_only("f", "fetch all remotes"),
     both("l", "log", "commit log"),
     both(
         "d",
         "delete",
         "delete worktree (folder, or folder + branch)",
     ),
-    both(
+    help_only(
         "⇧R",
-        "rename",
         "rename the worktree (renames its branch and moves the folder)",
     ),
     help_only("r", "refresh the list"),
@@ -234,7 +237,10 @@ pub const BRANCHES: &[Binding] = &[
 
 pub const DIFF: &[Binding] = &[
     help_only("↑/↓ or j/k", "move the file cursor"),
-    help_only("⇧↑/⇧↓ or J/K", "scroll the diff vertically (or mouse wheel)"),
+    help_only(
+        "⇧↑/⇧↓ or J/K",
+        "scroll the diff vertically (or mouse wheel)",
+    ),
     help_only("⇧←/⇧→ or H/L", "scroll the diff horizontally"),
     help_only("←/→ or h/l", "collapse/expand the folder"),
     both(
@@ -282,7 +288,11 @@ pub const COMMIT_FILES: &[Binding] = &[
 
 pub const STASH_LIST: &[Binding] = &[
     both("↑/↓", "select", "select a stash entry"),
-    both("Enter", "browse", "browse the files and diffs in the selected stash"),
+    both(
+        "Enter",
+        "browse",
+        "browse the files and diffs in the selected stash",
+    ),
     both("s", "stash", "stash the worktree's current changes"),
     both(
         "p",
@@ -308,6 +318,10 @@ pub const SETTINGS: &[Binding] = &[
     help_only(
         "Space",
         "cycle auto_update_check or diff_theme on those rows",
+    ),
+    help_only(
+        "open_command",
+        "Enter opens a list editor: ↑/↓ move, Enter edits the selected command, a adds one, d removes one, Enter on [ done ] saves the list to .wtm.toml, Esc discards the edits",
     ),
     both("q", "quit", "quit"),
 ];
@@ -341,7 +355,10 @@ pub const COMMIT_DIFF: &[Binding] = &[
         "file",
         "move between the commit's changed files",
     ),
-    help_only("⇧↑/⇧↓ or J/K", "scroll the diff vertically (or mouse wheel)"),
+    help_only(
+        "⇧↑/⇧↓ or J/K",
+        "scroll the diff vertically (or mouse wheel)",
+    ),
     help_only("⇧←/⇧→ or H/L", "scroll the diff horizontally"),
     help_only("←/→ or h/l", "collapse/expand the folder (Enter toggles)"),
     both("t", "tree/flat", "toggle folder tree vs. flat file list"),
@@ -382,11 +399,12 @@ const BASICS_SECTIONS: &[Section] = &[
         notes: &[],
     },
     Section {
-        heading: "settings tab  (o)",
+        heading: "settings tab  (Tab)",
         bindings: SETTINGS,
         notes: &[
             "edits the repo's .wtm.toml; leaving the tab discards unsaved changes.",
             "auto_update_check is saved in the global config, so it applies to every repo.",
+            "open_command holds one command or several, edited as a list; o shows them expanded ({path}, {name}, {branch}, {status}) in a picker.",
         ],
     },
     Section {

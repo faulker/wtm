@@ -72,6 +72,23 @@ pub struct WorktreeInfo {
     pub merged: bool,
 }
 
+impl WorktreeInfo {
+    /// Status label for `open_command` templates: `"merged"`, `"ahead"`,
+    /// `"behind"`, or `""` when none of those apply. Merged wins over
+    /// ahead/behind so a merged branch that is also behind upstream still
+    /// expands as `merged`.
+    pub fn open_status(&self) -> &'static str {
+        if self.merged {
+            return "merged";
+        }
+        match &self.ahead_behind {
+            Some(ab) if ab.ahead > 0 => "ahead",
+            Some(ab) if ab.behind > 0 => "behind",
+            _ => "",
+        }
+    }
+}
+
 /// Outcome of one setup step during `create`.
 #[derive(Debug, Clone, Serialize)]
 pub struct SetupStep {

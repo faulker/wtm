@@ -17,7 +17,8 @@ use super::app::{
     ResolverFile, RowList, Tab, TextInput, View, filtered_candidates,
 };
 use super::config_editor::{
-    CHECK_ROW, ConfigEditor, FIELD_ROWS, FORM_LINES, SAVE_ROW, THEME_ROW, UPDATE_ROW,
+    CHECK_ROW, ConfigEditor, FIELD_ROWS, FORM_LINES, OPEN_COMMAND_ROW, OpenCommandEditor, SAVE_ROW,
+    THEME_ROW, UPDATE_ROW,
 };
 use super::help::{self, Binding, HelpTab};
 use super::highlight;
@@ -25,7 +26,10 @@ use super::setup::{
     REVIEW_ROWS, SetupWizard, Step, WELCOME_OPTIONS, location_label, location_preview,
 };
 use super::theme::{self, ACCENT, BORDER, GRAPH_COLORS, SELECTION_BG};
-use crate::config::{DEFAULT_AUTO_UPDATE_CHECK, DEFAULT_DIFF_THEME, DEFAULT_LOCATION, LOCATION_PRESETS};
+use crate::config::{
+    DEFAULT_AUTO_UPDATE_CHECK, DEFAULT_DIFF_THEME, DEFAULT_LOCATION, LOCATION_PRESETS,
+    OpenCommandVars, expand_open_command,
+};
 use crate::conflict::{ConflictSegment, ResolutionAction};
 use crate::git::{GraphLine, StatusEntry};
 use crate::ops::ResolveKind;
@@ -235,6 +239,28 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             targets,
             selected,
         } => overlay_hit = draw_move_changes_pick(frame, main, from, targets, *selected),
+        View::OpenCommand {
+            name,
+            path,
+            branch,
+            status,
+            commands,
+            selected,
+        } => {
+            overlay_hit = draw_open_command_pick(
+                frame,
+                main,
+                name,
+                &OpenCommandVars {
+                    path,
+                    name,
+                    branch,
+                    status,
+                },
+                commands,
+                *selected,
+            )
+        }
         View::StashTarget {
             pop,
             label,
@@ -274,6 +300,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         | View::CherryPick { .. }
         | View::MergePick { .. }
         | View::MoveChanges { .. }
+        | View::OpenCommand { .. }
         | View::StashTarget { .. }
         | View::Setup(_) => overlay_hit,
         _ => None,
@@ -322,14 +349,21 @@ fn panel(title: impl Into<String>) -> Block<'static> {
         ]))
 }
 
-/// Top bar: app badge and repo path on the left; the worktree count on the
-/// right, or the transient status/error message when one is present.
+/// Top bar: app badge and the selected worktree's path on the left; the
+/// worktree count on the right, or the transient status/error message when one
+/// is present. Falls back to the repo root when nothing is selected.
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let count = app.worktrees.len();
+    let path = app
+        .worktrees
+        .get(app.selected)
+        .map(|wt| wt.path.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| app.ctx.repo_root.display().to_string());
     let left = Line::from(vec![
         Span::styled(" wtm ", Style::new().fg(Color::Black).bg(ACCENT).bold()),
         Span::raw("  "),
-        Span::styled(app.ctx.repo_root.display().to_string(), Style::new().bold()),
+        Span::styled(path, Style::new().bold()),
     ]);
     // The right slot is wide enough for the message (or count), and is drawn
     // right-aligned so it never overlaps the app badge.
@@ -347,10 +381,30 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Footer as key hints: the key in accent, its label dimmed. Bindings with no
-/// `short` label are help-panel-only and skipped here.
-fn hint_line(bindings: &[Binding]) -> Line<'static> {
+/// `short` label are help-panel-only and skipped here. Trailing hints that
+/// would overflow `width` are dropped and replaced with `…` so a narrow
+/// terminal never bleeds past the edge.
+fn hint_line_fitting(bindings: &[Binding], width: Option<u16>) -> Line<'static> {
+    let max = width.map(|w| w as usize);
     let mut spans = Vec::new();
-    for (key, label) in bindings.iter().filter_map(|b| b.short.map(|s| (b.key, s))) {
+    let mut used = 0usize;
+    let items: Vec<_> = bindings
+        .iter()
+        .filter_map(|b| b.short.map(|s| (b.key, s)))
+        .collect();
+    for (i, (key, label)) in items.iter().enumerate() {
+        let sep = if spans.is_empty() { 0 } else { 2 };
+        let piece = key.chars().count() + 1 + label.chars().count();
+        if let Some(max) = max {
+            // Reserve room for a trailing "  …" when more hints remain.
+            let ellipsis = if i + 1 < items.len() { 3 } else { 0 };
+            if used + sep + piece + ellipsis > max {
+                if !spans.is_empty() {
+                    spans.push(Span::styled("  …", Style::new().dim()));
+                }
+                break;
+            }
+        }
         if !spans.is_empty() {
             spans.push(Span::raw("  "));
         }
@@ -359,6 +413,7 @@ fn hint_line(bindings: &[Binding]) -> Line<'static> {
             Style::new().fg(ACCENT).bold(),
         ));
         spans.push(Span::styled(format!(" {label}"), Style::new().dim()));
+        used += sep + piece;
     }
     Line::from(spans)
 }
@@ -719,7 +774,10 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     // footer only shows how to dismiss it.
     if app.error.is_some() {
         frame.render_widget(
-            Paragraph::new(hint_line(&[hint("any key", "dismiss error")])),
+            Paragraph::new(hint_line_fitting(
+                &[hint("any key", "dismiss error")],
+                Some(area.width),
+            )),
             area,
         );
         return;
@@ -728,18 +786,27 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     // visible at all times.
     if app.show_help {
         frame.render_widget(
-            Paragraph::new(hint_line(&[
-                hint("⇥", "tab"),
-                hint("↑/↓", "scroll"),
-                hint("Esc", "close"),
-            ])),
+            Paragraph::new(hint_line_fitting(
+                &[
+                    hint("⇥", "tab"),
+                    hint("↑/↓", "scroll"),
+                    hint("Esc", "close"),
+                ],
+                Some(area.width),
+            )),
             area,
         );
         return;
     }
     // A modal overlay owns the keys, so show its hints instead of the view's.
     if let Some(modal) = &app.modal {
-        frame.render_widget(Paragraph::new(hint_line(modal_footer_hints(modal))), area);
+        frame.render_widget(
+            Paragraph::new(hint_line_fitting(
+                modal_footer_hints(modal),
+                Some(area.width),
+            )),
+            area,
+        );
         return;
     }
     let hints: &[Binding] = match &app.view {
@@ -748,9 +815,17 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             Tab::Branches => help::BRANCHES,
             Tab::Changes => help::DIFF,
             Tab::Stash => help::STASH_LIST,
-            Tab::Settings if app.settings.editing.is_some() => {
+            Tab::Settings if app.settings.is_typing() => {
                 &[hint("Enter", "save value"), hint("Esc", "cancel edit")]
             }
+            Tab::Settings if app.settings.open_list.is_some() => &[
+                hint("↑/↓", "row"),
+                hint("Enter", "edit"),
+                hint("a", "add"),
+                hint("d", "remove"),
+                hint("[ done ]", "save"),
+                hint("Esc", "discard"),
+            ],
             Tab::Settings => help::SETTINGS,
         },
         View::Log { .. } => &[
@@ -786,6 +861,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         View::MoveChanges { .. } => &[
             hint("↑/↓", "pick worktree"),
             hint("Enter", "move changes"),
+            hint("Esc", "cancel"),
+        ],
+        View::OpenCommand { .. } => &[
+            hint("↑/↓", "pick command"),
+            hint("Enter", "run"),
             hint("Esc", "cancel"),
         ],
         View::StashTarget { .. } => &[
@@ -894,7 +974,10 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             ],
         },
     };
-    frame.render_widget(Paragraph::new(hint_line(hints)), area);
+    frame.render_widget(
+        Paragraph::new(hint_line_fitting(hints, Some(area.width))),
+        area,
+    );
 }
 
 /// Appends `value` to `spans` with a reverse-video block cursor at character
@@ -1169,7 +1252,7 @@ fn draw_run_command(frame: &mut Frame, area: Rect, name: &str, input: &super::ap
     );
     frame.render_widget(
         Paragraph::new(Line::styled(
-            "e.g. cursor .  ·  set open_command in options to skip this prompt",
+            "e.g. open {path}  ·  set open_command in Settings to skip this prompt",
             Style::new().dim(),
         )),
         hint_area,
@@ -1795,7 +1878,8 @@ fn draw_settings_tab(
     ];
     let hints = [
         "sibling · inside · home · or a path ({repo} = repo name)",
-        "command the open key (e) runs in a worktree, e.g. cursor .",
+        "commands the open key (o) runs; Enter edits the list, [ done ] saves. \
+         {path} {name} {branch} {status}",
         "files copied into each new worktree, comma separated",
         "commands run in each new worktree, comma separated",
         "check GitHub for a newer wtm on start · saved for all repos",
@@ -1837,15 +1921,17 @@ fn draw_settings_tab(
             )),
             _ if row == THEME_ROW => spans.push(Span::styled(
                 if editor.fields.diff_theme.is_empty() {
-                    format!(
-                        "(default: {})",
-                        highlight::theme_label(DEFAULT_DIFF_THEME)
-                    )
+                    format!("(default: {})", highlight::theme_label(DEFAULT_DIFF_THEME))
                 } else {
                     highlight::theme_label(&editor.fields.diff_theme).to_string()
                 },
                 highlight,
             )),
+            // The list row shows a one-line summary of its entries; Enter
+            // opens the list editor drawn over the form below.
+            _ if row == OPEN_COMMAND_ROW && !editor.fields.open_command.is_empty() => {
+                spans.push(Span::styled(editor.open_command_summary(), highlight))
+            }
             _ if editor.field(row).is_empty() => {
                 spans.push(Span::styled("(default)".to_string(), highlight.dim()))
             }
@@ -1936,6 +2022,12 @@ fn draw_settings_tab(
     .areas(inner);
     let [_, form] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(form);
     frame.render_widget(Paragraph::new(lines), form);
+    // The list editor is modal over the form: it takes every key, so the form
+    // reports no clickable rows while it is up.
+    if let Some(list) = &editor.open_list {
+        draw_open_command_list(frame, area, list);
+        return None;
+    }
     // The line layout is shared with `config_editor::row_at_line`, which
     // `on_click` uses to turn a clicked line back into a row.
     Some(RowList {
@@ -1944,6 +2036,80 @@ fn draw_settings_tab(
         offset: 0,
         len: FORM_LINES,
     })
+}
+
+/// The `open_command` list editor, floating over the Settings form: one row
+/// per configured command, then an add row and a done row. The row being
+/// typed shows the live buffer with a movable cursor.
+fn draw_open_command_list(frame: &mut Frame, area: Rect, list: &OpenCommandEditor) {
+    let rows = list.rows().clamp(3, 14) as u16;
+    let popup = centered(area, 70, rows + 5);
+    frame.render_widget(Clear, popup);
+    let block = panel("open commands");
+    frame.render_widget(&block, popup);
+    let inner = block.inner(popup);
+    let [head_area, list_area, hint_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(
+            "the open key (o) runs these · {path} {name} {branch} {status} expand on run".dim(),
+        )),
+        head_area,
+    );
+
+    let row_style = |row: usize| {
+        if list.selected == row {
+            Style::new().bg(SELECTION_BG)
+        } else {
+            Style::new()
+        }
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    for (index, command) in list.commands.iter().enumerate() {
+        let style = row_style(index);
+        let mut spans = vec![Span::styled(" ● ", style.fg(Color::Green))];
+        match &list.input {
+            Some(input) if list.editing_index == Some(index) => {
+                push_cursor_spans(&mut spans, input.as_str(), input.cursor, style)
+            }
+            _ => spans.push(Span::styled(command.clone(), style)),
+        }
+        lines.push(Line::from(spans));
+    }
+    let add_style = row_style(list.add_row());
+    match &list.input {
+        // A new entry is typed on the add row itself, so it reads as the
+        // command being appended rather than as a detached prompt.
+        Some(input) if list.editing_index.is_none() => {
+            let mut spans = vec![Span::styled(" + ", add_style.fg(ACCENT))];
+            push_cursor_spans(&mut spans, input.as_str(), input.cursor, add_style);
+            lines.push(Line::from(spans));
+        }
+        _ => lines.push(Line::from(vec![
+            Span::styled(" + ", add_style.fg(ACCENT)),
+            Span::styled("add a command", add_style.dim()),
+        ])),
+    }
+    lines.push(Line::from(Span::styled(
+        " [ done ] ",
+        if list.selected == list.done_row() {
+            Style::new().bg(SELECTION_BG).bold().fg(ACCENT)
+        } else {
+            Style::new().bold()
+        },
+    )));
+    frame.render_widget(Paragraph::new(lines), list_area);
+
+    let hint = if list.input.is_some() {
+        "Enter save · Esc cancel entry"
+    } else {
+        "↑/↓ move · Enter edit · a add · d remove · [ done ] saves · Esc discard"
+    };
+    frame.render_widget(Paragraph::new(Line::from(hint.dim())), hint_area);
 }
 
 /// Commit dialog: a checklist of changed files (all ticked by default) above a
@@ -2821,6 +2987,62 @@ fn draw_move_changes_pick(
     })
 }
 
+/// The open-command picker: choose which configured command to run against
+/// the selected worktree. Rows are the expanded commands, so each one is a
+/// preview of exactly what will be executed.
+fn draw_open_command_pick(
+    frame: &mut Frame,
+    area: Rect,
+    name: &str,
+    vars: &OpenCommandVars<'_>,
+    commands: &[String],
+    selected: usize,
+) -> Option<RowList> {
+    // Expanded commands carry absolute paths, so this picker is wider than the
+    // worktree pickers around it.
+    let rows = commands.len().clamp(1, 12) as u16;
+    let popup = centered(area, 80, rows + 5);
+    frame.render_widget(Clear, popup);
+    let block = panel(format!("open '{name}' with…"));
+    frame.render_widget(&block, popup);
+    let inner = block.inner(popup);
+    let [head_area, list_area, hint_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from("this is what will run".dim())),
+        head_area,
+    );
+    let items: Vec<ListItem> = commands
+        .iter()
+        .map(|cmd| {
+            ListItem::new(Line::from(vec![
+                Span::styled("● ", Style::new().fg(Color::Green)),
+                Span::raw(expand_open_command(cmd, vars)),
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .highlight_style(Style::new().bg(SELECTION_BG).bold())
+        .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
+    let mut state =
+        ListState::default().with_selected(Some(selected.min(commands.len().max(1) - 1)));
+    frame.render_stateful_widget(list, list_area, &mut state);
+    frame.render_widget(
+        Paragraph::new(Line::from("↑/↓ pick · Enter run · Esc cancel".dim())),
+        hint_area,
+    );
+    (!commands.is_empty()).then_some(RowList {
+        inner: list_area,
+        header: 0,
+        offset: state.offset(),
+        len: commands.len(),
+    })
+}
+
 /// The stash apply/pop destination picker: stashes are repo-global, so
 /// choosing where to apply one is a worktree picker like cherry-pick/merge.
 fn draw_stash_target_pick(
@@ -3393,16 +3615,25 @@ mod tests {
     /// they were before the two lists were merged.
     #[test]
     fn footer_hints_skip_help_only_bindings() {
-        let line = hint_line(help::WORKTREES).to_string();
+        let line = hint_line_fitting(help::WORKTREES, None).to_string();
         assert_eq!(
             line,
-            "⇥ tabs  Enter changes  n new  b switch branch  c commit  s stash  \
-             m move changes  p pull  ⇧P push  f fetch  l log  d delete  ⇧R rename  \
-             ? help  q quit"
+            "⇥ tabs  Enter changes  n new  b switch branch  c commit  o open  \
+             s stash  p pull  ⇧P push  l log  d delete  ? help  q quit"
         );
-        // `u`, `o`, `e` and the cursor keys are documented in help but have no
-        // footer label, so they are absent above.
+        // `u`, `e`, `m`, `f`, `⇧R` and the cursor keys are documented in help
+        // but have no footer label, so they are absent above.
         assert!(!line.contains("select worktree"), "{line}");
+        assert!(!line.contains("move changes"), "{line}");
+    }
+
+    #[test]
+    fn footer_hints_truncate_to_width() {
+        let line = hint_line_fitting(help::WORKTREES, Some(40)).to_string();
+        assert!(line.contains('…'), "expected ellipsis, got {line}");
+        assert!(line.chars().count() <= 40, "overflow: {line}");
+        // Left-to-right fill keeps the early, high-traffic keys.
+        assert!(line.starts_with("⇥ tabs"), "{line}");
     }
 
     /// Every help tab is reachable from the bar, and the active one is marked.
@@ -3494,6 +3725,7 @@ mod tests {
             },
             selected: 0,
             editing: None,
+            open_list: None,
         }
     }
 
@@ -3523,7 +3755,11 @@ mod tests {
                 line(row * 2)
             );
         }
-        assert!(line(UPDATE_ROW * 2).contains("off"), "{:?}", line(UPDATE_ROW * 2));
+        assert!(
+            line(UPDATE_ROW * 2).contains("off"),
+            "{:?}",
+            line(UPDATE_ROW * 2)
+        );
         assert!(
             line(THEME_ROW * 2).contains("default"),
             "{:?}",
@@ -3599,6 +3835,71 @@ mod tests {
         });
         let version_line = &out[2 + VERSION_LINE];
         assert!(version_line.contains("9.9.9 available"), "{version_line}");
+    }
+
+    /// The list editor draws every command, the add row, and the done row, and
+    /// covers the form (which reports no clickable rows while it is up).
+    #[test]
+    fn settings_tab_draws_the_open_command_list_editor() {
+        let mut editor = settings_editor("");
+        editor.selected = OPEN_COMMAND_ROW;
+        editor.fields.open_command = vec!["cursor {path}".to_string(), "open {path}".to_string()];
+        let mut list = OpenCommandEditor::new(editor.fields.open_command.clone());
+        list.selected = 1;
+        editor.open_list = Some(list);
+        let hit = std::cell::Cell::new(true);
+        let out = render(90, 30, |frame, area| {
+            hit.set(draw_settings_tab(frame, area, &editor, None).is_some());
+        });
+        let text = out.join("\n");
+        assert!(text.contains("open commands"), "{text}");
+        assert!(text.contains("cursor {path}"), "{text}");
+        assert!(text.contains("add a command"), "{text}");
+        assert!(text.contains("[ done ]"), "{text}");
+        assert!(text.contains("Enter edit"), "{text}");
+        assert!(!hit.get(), "the modal list must swallow clicks");
+    }
+
+    /// With no list open, the row summarises the configured commands rather
+    /// than showing a single joined value.
+    #[test]
+    fn settings_tab_summarises_multiple_open_commands() {
+        let mut editor = settings_editor("");
+        editor.fields.open_command = vec!["cursor {path}".to_string(), "open {path}".to_string()];
+        let out = render(90, 30, |frame, area| {
+            draw_settings_tab(frame, area, &editor, None);
+        });
+        let row = &out[2 + OPEN_COMMAND_ROW * 2];
+        assert!(row.contains("2 commands"), "{row}");
+    }
+
+    /// The picker previews what will actually run, so the rows carry the
+    /// selected worktree's path rather than the raw `{path}` template.
+    #[test]
+    fn open_command_pick_draws_expanded_commands() {
+        let out = render(90, 12, |frame, area| {
+            draw_open_command_pick(
+                frame,
+                area,
+                "feature",
+                &OpenCommandVars {
+                    path: "/tmp/proj-feature",
+                    name: "feature",
+                    branch: "feature",
+                    status: "ahead",
+                },
+                &[
+                    "cursor {path}".to_string(),
+                    "open {path} # {branch}".to_string(),
+                ],
+                0,
+            );
+        });
+        let text = out.join("\n");
+        assert!(text.contains("open 'feature' with…"), "{text}");
+        assert!(text.contains("cursor /tmp/proj-feature"), "{text}");
+        assert!(text.contains("open /tmp/proj-feature # feature"), "{text}");
+        assert!(!text.contains("{path}"), "templates must not be shown raw");
     }
 
     #[test]

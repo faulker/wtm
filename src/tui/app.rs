@@ -479,11 +479,28 @@ pub enum View {
         kill_armed: bool,
     },
     /// Prompt for a one-off command to run in a worktree's directory, shown by
-    /// the `e` key when no `open_command` is configured.
+    /// the `o` key when no `open_command` is configured.
     RunCommand {
         name: String,
         path: String,
         input: TextInput,
+    },
+    /// Picker for which configured `open_command` to run against the selected
+    /// worktree. Shown whenever at least one command is configured, so the
+    /// expanded command is always previewed before it runs.
+    OpenCommand {
+        /// Worktree the command will run against (for the title and expansion).
+        name: String,
+        /// Absolute path of that worktree.
+        path: String,
+        /// Branch name, or empty when detached.
+        branch: String,
+        /// Expanded `{status}` value for the templates.
+        status: String,
+        /// Configured command templates (before `{…}` expansion).
+        commands: Vec<String>,
+        /// Cursor into `commands`.
+        selected: usize,
     },
     /// Prompt for a worktree's new name, shown by the `R` key on the Worktrees
     /// tab. Submitting renames the branch and moves the directory to match.
@@ -1769,7 +1786,7 @@ impl App {
             } => true,
             View::Switch { .. } | View::RunCommand { .. } | View::RenameWorktree { .. } => true,
             View::Creating { done: false, .. } => true,
-            View::List => self.tab == Tab::Settings && self.settings.editing.is_some(),
+            View::List => self.tab == Tab::Settings && self.settings.is_typing(),
             View::Setup(wizard) => matches!(
                 &wizard.step,
                 setup::Step::ClonePath { .. }
@@ -1883,7 +1900,18 @@ impl App {
                     {
                         let cmd = input.trimmed();
                         if !cmd.is_empty() {
-                            self.spawn_in_dir(&cmd, &path, &name);
+                            let (branch, status) = self
+                                .worktrees
+                                .iter()
+                                .find(|w| w.name == name)
+                                .map(|w| {
+                                    (
+                                        w.branch.clone().unwrap_or_default(),
+                                        w.open_status().to_string(),
+                                    )
+                                })
+                                .unwrap_or_default();
+                            self.spawn_open_command(&cmd, &name, &path, &branch, &status);
                         }
                     }
                 }
@@ -1958,6 +1986,7 @@ impl App {
             View::CherryPick { .. } => self.on_cherry_pick_key(key),
             View::MergePick { .. } => self.on_merge_pick_key(key),
             View::MoveChanges { .. } => self.on_move_changes_key(key),
+            View::OpenCommand { .. } => self.on_open_command_key(key),
             View::StashTarget { .. } => self.on_stash_target_key(key),
             View::ConflictResolver { .. } => self.on_resolver_key(key),
             // A background op owns the screen until tick() drains its result.
@@ -2676,8 +2705,7 @@ impl App {
             }
             KeyCode::Char('n') => self.open_create(),
             KeyCode::Char('c') => self.open_commit(),
-            KeyCode::Char('o') => self.open_settings_tab(),
-            KeyCode::Char('e') => self.run_open_command(),
+            KeyCode::Char('o') | KeyCode::Char('e') => self.run_open_command(),
             KeyCode::Char('s') => self.open_stash_tab(),
             KeyCode::Char('m') => self.open_move_changes_pick(),
             KeyCode::Char('p') => self.start_pull(),
@@ -3166,7 +3194,9 @@ impl App {
                 // Non-uniform layout: each field is a value line plus a dim
                 // hint line, with unselectable preview and version lines before
                 // the action rows, so `row_at_line` owns the decoding.
-                Tab::Settings if self.settings.editing.is_none() => {
+                Tab::Settings
+                    if self.settings.editing.is_none() && self.settings.open_list.is_none() =>
+                {
                     if let Some(row) = config_editor::row_at_line(idx) {
                         self.settings.selected = row;
                     }
@@ -3242,6 +3272,33 @@ impl App {
                     *selected = idx;
                 }
             }
+            View::MoveChanges { .. } => {
+                if let View::MoveChanges {
+                    targets, selected, ..
+                } = &mut self.view
+                    && idx < targets.len()
+                {
+                    *selected = idx;
+                }
+            }
+            View::OpenCommand { .. } => {
+                if let View::OpenCommand {
+                    commands, selected, ..
+                } = &mut self.view
+                    && idx < commands.len()
+                {
+                    *selected = idx;
+                }
+            }
+            View::StashTarget { .. } => {
+                if let View::StashTarget {
+                    targets, selected, ..
+                } = &mut self.view
+                    && idx < targets.len()
+                {
+                    *selected = idx;
+                }
+            }
             View::ConflictResolver { .. } => {
                 if let View::ConflictResolver { files, file, .. } = &mut self.view {
                     if idx >= files.len() || *file == idx {
@@ -3309,8 +3366,7 @@ impl App {
             return;
         }
         // Horizontal scroll: Shift+←/→ or H/L (plain h/l still tree-navigate).
-        let shift_right =
-            key.code == KeyCode::Right && key.modifiers.contains(KeyModifiers::SHIFT);
+        let shift_right = key.code == KeyCode::Right && key.modifiers.contains(KeyModifiers::SHIFT);
         let shift_left = key.code == KeyCode::Left && key.modifiers.contains(KeyModifiers::SHIFT);
         if shift_right || key.code == KeyCode::Char('L') {
             self.scroll_diff_h(|s| s.saturating_add(8));
@@ -4020,22 +4076,105 @@ impl App {
         };
     }
 
-    /// Runs the configured `open_command` in the selected worktree's directory,
-    /// or opens a prompt for a one-off command when none is configured.
+    /// Runs a configured `open_command` for the selected worktree. Any
+    /// configured commands open a picker (even a single one, so the command is
+    /// always confirmed before it runs); none opens a one-off prompt.
+    /// Templates may use `{path}`, `{name}`, `{branch}`, and `{status}`.
     fn run_open_command(&mut self) {
         let Some(wt) = self.selected_worktree() else {
             return;
         };
-        let path = wt.path.clone();
         let name = wt.name.clone();
-        match self.ctx.config.open_command.clone() {
-            Some(cmd) if !cmd.trim().is_empty() => self.spawn_in_dir(cmd.trim(), &path, &name),
-            _ => self.push_screen(View::RunCommand {
+        let path = wt.path.clone();
+        let branch = wt.branch.clone().unwrap_or_default();
+        let status = wt.open_status().to_string();
+        let commands: Vec<String> = self
+            .ctx
+            .config
+            .open_command
+            .iter()
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+            .collect();
+        match commands.as_slice() {
+            [] => self.push_screen(View::RunCommand {
                 name,
                 path,
                 input: TextInput::default(),
             }),
+            _ => self.push_screen(View::OpenCommand {
+                name,
+                path,
+                branch,
+                status,
+                commands,
+                selected: 0,
+            }),
         }
+    }
+
+    /// Key handling for the open-command picker.
+    fn on_open_command_key(&mut self, key: KeyEvent) {
+        let View::OpenCommand {
+            commands, selected, ..
+        } = &mut self.view
+        else {
+            return;
+        };
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                if *selected + 1 < commands.len() {
+                    *selected += 1;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+            KeyCode::Enter => self.confirm_open_command(),
+            KeyCode::Esc | KeyCode::Char('q') => self.pop_screen(),
+            _ => {}
+        }
+    }
+
+    /// Runs the open-command currently highlighted in the picker.
+    fn confirm_open_command(&mut self) {
+        let View::OpenCommand {
+            name,
+            path,
+            branch,
+            status,
+            commands,
+            selected,
+        } = &self.view
+        else {
+            return;
+        };
+        let Some(cmd) = commands.get(*selected).cloned() else {
+            return;
+        };
+        let (name, path, branch, status) =
+            (name.clone(), path.clone(), branch.clone(), status.clone());
+        self.pop_screen();
+        self.spawn_open_command(&cmd, &name, &path, &branch, &status);
+    }
+
+    /// Expands placeholders in `template` and spawns it detached in `path`.
+    fn spawn_open_command(
+        &mut self,
+        template: &str,
+        name: &str,
+        path: &str,
+        branch: &str,
+        status: &str,
+    ) {
+        let cmd = crate::config::expand_open_command(
+            template,
+            &crate::config::OpenCommandVars {
+                path,
+                name,
+                branch,
+                status,
+            },
+        );
+        self.spawn_in_dir(&cmd, path, name);
     }
 
     /// Spawns `cmd` through the shell, detached, in `dir`. Stdio is detached so
@@ -5819,8 +5958,7 @@ impl App {
             return;
         }
         // Horizontal scroll (Shift+←/→ or H/L). Plain h/l still tree-navigate.
-        let shift_right =
-            key.code == KeyCode::Right && key.modifiers.contains(KeyModifiers::SHIFT);
+        let shift_right = key.code == KeyCode::Right && key.modifiers.contains(KeyModifiers::SHIFT);
         let shift_left = key.code == KeyCode::Left && key.modifiers.contains(KeyModifiers::SHIFT);
         if shift_right || key.code == KeyCode::Char('L') {
             self.scroll_file_browser_h(|s| s.saturating_add(8));
@@ -5936,8 +6074,12 @@ impl App {
     /// Applies `f` to the commit/stash browser's horizontal scroll offset.
     fn scroll_file_browser_h(&mut self, f: impl FnOnce(u16) -> u16) {
         match &mut self.view {
-            View::CommitDiff { h_scroll, content, .. }
-            | View::StashDiff { h_scroll, content, .. } => {
+            View::CommitDiff {
+                h_scroll, content, ..
+            }
+            | View::StashDiff {
+                h_scroll, content, ..
+            } => {
                 let max = content
                     .lines()
                     .map(|l| l.chars().count())
@@ -6127,11 +6269,7 @@ impl App {
             *loading_new = false;
             let max_v = slot.lines().count().saturating_sub(1) as u16;
             *scroll = (*scroll).min(max_v);
-            let max_h = slot
-                .lines()
-                .map(|l| l.chars().count())
-                .max()
-                .unwrap_or(0) as u16;
+            let max_h = slot.lines().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
             *h_scroll = (*h_scroll).min(max_h);
         }
     }
@@ -6495,6 +6633,11 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode) {
         app.on_key(KeyEvent::from(code));
+    }
+
+    /// Opens the Settings tab the same way the tab bar / `select_tab` does.
+    fn goto_settings(app: &mut App) {
+        app.select_tab(Tab::Settings);
     }
 
     /// Waits out an in-flight background branch-list load (item 4 made
@@ -8594,6 +8737,151 @@ mod tests {
     }
 
     #[test]
+    fn open_key_picks_then_runs_a_single_open_command_with_expansion() {
+        let (_tmp, mut app) = test_app();
+        add_and_select_worktree(&mut app, "feature");
+        let path = app.worktrees[app.selected].path.clone();
+        app.ctx.config.open_command = vec!["touch {path}/opened.txt".into()];
+        press(&mut app, KeyCode::Char('o'));
+        // A lone command still opens the picker so it is confirmed first.
+        match &app.view {
+            View::OpenCommand { commands, .. } => assert_eq!(commands.len(), 1),
+            _ => panic!("expected open-command picker"),
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.view, View::List));
+        assert!(
+            app.message.as_deref().unwrap().contains("ran"),
+            "{:?}",
+            app.message
+        );
+        // Give the detached shell a moment to create the file.
+        let marker = Path::new(&path).join("opened.txt");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(marker.exists(), "expanded open_command should have run");
+    }
+
+    #[test]
+    fn open_key_picks_among_multiple_open_commands() {
+        let (_tmp, mut app) = test_app();
+        add_and_select_worktree(&mut app, "feature");
+        app.ctx.config.open_command =
+            vec!["touch {path}/a.txt".into(), "touch {path}/b.txt".into()];
+        press(&mut app, KeyCode::Char('o'));
+        match &app.view {
+            View::OpenCommand {
+                commands, selected, ..
+            } => {
+                assert_eq!(commands.len(), 2);
+                assert_eq!(*selected, 0);
+            }
+            _ => panic!("expected open-command picker"),
+        }
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.view, View::List));
+        let path = PathBuf::from(
+            app.worktrees
+                .iter()
+                .find(|w| w.name == "feature")
+                .unwrap()
+                .path
+                .clone(),
+        );
+        let marker = path.join("b.txt");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(marker.exists(), "second open_command should have run");
+        assert!(
+            !path.join("a.txt").exists(),
+            "first command was not selected"
+        );
+    }
+
+    /// The picker expands against whichever worktree is highlighted, so the
+    /// preview and the command that runs both point at that worktree.
+    #[test]
+    fn open_command_picker_expands_for_the_selected_worktree() {
+        let (_tmp, mut app) = test_app();
+        add_and_select_worktree(&mut app, "alpha");
+        add_and_select_worktree(&mut app, "beta");
+        app.ctx.config.open_command = vec!["cursor {path} # {name}".into()];
+        let selected = app.worktrees[app.selected].clone();
+        press(&mut app, KeyCode::Char('o'));
+        let View::OpenCommand {
+            name,
+            path,
+            branch,
+            status,
+            commands,
+            ..
+        } = &app.view
+        else {
+            panic!("expected open-command picker");
+        };
+        assert_eq!(name, &selected.name);
+        assert_eq!(path, &selected.path);
+        let preview = crate::config::expand_open_command(
+            &commands[0],
+            &crate::config::OpenCommandVars {
+                path,
+                name,
+                branch,
+                status,
+            },
+        );
+        assert_eq!(
+            preview,
+            format!("cursor {} # {}", selected.path, selected.name)
+        );
+    }
+
+    #[test]
+    fn open_key_prompts_when_no_open_command_is_set() {
+        let (_tmp, mut app) = test_app();
+        assert!(app.ctx.config.open_command.is_empty());
+        press(&mut app, KeyCode::Char('o'));
+        assert!(matches!(app.view, View::RunCommand { .. }));
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.view, View::List));
+    }
+
+    #[test]
+    fn header_shows_the_selected_worktree_path() {
+        let (_tmp, mut app) = test_app();
+        add_and_select_worktree(&mut app, "feature");
+        let path = app.worktrees[app.selected].path.clone();
+        let repo = app.ctx.repo_root.display().to_string();
+        assert_ne!(
+            path, repo,
+            "fixture worktree should sit outside the main root"
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::tui::ui::draw(frame, &mut app))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let header: String = (0..120).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(
+            header.contains(&path),
+            "header should show selected worktree path {path}: {header}"
+        );
+        // The path cell is the worktree folder, not a bare repo-root display
+        // (sibling worktrees nest under `{repo}-worktrees/…`, so a naive
+        // "does not contain repo root" check would false-positive).
+        assert!(
+            header.contains("proj-worktrees/feature") || header.ends_with(&format!("{path} ")),
+            "header path cell should be the worktree: {header}"
+        );
+    }
+
+    #[test]
     fn move_changes_key_opens_picker_and_moves_changes() {
         let (_tmp, mut app) = test_app();
         // The main worktree carries an untracked `.wtm.toml` in this fixture,
@@ -9929,7 +10217,7 @@ mod tests {
     #[test]
     fn config_editor_edits_and_saves_settings() {
         let (_tmp, mut app) = test_app();
-        press(&mut app, KeyCode::Char('o'));
+        goto_settings(&mut app);
         assert_eq!(app.tab, Tab::Settings);
 
         // Edit worktree_dir (row 0): clear, type "inside".
@@ -9958,6 +10246,173 @@ mod tests {
         assert!(text.contains("config/.env.local"), "{text}");
     }
 
+    /// The open_command row is edited as a list; finishing with `[ done ]`
+    /// writes a TOML array with each command kept whole, commas and all.
+    #[test]
+    fn config_editor_saves_the_open_command_list() {
+        let (_tmp, mut app) = test_app();
+        goto_settings(&mut app);
+        press(&mut app, KeyCode::Down); // open_command row
+        press(&mut app, KeyCode::Enter); // open the list editor
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "cursor {path}");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "sh -c 'cd {path}, npm start'");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Down); // add row
+        press(&mut app, KeyCode::Down); // [ done ]
+        press(&mut app, KeyCode::Enter);
+        assert!(app.settings.open_list.is_none());
+        assert!(
+            app.message.as_deref().unwrap().contains("saved"),
+            "{:?}",
+            app.message
+        );
+        assert_eq!(
+            app.ctx.config.open_command,
+            vec![
+                "cursor {path}".to_string(),
+                "sh -c 'cd {path}, npm start'".to_string(),
+            ]
+        );
+        // Leaving and re-entering the tab reloads from disk; the list must
+        // still be there without visiting [ save settings ].
+        app.select_tab(Tab::Worktrees);
+        goto_settings(&mut app);
+        assert_eq!(
+            app.settings.fields.open_command,
+            ["cursor {path}", "sh -c 'cd {path}, npm start'"]
+        );
+    }
+
+    /// Finishing the open_command list with `[ done ]` persists to disk, so
+    /// switching away from Settings and back does not wipe the commands.
+    #[test]
+    fn open_command_list_done_survives_leaving_settings() {
+        let (_tmp, mut app) = test_app();
+        goto_settings(&mut app);
+        press(&mut app, KeyCode::Down); // open_command row
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "cursor {path}");
+        press(&mut app, KeyCode::Enter);
+        let list = app.settings.open_list.as_ref().unwrap();
+        for _ in list.selected..list.done_row() {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.settings.fields.open_command, ["cursor {path}"]);
+
+        press(&mut app, KeyCode::Tab); // leave Settings
+        assert_ne!(app.tab, Tab::Settings);
+        goto_settings(&mut app);
+        assert_eq!(
+            app.settings.fields.open_command,
+            ["cursor {path}"],
+            "reload after a tab switch must still see the saved command"
+        );
+        assert_eq!(app.ctx.config.open_command, ["cursor {path}"]);
+    }
+
+    /// The whole multi-command path in one go: build the list in Settings
+    /// (adding, editing, and removing entries), save it, then go back to the
+    /// Worktrees tab and run the second command from the picker. Saving has to
+    /// reload the live config for `o` to see the new commands at all.
+    #[test]
+    fn settings_list_then_open_key_runs_the_chosen_command() {
+        let (_tmp, mut app) = test_app();
+        add_and_select_worktree(&mut app, "feature");
+        let path = PathBuf::from(app.worktrees[app.selected].path.clone());
+
+        goto_settings(&mut app);
+        press(&mut app, KeyCode::Down); // open_command row
+        press(&mut app, KeyCode::Enter); // open the list editor
+
+        // Add the first command.
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "touch {path}/a.txt");
+        press(&mut app, KeyCode::Enter);
+
+        // Add a second, then edit it into its final form.
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "touch {path}/wrong.txt");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter); // Enter on the row edits it
+        for _ in 0.."wrong.txt".len() {
+            press(&mut app, KeyCode::Backspace);
+        }
+        type_str(&mut app, "b.txt");
+        press(&mut app, KeyCode::Enter);
+
+        // Add a third and remove it again.
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "touch {path}/c.txt");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(
+            app.settings.open_list.as_ref().unwrap().commands,
+            ["touch {path}/a.txt", "touch {path}/b.txt"]
+        );
+
+        // `[ done ]` writes the list to disk and reloads the live config.
+        let list = app.settings.open_list.as_ref().unwrap();
+        for _ in list.selected..list.done_row() {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(app.settings.open_list.is_none());
+        assert_eq!(
+            app.ctx.config.open_command,
+            ["touch {path}/a.txt", "touch {path}/b.txt"]
+        );
+
+        app.select_tab(Tab::Worktrees);
+        press(&mut app, KeyCode::Char('o'));
+        let View::OpenCommand {
+            commands,
+            name,
+            path: picked,
+            branch,
+            status,
+            ..
+        } = &app.view
+        else {
+            panic!("expected open-command picker");
+        };
+        assert_eq!(commands.len(), 2);
+        // The picker previews the command expanded for this worktree, which is
+        // what `Enter` then runs.
+        assert_eq!(
+            crate::config::expand_open_command(
+                &commands[1],
+                &crate::config::OpenCommandVars {
+                    path: picked,
+                    name,
+                    branch,
+                    status,
+                },
+            ),
+            format!("touch {}/b.txt", path.display())
+        );
+
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.view, View::List));
+
+        let marker = path.join("b.txt");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(marker.exists(), "the selected command should have run");
+        assert!(
+            !path.join("a.txt").exists(),
+            "only the selected command runs"
+        );
+        assert!(!path.join("c.txt").exists(), "the removed command is gone");
+    }
+
     #[test]
     fn config_editor_clearing_a_field_unsets_it() {
         let (_tmp, mut app) = test_app();
@@ -9967,7 +10422,7 @@ mod tests {
         )
         .unwrap();
 
-        press(&mut app, KeyCode::Char('o'));
+        goto_settings(&mut app);
         // Row 0 (worktree_dir) should load the existing "home".
         assert_eq!(app.tab, Tab::Settings);
         assert_eq!(app.settings.fields.worktree_dir, "home");
@@ -9993,7 +10448,7 @@ mod tests {
     fn config_editor_cancel_leaves_file_untouched() {
         let (_tmp, mut app) = test_app();
         let before = std::fs::read_to_string(app.ctx.repo_root.join(".wtm.toml")).unwrap();
-        press(&mut app, KeyCode::Char('o'));
+        goto_settings(&mut app);
         press(&mut app, KeyCode::Enter);
         type_str(&mut app, "home");
         press(&mut app, KeyCode::Enter);
@@ -10109,7 +10564,7 @@ mod tests {
     #[test]
     fn check_now_reports_being_up_to_date() {
         let (_tmp, mut app) = test_app();
-        press(&mut app, KeyCode::Char('o')); // Settings tab
+        goto_settings(&mut app);
         while app.settings.selected < config_editor::CHECK_ROW {
             press(&mut app, KeyCode::Down);
         }
@@ -10173,7 +10628,7 @@ mod tests {
     fn the_settings_tab_toggle_writes_the_global_config() {
         let (tmp, mut app) = test_app();
         let global = tmp.path().join("global.toml");
-        press(&mut app, KeyCode::Char('o'));
+        goto_settings(&mut app);
         while app.settings.selected < config_editor::UPDATE_ROW {
             press(&mut app, KeyCode::Down);
         }
@@ -10312,7 +10767,7 @@ mod tests {
             press(&mut app, KeyCode::Esc);
 
             // Settings tab: navigating and mid-edit.
-            press(&mut app, KeyCode::Char('o'));
+            goto_settings(&mut app);
             draw(&mut app);
             press(&mut app, KeyCode::Enter); // edit worktree_dir
             type_str(&mut app, "inside");

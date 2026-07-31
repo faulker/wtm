@@ -14,7 +14,9 @@ use serde_json::json;
 use toml_edit::{Array, DocumentMut, value as toml_value};
 
 use crate::cli::ConfigAction;
-use crate::config::{self, CONFIG_FILE, Config, DEFAULT_LOCATION, FileConfig, LOCATION_PRESETS};
+use crate::config::{
+    self, CONFIG_FILE, Config, DEFAULT_LOCATION, FileConfig, LOCATION_PRESETS, OpenCommandList,
+};
 use crate::git;
 use crate::output;
 
@@ -26,7 +28,8 @@ const KEYS: &[(&str, &str)] = &[
     ),
     (
         "open_command",
-        "command the TUI's open key runs in a worktree (e.g. `cursor .`)",
+        "commands the TUI's o key runs for a worktree, comma separated; \
+         supports {path}, {name}, {branch}, {status}",
     ),
     (
         "auto_update_check",
@@ -210,9 +213,13 @@ pub fn repo_config_fields(
         .collect::<Vec<_>>()
         .join(", ");
     let run = setup.run.unwrap_or_default().join(", ");
+    let open_command = cfg
+        .open_command
+        .map(|OpenCommandList(cmds)| cmds)
+        .unwrap_or_default();
     Ok(RepoConfigFields {
         worktree_dir: cfg.worktree_dir.unwrap_or_default(),
-        open_command: cfg.open_command.unwrap_or_default(),
+        open_command,
         auto_update_check: global_auto_update_check(global_config),
         diff_theme: global_diff_theme(global_config),
         copy,
@@ -243,7 +250,10 @@ fn global_diff_theme(global_config: Option<&Path>) -> String {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RepoConfigFields {
     pub worktree_dir: String,
-    pub open_command: String,
+    /// One entry per configured open command. Kept as a list rather than a
+    /// joined string so a command containing a comma survives a round trip
+    /// through the TUI's list editor.
+    pub open_command: Vec<String>,
     /// `""`, `"true"`, or `"false"`; lives in the global config.
     pub auto_update_check: String,
     /// Diff theme short id, or `""` for the default; lives in the global config.
@@ -267,7 +277,7 @@ pub fn save_config_edits(
     let file = repo_root.join(CONFIG_FILE);
     let mut doc = load_doc(&file)?;
     set_or_unset(&mut doc, "worktree_dir", &fields.worktree_dir)?;
-    set_or_unset(&mut doc, "open_command", &fields.open_command)?;
+    set_or_unset_items(&mut doc, "open_command", &fields.open_command)?;
     set_or_unset(&mut doc, "setup.copy", &fields.copy)?;
     set_or_unset(&mut doc, "setup.run", &fields.run)?;
     save_doc(&file, &doc)?;
@@ -315,6 +325,26 @@ fn set_or_unset(doc: &mut DocumentMut, key: &str, raw: &str) -> Result<()> {
         apply_unset(doc, key)?;
     } else {
         apply_set(doc, key, raw)?;
+    }
+    Ok(())
+}
+
+/// Like [`set_or_unset`], but for an already-split list: writes a single item
+/// as a TOML string and several as a TOML array (matching how `open_command`
+/// is loaded). Items are taken verbatim, so one containing a comma stays one
+/// entry.
+fn set_or_unset_items(doc: &mut DocumentMut, key: &str, items: &[String]) -> Result<()> {
+    let items: Vec<String> = items
+        .iter()
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect();
+    if items.is_empty() {
+        apply_unset(doc, key)?;
+    } else if items.len() == 1 {
+        doc[key] = toml_value(&items[0]);
+    } else {
+        doc[key] = toml_value(to_array(&items));
     }
     Ok(())
 }
@@ -382,8 +412,7 @@ fn show(cwd: &Path, json: bool) -> Result<()> {
     println!("      new worktrees go in {}", resolved.display());
     println!(
         "  open_command = {:?}   ({})",
-        cfg.open_command.clone().unwrap_or_default(),
-        cfg.open_command_source
+        cfg.open_command, cfg.open_command_source
     );
     println!(
         "  auto_update_check = {}   ({})",
@@ -428,7 +457,7 @@ fn get(cwd: &Path, key: &str, json: bool) -> Result<()> {
                 .clone()
                 .unwrap_or_else(|| DEFAULT_LOCATION.to_string())
         ),
-        "open_command" => json!(cfg.open_command.clone().unwrap_or_default()),
+        "open_command" => json!(cfg.open_command.clone()),
         "auto_update_check" => json!(cfg.auto_update_check()),
         "diff_theme" => json!(cfg.diff_theme()),
         "setup.copy" => json!(cfg.setup.copy),
@@ -737,7 +766,12 @@ fn apply_set(doc: &mut DocumentMut, key: &str, raw: &str) -> Result<()> {
             doc["worktree_dir"] = toml_value(raw);
         }
         "open_command" => {
-            doc["open_command"] = toml_value(raw);
+            let items = split_list(raw);
+            if items.len() == 1 {
+                doc["open_command"] = toml_value(&items[0]);
+            } else {
+                doc["open_command"] = toml_value(to_array(&items));
+            }
         }
         "auto_update_check" => {
             doc["auto_update_check"] = toml_value(parse_bool(raw)?);
@@ -1091,10 +1125,15 @@ mod tests {
     }
 
     /// Editor fields with everything unset, for building one-field cases.
-    fn fields(worktree_dir: &str, open_command: &str, copy: &str, run: &str) -> RepoConfigFields {
+    fn fields(
+        worktree_dir: &str,
+        open_command: &[&str],
+        copy: &str,
+        run: &str,
+    ) -> RepoConfigFields {
         RepoConfigFields {
             worktree_dir: worktree_dir.to_string(),
-            open_command: open_command.to_string(),
+            open_command: open_command.iter().map(|c| c.to_string()).collect(),
             auto_update_check: String::new(),
             diff_theme: String::new(),
             copy: copy.to_string(),
@@ -1112,7 +1151,7 @@ mod tests {
         .unwrap();
         let fields = repo_config_fields(dir.path(), None).unwrap();
         assert_eq!(fields.worktree_dir, "home");
-        assert_eq!(fields.open_command, "");
+        assert!(fields.open_command.is_empty());
         assert_eq!(fields.copy, ".env, config/.env");
         assert_eq!(fields.run, "");
         // With no global config to read, the toggle shows as unset (default).
@@ -1123,13 +1162,49 @@ mod tests {
     fn save_and_read_open_command() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join(CONFIG_FILE);
-        save_config_edits(dir.path(), None, &fields("", "cursor .", "", "")).unwrap();
+        save_config_edits(dir.path(), None, &fields("", &["cursor ."], "", "")).unwrap();
         let cfg = FileConfig::load(&file).unwrap();
-        assert_eq!(cfg.open_command.as_deref(), Some("cursor ."));
+        assert_eq!(
+            cfg.open_command,
+            Some(OpenCommandList(vec!["cursor .".into()]))
+        );
         // Clearing it unsets the key again.
-        save_config_edits(dir.path(), None, &fields("", "", "", "")).unwrap();
+        save_config_edits(dir.path(), None, &fields("", &[], "", "")).unwrap();
         let cfg = FileConfig::load(&file).unwrap();
         assert_eq!(cfg.open_command, None);
+    }
+
+    #[test]
+    fn save_open_command_writes_an_array_for_multiple() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(CONFIG_FILE);
+        save_config_edits(
+            dir.path(),
+            None,
+            &fields("", &["open {path}", "cursor {path}"], "", ""),
+        )
+        .unwrap();
+        let cfg = FileConfig::load(&file).unwrap();
+        assert_eq!(
+            cfg.open_command,
+            Some(OpenCommandList(vec![
+                "open {path}".into(),
+                "cursor {path}".into(),
+            ]))
+        );
+        let fields = repo_config_fields(dir.path(), None).unwrap();
+        assert_eq!(fields.open_command, ["open {path}", "cursor {path}"]);
+    }
+
+    /// The editor path takes the list as-is, so a command with a comma in it
+    /// (a shell one-liner, say) stays one entry instead of being split.
+    #[test]
+    fn save_open_command_keeps_commands_containing_commas_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let commands = ["sh -c 'cd {path}, npm start'", "code --goto {path}:1,1"];
+        save_config_edits(dir.path(), None, &fields("", &commands, "", "")).unwrap();
+        let fields = repo_config_fields(dir.path(), None).unwrap();
+        assert_eq!(fields.open_command, commands);
     }
 
     #[test]
@@ -1143,7 +1218,7 @@ mod tests {
         .unwrap();
 
         // Change worktree_dir, add a run command, and clear copy (unset it).
-        save_config_edits(dir.path(), None, &fields("inside", "", "", "npm install")).unwrap();
+        save_config_edits(dir.path(), None, &fields("inside", &[], "", "npm install")).unwrap();
         let text = std::fs::read_to_string(&file).unwrap();
         assert!(text.contains("# keep me"), "comment lost: {text}");
         let cfg = FileConfig::load(&file).unwrap();
@@ -1159,7 +1234,7 @@ mod tests {
         let global = dir.path().join("global.toml");
         std::fs::write(&global, "# global notes\nworktree_dir = \"home\"\n").unwrap();
 
-        let mut edits = fields("", "", "", "");
+        let mut edits = fields("", &[], "", "");
         edits.auto_update_check = "false".to_string();
         save_config_edits(dir.path(), Some(&global), &edits).unwrap();
 

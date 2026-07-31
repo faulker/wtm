@@ -105,7 +105,11 @@ pub fn is_dev_build() -> bool {
 /// `wtm upgrade` or the Settings tab's check-now row ignores all three and
 /// always checks.
 pub fn auto_check_enabled(config: &crate::config::Config) -> bool {
-    auto_check_enabled_for(config, is_dev_build(), std::env::var_os(DISABLE_ENV).is_some())
+    auto_check_enabled_for(
+        config,
+        is_dev_build(),
+        std::env::var_os(DISABLE_ENV).is_some(),
+    )
 }
 
 /// Pure form of [`auto_check_enabled`], so tests can pin the ambient inputs.
@@ -643,8 +647,10 @@ ccc333  ./nested/wtm-v1.0.0-aarch64-unknown-linux-gnu.tar.gz
         let cfg = crate::config::Config::default();
         assert!(auto_check_enabled_for(&cfg, false, false));
 
-        let mut off = crate::config::Config::default();
-        off.auto_update_check = Some(false);
+        let off = crate::config::Config {
+            auto_update_check: Some(false),
+            ..Default::default()
+        };
         assert!(!auto_check_enabled_for(&off, false, false));
     }
 
@@ -653,7 +659,9 @@ ccc333  ./nested/wtm-v1.0.0-aarch64-unknown-linux-gnu.tar.gz
         // This suite itself runs under cargo (CARGO set) as a debug binary, so
         // a local `cargo run` looks the same from here.
         assert!(is_dev_build());
-        assert!(cfg!(debug_assertions));
+        const {
+            assert!(cfg!(debug_assertions));
+        }
         assert!(std::env::var_os("CARGO").is_some());
     }
 }

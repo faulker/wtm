@@ -11,7 +11,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::de::{self, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
 pub const CONFIG_FILE: &str = ".wtm.toml";
 
@@ -55,15 +56,53 @@ impl fmt::Display for Source {
     }
 }
 
+/// One or more open-command templates. A TOML string still loads as a
+/// single-entry list so existing configs keep working; an array holds several
+/// commands the TUI's `o` key can pick from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OpenCommandList(pub Vec<String>);
+
+impl<'de> Deserialize<'de> for OpenCommandList {
+    /// Accepts either `"cursor ."` or `["open {path}", "cursor {path}"]`.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct OpenCommandVisitor;
+        impl<'de> Visitor<'de> for OpenCommandVisitor {
+            type Value = OpenCommandList;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a string or an array of strings")
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(OpenCommandList(vec![v.to_string()]))
+            }
+
+            fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(OpenCommandList(vec![v]))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut out = Vec::new();
+                while let Some(item) = seq.next_element::<String>()? {
+                    out.push(item);
+                }
+                Ok(OpenCommandList(out))
+            }
+        }
+        deserializer.deserialize_any(OpenCommandVisitor)
+    }
+}
+
 /// Raw contents of one config file. Every field is optional so a file can set
 /// only what it cares about and inherit the rest.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
     pub worktree_dir: Option<String>,
-    /// Command run in a worktree's directory by the TUI's "open" key (e.g.
-    /// `cursor .` to open an editor there).
-    pub open_command: Option<String>,
+    /// Commands the TUI's open key (`o`) can run for a worktree. Each entry is
+    /// a shell template; `{path}`, `{name}`, `{branch}`, and `{status}` expand
+    /// before the command runs. A plain string in TOML is treated as one entry.
+    pub open_command: Option<OpenCommandList>,
     /// Whether the TUI checks GitHub for a newer wtm on start. Unset means
     /// [`DEFAULT_AUTO_UPDATE_CHECK`].
     pub auto_update_check: Option<bool>,
@@ -102,8 +141,8 @@ pub struct Config {
     /// Raw `worktree_dir` setting; `None` means the `sibling` preset.
     pub worktree_dir: Option<String>,
     pub worktree_dir_source: Source,
-    /// Command the TUI runs in a worktree's directory on the "open" key.
-    pub open_command: Option<String>,
+    /// Commands the TUI runs from the open key (`o`); empty when unset.
+    pub open_command: Vec<String>,
     pub open_command_source: Source,
     /// Raw `auto_update_check` setting; `None` means
     /// [`DEFAULT_AUTO_UPDATE_CHECK`].
@@ -131,7 +170,7 @@ impl Default for Config {
         Config {
             worktree_dir: None,
             worktree_dir_source: Source::Default,
-            open_command: None,
+            open_command: Vec::new(),
             open_command_source: Source::Default,
             auto_update_check: None,
             auto_update_check_source: Source::Default,
@@ -165,7 +204,10 @@ impl Config {
             }
         }
         let (worktree_dir, worktree_dir_source) = pick(global.worktree_dir, repo.worktree_dir);
-        let (open_command, open_command_source) = pick(global.open_command, repo.open_command);
+        let (open_command_raw, open_command_source) = pick(global.open_command, repo.open_command);
+        let open_command = open_command_raw
+            .map(|OpenCommandList(cmds)| cmds)
+            .unwrap_or_default();
         let (auto_update_check, auto_update_check_source) =
             pick(global.auto_update_check, repo.auto_update_check);
         let (diff_theme, diff_theme_source) = pick(global.diff_theme, repo.diff_theme);
@@ -272,6 +314,26 @@ fn repo_name(repo_root: &Path) -> String {
         .unwrap_or_else(|| "repo".to_string())
 }
 
+/// Values substituted into an `open_command` template before it is spawned.
+#[derive(Debug, Clone, Copy)]
+pub struct OpenCommandVars<'a> {
+    pub path: &'a str,
+    pub name: &'a str,
+    pub branch: &'a str,
+    /// One of `"behind"`, `"ahead"`, `"merged"`, or `""` when none apply.
+    pub status: &'a str,
+}
+
+/// Expands `{path}`, `{name}`, `{branch}`, and `{status}` in an open-command
+/// template. Unknown `{…}` placeholders are left untouched.
+pub fn expand_open_command(template: &str, vars: &OpenCommandVars<'_>) -> String {
+    template
+        .replace("{path}", vars.path)
+        .replace("{name}", vars.name)
+        .replace("{branch}", vars.branch)
+        .replace("{status}", vars.status)
+}
+
 /// Path of the user-wide config file: `$WTM_GLOBAL_CONFIG` when set (mainly
 /// for tests), otherwise `$XDG_CONFIG_HOME/wtm/config.toml`, falling back to
 /// `~/.config/wtm/config.toml`. `None` when no relevant env var is set.
@@ -293,6 +355,38 @@ pub fn global_config_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_open_command_as_string_or_array() {
+        let one: FileConfig = toml::from_str(r#"open_command = "cursor .""#).unwrap();
+        assert_eq!(
+            one.open_command,
+            Some(OpenCommandList(vec!["cursor .".into()]))
+        );
+        let many: FileConfig =
+            toml::from_str(r#"open_command = ["open {path}", "cursor {path}"]"#).unwrap();
+        assert_eq!(
+            many.open_command,
+            Some(OpenCommandList(vec![
+                "open {path}".into(),
+                "cursor {path}".into(),
+            ]))
+        );
+    }
+
+    #[test]
+    fn expands_open_command_placeholders() {
+        let expanded = expand_open_command(
+            "open {path} # {name}@{branch} ({status})",
+            &OpenCommandVars {
+                path: "/tmp/wt",
+                name: "feat",
+                branch: "feat",
+                status: "ahead",
+            },
+        );
+        assert_eq!(expanded, "open /tmp/wt # feat@feat (ahead)");
+    }
 
     #[test]
     fn parses_full_file_config() {
