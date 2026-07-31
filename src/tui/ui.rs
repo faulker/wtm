@@ -14,11 +14,11 @@ use ratatui::widgets::{
 
 use super::app::{
     App, CheckoutCandidate, CherryTarget, CommitFocus, ConfirmOption, DiffRow, LogMode, Modal,
-    ResolverFile, RowList, Tab, TextInput, View, filtered_candidates,
+    ResolverFile, RowList, Tab, TextInput, View, WorktreesFocus, filtered_candidates,
 };
 use super::config_editor::{
-    CHECK_ROW, ConfigEditor, FIELD_ROWS, FORM_LINES, OPEN_COMMAND_ROW, OpenCommandEditor, SAVE_ROW,
-    THEME_ROW, UPDATE_ROW,
+    CHECK_ROW, ConfigEditor, FIELD_ROWS, FORM_LINES, LAYOUT_ROW, OPEN_COMMAND_ROW,
+    OpenCommandEditor, THEME_ROW, UPDATE_ROW,
 };
 use super::help::{self, Binding, HelpTab};
 use super::highlight;
@@ -28,7 +28,7 @@ use super::setup::{
 use super::theme::{self, ACCENT, BORDER, GRAPH_COLORS, SELECTION_BG};
 use crate::config::{
     DEFAULT_AUTO_UPDATE_CHECK, DEFAULT_DIFF_THEME, DEFAULT_LOCATION, LOCATION_PRESETS,
-    OpenCommandVars, expand_open_command,
+    OpenCommandVars, WorktreesLayout, expand_open_command, worktrees_layout_label,
 };
 use crate::conflict::{ConflictSegment, ResolutionAction};
 use crate::git::{GraphLine, StatusEntry};
@@ -48,6 +48,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // them, so last frame's geometry can't outlive what's on screen.
     app.tab_hits.clear();
     app.preview_list = None;
+    app.files_list = None;
     app.diff_path_hit = None;
     // The full-screen view's clickable list, if any.
     let list_hit = match &app.view {
@@ -134,6 +135,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         _ => {
             let [bar, body] =
                 Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(main);
+            // The layout in force for this frame: the configured one, unless
+            // the terminal is too short to give three panels a usable height,
+            // in which case the tab falls back to two (and the Changes tab
+            // comes back, so the diff is still reachable).
+            app.three_panel = app.ctx.config.worktrees_layout() == WorktreesLayout::ThreePanel
+                && body.height >= THREE_PANEL_MIN_HEIGHT;
             draw_tab_bar(frame, bar, app);
             match app.tab {
                 Tab::Worktrees => draw_worktrees_tab(frame, body, app),
@@ -150,6 +157,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     app.changes.loading_new,
                     app.changes.scroll,
                     app.changes.h_scroll,
+                    true,
                     &mut app.diff_path_hit,
                 ),
                 Tab::Stash => draw_stash_tab(frame, body, app),
@@ -427,7 +435,34 @@ const fn hint(key: &'static str, label: &'static str) -> Binding {
     }
 }
 
-fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) -> Option<RowList> {
+/// Height the three-panel Worktrees layout gives the worktree list: four rows
+/// plus the table header and the panel's borders.
+const THREE_PANEL_LIST_HEIGHT: u16 = 7;
+
+/// Shortest body the three-panel layout is drawn in: the worktree list plus
+/// enough room for a file list and diff worth reading. Below this the tab falls
+/// back to two panels.
+const THREE_PANEL_MIN_HEIGHT: u16 = THREE_PANEL_LIST_HEIGHT + 7;
+
+/// Row highlight for a selectable list, dimmed when the panel doesn't hold the
+/// keyboard so only one cursor on screen looks live.
+fn highlight_style(focused: bool) -> Style {
+    if focused {
+        Style::new().bg(SELECTION_BG).bold()
+    } else {
+        Style::new().bg(SELECTION_BG).dim()
+    }
+}
+
+/// Color of a list's cursor marker, matching `highlight_style`.
+fn cursor_color(focused: bool) -> Color {
+    if focused { ACCENT } else { BORDER }
+}
+
+/// The worktree table. `focused` is false when another panel owns the keyboard
+/// (the three-panel layout's file list), which dims the row highlight so it is
+/// clear which cursor the arrow keys move.
+fn draw_list(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) -> Option<RowList> {
     let rows: Vec<Row> = app
         .worktrees
         .iter()
@@ -499,8 +534,8 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) -> Option<RowList> {
         Row::new(["NAME", "CHANGES", "UPSTREAM", "FLAGS", "PATH"]).style(Style::new().dim().bold()),
     )
     .block(block)
-    .row_highlight_style(Style::new().bg(SELECTION_BG).bold())
-    .highlight_symbol(Span::styled("▌ ", Style::new().fg(ACCENT)));
+    .row_highlight_style(highlight_style(focused))
+    .highlight_symbol(Span::styled("▌ ", Style::new().fg(cursor_color(focused))));
     let mut state = TableState::default().with_selected(Some(app.selected));
     frame.render_stateful_widget(table, area, &mut state);
     // The table header occupies the first inner row, so data rows start one
@@ -516,12 +551,47 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) -> Option<RowList> {
 /// Worktrees tab: the worktree table on top, a read-only changed-file
 /// preview for the highlighted row on the bottom.
 fn draw_worktrees_tab(frame: &mut Frame, area: Rect, app: &mut App) -> Option<RowList> {
+    if app.three_panel {
+        return draw_worktrees_three_panel(frame, area, app);
+    }
     let [list_area, preview_area] =
         Layout::vertical([Constraint::Percentage(62), Constraint::Percentage(38)]).areas(area);
-    let row_list = draw_list(frame, list_area, app);
+    let row_list = draw_list(frame, list_area, app, true);
     // Status runs off-thread; never call `ops::status` on the render path.
     app.ensure_worktree_preview();
     draw_worktree_preview(frame, preview_area, app);
+    row_list
+}
+
+/// Three-panel Worktrees tab: a compact scrollable worktree list on top, with
+/// the Changes tab's changed-file list and diff filling the space below it, so
+/// the highlighted worktree's changes are readable without leaving the tab.
+fn draw_worktrees_three_panel(frame: &mut Frame, area: Rect, app: &mut App) -> Option<RowList> {
+    let [list_area, changes_area] = Layout::vertical([
+        Constraint::Length(THREE_PANEL_LIST_HEIGHT),
+        Constraint::Min(1),
+    ])
+    .areas(area);
+    let focus = app.worktrees_focus;
+    let row_list = draw_list(frame, list_area, app, focus == WorktreesFocus::List);
+    // Status runs off-thread; never call `ops::status` on the render path. Its
+    // result also swaps the two panels below (`sync_three_panel_changes`).
+    app.ensure_worktree_preview();
+    app.files_list = draw_diff(
+        frame,
+        changes_area,
+        &app.changes.name,
+        &app.changes.files,
+        &app.changes.marked,
+        &app.changes.rows,
+        app.changes.selected,
+        &app.changes.content,
+        app.changes.loading_new,
+        app.changes.scroll,
+        app.changes.h_scroll,
+        focus == WorktreesFocus::Files,
+        &mut app.diff_path_hit,
+    );
     row_list
 }
 
@@ -618,6 +688,10 @@ fn draw_diff(
     loading_new: bool,
     scroll: u16,
     h_scroll: u16,
+    // Whether the changed-file list holds the keyboard. Always true on the
+    // Changes tab; false in the three-panel Worktrees layout while the worktree
+    // list above owns it. The diff pane is never focused either way.
+    focused: bool,
     // `path_hit` is set to the screen rect of the diff panel's clickable path
     // title, so a click there can copy the path, or cleared when the cursor
     // isn't on a file.
@@ -698,8 +772,8 @@ fn draw_diff(
     let inner = block.inner(list_area);
     let list = List::new(items)
         .block(block)
-        .highlight_style(Style::new().bg(SELECTION_BG).bold())
-        .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
+        .highlight_style(highlight_style(focused))
+        .highlight_symbol(Span::styled("▌", Style::new().fg(cursor_color(focused))));
     let mut state = ListState::default().with_selected(Some(selected));
     frame.render_stateful_widget(list, list_area, &mut state);
     let list_hit = RowList {
@@ -811,6 +885,12 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     }
     let hints: &[Binding] = match &app.view {
         View::List => match app.tab {
+            // Three-panel layout: the hints follow the focused panel, since the
+            // same keys act on a different list in each.
+            Tab::Worktrees if app.three_panel && app.worktrees_focus == WorktreesFocus::Files => {
+                help::WORKTREE_FILES
+            }
+            Tab::Worktrees if app.three_panel => help::WORKTREES_THREE_PANEL,
             Tab::Worktrees => help::WORKTREES,
             Tab::Branches => help::BRANCHES,
             Tab::Changes => help::DIFF,
@@ -1859,9 +1939,9 @@ fn draw_review(
 
 /// The Settings tab: editable rows for the repo settings, the update-check
 /// toggle, a live resolved-location preview, a live diff-theme colour sample,
-/// the running version, a save row, and a check-for-updates row. The form
-/// keeps a fixed width inside the full-height panel so long paths don't
-/// stretch it.
+/// the running version, and a check-for-updates row. Changes write to disk as
+/// soon as they are made. The form keeps a fixed width inside the full-height
+/// panel so long paths don't stretch it.
 fn draw_settings_tab(
     frame: &mut Frame,
     area: Rect,
@@ -1875,6 +1955,7 @@ fn draw_settings_tab(
         "setup.run        ",
         "auto_update_check",
         "diff_theme       ",
+        "worktrees_layout ",
     ];
     let hints = [
         "sibling · inside · home · or a path ({repo} = repo name)",
@@ -1882,8 +1963,9 @@ fn draw_settings_tab(
          {path} {name} {branch} {status}",
         "files copied into each new worktree, comma separated",
         "commands run in each new worktree, comma separated",
-        "check GitHub for a newer wtm on start · saved for all repos",
+        "check GitHub for a newer wtm on start · Enter cycles · saved for all repos",
         "syntax colours in the diff pane · Enter cycles · saved for all repos",
+        "Worktrees tab layout · three panels adds files + diff · Enter cycles · applies immediately",
     ];
     let mut lines: Vec<Line> = Vec::new();
     for row in 0..FIELD_ROWS {
@@ -1924,6 +2006,17 @@ fn draw_settings_tab(
                     format!("(default: {})", highlight::theme_label(DEFAULT_DIFF_THEME))
                 } else {
                     highlight::theme_label(&editor.fields.diff_theme).to_string()
+                },
+                highlight,
+            )),
+            _ if row == LAYOUT_ROW => spans.push(Span::styled(
+                if editor.fields.worktrees_layout.is_empty() {
+                    format!(
+                        "(default: {})",
+                        worktrees_layout_label(WorktreesLayout::default().as_str())
+                    )
+                } else {
+                    worktrees_layout_label(&editor.fields.worktrees_layout).to_string()
                 },
                 highlight,
             )),
@@ -2000,10 +2093,6 @@ fn draw_settings_tab(
             Style::new().bold()
         }
     };
-    lines.push(Line::from(Span::styled(
-        " [ save settings ] ",
-        action_style(SAVE_ROW),
-    )));
     lines.push(Line::from(Span::styled(
         " [ check for updates now ] ",
         action_style(CHECK_ROW),
@@ -2290,6 +2379,11 @@ fn draw_tab_bar(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut x = area.x;
     let mut hits = Vec::new();
     for tab in Tab::ALL {
+        // The three-panel layout folds the Changes tab into the Worktrees tab,
+        // so it isn't offered here either.
+        if app.tab_hidden(tab) {
+            continue;
+        }
         if !spans.is_empty() {
             spans.push(Span::raw(" "));
             x += 1;
@@ -3544,7 +3638,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::super::config_editor::{
-        CHECK_LINE, PREVIEW_LINE, SAVE_LINE, THEME_PREVIEW_LABEL_LINE, THEME_PREVIEW_LINE,
+        CHECK_LINE, LAYOUT_ROW, PREVIEW_LINE, THEME_PREVIEW_LABEL_LINE, THEME_PREVIEW_LINE,
         THEME_ROW, UPDATE_ROW, VERSION_LINE,
     };
     use super::*;
@@ -3748,6 +3842,7 @@ mod tests {
             (3, "setup.run"),
             (UPDATE_ROW, "auto_update_check"),
             (THEME_ROW, "diff_theme"),
+            (LAYOUT_ROW, "worktrees_layout"),
         ] {
             assert!(
                 line(row * 2).contains(label),
@@ -3764,6 +3859,11 @@ mod tests {
             line(THEME_ROW * 2).contains("default"),
             "{:?}",
             line(THEME_ROW * 2)
+        );
+        assert!(
+            line(LAYOUT_ROW * 2).contains("default: two panels"),
+            "{:?}",
+            line(LAYOUT_ROW * 2)
         );
         assert!(line(PREVIEW_LINE).contains("new worktrees go in"));
         assert!(
@@ -3792,7 +3892,6 @@ mod tests {
             line(THEME_PREVIEW_LINE + 2)
         );
         assert!(line(VERSION_LINE).contains(CURRENT_VERSION));
-        assert!(line(SAVE_LINE).contains("save settings"));
         assert!(line(CHECK_LINE).contains("check for updates"));
     }
 

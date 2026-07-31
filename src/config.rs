@@ -28,6 +28,46 @@ pub const DEFAULT_AUTO_UPDATE_CHECK: bool = true;
 /// isn't set. Kept in sync with `tui::highlight::DEFAULT_DIFF_THEME`.
 pub const DEFAULT_DIFF_THEME: &str = "eighties";
 
+/// How the TUI's Worktrees tab is laid out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreesLayout {
+    /// The worktree table on top, a read-only changed-file preview below it.
+    #[default]
+    TwoPanel,
+    /// A compact worktree list on top, with the Changes tab's file list and
+    /// diff filling the bottom half. The Changes tab is hidden in this layout.
+    ThreePanel,
+}
+
+impl WorktreesLayout {
+    /// The config-file spelling of this layout, matching the serde renaming.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorktreesLayout::TwoPanel => "two_panel",
+            WorktreesLayout::ThreePanel => "three_panel",
+        }
+    }
+}
+
+/// The `worktrees_layout` values `wtm config` accepts and the TUI's Settings
+/// row cycles through, each with a human-readable label. The first entry is
+/// the default.
+pub const WORKTREES_LAYOUTS: &[(&str, &str)] = &[
+    ("two_panel", "two panels"),
+    ("three_panel", "three panels"),
+];
+
+/// Human-readable label for a `worktrees_layout` value, falling back to the
+/// raw value for anything unrecognised.
+pub fn worktrees_layout_label(id: &str) -> &str {
+    WORKTREES_LAYOUTS
+        .iter()
+        .find(|(name, _)| *name == id)
+        .map(|(_, label)| *label)
+        .unwrap_or(id)
+}
+
 /// Predefined location rules accepted by `worktree_dir`, with a short
 /// human-readable label for each.
 pub const LOCATION_PRESETS: &[(&str, &str)] = &[
@@ -109,6 +149,9 @@ pub struct FileConfig {
     /// Diff syntax-highlight theme short id (e.g. `eighties`, `ocean`). Unset
     /// means [`DEFAULT_DIFF_THEME`].
     pub diff_theme: Option<String>,
+    /// Layout of the TUI's Worktrees tab. Unset means
+    /// [`WorktreesLayout::TwoPanel`].
+    pub worktrees_layout: Option<WorktreesLayout>,
     pub setup: Option<FileSetup>,
 }
 
@@ -151,6 +194,10 @@ pub struct Config {
     /// Raw `diff_theme` setting; `None` means [`DEFAULT_DIFF_THEME`].
     pub diff_theme: Option<String>,
     pub diff_theme_source: Source,
+    /// Raw `worktrees_layout` setting; `None` means
+    /// [`WorktreesLayout::TwoPanel`].
+    pub worktrees_layout: Option<WorktreesLayout>,
+    pub worktrees_layout_source: Source,
     pub setup: Setup,
     pub copy_source: Source,
     pub run_source: Source,
@@ -176,6 +223,8 @@ impl Default for Config {
             auto_update_check_source: Source::Default,
             diff_theme: None,
             diff_theme_source: Source::Default,
+            worktrees_layout: None,
+            worktrees_layout_source: Source::Default,
             setup: Setup::default(),
             copy_source: Source::Default,
             run_source: Source::Default,
@@ -211,6 +260,8 @@ impl Config {
         let (auto_update_check, auto_update_check_source) =
             pick(global.auto_update_check, repo.auto_update_check);
         let (diff_theme, diff_theme_source) = pick(global.diff_theme, repo.diff_theme);
+        let (worktrees_layout, worktrees_layout_source) =
+            pick(global.worktrees_layout, repo.worktrees_layout);
         let global_setup = global.setup.unwrap_or_default();
         let repo_setup = repo.setup.unwrap_or_default();
         let (copy, copy_source) = pick(global_setup.copy, repo_setup.copy);
@@ -224,6 +275,8 @@ impl Config {
             auto_update_check_source,
             diff_theme,
             diff_theme_source,
+            worktrees_layout,
+            worktrees_layout_source,
             setup: Setup {
                 copy: copy.unwrap_or_default(),
                 run: run.unwrap_or_default(),
@@ -244,6 +297,12 @@ impl Config {
             .as_deref()
             .filter(|s| !s.is_empty())
             .unwrap_or(DEFAULT_DIFF_THEME)
+    }
+
+    /// Layout of the TUI's Worktrees tab; two-panel unless a config file says
+    /// otherwise.
+    pub fn worktrees_layout(&self) -> WorktreesLayout {
+        self.worktrees_layout.unwrap_or_default()
     }
 
     /// Absolute directory new worktrees are created under for a repo rooted
@@ -486,6 +545,23 @@ mod tests {
         let cfg = Config::merge(global, repo);
         assert_eq!(cfg.diff_theme(), "mocha");
         assert_eq!(cfg.diff_theme_source, Source::Repo);
+    }
+
+    #[test]
+    fn worktrees_layout_defaults_to_two_panel_and_merges() {
+        assert_eq!(
+            Config::default().worktrees_layout(),
+            WorktreesLayout::TwoPanel
+        );
+        let global: FileConfig = toml::from_str("worktrees_layout = \"three_panel\"").unwrap();
+        let cfg = Config::merge(global.clone(), FileConfig::default());
+        assert_eq!(cfg.worktrees_layout(), WorktreesLayout::ThreePanel);
+        assert_eq!(cfg.worktrees_layout_source, Source::Global);
+        // A repo can go back to the two-panel layout over a global opt-in.
+        let repo: FileConfig = toml::from_str("worktrees_layout = \"two_panel\"").unwrap();
+        let cfg = Config::merge(global, repo);
+        assert_eq!(cfg.worktrees_layout(), WorktreesLayout::TwoPanel);
+        assert_eq!(cfg.worktrees_layout_source, Source::Repo);
     }
 
     #[test]

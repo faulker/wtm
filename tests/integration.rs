@@ -563,6 +563,42 @@ fn auto_update_check_is_a_boolean_setting() {
 }
 
 #[test]
+fn worktrees_layout_switches_the_worktrees_tab_layout() {
+    let (_tmp, repo) = setup_repo();
+
+    // It defaults to the two-panel layout and shows up in `config show`.
+    let out = wtm(&repo, &["config", "get", "worktrees_layout"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "two_panel");
+    let shown = stdout_json(&wtm(&repo, &["config", "--json"]));
+    assert_eq!(shown["worktrees_layout"]["value"], "two_panel");
+    assert_eq!(shown["worktrees_layout"]["source"], "default");
+
+    let out = wtm(&repo, &["config", "set", "worktrees_layout", "three_panel"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = std::fs::read_to_string(repo.join(".wtm.toml")).unwrap();
+    assert!(text.contains("worktrees_layout = \"three_panel\""), "{text}");
+    let shown = stdout_json(&wtm(&repo, &["config", "--json"]));
+    assert_eq!(shown["worktrees_layout"]["value"], "three_panel");
+    assert_eq!(shown["worktrees_layout"]["source"], "repo");
+
+    // Unknown layouts are refused rather than silently stored.
+    let out = wtm(&repo, &["config", "set", "worktrees_layout", "four_panel"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("unknown layout"), "{err}");
+
+    // Unsetting restores the two-panel default.
+    let out = wtm(&repo, &["config", "unset", "worktrees_layout"]);
+    assert!(out.status.success());
+    let out = wtm(&repo, &["config", "get", "worktrees_layout"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "two_panel");
+}
+
+#[test]
 fn upgrade_check_reports_the_running_version() {
     let (_tmp, repo) = setup_repo();
     // `wtm upgrade --check` reaches GitHub, so this only asserts the shape of

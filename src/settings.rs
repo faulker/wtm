@@ -40,6 +40,10 @@ const KEYS: &[(&str, &str)] = &[
         "diff syntax-highlight theme: eighties, mocha, ocean, solarized, github",
     ),
     (
+        "worktrees_layout",
+        "layout of the TUI's Worktrees tab: two_panel or three_panel",
+    ),
+    (
         "setup.copy",
         "files copied into each new worktree, comma separated",
     ),
@@ -195,15 +199,19 @@ pub fn write_draft(repo_root: &Path, draft: &ConfigDraft) -> Result<PathBuf> {
 /// strings for the TUI config editor. Unset keys come back empty; `copy` and
 /// `run` are comma-joined.
 ///
-/// `auto_update_check` and `diff_theme` are the exceptions: they govern wtm
-/// itself rather than one repo, so they are read from `global_config` (the
-/// caller's resolved global config path, or `None` when there isn't one)
-/// instead of the repo file.
+/// `auto_update_check`, `diff_theme`, and `worktrees_layout` are the
+/// exceptions: they govern wtm itself rather than one repo, so the editor
+/// shows the *effective* merged value (so a stale repo override cannot make
+/// the row disagree with what the Worktrees tab is drawing) and Settings
+/// save writes them to `global_config`.
 pub fn repo_config_fields(
     repo_root: &Path,
     global_config: Option<&Path>,
 ) -> Result<RepoConfigFields> {
     let cfg = FileConfig::load(&repo_root.join(CONFIG_FILE))?;
+    let auto_update_check = effective_auto_update_check(global_config, &cfg);
+    let diff_theme = effective_diff_theme(global_config, &cfg);
+    let worktrees_layout = effective_worktrees_layout(global_config, &cfg);
     let setup = cfg.setup.unwrap_or_default();
     let copy = setup
         .copy
@@ -220,30 +228,55 @@ pub fn repo_config_fields(
     Ok(RepoConfigFields {
         worktree_dir: cfg.worktree_dir.unwrap_or_default(),
         open_command,
-        auto_update_check: global_auto_update_check(global_config),
-        diff_theme: global_diff_theme(global_config),
+        auto_update_check,
+        diff_theme,
+        worktrees_layout,
         copy,
         run,
     })
 }
 
-/// The global config's `auto_update_check` as an editor string: `""` when
-/// unset, otherwise `"true"`/`"false"`. A missing or unreadable global config
-/// reads as unset rather than failing the whole Settings tab.
-fn global_auto_update_check(global_config: Option<&Path>) -> String {
+/// Loads the optional global file, treating a missing/unreadable path as empty
+/// so the Settings tab still opens.
+fn load_global_file(global_config: Option<&Path>) -> FileConfig {
     global_config
         .and_then(|path| FileConfig::load(path).ok())
-        .and_then(|cfg| cfg.auto_update_check)
-        .map(|v| v.to_string())
         .unwrap_or_default()
 }
 
-/// The global config's `diff_theme` as an editor string: `""` when unset.
-fn global_diff_theme(global_config: Option<&Path>) -> String {
-    global_config
-        .and_then(|path| FileConfig::load(path).ok())
-        .and_then(|cfg| cfg.diff_theme)
-        .unwrap_or_default()
+/// Effective `auto_update_check` for the editor: `""` when the built-in
+/// default applies, otherwise `"true"`/`"false"`.
+fn effective_auto_update_check(global_config: Option<&Path>, repo: &FileConfig) -> String {
+    let merged = Config::merge(load_global_file(global_config), repo.clone());
+    match merged.auto_update_check_source {
+        config::Source::Default => String::new(),
+        _ => merged
+            .auto_update_check
+            .unwrap_or(config::DEFAULT_AUTO_UPDATE_CHECK)
+            .to_string(),
+    }
+}
+
+/// Effective `diff_theme` for the editor: `""` when the built-in default
+/// applies, otherwise the theme id in force.
+fn effective_diff_theme(global_config: Option<&Path>, repo: &FileConfig) -> String {
+    let merged = Config::merge(load_global_file(global_config), repo.clone());
+    match merged.diff_theme_source {
+        config::Source::Default => String::new(),
+        _ => merged
+            .diff_theme
+            .unwrap_or_else(|| config::DEFAULT_DIFF_THEME.to_string()),
+    }
+}
+
+/// Effective `worktrees_layout` for the editor: `""` when the two-panel
+/// default applies, otherwise the layout id currently drawn by the TUI.
+fn effective_worktrees_layout(global_config: Option<&Path>, repo: &FileConfig) -> String {
+    let merged = Config::merge(load_global_file(global_config), repo.clone());
+    match merged.worktrees_layout_source {
+        config::Source::Default => String::new(),
+        _ => merged.worktrees_layout().as_str().to_string(),
+    }
 }
 
 /// The settings the TUI config editor shows, each empty when unset.
@@ -258,6 +291,8 @@ pub struct RepoConfigFields {
     pub auto_update_check: String,
     /// Diff theme short id, or `""` for the default; lives in the global config.
     pub diff_theme: String,
+    /// `""`, `"two_panel"`, or `"three_panel"`; lives in the global config.
+    pub worktrees_layout: String,
     pub copy: String,
     pub run: String,
 }
@@ -266,9 +301,11 @@ pub struct RepoConfigFields {
 /// surrounding TOML. An empty value unsets the key so the default (or global
 /// value) applies again. Returns the repo file's path.
 ///
-/// Repo settings go to the repo's `.wtm.toml`; `auto_update_check` and
-/// `diff_theme` go to `global_config`, since they are about wtm rather than
-/// about this repository.
+/// Repo settings go to the repo's `.wtm.toml`; `auto_update_check`,
+/// `diff_theme`, and `worktrees_layout` go to `global_config`, since they are
+/// about wtm rather than about this repository. Any repo-level copies of those
+/// three keys are cleared on save so a prior `wtm config set` (without `-g`)
+/// cannot keep overriding the value the user just chose in Settings.
 pub fn save_config_edits(
     repo_root: &Path,
     global_config: Option<&Path>,
@@ -280,37 +317,27 @@ pub fn save_config_edits(
     set_or_unset_items(&mut doc, "open_command", &fields.open_command)?;
     set_or_unset(&mut doc, "setup.copy", &fields.copy)?;
     set_or_unset(&mut doc, "setup.run", &fields.run)?;
+    // Drop repo overrides of UI prefs; Settings owns them at the global layer.
+    apply_unset(&mut doc, "auto_update_check")?;
+    apply_unset(&mut doc, "diff_theme")?;
+    apply_unset(&mut doc, "worktrees_layout")?;
     save_doc(&file, &doc)?;
     if let Some(path) = global_config {
-        save_global_auto_update_check(path, &fields.auto_update_check)?;
-        save_global_diff_theme(path, &fields.diff_theme)?;
+        save_global_setting(path, "auto_update_check", &fields.auto_update_check)?;
+        save_global_setting(path, "diff_theme", &fields.diff_theme)?;
+        save_global_setting(path, "worktrees_layout", &fields.worktrees_layout)?;
     }
     Ok(file)
 }
 
-/// Writes (or clears) `auto_update_check` in the global config at `path`,
+/// Writes (or clears) one wtm-wide `key` in the global config at `path`,
 /// leaving the file untouched when nothing about that key changed.
-fn save_global_auto_update_check(path: &Path, raw: &str) -> Result<()> {
+fn save_global_setting(path: &Path, key: &str, raw: &str) -> Result<()> {
     let mut doc = load_doc(path)?;
     let changed = if raw.trim().is_empty() {
-        apply_unset(&mut doc, "auto_update_check")?
+        apply_unset(&mut doc, key)?
     } else {
-        apply_set(&mut doc, "auto_update_check", raw)?;
-        true
-    };
-    if changed {
-        save_doc(path, &doc)?;
-    }
-    Ok(())
-}
-
-/// Writes (or clears) `diff_theme` in the global config at `path`.
-fn save_global_diff_theme(path: &Path, raw: &str) -> Result<()> {
-    let mut doc = load_doc(path)?;
-    let changed = if raw.trim().is_empty() {
-        apply_unset(&mut doc, "diff_theme")?
-    } else {
-        apply_set(&mut doc, "diff_theme", raw)?;
+        apply_set(&mut doc, key, raw)?;
         true
     };
     if changed {
@@ -391,6 +418,10 @@ fn show(cwd: &Path, json: bool) -> Result<()> {
                 "value": cfg.diff_theme(),
                 "source": cfg.diff_theme_source,
             },
+            "worktrees_layout": {
+                "value": cfg.worktrees_layout().as_str(),
+                "source": cfg.worktrees_layout_source,
+            },
             "version": crate::update::CURRENT_VERSION,
             "setup": {
                 "copy": { "value": cfg.setup.copy, "source": cfg.copy_source },
@@ -423,6 +454,11 @@ fn show(cwd: &Path, json: bool) -> Result<()> {
         "  diff_theme = {:?}   ({})",
         cfg.diff_theme(),
         cfg.diff_theme_source
+    );
+    println!(
+        "  worktrees_layout = {:?}   ({})",
+        cfg.worktrees_layout().as_str(),
+        cfg.worktrees_layout_source
     );
     println!(
         "  setup.copy   = {:?}   ({})",
@@ -460,6 +496,7 @@ fn get(cwd: &Path, key: &str, json: bool) -> Result<()> {
         "open_command" => json!(cfg.open_command.clone()),
         "auto_update_check" => json!(cfg.auto_update_check()),
         "diff_theme" => json!(cfg.diff_theme()),
+        "worktrees_layout" => json!(cfg.worktrees_layout().as_str()),
         "setup.copy" => json!(cfg.setup.copy),
         "setup.run" => json!(cfg.setup.run),
         _ => unreachable!("known_key checked"),
@@ -779,6 +816,9 @@ fn apply_set(doc: &mut DocumentMut, key: &str, raw: &str) -> Result<()> {
         "diff_theme" => {
             doc["diff_theme"] = toml_value(parse_diff_theme(raw)?);
         }
+        "worktrees_layout" => {
+            doc["worktrees_layout"] = toml_value(parse_worktrees_layout(raw)?);
+        }
         "setup.copy" | "setup.run" => {
             let sub = key.strip_prefix("setup.").unwrap();
             let setup = doc
@@ -800,6 +840,7 @@ fn apply_unset(doc: &mut DocumentMut, key: &str) -> Result<bool> {
         "open_command" => doc.remove("open_command").is_some(),
         "auto_update_check" => doc.remove("auto_update_check").is_some(),
         "diff_theme" => doc.remove("diff_theme").is_some(),
+        "worktrees_layout" => doc.remove("worktrees_layout").is_some(),
         "setup.copy" | "setup.run" => {
             let sub = key.strip_prefix("setup.").unwrap();
             let removed = doc
@@ -853,6 +894,27 @@ fn parse_diff_theme(raw: &str) -> Result<&str> {
     bail!(
         "unknown diff theme {trimmed:?}; choose one of: {}",
         KNOWN.join(", ")
+    )
+}
+
+/// Accepts a known Worktrees-tab layout (case-insensitive), also allowing the
+/// hyphenated and spaced spellings people reach for.
+fn parse_worktrees_layout(raw: &str) -> Result<&'static str> {
+    let trimmed = raw.trim().replace(['-', ' '], "_");
+    if let Some((id, _)) = config::WORKTREES_LAYOUTS
+        .iter()
+        .find(|(id, _)| trimmed.eq_ignore_ascii_case(id))
+    {
+        return Ok(*id);
+    }
+    bail!(
+        "unknown layout {:?}; choose one of: {}",
+        raw.trim(),
+        config::WORKTREES_LAYOUTS
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>()
+            .join(", ")
     )
 }
 
@@ -1136,6 +1198,7 @@ mod tests {
             open_command: open_command.iter().map(|c| c.to_string()).collect(),
             auto_update_check: String::new(),
             diff_theme: String::new(),
+            worktrees_layout: String::new(),
             copy: copy.to_string(),
             run: run.to_string(),
         }
@@ -1261,6 +1324,100 @@ mod tests {
                 .auto_update_check,
             ""
         );
+    }
+
+    #[test]
+    fn worktrees_layout_round_trips_through_the_global_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.toml");
+        std::fs::write(&global, "# global notes\nworktree_dir = \"home\"\n").unwrap();
+
+        let mut edits = fields("", &[], "", "");
+        edits.worktrees_layout = "three_panel".to_string();
+        save_config_edits(dir.path(), Some(&global), &edits).unwrap();
+
+        let text = std::fs::read_to_string(&global).unwrap();
+        assert!(text.contains("# global notes"), "comment lost: {text}");
+        assert_eq!(
+            FileConfig::load(&global).unwrap().worktrees_layout,
+            Some(config::WorktreesLayout::ThreePanel)
+        );
+        // The layout is about wtm, not this repo, so the repo file stays clean.
+        let repo = FileConfig::load(&dir.path().join(CONFIG_FILE)).unwrap();
+        assert_eq!(repo.worktrees_layout, None);
+        let read = repo_config_fields(dir.path(), Some(&global)).unwrap();
+        assert_eq!(read.worktrees_layout, "three_panel");
+
+        // Clearing it removes the key so the two-panel default applies again.
+        edits.worktrees_layout = String::new();
+        save_config_edits(dir.path(), Some(&global), &edits).unwrap();
+        assert_eq!(FileConfig::load(&global).unwrap().worktrees_layout, None);
+        assert_eq!(
+            repo_config_fields(dir.path(), Some(&global))
+                .unwrap()
+                .worktrees_layout,
+            ""
+        );
+    }
+
+    /// A prior `wtm config set worktrees_layout` (repo layer) must not keep
+    /// winning after the user picks a layout in Settings and saves.
+    #[test]
+    fn settings_save_clears_a_repo_worktrees_layout_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_file = dir.path().join(CONFIG_FILE);
+        std::fs::write(
+            &repo_file,
+            "worktree_dir = \"sibling\"\nworktrees_layout = \"two_panel\"\n",
+        )
+        .unwrap();
+        let global = dir.path().join("global.toml");
+        std::fs::write(&global, "worktrees_layout = \"three_panel\"\n").unwrap();
+
+        // Effective value is the repo override, which is what the editor shows.
+        let read = repo_config_fields(dir.path(), Some(&global)).unwrap();
+        assert_eq!(read.worktrees_layout, "two_panel");
+
+        let mut edits = fields("sibling", &[], "", "");
+        edits.worktrees_layout = "three_panel".to_string();
+        save_config_edits(dir.path(), Some(&global), &edits).unwrap();
+
+        let repo = FileConfig::load(&repo_file).unwrap();
+        assert_eq!(
+            repo.worktrees_layout, None,
+            "repo override must be cleared so Settings takes effect"
+        );
+        assert_eq!(
+            FileConfig::load(&global).unwrap().worktrees_layout,
+            Some(config::WorktreesLayout::ThreePanel)
+        );
+        let cfg = Config::merge(
+            FileConfig::load(&global).unwrap(),
+            FileConfig::load(&repo_file).unwrap(),
+        );
+        assert_eq!(cfg.worktrees_layout(), config::WorktreesLayout::ThreePanel);
+        assert_eq!(cfg.worktrees_layout_source, config::Source::Global);
+    }
+
+    #[test]
+    fn setting_worktrees_layout_writes_a_known_value() {
+        let mut doc = DocumentMut::new();
+        apply_set(&mut doc, "worktrees_layout", "Three-Panel").unwrap();
+        assert_eq!(doc.to_string().trim(), "worktrees_layout = \"three_panel\"");
+        // It must round-trip through the strict FileConfig parser.
+        let cfg: FileConfig = toml::from_str(&doc.to_string()).unwrap();
+        assert_eq!(
+            cfg.worktrees_layout,
+            Some(config::WorktreesLayout::ThreePanel)
+        );
+        assert!(apply_unset(&mut doc, "worktrees_layout").unwrap());
+        assert_eq!(doc.to_string().trim(), "");
+
+        let err = apply_set(&mut doc, "worktrees_layout", "four_panel")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown layout"), "{err}");
+        assert!(err.contains("two_panel"), "{err}");
     }
 
     #[test]

@@ -208,6 +208,40 @@ pub const WORKTREES: &[Binding] = &[
     both("q", "quit", "quit"),
 ];
 
+/// Footer hints for the three-panel Worktrees layout while the worktree list
+/// holds the focus. The full worktree keys still apply (see `WORKTREES`); this
+/// only re-labels what the panels below the list do.
+pub const WORKTREES_THREE_PANEL: &[Binding] = &[
+    both("⇥", "tabs", "cycle the tabs (⇧Tab to go back)"),
+    help_only("↑/↓ or j/k", "select worktree"),
+    both(
+        "Enter",
+        "changed files",
+        "focus the changed-file panel below",
+    ),
+    both("⇧↑/⇧↓", "scroll diff", "scroll the diff (or J/K)"),
+    both("n", "new", "new worktree (new branch or existing branch)"),
+    both(
+        "c",
+        "commit",
+        "commit (pick files, all selected by default)",
+    ),
+    both("?", "help", "show this help"),
+    both("q", "quit", "quit"),
+];
+
+/// Footer hints for the three-panel Worktrees layout while the changed-file
+/// panel holds the focus: the Changes-tab keys, except that q/Esc go back to
+/// the worktree list instead of quitting.
+pub const WORKTREE_FILES: &[Binding] = &[
+    help_only("↑/↓ or j/k", "move the file cursor"),
+    both("⇧↑/⇧↓", "scroll diff", "scroll the diff (or J/K)"),
+    both("Enter", "open", "open the file in your default app"),
+    both("Space", "mark", "mark a file (or folder) for commit"),
+    both("c", "commit", "commit the marked files"),
+    both("q/Esc", "worktrees", "focus the worktree list again"),
+];
+
 pub const BRANCHES: &[Binding] = &[
     both("⇥", "tabs", "cycle the 5 tabs (⇧Tab to go back)"),
     help_only("↑/↓ or j/k", "select branch"),
@@ -309,15 +343,15 @@ pub const STASH_LIST: &[Binding] = &[
 ];
 
 pub const SETTINGS: &[Binding] = &[
-    both("↑/↓", "select", "move between settings and the action rows"),
+    both("↑/↓", "select", "move between settings and the check-for-updates row"),
     both(
         "Enter",
         "edit/run",
-        "edit the selected setting, cycle auto_update_check or diff_theme, save, or check for updates",
+        "edit or cycle the selected setting (writes immediately), or check for updates",
     ),
     help_only(
         "Space",
-        "cycle auto_update_check or diff_theme on those rows",
+        "cycle auto_update_check, diff_theme, or worktrees_layout on those rows (writes immediately)",
     ),
     help_only(
         "open_command",
@@ -402,8 +436,8 @@ const BASICS_SECTIONS: &[Section] = &[
         heading: "settings tab  (Tab)",
         bindings: SETTINGS,
         notes: &[
-            "edits the repo's .wtm.toml; leaving the tab discards unsaved changes.",
-            "auto_update_check is saved in the global config, so it applies to every repo.",
+            "edits write to .wtm.toml (and the global config for UI prefs) as soon as you change a row; Esc cancels an in-progress text edit.",
+            "auto_update_check, diff_theme, and worktrees_layout are saved in the global config, so they apply to every repo.",
             "open_command holds one command or several, edited as a list; o shows them expanded ({path}, {name}, {branch}, {status}) in a picker.",
         ],
     },
@@ -418,11 +452,29 @@ const BASICS_SECTIONS: &[Section] = &[
     },
 ];
 
-const WORKTREES_SECTIONS: &[Section] = &[Section {
-    heading: "worktrees tab",
-    bindings: WORKTREES,
-    notes: &[],
-}];
+const WORKTREES_SECTIONS: &[Section] = &[
+    Section {
+        heading: "worktrees tab",
+        bindings: WORKTREES,
+        notes: &[
+            "with worktrees_layout set to three_panel (Settings tab), Enter focuses the",
+            "changed-file panel below the list instead of opening the Changes tab; see below.",
+        ],
+    },
+    Section {
+        heading: "worktrees tab — three-panel layout  (worktrees_layout = three_panel, list focused)",
+        bindings: WORKTREES_THREE_PANEL,
+        notes: &[
+            "the Changes tab is hidden in this layout; its files and diff live in the",
+            "panel below the worktree list instead.",
+        ],
+    },
+    Section {
+        heading: "changed-file panel  (three-panel layout, after Enter)",
+        bindings: WORKTREE_FILES,
+        notes: &["q or Esc returns focus to the worktree list; it doesn't quit from here."],
+    },
+];
 
 const BRANCHES_SECTIONS: &[Section] = &[Section {
     heading: "branches tab",

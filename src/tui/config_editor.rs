@@ -2,10 +2,12 @@
 //! settings can be changed without editing the file by hand.
 //!
 //! It shows the repo-level settings as editable rows, the update-check toggle,
-//! the diff-theme cycle (with a live colour sample), a save row, and a
-//! "check for updates now" row. Saving preserves comments and only writes the
-//! keys the repo actually sets; a cleared field unsets that key so the default
-//! (or global value) applies again.
+//! the diff-theme cycle (with a live colour sample), the Worktrees-tab layout
+//! cycle, and a "check for updates now" row. Every change is written
+//! immediately (text fields on Enter, cycle rows on Enter/Space, the
+//! open_command list on `[ done ]`), preserving comments and only writing the
+//! keys that are set; a cleared field unsets that key so the default (or
+//! global value) applies again.
 
 use std::path::PathBuf;
 
@@ -27,20 +29,20 @@ pub const OPEN_COMMAND_ROW: usize = 1;
 pub const UPDATE_ROW: usize = TEXT_ROWS;
 /// Index of the diff-theme cycle row.
 pub const THEME_ROW: usize = TEXT_ROWS + 1;
-/// Number of setting rows, text fields plus the two cycle toggles.
-pub const FIELD_ROWS: usize = TEXT_ROWS + 2;
-/// Index of the save row.
-pub const SAVE_ROW: usize = FIELD_ROWS;
+/// Index of the Worktrees-tab layout cycle row.
+pub const LAYOUT_ROW: usize = TEXT_ROWS + 2;
+/// Number of setting rows, text fields plus the three cycle rows.
+pub const FIELD_ROWS: usize = TEXT_ROWS + 3;
 /// Index of the "check for updates now" row.
-pub const CHECK_ROW: usize = FIELD_ROWS + 1;
+pub const CHECK_ROW: usize = FIELD_ROWS;
 /// Total selectable rows.
-pub const ROWS: usize = FIELD_ROWS + 2;
+pub const ROWS: usize = FIELD_ROWS + 1;
 
 // Line offsets within the Settings tab's rendered form, so the renderer and
 // the click handler cannot drift apart. Each setting row draws a value line
 // followed by a dim hint line, filling `FIELD_ROWS * 2` lines. After that:
 // the worktree-location preview, a labelled theme-colour sample, the version
-// line, then the two action rows.
+// line, then the check-for-updates action row.
 /// Line showing where worktrees will actually be created.
 pub const PREVIEW_LINE: usize = FIELD_ROWS * 2;
 /// Label line above the theme colour sample ("diff colours look like").
@@ -52,8 +54,7 @@ pub const THEME_PREVIEW_SAMPLE_LINES: usize = 3;
 pub const THEME_PREVIEW_LINE: usize = THEME_PREVIEW_LABEL_LINE + 1;
 /// Line showing the running version and any update found.
 pub const VERSION_LINE: usize = THEME_PREVIEW_LINE + THEME_PREVIEW_SAMPLE_LINES;
-pub const SAVE_LINE: usize = VERSION_LINE + 1;
-pub const CHECK_LINE: usize = SAVE_LINE + 1;
+pub const CHECK_LINE: usize = VERSION_LINE + 1;
 /// Total lines the form occupies.
 pub const FORM_LINES: usize = CHECK_LINE + 1;
 
@@ -61,7 +62,6 @@ pub const FORM_LINES: usize = CHECK_LINE + 1;
 /// preview, theme sample, and version lines, which are not selectable.
 pub fn row_at_line(line: usize) -> Option<usize> {
     match line {
-        SAVE_LINE => Some(SAVE_ROW),
         CHECK_LINE => Some(CHECK_ROW),
         // Only a field's value line (the even offset) selects it; its hint line
         // below is decoration.
@@ -73,13 +73,14 @@ pub fn row_at_line(line: usize) -> Option<usize> {
 /// State of the Settings tab's editor.
 pub struct ConfigEditor {
     pub repo_root: PathBuf,
-    /// The global config file `auto_update_check` / `diff_theme` are read from
-    /// and written to, resolved once at load so a save cannot land somewhere
-    /// else. `None` on a system with no locatable global config.
+    /// The global config file `auto_update_check`, `diff_theme`, and
+    /// `worktrees_layout` are read from and written to, resolved once at load
+    /// so a save cannot land somewhere else. `None` on a system with no
+    /// locatable global config.
     pub global_config: Option<PathBuf>,
     /// The setting values as shown, each empty when unset.
     pub fields: RepoConfigFields,
-    /// Selected row: 0..FIELD_ROWS edit a setting, then save, then check-now.
+    /// Selected row: 0..FIELD_ROWS edit a setting, then check-now.
     pub selected: usize,
     /// Cursor-aware buffer while editing the selected row; `None` when
     /// navigating. Shares `TextInput` with the other prompts so `←/→`,
@@ -265,7 +266,8 @@ impl ConfigEditor {
             2 => &self.fields.copy,
             3 => &self.fields.run,
             UPDATE_ROW => &self.fields.auto_update_check,
-            _ => &self.fields.diff_theme,
+            THEME_ROW => &self.fields.diff_theme,
+            _ => &self.fields.worktrees_layout,
         }
     }
 
@@ -293,6 +295,7 @@ impl ConfigEditor {
             3 => self.fields.run = value,
             UPDATE_ROW => self.fields.auto_update_check = value,
             THEME_ROW => self.fields.diff_theme = value,
+            LAYOUT_ROW => self.fields.worktrees_layout = value,
             // `open_command` is edited as a list, never as one text value.
             _ => {}
         }
@@ -327,8 +330,28 @@ impl ConfigEditor {
         }
     }
 
-    /// Writes every field to disk and applies the chosen diff theme. Shared by
-    /// the save row and by finishing the open_command list editor.
+    /// Cycles the Worktrees-tab layout through the catalog, then back to the
+    /// default (empty string) so the inherited default stays reachable.
+    fn cycle_worktrees_layout(&mut self) {
+        let layouts = config::WORKTREES_LAYOUTS;
+        let current = self.fields.worktrees_layout.as_str();
+        if current.is_empty() {
+            self.fields.worktrees_layout = layouts[0].0.to_string();
+            return;
+        }
+        let idx = layouts
+            .iter()
+            .position(|(id, _)| *id == current)
+            .unwrap_or(0);
+        if idx + 1 >= layouts.len() {
+            self.fields.worktrees_layout.clear();
+        } else {
+            self.fields.worktrees_layout = layouts[idx + 1].0.to_string();
+        }
+    }
+
+    /// Writes every field to disk and applies the chosen diff theme. Called
+    /// after each edit so Settings never holds unsaved changes.
     fn save_fields(&mut self, message: &mut Option<String>) -> EditorOutcome {
         match settings::save_config_edits(
             &self.repo_root,
@@ -375,12 +398,15 @@ impl ConfigEditor {
             }
         }
         // While editing, work on the buffer taken out of `self`; Esc and Enter
-        // leave it out (cancel / commit), other keys drive the text input and
-        // put the edited buffer back.
+        // leave it out (cancel / commit+save), other keys drive the text input
+        // and put the edited buffer back.
         if let Some(mut input) = self.editing.take() {
             match key.code {
                 KeyCode::Esc => {}
-                KeyCode::Enter => self.set_field(self.selected, input.trimmed()),
+                KeyCode::Enter => {
+                    self.set_field(self.selected, input.trimmed());
+                    return self.save_fields(message);
+                }
                 _ => {
                     input.on_key(key);
                     self.editing = Some(input);
@@ -399,16 +425,19 @@ impl ConfigEditor {
             KeyCode::Enter if self.selected == CHECK_ROW => {
                 return EditorOutcome::CheckForUpdates;
             }
-            KeyCode::Enter if self.selected == SAVE_ROW => {
+            // The toggles have no free text to type, so Enter and Space both
+            // flip them and write immediately.
+            KeyCode::Enter | KeyCode::Char(' ') if self.selected == UPDATE_ROW => {
+                self.cycle_auto_update_check();
                 return self.save_fields(message);
             }
-            // The toggles have no free text to type, so Enter and Space both
-            // flip them instead of opening an input.
-            KeyCode::Enter | KeyCode::Char(' ') if self.selected == UPDATE_ROW => {
-                self.cycle_auto_update_check()
-            }
             KeyCode::Enter | KeyCode::Char(' ') if self.selected == THEME_ROW => {
-                self.cycle_diff_theme()
+                self.cycle_diff_theme();
+                return self.save_fields(message);
+            }
+            KeyCode::Enter | KeyCode::Char(' ') if self.selected == LAYOUT_ROW => {
+                self.cycle_worktrees_layout();
+                return self.save_fields(message);
             }
             // The list row opens its own editor rather than a text input, so
             // a command containing a comma stays one entry.
@@ -493,6 +522,25 @@ mod tests {
         assert_eq!(ed.fields.diff_theme, DIFF_THEMES[DIFF_THEMES.len() - 1].0);
         press(&mut ed, KeyCode::Enter);
         assert_eq!(ed.fields.diff_theme, "", "wraps back to the default");
+    }
+
+    #[test]
+    fn layout_row_cycles_through_layouts_then_default() {
+        let mut ed = editor();
+        ed.selected = LAYOUT_ROW;
+        press(&mut ed, KeyCode::Enter);
+        assert_eq!(ed.fields.worktrees_layout, "two_panel");
+        assert!(
+            ed.editing.is_none(),
+            "the layout row must not open a text input"
+        );
+        press(&mut ed, KeyCode::Char(' '));
+        assert_eq!(ed.fields.worktrees_layout, "three_panel");
+        press(&mut ed, KeyCode::Enter);
+        assert_eq!(
+            ed.fields.worktrees_layout, "",
+            "the inherited default stays reachable"
+        );
     }
 
     /// Types `text` into whatever input is open, one key at a time.
@@ -658,10 +706,8 @@ mod tests {
     }
 
     #[test]
-    fn save_and_check_rows_are_past_the_fields() {
-        assert_eq!(SAVE_ROW, FIELD_ROWS);
-        assert_eq!(CHECK_ROW, FIELD_ROWS + 1);
-        assert_eq!(row_at_line(SAVE_LINE), Some(SAVE_ROW));
+    fn check_row_is_past_the_fields() {
+        assert_eq!(CHECK_ROW, FIELD_ROWS);
         assert_eq!(row_at_line(CHECK_LINE), Some(CHECK_ROW));
         assert_eq!(row_at_line(PREVIEW_LINE), None);
         assert_eq!(row_at_line(THEME_PREVIEW_LABEL_LINE), None);

@@ -160,7 +160,7 @@ pub const THEME_PREVIEW_SAMPLE: &str = "\
 ";
 
 /// Renders [`THEME_PREVIEW_SAMPLE`] with `theme_id`'s palette without touching
-/// the process-wide active theme (so an unsaved Settings cycle stays a preview).
+/// the process-wide active theme (Settings cycles apply on change).
 pub fn theme_preview_lines(theme_id: &str) -> Vec<Line<'static>> {
     render_with_theme(
         "preview.rs",

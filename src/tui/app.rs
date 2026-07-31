@@ -17,6 +17,7 @@ use super::help::HelpTab;
 use super::highlight;
 use super::setup::{self, SetupWizard, WizardOutcome};
 use super::theme;
+use crate::config::WorktreesLayout;
 use crate::conflict::{self, ConflictSegment, ResolutionAction};
 use crate::git::{self, GraphLine, LogEntry, StashEntry, StatusEntry};
 use crate::ops::{self, BranchListItem, ConflictFile, Ctx, SetupControl, WorktreeInfo};
@@ -999,6 +1000,18 @@ pub enum ForceBranchReason {
     CheckedOutElsewhere(String),
 }
 
+/// Which panel of the three-panel Worktrees tab owns the keyboard. The diff
+/// pane never takes focus: it is scrolled remotely (Shift+arrows, J/K/H/L, or
+/// the wheel over it), the same way the Changes tab scrolls it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WorktreesFocus {
+    /// The worktree list on top.
+    #[default]
+    List,
+    /// The changed-file list at the bottom left.
+    Files,
+}
+
 /// The top-level tabs of the main window. `View::List` renders whichever tab
 /// is active; overlays (create, diff, switch, …) draw on top of it and leave
 /// the active tab intact when they close.
@@ -1187,7 +1200,18 @@ pub struct App {
     pub preview_list: Option<RowList>,
     /// Active top-level tab. Only meaningful while `view` is `View::List`.
     pub tab: Tab,
-    /// Content of the Changes tab, populated by `open_changes_tab`.
+    /// Whether the Worktrees tab is drawing three panels. The configured
+    /// layout, unless the terminal is too short to fit it: the renderer
+    /// recomputes it each frame (see `ui::draw`), and the key, mouse, and tab
+    /// handlers read it so they always match what is on screen.
+    pub three_panel: bool,
+    /// Which panel of the three-panel Worktrees tab has the keyboard.
+    pub worktrees_focus: WorktreesFocus,
+    /// Geometry of the three-panel layout's changed-file rows, recorded by the
+    /// renderer each frame so clicks and the wheel can be resolved against it.
+    pub files_list: Option<RowList>,
+    /// Content of the Changes tab, populated by `open_changes_tab`. Also feeds
+    /// the bottom two panels of the three-panel Worktrees layout.
     pub changes: ChangesTab,
     /// Branches shown on the Branches tab, loaded by `load_branches`. Kept
     /// on screen (stale) while a background reload is in flight, so
@@ -1210,7 +1234,7 @@ pub struct App {
     /// Cursor into `stash_entries` on the Stash tab.
     pub stash_selected: usize,
     /// The repo's `.wtm.toml` as edited on the Settings tab. Reloaded from disk
-    /// every time the tab is entered, so leaving it discards unsaved edits.
+    /// every time the tab is entered; edits write immediately on change.
     pub settings: ConfigEditor,
     /// The screen currently on top and interacting with the user. Always the
     /// top of the navigation stack: `push_screen` moves it onto `stack` and puts
@@ -1308,6 +1332,10 @@ impl App {
         // An uninitialized repo opens into the setup wizard instead of the
         // worktree list; everything else waits until `.wtm.toml` exists.
         let initialized = setup::is_initialized(&ctx.repo_root);
+        // The renderer refines this each frame (a short terminal falls back to
+        // two panels); seed it so the first key press already agrees with the
+        // configured layout.
+        let config_three_panel = ctx.config.worktrees_layout() == WorktreesLayout::ThreePanel;
         let view = if initialized {
             View::List
         } else {
@@ -1323,6 +1351,9 @@ impl App {
             preview_scroll: 0,
             preview_list: None,
             tab: Tab::Worktrees,
+            three_panel: config_three_panel,
+            worktrees_focus: WorktreesFocus::default(),
+            files_list: None,
             changes: ChangesTab::default(),
             branches: Vec::new(),
             branch_selected: 0,
@@ -1680,10 +1711,21 @@ impl App {
             }
             return;
         }
+        // The Changes tab folded away under the three-panel layout (a config
+        // change, or a terminal that grew back to full height): move what the
+        // user was looking at into the Worktrees tab's file panel.
+        if self.tab_hidden(self.tab) && matches!(self.view, View::List) {
+            self.tab = Tab::Worktrees;
+            self.worktrees_focus = WorktreesFocus::Files;
+        }
         // The Changes tab keeps its diff fresh while it is the visible screen;
         // a drill-in pushed on top of it (a log, a commit browser) owns the
         // tick instead, so the tab only polls while `view` is back at the root.
-        if self.tab == Tab::Changes && matches!(self.view, View::List) {
+        // The three-panel Worktrees tab shows the same diff, so it polls and
+        // refreshes on the same schedule.
+        let diff_on_screen =
+            self.tab == Tab::Changes || (self.tab == Tab::Worktrees && self.three_panel);
+        if diff_on_screen && matches!(self.view, View::List) {
             self.poll_diff_load();
             if self.changes.last_refresh.elapsed() >= DIFF_REFRESH_INTERVAL {
                 self.refresh_diff();
@@ -2632,6 +2674,11 @@ impl App {
             return;
         }
         match self.tab {
+            // In the three-panel layout the changed-file panel can hold the
+            // keyboard instead of the worktree list above it.
+            Tab::Worktrees if self.three_panel && self.worktrees_focus == WorktreesFocus::Files => {
+                self.on_worktrees_files_key(key)
+            }
             Tab::Worktrees => self.on_worktrees_tab_key(key),
             Tab::Changes => self.on_changes_tab_key(key),
             Tab::Branches => self.on_branches_tab_key(key),
@@ -2643,18 +2690,40 @@ impl App {
     /// Cycles to the next (`forward`) or previous top-level tab, then runs
     /// whatever "on entry" loader that tab needs so its content isn't stale.
     fn cycle_tab(&mut self, forward: bool) {
-        let next = if forward {
-            self.tab.next()
-        } else {
-            self.tab.prev()
-        };
+        let step = |tab: Tab| if forward { tab.next() } else { tab.prev() };
+        let mut next = step(self.tab);
+        // The three-panel layout folds the Changes tab into the Worktrees tab,
+        // so the cycle steps straight past it.
+        if self.tab_hidden(next) {
+            next = step(next);
+        }
         self.select_tab(next);
+    }
+
+    /// Whether `tab` is currently folded away: the Changes tab is part of the
+    /// Worktrees tab under the three-panel layout, so it is kept out of the tab
+    /// bar and the Tab-key cycle.
+    pub fn tab_hidden(&self, tab: Tab) -> bool {
+        self.three_panel && tab == Tab::Changes
     }
 
     /// Switches to `tab` and runs its "on entry" loader, the same work
     /// `cycle_tab` does. Re-selecting the active tab still reloads it, matching
     /// what a click on the current tab implies (refresh what I'm looking at).
     pub fn select_tab(&mut self, tab: Tab) {
+        // Under the three-panel layout the Changes tab has no tab of its own:
+        // asking for it means focusing the changed-file panel on the Worktrees
+        // tab, which `open_changes_tab` already knows how to do.
+        if self.tab_hidden(tab) {
+            self.tab = Tab::Worktrees;
+            match self.selected_worktree().map(|w| w.name.clone()) {
+                Some(name) => self.open_changes_tab(name),
+                None => self.worktrees_focus = WorktreesFocus::Files,
+            }
+            return;
+        }
+        // Any other tab switch lands back on the worktree list.
+        self.worktrees_focus = WorktreesFocus::List;
         self.tab = tab;
         match self.tab {
             Tab::Branches => self.load_branches(0),
@@ -2679,6 +2748,18 @@ impl App {
     fn on_worktrees_tab_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            // Three-panel: the panel below the list is the diff, scrolled
+            // remotely with the same keys the Changes tab uses.
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) && self.three_panel => {
+                self.scroll_diff(|s| s.saturating_sub(3));
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) && self.three_panel => {
+                self.scroll_diff(|s| s.saturating_add(3));
+            }
+            KeyCode::Char('J') if self.three_panel => self.scroll_diff(|s| s.saturating_add(3)),
+            KeyCode::Char('K') if self.three_panel => self.scroll_diff(|s| s.saturating_sub(3)),
+            KeyCode::Char('L') if self.three_panel => self.scroll_diff_h(|s| s.saturating_add(8)),
+            KeyCode::Char('H') if self.three_panel => self.scroll_diff_h(|s| s.saturating_sub(8)),
             // Shift+↑/↓ scrolls the changed-file preview below the table; the
             // plain arrows still move the worktree cursor.
             KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -2735,6 +2816,18 @@ impl App {
         }
     }
 
+    /// Keys while the changed-file panel of the three-panel Worktrees layout
+    /// holds the focus. Identical to the Changes tab, except that q/Esc hand
+    /// the keyboard back to the worktree list rather than quitting: the app
+    /// only quits from the list, so focus is never a trap.
+    fn on_worktrees_files_key(&mut self, key: KeyEvent) {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+            self.worktrees_focus = WorktreesFocus::List;
+            return;
+        }
+        self.on_changes_tab_key(key);
+    }
+
     /// Opens the rename prompt for the selected worktree, prefilled with its
     /// current name. Refuses the main worktree (it is the repository itself).
     fn open_rename_worktree(&mut self) {
@@ -2771,12 +2864,32 @@ impl App {
     }
 
     /// Switches to the Changes tab, loaded with the worktree named `name`.
+    /// Under the three-panel layout those changes are already on screen below
+    /// the worktree list, so this focuses that panel instead of switching tabs.
     fn open_changes_tab(&mut self, name: String) {
+        if self.three_panel {
+            // The panel follows the worktree cursor (`sync_three_panel_changes`),
+            // so it usually holds `name` already; only a mismatch needs a load.
+            if self.changes.name != name && !self.load_changes(name) {
+                return;
+            }
+            self.worktrees_focus = WorktreesFocus::Files;
+            return;
+        }
+        if self.load_changes(name) {
+            self.tab = Tab::Changes;
+        }
+    }
+
+    /// Points the changes pane (the Changes tab, or the bottom two panels of
+    /// the three-panel Worktrees layout) at the worktree named `name`, reading
+    /// its status now. Returns false when status failed, having already put the
+    /// error on screen.
+    fn load_changes(&mut self, name: String) -> bool {
         match ops::status(&self.ctx, &name) {
             Ok((_, files)) => {
                 let marked = vec![true; files.len()];
                 let rows = build_rows(&files, self.file_tree, &self.collapsed_folders);
-                self.tab = Tab::Changes;
                 self.changes = ChangesTab {
                     name,
                     files,
@@ -2785,8 +2898,12 @@ impl App {
                     ..ChangesTab::default()
                 };
                 self.load_diff_content(true);
+                true
             }
-            Err(e) => self.set_error(format!("{e:#}")),
+            Err(e) => {
+                self.set_error(format!("{e:#}"));
+                false
+            }
         }
     }
 
@@ -2795,8 +2912,9 @@ impl App {
     /// that file's diff. A path that no longer shows up as changed (the status
     /// is re-read on the way in) just leaves the cursor at the top.
     fn open_changes_tab_at(&mut self, name: String, path: &str) {
-        self.open_changes_tab(name);
-        if self.tab != Tab::Changes {
+        self.open_changes_tab(name.clone());
+        // Status may have failed, leaving the pane on another worktree.
+        if self.changes.name != name {
             return;
         }
         let Some(file) = self.changes.files.iter().position(|f| f.path == path) else {
@@ -2958,6 +3076,36 @@ impl App {
             .is_some_and(|rl| rl.contains(mouse.column, mouse.row));
         // Worktrees tab: the wheel steps the worktree cursor over the table and
         // scrolls the changed-file preview over the panel below it.
+        if matches!(self.view, View::List) && self.tab == Tab::Worktrees && self.three_panel {
+            // Three panels, three destinations: the file rows step the file
+            // cursor, the worktree rows step the worktree cursor, and anywhere
+            // else (the diff) scrolls the diff text.
+            if self
+                .files_list
+                .is_some_and(|rl| rl.contains(mouse.column, mouse.row))
+            {
+                let c = &mut self.changes;
+                let moved = if down {
+                    (c.selected + 1 < c.rows.len()).then(|| c.selected += 1)
+                } else {
+                    (c.selected > 0).then(|| c.selected -= 1)
+                };
+                if moved.is_some() {
+                    self.load_diff_content(true);
+                }
+            } else if over_list {
+                if down {
+                    if self.selected + 1 < self.worktrees.len() {
+                        self.selected += 1;
+                    }
+                } else if self.selected > 0 {
+                    self.selected -= 1;
+                }
+            } else {
+                self.changes.scroll = delta(self.changes.scroll);
+            }
+            return;
+        }
         if matches!(self.view, View::List) && self.tab == Tab::Worktrees {
             if self
                 .preview_list
@@ -3047,7 +3195,16 @@ impl App {
     /// A double click activates whatever the cursor now sits on: on the Changes
     /// tab that opens the file (or expands the folder), matching Enter.
     fn on_double_click(&mut self) {
-        if matches!(self.view, View::List) && self.tab == Tab::Changes {
+        if !matches!(self.view, View::List) {
+            return;
+        }
+        // The three-panel layout's file panel is the Changes tab's list, so a
+        // double click there activates the row the same way.
+        let on_files = self.tab == Tab::Changes
+            || (self.tab == Tab::Worktrees
+                && self.three_panel
+                && self.worktrees_focus == WorktreesFocus::Files);
+        if on_files {
             self.activate_changes_row();
         }
     }
@@ -3137,6 +3294,17 @@ impl App {
             self.last_click = None;
             return;
         }
+        // Three-panel layout: a click in the changed-file panel takes the focus
+        // (the mouse equivalent of Enter) and lands the cursor on that file.
+        if let Some(idx) = self.files_list.and_then(|rl| rl.hit(col, row)) {
+            self.worktrees_focus = WorktreesFocus::Files;
+            let c = &mut self.changes;
+            if idx < c.rows.len() && c.selected != idx {
+                c.selected = idx;
+                self.load_diff_content(true);
+            }
+            return;
+        }
         // A click on a changed file in the Worktrees tab's preview opens that
         // file's diff on the Changes tab, the mouse equivalent of Enter.
         if let Some(idx) = self.preview_list.and_then(|rl| rl.hit(col, row)) {
@@ -3168,6 +3336,9 @@ impl App {
         match self.view {
             View::List => match self.tab {
                 Tab::Worktrees => {
+                    // A click on the worktree table takes the focus back from
+                    // the three-panel layout's file panel.
+                    self.worktrees_focus = WorktreesFocus::List;
                     if idx < self.worktrees.len() && self.selected != idx {
                         self.selected = idx;
                         self.preview_scroll = 0;
@@ -4753,6 +4924,37 @@ impl App {
         }
         self.worktree_preview = files;
         self.preview_for = Some(idx);
+        self.sync_three_panel_changes();
+    }
+
+    /// Hands a freshly loaded worktree status to the three-panel layout's
+    /// changed-file and diff panels, so moving the worktree cursor swaps them
+    /// without an `ops::status` on the UI thread. The status itself comes from
+    /// the preview loader, which already drops results for a selection the
+    /// cursor has since moved off.
+    fn sync_three_panel_changes(&mut self) {
+        if !self.three_panel {
+            return;
+        }
+        let Some(name) = self.worktrees.get(self.selected).map(|w| w.name.clone()) else {
+            return;
+        };
+        // Already showing this worktree: leave the cursor, marks, and scroll
+        // alone (the periodic `refresh_diff` keeps the contents current).
+        if self.changes.name == name {
+            return;
+        }
+        let files = self.worktree_preview.clone();
+        let marked = vec![true; files.len()];
+        let rows = build_rows(&files, self.file_tree, &self.collapsed_folders);
+        self.changes = ChangesTab {
+            name,
+            files,
+            marked,
+            rows,
+            ..ChangesTab::default()
+        };
+        self.load_diff_content(true);
     }
 
     /// Whether the Worktrees tab preview is waiting on status for the current
@@ -10220,26 +10422,21 @@ mod tests {
         goto_settings(&mut app);
         assert_eq!(app.tab, Tab::Settings);
 
-        // Edit worktree_dir (row 0): clear, type "inside".
+        // Edit worktree_dir (row 0): clear, type "inside". Enter writes immediately.
         press(&mut app, KeyCode::Enter);
         type_str(&mut app, "inside");
         press(&mut app, KeyCode::Enter);
+        assert!(app.message.as_deref().unwrap().contains("saved"));
+        assert_eq!(app.ctx.config.worktree_dir.as_deref(), Some("inside"));
+
         // Move past open_command (row 1) to setup.copy (row 2) and set it.
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Enter);
         type_str(&mut app, ".env, config/.env.local");
         press(&mut app, KeyCode::Enter);
-        // Walk down to the save row and save.
-        while app.settings.selected < config_editor::SAVE_ROW {
-            press(&mut app, KeyCode::Down);
-        }
-        press(&mut app, KeyCode::Enter);
 
         assert_eq!(app.tab, Tab::Settings, "saving stays on the tab");
-        assert!(app.message.as_deref().unwrap().contains("saved"));
-        // The live config reflects the change without a reload.
-        assert_eq!(app.ctx.config.worktree_dir.as_deref(), Some("inside"));
         let text = std::fs::read_to_string(app.ctx.repo_root.join(".wtm.toml")).unwrap();
         assert!(text.contains("worktree_dir = \"inside\""), "{text}");
         assert!(text.contains(".env"), "{text}");
@@ -10277,7 +10474,7 @@ mod tests {
             ]
         );
         // Leaving and re-entering the tab reloads from disk; the list must
-        // still be there without visiting [ save settings ].
+        // still be there ( [ done ] already wrote it ).
         app.select_tab(Tab::Worktrees);
         goto_settings(&mut app);
         assert_eq!(
@@ -10432,13 +10629,8 @@ mod tests {
             press(&mut app, KeyCode::Backspace);
         }
         press(&mut app, KeyCode::Enter);
-        // Save (down past the other settings to the save row).
-        while app.settings.selected < config_editor::SAVE_ROW {
-            press(&mut app, KeyCode::Down);
-        }
-        press(&mut app, KeyCode::Enter);
-
-        assert!(matches!(app.view, View::List));
+        // Enter commits the empty value and writes immediately.
+        assert_eq!(app.tab, Tab::Settings);
         let text = std::fs::read_to_string(app.ctx.repo_root.join(".wtm.toml")).unwrap();
         assert!(!text.contains("worktree_dir"), "should be unset: {text}");
         assert!(text.contains(".env"), "copy should remain: {text}");
@@ -10451,8 +10643,8 @@ mod tests {
         goto_settings(&mut app);
         press(&mut app, KeyCode::Enter);
         type_str(&mut app, "home");
-        press(&mut app, KeyCode::Enter);
-        press(&mut app, KeyCode::Esc); // cancel without saving
+        press(&mut app, KeyCode::Esc); // cancel the in-progress edit
+        press(&mut app, KeyCode::Esc); // quit
         assert!(matches!(app.view, View::List));
         let after = std::fs::read_to_string(app.ctx.repo_root.join(".wtm.toml")).unwrap();
         assert_eq!(before, after, "cancel must not write the file");
@@ -10632,15 +10824,9 @@ mod tests {
         while app.settings.selected < config_editor::UPDATE_ROW {
             press(&mut app, KeyCode::Down);
         }
-        press(&mut app, KeyCode::Enter); // default -> on
-        press(&mut app, KeyCode::Enter); // on -> off
+        press(&mut app, KeyCode::Enter); // default -> on (writes)
+        press(&mut app, KeyCode::Enter); // on -> off (writes)
         assert_eq!(app.settings.fields.auto_update_check, "false");
-        // Skip the diff_theme cycle row that sits between the update toggle and
-        // the save action.
-        while app.settings.selected < config_editor::SAVE_ROW {
-            press(&mut app, KeyCode::Down);
-        }
-        press(&mut app, KeyCode::Enter);
 
         let text = std::fs::read_to_string(&global).unwrap();
         assert!(text.contains("auto_update_check = false"), "{text}");
@@ -11518,5 +11704,232 @@ mod tests {
             _ => panic!("expected the busy overlay"),
         }
         settle(&mut app);
+    }
+
+    /// An app whose repo asks for the three-panel Worktrees layout, with one
+    /// changed file so the bottom panels have something to show.
+    fn three_panel_app() -> (tempfile::TempDir, App) {
+        let (tmp, mut app) = test_app();
+        app.ctx.config.worktrees_layout = Some(WorktreesLayout::ThreePanel);
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        app.refresh();
+        app.selected = app.worktrees.iter().position(|w| w.is_main).unwrap();
+        // The renderer decides the effective layout, so draw once before the
+        // key handlers are asked about it.
+        render_app(&mut app, 100, 30);
+        settle_preview(&mut app);
+        render_app(&mut app, 100, 30);
+        (tmp, app)
+    }
+
+    /// Enter hands the keyboard to the changed-file panel and q/Esc gives it
+    /// back, so the app still only quits from the worktree list.
+    #[test]
+    fn three_panel_enter_focuses_the_files_panel_and_esc_returns() {
+        let (_tmp, mut app) = three_panel_app();
+        assert!(app.three_panel, "the configured layout is in force");
+        assert_eq!(app.worktrees_focus, WorktreesFocus::List);
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.worktrees_focus, WorktreesFocus::Files);
+        assert_eq!(app.tab, Tab::Worktrees, "no tab switch, just focus");
+        assert_eq!(app.changes.name, app.worktrees[app.selected].name);
+
+        // q from the file panel returns focus instead of quitting.
+        press(&mut app, KeyCode::Char('q'));
+        assert!(!app.quit);
+        assert_eq!(app.worktrees_focus, WorktreesFocus::List);
+
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.quit);
+        assert_eq!(app.worktrees_focus, WorktreesFocus::List);
+
+        // Quit still works from the list.
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.quit);
+    }
+
+    /// The file panel gets the Changes-tab keys: the cursor moves there, not
+    /// over the worktree list.
+    #[test]
+    fn three_panel_files_focus_moves_the_file_cursor() {
+        let (_tmp, mut app) = three_panel_app();
+        let root = app.ctx.repo_root.clone();
+        write_changed_files(&root, 5);
+        app.refresh();
+        app.selected = app.worktrees.iter().position(|w| w.is_main).unwrap();
+        render_app(&mut app, 100, 30);
+        settle_preview(&mut app);
+
+        press(&mut app, KeyCode::Enter);
+        let worktree_cursor = app.selected;
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.changes.selected, 1, "the file cursor moved");
+        assert_eq!(app.selected, worktree_cursor, "the worktree cursor did not");
+    }
+
+    /// The Changes tab is folded into the Worktrees tab, so it is skipped by
+    /// the Tab key, left out of the tab bar, and redirected to the file panel.
+    #[test]
+    fn three_panel_hides_the_changes_tab() {
+        let (_tmp, mut app) = three_panel_app();
+        assert!(app.tab_hidden(Tab::Changes));
+
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.tab, Tab::Branches, "the cycle steps past Changes");
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.tab, Tab::Worktrees, "and back the other way");
+
+        render_app(&mut app, 100, 30);
+        assert!(
+            !app.tab_hits.iter().any(|(_, tab)| *tab == Tab::Changes),
+            "the tab bar doesn't offer it either"
+        );
+
+        // Asking for it anyway (a click, or code calling `select_tab`) lands on
+        // the file panel of the Worktrees tab.
+        app.select_tab(Tab::Changes);
+        assert_eq!(app.tab, Tab::Worktrees);
+        assert_eq!(app.worktrees_focus, WorktreesFocus::Files);
+    }
+
+    /// Moving the worktree cursor swaps the bottom panels to that worktree,
+    /// off the UI thread via the same status load the preview uses.
+    #[test]
+    fn three_panel_changes_follow_the_worktree_cursor() {
+        let (_tmp, mut app) = three_panel_app();
+        add_and_select_worktree(&mut app, "feature");
+        let feature_root = app.worktrees[app.selected].path.clone();
+        std::fs::write(Path::new(&feature_root).join("b.txt"), "b\n").unwrap();
+        render_app(&mut app, 100, 30);
+        settle_preview(&mut app);
+        assert_eq!(app.changes.name, "feature");
+        assert!(app.changes.files.iter().any(|f| f.path == "b.txt"));
+
+        let main = app.worktrees.iter().position(|w| w.is_main).unwrap();
+        app.selected = main;
+        render_app(&mut app, 100, 30);
+        settle_preview(&mut app);
+        assert_eq!(app.changes.name, app.worktrees[main].name);
+        assert!(app.changes.files.iter().any(|f| f.path == "a.txt"));
+    }
+
+    /// A click on either list takes the focus, the mouse equivalent of
+    /// Enter and q.
+    #[test]
+    fn three_panel_clicks_steal_focus() {
+        let (_tmp, mut app) = three_panel_app();
+        let files = app.files_list.expect("the file panel records its geometry");
+        click(&mut app, files.inner.x + 1, files.inner.y);
+        assert_eq!(app.worktrees_focus, WorktreesFocus::Files);
+
+        render_app(&mut app, 100, 30);
+        let list = app
+            .row_list
+            .expect("the worktree list records its geometry");
+        click(&mut app, list.inner.x + 1, list.inner.y + list.header);
+        assert_eq!(app.worktrees_focus, WorktreesFocus::List);
+    }
+
+    /// Too short a terminal falls back to two panels, which brings the Changes
+    /// tab back so the diff is still reachable.
+    #[test]
+    fn three_panel_falls_back_in_a_short_terminal() {
+        let (_tmp, mut app) = three_panel_app();
+        render_app(&mut app, 100, 12);
+        assert!(!app.three_panel);
+        assert!(!app.tab_hidden(Tab::Changes));
+        render_app(&mut app, 100, 30);
+        assert!(app.three_panel, "and comes back when there is room again");
+    }
+
+    /// Nothing about the two-panel path changes: it is still the default, Enter
+    /// opens the Changes tab, and that tab stays in the cycle.
+    #[test]
+    fn two_panel_is_the_default_layout() {
+        let (_tmp, mut app) = test_app();
+        assert_eq!(
+            app.ctx.config.worktrees_layout(),
+            WorktreesLayout::TwoPanel,
+            "an empty config means two panels"
+        );
+        render_app(&mut app, 100, 30);
+        assert!(!app.three_panel);
+        assert!(!app.tab_hidden(Tab::Changes));
+
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.tab, Tab::Changes, "the Changes tab is in the cycle");
+        app.select_tab(Tab::Worktrees);
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.tab, Tab::Changes, "Enter opens the Changes tab");
+        assert_eq!(app.worktrees_focus, WorktreesFocus::List);
+    }
+
+    /// Saving on the Settings tab reloads the merged config, so the next frame
+    /// already draws the newly chosen layout: no restart to switch. A stale
+    /// repo-level override is cleared so Settings (global) actually wins.
+    #[test]
+    fn saving_settings_switches_the_layout_without_a_restart() {
+        let (_tmp, mut app) = test_app();
+        let global = app.settings.global_config.clone().unwrap();
+        std::fs::write(&global, "# test global\n").unwrap();
+
+        // Stale repo override: this is what made Settings saves look like no-ops.
+        let file = app.ctx.repo_root.join(".wtm.toml");
+        let text = std::fs::read_to_string(&file).unwrap();
+        std::fs::write(&file, format!("{text}\nworktrees_layout = \"two_panel\"\n")).unwrap();
+        app.ctx.config = crate::config::Config::merge(
+            crate::config::FileConfig::load(&global).unwrap(),
+            crate::config::FileConfig::load(&file).unwrap(),
+        );
+        render_app(&mut app, 100, 30);
+        assert!(!app.three_panel);
+
+        goto_settings(&mut app);
+        assert_eq!(
+            app.settings.fields.worktrees_layout, "two_panel",
+            "editor shows the effective (repo) value, not a masked global"
+        );
+        while app.settings.selected < config_editor::LAYOUT_ROW {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Enter); // two_panel → three_panel (writes immediately)
+        assert_eq!(app.settings.fields.worktrees_layout, "three_panel");
+
+        // Settings writes the UI pref to its dedicated global path (tests point
+        // that at a temp file) and clears the repo override. Re-merge from those
+        // two files: production keeps `settings.global_config` in sync with
+        // `Config::load`'s path via `global_config_path()`.
+        assert_eq!(
+            crate::config::FileConfig::load(&global)
+                .unwrap()
+                .worktrees_layout,
+            Some(WorktreesLayout::ThreePanel)
+        );
+        let repo_text = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            !repo_text.contains("worktrees_layout"),
+            "repo override must be cleared: {repo_text}"
+        );
+        app.ctx.config = crate::config::Config::merge(
+            crate::config::FileConfig::load(&global).unwrap(),
+            crate::config::FileConfig::load(&file).unwrap(),
+        );
+        assert_eq!(
+            app.ctx.config.worktrees_layout(),
+            WorktreesLayout::ThreePanel
+        );
+        assert_eq!(
+            app.ctx.config.worktrees_layout_source,
+            crate::config::Source::Global
+        );
+
+        app.select_tab(Tab::Worktrees);
+        render_app(&mut app, 100, 30);
+        assert!(app.three_panel, "the next frame draws three panels");
+        assert!(app.tab_hidden(Tab::Changes));
     }
 }
