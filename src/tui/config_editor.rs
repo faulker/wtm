@@ -78,6 +78,7 @@ pub fn row_at_line(line: usize) -> Option<usize> {
 }
 
 /// Form line of a field row's value, mirroring [`row_at_line`].
+#[cfg(test)]
 pub fn line_of_row(row: usize) -> usize {
     if row == LAYOUT_ROW {
         LAYOUT_LINE
