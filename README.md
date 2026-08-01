@@ -10,7 +10,7 @@ Three ways to use it:
 
 ![The Worktrees tab: a table of worktrees with change counts, ahead/behind, and paths, over a preview of the selected worktree's changed files](docs/images/tui-worktrees.png)
 
-The Worktrees tab is the home screen: every worktree with how many files it has changed, how far it is ahead of or behind its upstream, and any flags (`same`/`changed` vs its creation base, `outdated` when that base has moved ahead, `✓merged`, `locked`). The panel underneath lists the changed files of whichever worktree you have selected, so you can see what an agent has been up to without leaving the list. Every changed file is listed: when there are more than fit, `⇧↑`/`⇧↓` or the mouse wheel over the panel scroll it, and the border shows your position (`10-18/27`). Clicking a file there opens it on the Changes tab.
+The Worktrees tab is the home screen: every worktree with how many files it has changed, how far it is ahead of or behind its upstream, and any flags (`unpushed`/`behind` vs upstream, `same`/`changed`/`outdated` vs its creation base or the default branch, `✓merged`, `locked`). The panel underneath lists the changed files of whichever worktree you have selected, so you can see what an agent has been up to without leaving the list. Every changed file is listed: when there are more than fit, `⇧↑`/`⇧↓` or the mouse wheel over the panel scroll it, and the border shows your position (`10-18/27`). Clicking a file there opens it on the Changes tab.
 
 If you'd rather read the diff without leaving the tab, `wtm config set --global worktrees_layout three_panel` (or the `worktrees_layout` row on the Settings tab) swaps that in for a **three-panel** Worktrees tab: a compact scrollable worktree list on top, and the Changes tab's file list and syntax-highlighted diff filling the space below it. When the highlighted worktree is clean, that bottom area shows the branch's commit list instead (navigate and open a commit the same way as Branches → Enter). `Enter` hands the keyboard to the panel below and `q`/`Esc` gives it back, so the app still only quits from the worktree list. The Changes tab is folded away while this layout is on (it's already on screen), and a terminal too short for three panels falls back to two so the diff stays reachable. The default is `two_panel`.
 
@@ -208,7 +208,7 @@ Worktrees are addressed by branch name (or directory name when detached). Every 
 
 ## TUI
 
-Run `wtm` inside a repo. If the repo isn't initialized yet, the setup wizard opens first (see [Settings](#settings)); once `.wtm.toml` exists you get the worktree list. Each worktree shows its change count, ahead/behind, and a **FLAGS** column: `same` / `changed` compare the branch to the base it was created from (stored in `.wtm.toml` under `[created_from]`), `outdated` means that base has new commits the worktree branch lacks, `✓merged` marks a branch fully merged into the default branch (safe to clean up), and `locked` marks a locked worktree.
+Run `wtm` inside a repo. If the repo isn't initialized yet, the setup wizard opens first (see [Settings](#settings)); once `.wtm.toml` exists you get the worktree list. Each worktree shows its change count, ahead/behind, and a **FLAGS** column: `unpushed` / `behind` vs upstream, `same` / `changed` / `outdated` vs the comparison base (recorded `[created_from]` in `.wtm.toml` when present, otherwise the repo default branch, with a merge-base fallback when that tip is missing), `✓merged` when fully merged into the default branch (safe to clean up), and `locked` for a locked worktree.
 
 ![The Changes tab: changed files grouped into a folder tree on the left, the selected file's syntax-highlighted diff on the right with added lines tinted green and removed lines red](docs/images/tui-changes.png)
 
@@ -224,7 +224,7 @@ Run `wtm` inside a repo. If the repo isn't initialized yet, the setup wizard ope
 
 ![The Branches tab: every local branch with where it is checked out, its upstream, a ✓merged flag on release/1.4, and the last commit on each](docs/images/tui-branches.png)
 
-The Branches tab shows every branch, where each one is checked out, and which have already landed in the default branch (`✓merged`, safe to clean up). Remote-only branches are marked with `☁`. From here you can check a branch out in a new worktree, create or delete branches, merge one into a worktree, fast-forward onto upstream, or press `Enter` to browse and cherry-pick its commits.
+The Branches tab shows every branch, where each one is checked out, and the same **FLAGS** vocabulary as the worktree list (`unpushed` / `behind`, `same` / `changed` / `outdated`, `✓merged`). Remote-only branches are marked with `☁`. From here you can check a branch out in a new worktree, create or delete branches, merge one into a worktree, fast-forward onto upstream, or press `Enter` to browse and cherry-pick its commits.
 
 ![The commit log drawn as a tree, with branch and tag names marked on the commits they point at and a fork and merge visible in the graph](docs/images/tui-log.png)
 

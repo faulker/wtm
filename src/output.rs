@@ -51,7 +51,7 @@ pub fn print_list(infos: &[WorktreeInfo]) {
         if info.is_main {
             name.push('*');
         }
-        let flags = worktree_flags(info);
+        let flags = format_flags(&info.flag_labels());
         println!(
             "{name:<name_w$}  {dirty:<10}  {upstream:<10}  {flags:<28}  {}",
             info.path
@@ -59,27 +59,12 @@ pub fn print_list(infos: &[WorktreeInfo]) {
     }
 }
 
-/// Concise FLAGS column text for a worktree (same labels as the TUI).
-fn worktree_flags(info: &WorktreeInfo) -> String {
-    let mut parts = Vec::new();
-    if info.changed_from_base {
-        parts.push("changed");
-    } else if info.created_from.is_some() && !info.is_main && !info.behind_base {
-        parts.push("same");
-    }
-    if info.behind_base {
-        parts.push("outdated");
-    }
-    if info.merged {
-        parts.push("merged");
-    }
-    if info.locked {
-        parts.push("locked");
-    }
-    if parts.is_empty() {
+/// Joins flag labels for a FLAGS column, or `-` when none apply.
+fn format_flags(labels: &[&str]) -> String {
+    if labels.is_empty() {
         "-".to_string()
     } else {
-        parts.join(" ")
+        labels.join(" ")
     }
 }
 
@@ -237,7 +222,7 @@ pub fn print_branch_list(result: &BranchListResult) {
         .unwrap_or(4)
         .max(4);
     println!(
-        "{:<name_w$}  {:<10}  {:<10}  {:<7}  LAST COMMIT",
+        "{:<name_w$}  {:<10}  {:<10}  {:<28}  LAST COMMIT",
         "NAME", "CHECKOUT", "UPSTREAM", "FLAGS"
     );
     for b in &result.branches {
@@ -251,9 +236,9 @@ pub fn print_branch_list(result: &BranchListResult) {
         } else {
             "-".to_string()
         };
-        let flags = if b.merged { "merged" } else { "-" };
+        let flags = format_flags(&b.flag_labels());
         println!(
-            "{:<name_w$}  {checkout:<10}  {upstream:<10}  {flags:<7}  {} ({})",
+            "{:<name_w$}  {checkout:<10}  {upstream:<10}  {flags:<28}  {} ({})",
             b.name, b.subject, b.date
         );
     }

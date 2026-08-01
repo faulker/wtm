@@ -482,6 +482,31 @@ fn cursor_color(focused: bool) -> Color {
     if focused { ACCENT } else { BORDER }
 }
 
+/// Colored FLAGS spans from the shared `flag_labels` vocabulary.
+fn status_flag_spans(labels: &[&str]) -> Vec<Span<'static>> {
+    if labels.is_empty() {
+        return vec![Span::styled("–".to_string(), Style::new().dim())];
+    }
+    let mut spans = Vec::new();
+    for label in labels {
+        if !spans.is_empty() {
+            spans.push(Span::raw(" "));
+        }
+        let (text, style) = match *label {
+            "unpushed" => ("unpushed", Style::new().fg(theme::WARNING)),
+            "behind" => ("behind", Style::new().fg(theme::INFO)),
+            "changed" => ("changed", Style::new().fg(theme::WARNING)),
+            "same" => ("same", Style::new().dim()),
+            "outdated" => ("outdated", Style::new().fg(theme::WARNING)),
+            "merged" => ("✓merged", Style::new().fg(theme::SUCCESS)),
+            "locked" => ("locked", Style::new().fg(theme::DANGER)),
+            other => (other, Style::new()),
+        };
+        spans.push(Span::styled(text.to_string(), style));
+    }
+    spans
+}
+
 /// The worktree table. `focused` is false when another panel owns the keyboard
 /// (the three-panel layout's file list), which dims the row highlight so it is
 /// clear which cursor the arrow keys move.
@@ -513,40 +538,8 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) -> Opt
                 ),
                 None => Span::styled("–".to_string(), Style::new().dim()),
             };
-            // Flags stack: base-relative status, then cleanup/lock signals.
-            let mut flag_spans = Vec::new();
-            let push_flag = |spans: &mut Vec<Span<'_>>, text: &str, style: Style| {
-                if !spans.is_empty() {
-                    spans.push(Span::raw(" "));
-                }
-                spans.push(Span::styled(text.to_string(), style));
-            };
-            if wt.changed_from_base {
-                push_flag(
-                    &mut flag_spans,
-                    "changed",
-                    Style::new().fg(theme::WARNING),
-                );
-            } else if wt.created_from.is_some() && !wt.is_main && !wt.behind_base {
-                push_flag(&mut flag_spans, "same", Style::new().dim());
-            }
-            if wt.behind_base {
-                push_flag(
-                    &mut flag_spans,
-                    "outdated",
-                    Style::new().fg(theme::WARNING),
-                );
-            }
-            if wt.merged {
-                push_flag(
-                    &mut flag_spans,
-                    "✓merged",
-                    Style::new().fg(theme::SUCCESS),
-                );
-            }
-            if wt.locked {
-                push_flag(&mut flag_spans, "locked", Style::new().fg(theme::DANGER));
-            }
+            // Flags: upstream sync, base-relative status, then cleanup/lock.
+            let flag_spans = status_flag_spans(&wt.flag_labels());
             Row::new(vec![
                 Cell::from(name),
                 Cell::from(changes),
@@ -2595,17 +2588,13 @@ fn draw_branches(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
             } else {
                 Span::styled("no upstream".to_string(), Style::new().dim())
             };
-            let flags = if b.merged {
-                Span::styled("✓merged", Style::new().fg(theme::SUCCESS))
-            } else {
-                Span::styled("–".to_string(), Style::new().dim())
-            };
+            let flag_spans = status_flag_spans(&b.flag_labels());
             let last = Span::styled(format!("{}  {}", b.date, b.subject), Style::new().dim());
             Row::new(vec![
                 Cell::from(Line::from(name)),
                 Cell::from(Line::from(checkout)),
                 Cell::from(Line::from(track)),
-                Cell::from(Line::from(flags)),
+                Cell::from(Line::from(flag_spans)),
                 Cell::from(Line::from(last)),
             ])
         })
@@ -2616,7 +2605,7 @@ fn draw_branches(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
             Constraint::Length(22),
             Constraint::Length(24),
             Constraint::Length(14),
-            Constraint::Length(9),
+            Constraint::Length(28),
             Constraint::Min(20),
         ],
     )

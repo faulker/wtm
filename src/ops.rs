@@ -70,18 +70,21 @@ pub struct WorktreeInfo {
     /// clean up. False for the main worktree, a detached HEAD, the default
     /// branch itself, or a branch with commits not yet on the mainline.
     pub merged: bool,
-    /// Ref this worktree's branch was created from (e.g. `"main"`), recorded
-    /// in `.wtm.toml`'s `[created_from]` at create time. `null` for the main
-    /// worktree, detached HEADs, checkouts of pre-existing branches, or when
-    /// no create-time base was stored.
+    /// Parent used for `same`/`changed`/`outdated`: recorded `[created_from]`
+    /// when that ref resolves, else the repo default branch name (even when
+    /// status was computed via merge-base against that parent). `null` for the
+    /// main worktree, detached HEADs, the default branch itself, or when no
+    /// parent could be resolved at all.
     pub created_from: Option<String>,
-    /// True when the branch has commits not reachable from its creation base
-    /// (unique local work since create). Always false for the main worktree,
+    /// True when the branch has commits not reachable from its comparison base
+    /// (unique local work vs that base). Always false for the main worktree,
     /// when the base is unknown/missing, or when the tip still matches the base.
     pub changed_from_base: bool,
-    /// True when the creation base has commits not in this branch (base moved
-    /// ahead; the worktree is out of date). Always false for the main worktree
-    /// or when the base is unknown/missing.
+    /// True when the comparison **tip** has commits not in this branch (base
+    /// moved ahead; the worktree is out of date). Always false for the main
+    /// worktree, when the base is unknown/missing, or when only a merge-base
+    /// SHA was available (a merge-base is always an ancestor, so it cannot
+    /// signal "outdated").
     pub behind_base: bool,
 }
 
@@ -99,6 +102,19 @@ impl WorktreeInfo {
             Some(ab) if ab.behind > 0 => "behind",
             _ => "",
         }
+    }
+
+    /// Plain-language FLAGS labels for TUI/CLI (upstream sync, then base
+    /// status, then cleanup/lock). Same vocabulary as `branch_flag_labels`.
+    pub fn flag_labels(&self) -> Vec<&'static str> {
+        flag_labels(
+            self.ahead_behind.as_ref().map(|ab| (ab.ahead, ab.behind)),
+            self.changed_from_base,
+            self.behind_base,
+            /* show_same */ self.created_from.is_some() && !self.is_main,
+            self.merged,
+            self.locked,
+        )
     }
 }
 
@@ -252,16 +268,17 @@ pub fn list(ctx: &Ctx) -> Result<Vec<WorktreeInfo>> {
             }
             _ => false,
         };
-        let created_from = wt
-            .branch
-            .as_ref()
-            .filter(|_| !is_main)
-            .and_then(|b| created_from_map.get(b).cloned());
-        let (changed_from_base, behind_base) = match (&created_from, &wt.branch) {
-            (Some(base), Some(branch)) if !is_main => {
-                base_status_vs(&ctx.repo_root, base, branch)
+        let (created_from, changed_from_base, behind_base) = match &wt.branch {
+            Some(branch) if !is_main => {
+                let status = resolve_base_status(
+                    &ctx.repo_root,
+                    branch,
+                    created_from_map.get(branch).map(String::as_str),
+                    default.as_deref(),
+                );
+                (status.label, status.changed, status.behind)
             }
-            _ => (false, false),
+            _ => (None, false, false),
         };
         infos.push(WorktreeInfo {
             name: worktree_name(&wt.branch, &wt.path),
@@ -280,16 +297,164 @@ pub fn list(ctx: &Ctx) -> Result<Vec<WorktreeInfo>> {
     Ok(infos)
 }
 
-/// Compares `branch` to its creation `base`: whether the branch has unique
-/// commits (`changed_from_base`) and whether the base has moved ahead
-/// (`behind_base`). Missing/unresolvable bases degrade to `(false, false)`.
-fn base_status_vs(repo_root: &Path, base: &str, branch: &str) -> (bool, bool) {
-    if !git::ref_exists(repo_root, base) || !git::branch_exists(repo_root, branch) {
-        return (false, false);
+/// How a branch tip was compared for `same`/`changed`/`outdated`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaseCompareKind {
+    /// Named tip (creation base or default branch): both changed and outdated.
+    Tip,
+    /// Merge-base SHA only: changed is meaningful; outdated is always false.
+    MergeBase,
+}
+
+/// Resolved comparison base for a branch's status flags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BaseStatus {
+    /// Parent label shown as `created_from` (named tip or merge-base parent).
+    label: Option<String>,
+    changed: bool,
+    behind: bool,
+}
+
+/// Resolves the comparison base for `branch`:
+/// 1. recorded `created_from` when that ref still exists
+/// 2. else the repo default branch tip (when it exists and is not `branch`)
+/// 3. else `git merge-base` against the default / `origin/HEAD`
+///
+/// Returns an empty status when nothing is comparable (default branch itself,
+/// missing refs, etc.).
+fn resolve_base_status(
+    repo_root: &Path,
+    branch: &str,
+    recorded: Option<&str>,
+    default: Option<&str>,
+) -> BaseStatus {
+    if !git::branch_exists(repo_root, branch) {
+        return BaseStatus {
+            label: None,
+            changed: false,
+            behind: false,
+        };
+    }
+    // Prefer a recorded creation base that still resolves.
+    if let Some(base) = recorded.filter(|b| git::ref_exists(repo_root, b)) {
+        return base_status_vs(repo_root, base, branch, BaseCompareKind::Tip);
+    }
+    // Fall back to the default branch tip when it is a different, resolvable ref.
+    if let Some(def) = default.filter(|d| *d != branch) {
+        if git::ref_exists(repo_root, def) {
+            return base_status_vs(repo_root, def, branch, BaseCompareKind::Tip);
+        }
+        // Local default missing: try the remote-tracking tip of the same name.
+        let remote_tip = format!("origin/{def}");
+        if git::ref_exists(repo_root, &remote_tip) {
+            return base_status_vs(repo_root, &remote_tip, branch, BaseCompareKind::Tip)
+                .with_label(def.to_string());
+        }
+    }
+    // Last resort: merge-base against a resolvable parent (changed only).
+    // Tip paths above already covered local/remote default tips; this runs when
+    // those tips are missing but e.g. origin/HEAD still resolves.
+    let mut merge_parents: Vec<(String, String)> = Vec::new();
+    if let Some(def) = default.filter(|d| *d != branch) {
+        if git::ref_exists(repo_root, def) {
+            merge_parents.push((def.to_string(), def.to_string()));
+        } else {
+            let remote = format!("origin/{def}");
+            if git::ref_exists(repo_root, &remote) {
+                merge_parents.push((remote, def.to_string()));
+            }
+        }
+    }
+    if git::ref_exists(repo_root, "origin/HEAD") {
+        let label = default
+            .filter(|d| *d != branch)
+            .unwrap_or("origin/HEAD")
+            .to_string();
+        merge_parents.push(("origin/HEAD".to_string(), label));
+    }
+    for (parent, label) in merge_parents {
+        if let Ok(mb) = git::merge_base(repo_root, branch, &parent)
+            && !mb.is_empty()
+        {
+            return base_status_vs(repo_root, &mb, branch, BaseCompareKind::MergeBase)
+                .with_label(label);
+        }
+    }
+    BaseStatus {
+        label: None,
+        changed: false,
+        behind: false,
+    }
+}
+
+impl BaseStatus {
+    fn with_label(mut self, label: String) -> Self {
+        self.label = Some(label);
+        self
+    }
+}
+
+/// Compares `branch` to `base`: unique commits (`changed`) and, for tip bases,
+/// whether the base has moved ahead (`behind`). Merge-base comparisons never
+/// set `behind`. Missing/unresolvable bases degrade to empty flags.
+fn base_status_vs(
+    repo_root: &Path,
+    base: &str,
+    branch: &str,
+    kind: BaseCompareKind,
+) -> BaseStatus {
+    if !git::ref_exists(repo_root, base) {
+        return BaseStatus {
+            label: None,
+            changed: false,
+            behind: false,
+        };
     }
     let changed = git::commits_ahead_of(repo_root, base, branch).unwrap_or(0) > 0;
-    let behind = git::commits_ahead_of(repo_root, branch, base).unwrap_or(0) > 0;
-    (changed, behind)
+    let behind = match kind {
+        BaseCompareKind::Tip => git::commits_ahead_of(repo_root, branch, base).unwrap_or(0) > 0,
+        BaseCompareKind::MergeBase => false,
+    };
+    BaseStatus {
+        label: Some(base.to_string()),
+        changed,
+        behind,
+    }
+}
+
+/// Shared FLAGS vocabulary for worktrees and branches.
+fn flag_labels(
+    upstream: Option<(u32, u32)>,
+    changed_from_base: bool,
+    behind_base: bool,
+    show_same: bool,
+    merged: bool,
+    locked: bool,
+) -> Vec<&'static str> {
+    let mut parts = Vec::new();
+    if let Some((ahead, behind)) = upstream {
+        if ahead > 0 {
+            parts.push("unpushed");
+        }
+        if behind > 0 {
+            parts.push("behind");
+        }
+    }
+    if changed_from_base {
+        parts.push("changed");
+    } else if show_same && !behind_base {
+        parts.push("same");
+    }
+    if behind_base {
+        parts.push("outdated");
+    }
+    if merged {
+        parts.push("merged");
+    }
+    if locked {
+        parts.push("locked");
+    }
+    parts
 }
 
 /// Resolves the base ref to persist at create time. `HEAD` becomes the current
@@ -868,6 +1033,27 @@ pub struct BranchListItem {
     /// `Some("origin/feature")` when this branch exists only on a remote, with
     /// no local branch yet; `None` for a normal local branch.
     pub remote: Option<String>,
+    /// Effective comparison parent for base flags (see `WorktreeInfo::created_from`).
+    pub created_from: Option<String>,
+    /// True when this branch has commits not in its comparison base.
+    pub changed_from_base: bool,
+    /// True when the comparison tip has moved ahead of this branch.
+    pub behind_base: bool,
+}
+
+impl BranchListItem {
+    /// Plain-language FLAGS labels (same vocabulary as worktrees).
+    pub fn flag_labels(&self) -> Vec<&'static str> {
+        let upstream = self.upstream.as_ref().map(|_| (self.ahead, self.behind));
+        flag_labels(
+            upstream,
+            self.changed_from_base,
+            self.behind_base,
+            /* show_same */ self.created_from.is_some() && self.remote.is_none(),
+            self.merged,
+            false,
+        )
+    }
 }
 
 /// Result of `branch list`.
@@ -1286,6 +1472,7 @@ pub fn branch_list(ctx: &Ctx) -> Result<BranchListResult> {
         Some(d) => git::first_parent_commits(&ctx.repo_root, d).unwrap_or_default(),
         None => HashSet::new(),
     };
+    let created_from_map = crate::config::load_created_from(&ctx.repo_root).unwrap_or_default();
     let local_names: HashSet<String> = local_details.iter().map(|d| d.name.clone()).collect();
     let mut branches = Vec::with_capacity(local_details.len());
     for d in local_details {
@@ -1297,6 +1484,13 @@ pub fn branch_list(ctx: &Ctx) -> Result<BranchListResult> {
             Some(default) => branch_merged_into(&ctx.repo_root, default, &d.name, &trunk)?,
             None => false,
         };
+        // Base flags for local branches only; skip the default branch itself.
+        let base = resolve_base_status(
+            &ctx.repo_root,
+            &d.name,
+            created_from_map.get(&d.name).map(String::as_str),
+            default.as_deref(),
+        );
         branches.push(BranchListItem {
             name: d.name,
             checked_out_path,
@@ -1307,11 +1501,15 @@ pub fn branch_list(ctx: &Ctx) -> Result<BranchListResult> {
             date: d.date,
             merged,
             remote: None,
+            created_from: base.label,
+            changed_from_base: base.changed,
+            behind_base: base.behind,
         });
     }
     // Remote-tracking refs whose short name (after stripping `<remote>/`) has
     // no matching local branch are branches that exist only on a remote —
     // surface them as their own rows rather than leaving them invisible.
+    // Base-relative flags stay off for remote-only rows (noisy / no local tip).
     for d in remote_details {
         if d.name.ends_with("/HEAD") {
             continue;
@@ -1336,6 +1534,9 @@ pub fn branch_list(ctx: &Ctx) -> Result<BranchListResult> {
             date: d.date,
             merged,
             remote: Some(d.name),
+            created_from: None,
+            changed_from_base: false,
+            behind_base: false,
         });
     }
     Ok(BranchListResult { branches })
@@ -2827,9 +3028,9 @@ mod tests {
         );
     }
 
-    /// A deleted creation base omits the relative flags instead of failing list.
+    /// A deleted creation base falls through to the default branch tip.
     #[test]
-    fn list_degrades_when_creation_base_is_gone() {
+    fn list_falls_back_to_default_when_creation_base_is_gone() {
         let (_tmp, ctx) = temp_ctx();
         create(&ctx, "feature", Some("main"), RunMode::Capture, |_| {}).unwrap();
         crate::config::set_created_from(&ctx.repo_root, "feature", "vanished").unwrap();
@@ -2838,9 +3039,204 @@ mod tests {
 
         let infos = list(&ctx).unwrap();
         let feature = infos.iter().find(|i| i.name == "feature").unwrap();
-        assert_eq!(feature.created_from.as_deref(), Some("vanished"));
+        assert_eq!(
+            feature.created_from.as_deref(),
+            Some("main"),
+            "missing recorded base falls back to default"
+        );
         assert!(!feature.changed_from_base);
         assert!(!feature.behind_base);
+
+        git(
+            &ctx.repo_root,
+            &["commit", "--allow-empty", "-m", "main moved"],
+        );
+        let infos = list(&ctx).unwrap();
+        let feature = infos.iter().find(|i| i.name == "feature").unwrap();
+        assert!(
+            feature.behind_base,
+            "default-branch fallback still detects outdated"
+        );
+    }
+
+    /// Without a `[created_from]` entry, list still compares against the default
+    /// branch so older / existing-branch worktrees get same/changed/outdated.
+    #[test]
+    fn list_flags_vs_default_branch_without_created_from() {
+        let (_tmp, ctx) = temp_ctx();
+        create(&ctx, "feature", Some("main"), RunMode::Capture, |_| {}).unwrap();
+        crate::config::unset_created_from(&ctx.repo_root, "feature").unwrap();
+
+        let infos = list(&ctx).unwrap();
+        let feature = infos.iter().find(|i| i.name == "feature").unwrap();
+        assert_eq!(feature.created_from.as_deref(), Some("main"));
+        assert!(!feature.changed_from_base);
+        assert!(!feature.behind_base);
+        assert!(
+            feature.flag_labels().contains(&"same"),
+            "fresh feature vs default shows same: {:?}",
+            feature.flag_labels()
+        );
+
+        let feature_path = PathBuf::from(&feature.path);
+        std::fs::write(feature_path.join("f.txt"), "x\n").unwrap();
+        git(&feature_path, &["add", "f.txt"]);
+        git(&feature_path, &["commit", "-m", "feature work"]);
+        git(
+            &ctx.repo_root,
+            &["commit", "--allow-empty", "-m", "main moved"],
+        );
+
+        let infos = list(&ctx).unwrap();
+        let feature = infos.iter().find(|i| i.name == "feature").unwrap();
+        assert!(feature.changed_from_base);
+        assert!(feature.behind_base);
+        let flags = feature.flag_labels();
+        assert!(flags.contains(&"changed"), "{flags:?}");
+        assert!(flags.contains(&"outdated"), "{flags:?}");
+    }
+
+    /// Merge-base comparison reports unique commits but never `outdated`.
+    #[test]
+    fn base_status_merge_base_kind_is_changed_not_outdated() {
+        let (_tmp, ctx) = temp_ctx();
+        let path = make_worktree(&ctx, "feature");
+        std::fs::write(path.join("f.txt"), "x\n").unwrap();
+        git(&path, &["add", "f.txt"]);
+        git(&path, &["commit", "-m", "feature work"]);
+
+        let mb = git::merge_base(&ctx.repo_root, "feature", "main").unwrap();
+        let status = base_status_vs(&ctx.repo_root, &mb, "feature", BaseCompareKind::MergeBase);
+        assert!(status.changed, "feature is ahead of the fork point");
+        assert!(!status.behind, "merge-base kind cannot be outdated");
+    }
+
+    /// When the named default tip is missing, resolve falls back to merge-base
+    /// against origin/HEAD and still flags unique commits (not outdated).
+    #[test]
+    fn resolve_base_status_merge_base_via_origin_head() {
+        let (tmp, ctx) = temp_ctx();
+        let path = make_worktree(&ctx, "feature");
+        std::fs::write(path.join("f.txt"), "x\n").unwrap();
+        git(&path, &["add", "f.txt"]);
+        git(&path, &["commit", "-m", "feature work"]);
+
+        let bare = tmp.path().join("bare.git");
+        git(
+            tmp.path(),
+            &[
+                "clone",
+                "--bare",
+                ctx.repo_root.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        );
+        git(
+            &ctx.repo_root,
+            &["remote", "add", "origin", bare.to_str().unwrap()],
+        );
+        git(&ctx.repo_root, &["fetch", "origin"]);
+        git(
+            &ctx.repo_root,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+
+        // Bogus default name: tip paths miss; origin/HEAD still resolves.
+        let status = resolve_base_status(&ctx.repo_root, "feature", None, Some("nope"));
+        assert_eq!(status.label.as_deref(), Some("nope"));
+        assert!(status.changed);
+        assert!(!status.behind);
+    }
+
+    /// Upstream ahead/behind become `unpushed` / `behind` in flag labels.
+    #[test]
+    fn list_flag_labels_unpushed_and_behind_upstream() {
+        let (tmp, ctx) = temp_ctx();
+        let bare = tmp.path().join("bare.git");
+        git(
+            tmp.path(),
+            &[
+                "init",
+                "--bare",
+                "-b",
+                "main",
+                bare.to_str().unwrap(),
+            ],
+        );
+        git(
+            &ctx.repo_root,
+            &["remote", "add", "origin", bare.to_str().unwrap()],
+        );
+        git(&ctx.repo_root, &["push", "-u", "origin", "main"]);
+
+        let path = make_worktree(&ctx, "feature");
+        git(&path, &["push", "-u", "origin", "feature"]);
+
+        // Local commit → unpushed.
+        std::fs::write(path.join("local.txt"), "mine\n").unwrap();
+        git(&path, &["add", "local.txt"]);
+        git(&path, &["commit", "-m", "local"]);
+        let infos = list(&ctx).unwrap();
+        let feature = infos.iter().find(|i| i.name == "feature").unwrap();
+        assert!(
+            feature.flag_labels().contains(&"unpushed"),
+            "{:?}",
+            feature.flag_labels()
+        );
+
+        // Advance remote without pulling → behind (and still unpushed).
+        let second = tmp.path().join("second");
+        git(
+            tmp.path(),
+            &["clone", bare.to_str().unwrap(), second.to_str().unwrap()],
+        );
+        git(&second, &["config", "user.email", "t@e.st"]);
+        git(&second, &["config", "user.name", "t"]);
+        git(&second, &["checkout", "-B", "feature", "origin/feature"]);
+        std::fs::write(second.join("remote.txt"), "theirs\n").unwrap();
+        git(&second, &["add", "remote.txt"]);
+        git(&second, &["commit", "-m", "remote"]);
+        git(&second, &["push"]);
+        git(&ctx.repo_root, &["fetch", "origin"]);
+
+        let infos = list(&ctx).unwrap();
+        let feature = infos.iter().find(|i| i.name == "feature").unwrap();
+        let flags = feature.flag_labels();
+        assert!(flags.contains(&"unpushed"), "{flags:?}");
+        assert!(flags.contains(&"behind"), "{flags:?}");
+    }
+
+    /// Branch list carries the same base flags as worktree list.
+    #[test]
+    fn branch_list_flags_changed_and_outdated_vs_default() {
+        let (_tmp, ctx) = temp_ctx();
+        let path = make_worktree(&ctx, "feature");
+        crate::config::unset_created_from(&ctx.repo_root, "feature").unwrap();
+        std::fs::write(path.join("f.txt"), "x\n").unwrap();
+        git(&path, &["add", "f.txt"]);
+        git(&path, &["commit", "-m", "feature work"]);
+        git(
+            &ctx.repo_root,
+            &["commit", "--allow-empty", "-m", "main moved"],
+        );
+
+        let branches = branch_list(&ctx).unwrap().branches;
+        let feature = branches.iter().find(|b| b.name == "feature").unwrap();
+        assert_eq!(feature.created_from.as_deref(), Some("main"));
+        assert!(feature.changed_from_base);
+        assert!(feature.behind_base);
+        let flags = feature.flag_labels();
+        assert!(flags.contains(&"changed"), "{flags:?}");
+        assert!(flags.contains(&"outdated"), "{flags:?}");
+
+        let main = branches.iter().find(|b| b.name == "main").unwrap();
+        assert!(main.created_from.is_none());
+        assert!(!main.changed_from_base);
+        assert!(!main.behind_base);
     }
 
     /// Removing a worktree clears its `[created_from]` entry; renaming moves it.

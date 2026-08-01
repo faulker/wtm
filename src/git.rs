@@ -295,6 +295,12 @@ pub fn commits_ahead_of(dir: &Path, base: &str, branch: &str) -> Result<u32> {
     Ok(out.trim().parse().unwrap_or(0))
 }
 
+/// Best common ancestor of `a` and `b` (`git merge-base`). Used when a named
+/// tip base is unavailable so we can still detect unique commits on a branch.
+pub fn merge_base(dir: &Path, a: &str, b: &str) -> Result<String> {
+    Ok(run(dir, &["merge-base", a, b])?.trim().to_string())
+}
+
 /// True when `reference` resolves to a commit (branch, tag, remote-tracking
 /// ref, or SHA). Used to degrade gracefully when a creation base was deleted.
 pub fn ref_exists(dir: &Path, reference: &str) -> bool {
@@ -1349,6 +1355,16 @@ mod tests {
         let (_tmp, repo) = temp_repo();
         // No origin remote, but a local `main`, so it should report "main".
         assert_eq!(default_branch(&repo).unwrap(), "main");
+    }
+
+    #[test]
+    fn merge_base_finds_common_ancestor() {
+        let (_tmp, repo) = temp_repo();
+        run(&repo, &["branch", "feature"]).unwrap();
+        run(&repo, &["commit", "--allow-empty", "-m", "on main"]).unwrap();
+        let mb = merge_base(&repo, "feature", "main").unwrap();
+        let feature_tip = rev_parse(&repo, "feature").unwrap();
+        assert_eq!(mb, feature_tip, "feature still at the fork point");
     }
 
     #[test]
