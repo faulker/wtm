@@ -357,6 +357,29 @@ fn panel(title: impl Into<String>) -> Block<'static> {
         ]))
 }
 
+/// Panel chrome for a focusable list: accent border and bold title when it
+/// owns the keyboard, dim border and title when another panel does. Diff
+/// panes and other non-focus targets keep using [`panel`].
+fn focus_panel(title: impl Into<String>, focused: bool) -> Block<'static> {
+    let (border, title_style) = if focused {
+        (
+            ACCENT,
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (BORDER, Style::new().fg(BORDER))
+    };
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(border))
+        .padding(Padding::horizontal(1))
+        .title(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(title.into(), title_style),
+            Span::raw(" "),
+        ]))
+}
+
 /// Top bar: app badge and the selected worktree's path on the left; the
 /// worktree count on the right, or the transient status/error message when one
 /// is present. Falls back to the repo root when nothing is selected.
@@ -490,16 +513,39 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) -> Opt
                 ),
                 None => Span::styled("–".to_string(), Style::new().dim()),
             };
-            // Both a merged branch and a lock can apply; show whichever hold.
+            // Flags stack: base-relative status, then cleanup/lock signals.
             let mut flag_spans = Vec::new();
+            let push_flag = |spans: &mut Vec<Span<'_>>, text: &str, style: Style| {
+                if !spans.is_empty() {
+                    spans.push(Span::raw(" "));
+                }
+                spans.push(Span::styled(text.to_string(), style));
+            };
+            if wt.changed_from_base {
+                push_flag(
+                    &mut flag_spans,
+                    "changed",
+                    Style::new().fg(theme::WARNING),
+                );
+            } else if wt.created_from.is_some() && !wt.is_main && !wt.behind_base {
+                push_flag(&mut flag_spans, "same", Style::new().dim());
+            }
+            if wt.behind_base {
+                push_flag(
+                    &mut flag_spans,
+                    "outdated",
+                    Style::new().fg(theme::WARNING),
+                );
+            }
             if wt.merged {
-                flag_spans.push(Span::styled("✓merged", Style::new().fg(theme::SUCCESS)));
+                push_flag(
+                    &mut flag_spans,
+                    "✓merged",
+                    Style::new().fg(theme::SUCCESS),
+                );
             }
             if wt.locked {
-                if !flag_spans.is_empty() {
-                    flag_spans.push(Span::raw(" "));
-                }
-                flag_spans.push(Span::styled("locked", Style::new().fg(theme::DANGER)));
+                push_flag(&mut flag_spans, "locked", Style::new().fg(theme::DANGER));
             }
             Row::new(vec![
                 Cell::from(name),
@@ -518,7 +564,7 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) -> Opt
         .max()
         .unwrap_or(10)
         .max(10) as u16;
-    let block = panel("worktrees");
+    let block = focus_panel("worktrees", focused);
     let inner = block.inner(area);
     let table = Table::new(
         rows,
@@ -526,7 +572,7 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) -> Opt
             Constraint::Length(name_w),
             Constraint::Length(12),
             Constraint::Length(9),
-            Constraint::Length(15),
+            Constraint::Length(28),
             Constraint::Min(20),
         ],
     )
@@ -577,21 +623,35 @@ fn draw_worktrees_three_panel(frame: &mut Frame, area: Rect, app: &mut App) -> O
     // Status runs off-thread; never call `ops::status` on the render path. Its
     // result also swaps the two panels below (`sync_three_panel_changes`).
     app.ensure_worktree_preview();
-    app.files_list = draw_diff(
-        frame,
-        changes_area,
-        &app.changes.name,
-        &app.changes.files,
-        &app.changes.marked,
-        &app.changes.rows,
-        app.changes.selected,
-        &app.changes.content,
-        app.changes.loading_new,
-        app.changes.scroll,
-        app.changes.h_scroll,
-        focus == WorktreesFocus::Files,
-        &mut app.diff_path_hit,
-    );
+    let files_focused = focus == WorktreesFocus::Files;
+    if let Some(panel) = &app.worktree_commits {
+        app.diff_path_hit = None;
+        app.files_list = draw_worktree_commits(
+            frame,
+            changes_area,
+            &panel.branch,
+            &panel.lines,
+            panel.selected,
+            app.log_mode,
+            files_focused,
+        );
+    } else {
+        app.files_list = draw_diff(
+            frame,
+            changes_area,
+            &app.changes.name,
+            &app.changes.files,
+            &app.changes.marked,
+            &app.changes.rows,
+            app.changes.selected,
+            &app.changes.content,
+            app.changes.loading_new,
+            app.changes.scroll,
+            app.changes.h_scroll,
+            files_focused,
+            &mut app.diff_path_hit,
+        );
+    }
     row_list
 }
 
@@ -700,7 +760,7 @@ fn draw_diff(
     *path_hit = None;
     if files.is_empty() {
         let para = Paragraph::new(Line::from("no uncommitted changes".dim()))
-            .block(panel(format!("changes · {name}")));
+            .block(focus_panel(format!("changes · {name}"), focused));
         frame.render_widget(para, area);
         return None;
     }
@@ -768,7 +828,7 @@ fn draw_diff(
             }
         })
         .collect();
-    let block = panel(format!("files · {name}"));
+    let block = focus_panel(format!("files · {name}"), focused);
     let inner = block.inner(list_area);
     let list = List::new(items)
         .block(block)
@@ -887,6 +947,13 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         View::List => match app.tab {
             // Three-panel layout: the hints follow the focused panel, since the
             // same keys act on a different list in each.
+            Tab::Worktrees
+                if app.three_panel
+                    && app.worktrees_focus == WorktreesFocus::Files
+                    && app.worktree_commits.is_some() =>
+            {
+                help::WORKTREE_COMMITS
+            }
             Tab::Worktrees if app.three_panel && app.worktrees_focus == WorktreesFocus::Files => {
                 help::WORKTREE_FILES
             }
@@ -1386,15 +1453,94 @@ fn output_line(line: &str) -> Line<'_> {
 
 /// The help panel: a tabbed, scrollable overlay. Content comes from the
 /// `help` registry, the same data the footer hints are built from.
+/// Width of the help panel's key column (`"  {key:<12}"`), used so wrapped
+/// description lines hang under the description rather than the left edge.
+const HELP_KEY_COL: usize = 14;
+
+/// Push hard-split chunks of an overlong `word` into `lines`, leaving any
+/// final partial chunk in `current` so the next word can still join it.
+fn push_overlong(word: &str, width: usize, lines: &mut Vec<String>, current: &mut String) {
+    let mut rest = word;
+    while !rest.is_empty() {
+        let mut chars = rest.chars();
+        let take: String = chars.by_ref().take(width).collect();
+        rest = chars.as_str();
+        if rest.is_empty() {
+            *current = take;
+        } else {
+            lines.push(take);
+        }
+    }
+}
+
+/// Word-wrap `text` into lines of at most `width` characters.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+        if current.is_empty() {
+            if word_len > width {
+                push_overlong(word, width, &mut lines, &mut current);
+            } else {
+                current.push_str(word);
+            }
+            continue;
+        }
+        if current.chars().count() + 1 + word_len <= width {
+            current.push(' ');
+            current.push_str(word);
+            continue;
+        }
+        lines.push(std::mem::take(&mut current));
+        if word_len > width {
+            push_overlong(word, width, &mut lines, &mut current);
+        } else {
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// One help binding as one or more lines, with continuation lines indented
+/// under the description (after the key column).
+fn help_binding_lines(key: &str, label: &str, width: usize) -> Vec<Line<'static>> {
+    let key_span = Span::styled(
+        format!("  {key:<12}"),
+        Style::new().fg(ACCENT).bold(),
+    );
+    let desc_width = width.saturating_sub(HELP_KEY_COL).max(1);
+    let chunks = wrap_words(label, desc_width);
+    let indent = " ".repeat(HELP_KEY_COL);
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            if i == 0 {
+                Line::from(vec![key_span.clone(), Span::raw(chunk)])
+            } else {
+                Line::from(vec![Span::raw(indent.clone()), Span::raw(chunk)])
+            }
+        })
+        .collect()
+}
+
 fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
-    let key = |k: &str, label: &str| -> Line<'static> {
-        Line::from(vec![
-            Span::styled(format!("  {k:<12}"), Style::new().fg(ACCENT).bold()),
-            Span::raw(label.to_string()),
-        ])
-    };
     let heading =
         |t: &str| -> Line<'static> { Line::from(Span::styled(t.to_string(), Style::new().bold())) };
+
+    // Wrap against the panel's inner width before sizing height, so long
+    // descriptions contribute the right number of scroll rows.
+    const HELP_WIDTH: u16 = 78;
+    // Borders (2) + horizontal padding (2) match `panel`.
+    let body_width = HELP_WIDTH.min(area.width).saturating_sub(4) as usize;
 
     let mut text: Vec<Line> = Vec::new();
     for section in help::sections(app.help_tab) {
@@ -1403,7 +1549,7 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
         }
         text.push(heading(section.heading));
         for b in section.bindings {
-            text.push(key(b.key, b.long));
+            text.extend(help_binding_lines(b.key, b.long, body_width));
         }
         for note in section.notes {
             text.push(Line::from(format!("  {note}").dim()));
@@ -1415,7 +1561,7 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
     // screens. 4 = the block's two borders plus the tab bar and its spacer.
     const CHROME: u16 = 4;
     let content_height = text.len() as u16;
-    let popup = modal_rect(area, content_height, 78, CHROME);
+    let popup = modal_rect(area, content_height, HELP_WIDTH, CHROME);
     frame.render_widget(Clear, popup);
     let block = panel("help");
     let inner = block.inner(popup);
@@ -1433,12 +1579,9 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
     // viewport height is only known at render time.
     let max_scroll = content_height.saturating_sub(body.height);
     let scroll = app.help_scroll.min(max_scroll);
-    frame.render_widget(
-        Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
-        body,
-    );
+    // Descriptions are pre-wrapped with a hanging indent; leave Wrap off so
+    // ratatui does not reflow continuation lines back to column 0.
+    frame.render_widget(Paragraph::new(text).scroll((scroll, 0)), body);
     if max_scroll > 0 {
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight),
@@ -1938,10 +2081,11 @@ fn draw_review(
 }
 
 /// The Settings tab: editable rows for the repo settings, the update-check
-/// toggle, a live resolved-location preview, a live diff-theme colour sample,
-/// the running version, and a check-for-updates row. Changes write to disk as
-/// soon as they are made. The form keeps a fixed width inside the full-height
-/// panel so long paths don't stretch it.
+/// toggle, a live diff-theme colour sample under the theme row, the Worktrees
+/// layout cycle, a live resolved-location preview, the running version, and a
+/// check-for-updates row. Changes write to disk as soon as they are made. The
+/// form keeps a fixed width inside the full-height panel so long paths don't
+/// stretch it.
 fn draw_settings_tab(
     frame: &mut Frame,
     area: Rect,
@@ -2035,6 +2179,29 @@ fn draw_settings_tab(
             format!("   {}", hints[row]),
             Style::new().dim(),
         )));
+
+        // Live colour sample sits under the theme row (before layout) so
+        // cycling `diff_theme` shows the palette next to that setting.
+        if row == THEME_ROW {
+            let theme_id = if editor.fields.diff_theme.is_empty() {
+                DEFAULT_DIFF_THEME
+            } else {
+                editor.fields.diff_theme.as_str()
+            };
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " → diff colours look like ({})",
+                    highlight::theme_label(theme_id)
+                ),
+                Style::new().fg(Color::Green),
+            )));
+            for sample in highlight::theme_preview_lines(theme_id) {
+                // Indent under the arrow so the sample reads as part of the preview.
+                let mut spans = vec![Span::raw("   ")];
+                spans.extend(sample.spans);
+                lines.push(Line::from(spans));
+            }
+        }
     }
 
     // Live preview of where worktrees will actually be created.
@@ -2050,27 +2217,6 @@ fn draw_settings_tab(
         format!(" → new worktrees go in {resolved}"),
         Style::new().fg(Color::Green),
     )));
-
-    // Live colour sample for the selected diff theme, so cycling the row
-    // shows the palette before the user saves.
-    let theme_id = if editor.fields.diff_theme.is_empty() {
-        DEFAULT_DIFF_THEME
-    } else {
-        editor.fields.diff_theme.as_str()
-    };
-    lines.push(Line::from(Span::styled(
-        format!(
-            " → diff colours look like ({})",
-            highlight::theme_label(theme_id)
-        ),
-        Style::new().fg(Color::Green),
-    )));
-    for sample in highlight::theme_preview_lines(theme_id) {
-        // Indent under the arrow so the sample reads as part of the preview.
-        let mut spans = vec![Span::raw("   ")];
-        spans.extend(sample.spans);
-        lines.push(Line::from(spans));
-    }
 
     // Running version, plus whatever the last update check turned up.
     let mut version = vec![Span::styled(
@@ -2808,6 +2954,51 @@ fn draw_commit_diff(
         &mut sb_state,
     );
     Some(list_hit)
+}
+
+/// Commit history filling the bottom of the three-panel Worktrees layout when
+/// the selected worktree is clean. Same row content as `draw_log` /
+/// `View::BranchCommits`, with the focus dimming used by the files panel.
+fn draw_worktree_commits(
+    frame: &mut Frame,
+    area: Rect,
+    branch: &str,
+    rows: &[GraphLine],
+    selected: usize,
+    mode: LogMode,
+    focused: bool,
+) -> Option<RowList> {
+    let block = focus_panel(format!("commits · {branch} · {}", mode.label()), focused);
+    if rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from("no commits".dim())).block(block),
+            area,
+        );
+        return None;
+    }
+    let inner = block.inner(area);
+    let items: Vec<ListItem> = rows
+        .iter()
+        .map(|row| {
+            let mut spans = graph_spans(&row.graph);
+            if let Some(e) = &row.entry {
+                spans.extend(commit_spans(e, 9));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(highlight_style(focused))
+        .highlight_symbol(Span::styled("▌", Style::new().fg(cursor_color(focused))));
+    let mut state = ListState::default().with_selected(Some(selected.min(rows.len() - 1)));
+    frame.render_stateful_widget(list, area, &mut state);
+    Some(RowList {
+        inner,
+        header: 0,
+        offset: state.offset(),
+        len: rows.len(),
+    })
 }
 
 /// A branch's commit history with a commit checkbox on each row. Marked commits
@@ -3638,8 +3829,8 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::super::config_editor::{
-        CHECK_LINE, LAYOUT_ROW, PREVIEW_LINE, THEME_PREVIEW_LABEL_LINE, THEME_PREVIEW_LINE,
-        THEME_ROW, UPDATE_ROW, VERSION_LINE,
+        CHECK_LINE, LAYOUT_LINE, LAYOUT_ROW, PREVIEW_LINE, THEME_PREVIEW_LABEL_LINE,
+        THEME_PREVIEW_LINE, THEME_ROW, UPDATE_ROW, VERSION_LINE, line_of_row,
     };
     use super::*;
     use crate::git::LogEntry;
@@ -3844,28 +4035,37 @@ mod tests {
             (THEME_ROW, "diff_theme"),
             (LAYOUT_ROW, "worktrees_layout"),
         ] {
+            let offset = line_of_row(row);
             assert!(
-                line(row * 2).contains(label),
+                line(offset).contains(label),
                 "row {row} should be {label}: {:?}",
-                line(row * 2)
+                line(offset)
             );
         }
         assert!(
-            line(UPDATE_ROW * 2).contains("off"),
+            line(line_of_row(UPDATE_ROW)).contains("off"),
             "{:?}",
-            line(UPDATE_ROW * 2)
+            line(line_of_row(UPDATE_ROW))
         );
         assert!(
-            line(THEME_ROW * 2).contains("default"),
+            line(line_of_row(THEME_ROW)).contains("default"),
             "{:?}",
-            line(THEME_ROW * 2)
+            line(line_of_row(THEME_ROW))
         );
         assert!(
-            line(LAYOUT_ROW * 2).contains("default: two panels"),
+            line(LAYOUT_LINE).contains("default: two panels"),
             "{:?}",
-            line(LAYOUT_ROW * 2)
+            line(LAYOUT_LINE)
         );
-        assert!(line(PREVIEW_LINE).contains("new worktrees go in"));
+        // Theme preview belongs under the theme row, before layout.
+        assert!(
+            THEME_PREVIEW_LABEL_LINE > line_of_row(THEME_ROW),
+            "theme preview must follow the theme row"
+        );
+        assert!(
+            THEME_PREVIEW_LABEL_LINE < LAYOUT_LINE,
+            "theme preview must sit above the layout row"
+        );
         assert!(
             line(THEME_PREVIEW_LABEL_LINE).contains("diff colours look like"),
             "{:?}",
@@ -3891,6 +4091,7 @@ mod tests {
             "sample addition missing: {:?}",
             line(THEME_PREVIEW_LINE + 2)
         );
+        assert!(line(PREVIEW_LINE).contains("new worktrees go in"));
         assert!(line(VERSION_LINE).contains(CURRENT_VERSION));
         assert!(line(CHECK_LINE).contains("check for updates"));
     }
@@ -4010,5 +4211,124 @@ mod tests {
         assert_eq!(spinner_glyph(3), spinner_glyph(13));
         // Guard against an out-of-range index panic at the u64 boundary.
         let _ = spinner_glyph(u64::MAX);
+    }
+
+    #[test]
+    fn help_binding_continuation_hangs_under_the_description() {
+        // Narrow width forces a wrap; the second line must start under the
+        // description, not at column 0.
+        let width = HELP_KEY_COL + 10;
+        let lines = help_binding_lines(
+            "Space",
+            "cycle auto_update_check, diff_theme, or worktrees_layout",
+            width,
+        );
+        assert!(lines.len() > 1, "expected wrap: {lines:?}");
+        let first = lines[0].to_string();
+        let second = lines[1].to_string();
+        assert!(first.contains("Space"), "{first}");
+        assert!(
+            second.starts_with(&" ".repeat(HELP_KEY_COL)),
+            "continuation must hang under the description: {second:?}"
+        );
+        assert!(
+            !second[HELP_KEY_COL..].starts_with(' '),
+            "indent should be exact, not deeper: {second:?}"
+        );
+    }
+
+    #[test]
+    fn focus_panel_uses_accent_border_only_when_focused() {
+        let mut terminal = Terminal::new(TestBackend::new(24, 3)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new("").block(focus_panel("worktrees", true)),
+                    frame.area(),
+                );
+            })
+            .unwrap();
+        let focused = terminal.backend().buffer().clone();
+        assert_eq!(
+            focused[(0, 0)].style().fg,
+            Some(ACCENT),
+            "focused border should use the accent"
+        );
+
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new("").block(focus_panel("worktrees", false)),
+                    frame.area(),
+                );
+            })
+            .unwrap();
+        let idle = terminal.backend().buffer().clone();
+        assert_eq!(
+            idle[(0, 0)].style().fg,
+            Some(BORDER),
+            "unfocused border should stay dim"
+        );
+        // Title colour follows the same rule (find the 'w' of "worktrees").
+        let title_x = (0..24u16)
+            .find(|&x| idle[(x, 0)].symbol() == "w")
+            .expect("title missing");
+        assert_eq!(idle[(title_x, 0)].style().fg, Some(BORDER));
+        assert_eq!(focused[(title_x, 0)].style().fg, Some(ACCENT));
+    }
+
+    /// Three-panel commits chrome must follow Files focus the same way the
+    /// changed-file list does: accent border when focused, dim when not.
+    #[test]
+    fn worktree_commits_panel_uses_focus_chrome() {
+        let rows = vec![GraphLine {
+            graph: String::new(),
+            entry: Some(entry("1a2b3c4", "fix parser", &[])),
+        }];
+        let mut terminal = Terminal::new(TestBackend::new(40, 4)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_worktree_commits(
+                    frame,
+                    frame.area(),
+                    "main",
+                    &rows,
+                    0,
+                    LogMode::Flat,
+                    true,
+                );
+            })
+            .unwrap();
+        let focused = terminal.backend().buffer().clone();
+        assert_eq!(
+            focused[(0, 0)].style().fg,
+            Some(ACCENT),
+            "focused commits border should use the accent"
+        );
+
+        terminal
+            .draw(|frame| {
+                draw_worktree_commits(
+                    frame,
+                    frame.area(),
+                    "main",
+                    &rows,
+                    0,
+                    LogMode::Flat,
+                    false,
+                );
+            })
+            .unwrap();
+        let idle = terminal.backend().buffer().clone();
+        assert_eq!(
+            idle[(0, 0)].style().fg,
+            Some(BORDER),
+            "unfocused commits border should stay dim"
+        );
+        let title_x = (0..40u16)
+            .find(|&x| idle[(x, 0)].symbol() == "c")
+            .expect("commits title missing");
+        assert_eq!(idle[(title_x, 0)].style().fg, Some(BORDER));
+        assert_eq!(focused[(title_x, 0)].style().fg, Some(ACCENT));
     }
 }

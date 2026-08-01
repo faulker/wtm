@@ -59,15 +59,28 @@ pub fn run(ctx: Ctx) -> Result<()> {
 /// the screen updating even without keypresses.
 fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     while !app.quit {
+        // Drain any already-queued input before tick/draw. A slow refresh or
+        // syntect pass must not delay Back/q; otherwise a second press buffered
+        // during the stall can quit once the pop finally lands.
+        if event::poll(Duration::ZERO)? {
+            dispatch_event(app, event::read()?)?;
+            continue;
+        }
         app.tick();
         terminal.draw(|frame| ui::draw(frame, app))?;
         if event::poll(Duration::from_millis(100))? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
-                Event::Mouse(mouse) => app.on_mouse(mouse),
-                _ => {}
-            }
+            dispatch_event(app, event::read()?)?;
         }
+    }
+    Ok(())
+}
+
+/// Routes one crossterm event into the app.
+fn dispatch_event(app: &mut App, ev: Event) -> Result<()> {
+    match ev {
+        Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
+        Event::Mouse(mouse) => app.on_mouse(mouse),
+        _ => {}
     }
     Ok(())
 }

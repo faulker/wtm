@@ -39,21 +39,26 @@ pub const CHECK_ROW: usize = FIELD_ROWS;
 pub const ROWS: usize = FIELD_ROWS + 1;
 
 // Line offsets within the Settings tab's rendered form, so the renderer and
-// the click handler cannot drift apart. Each setting row draws a value line
-// followed by a dim hint line, filling `FIELD_ROWS * 2` lines. After that:
-// the worktree-location preview, a labelled theme-colour sample, the version
-// line, then the check-for-updates action row.
-/// Line showing where worktrees will actually be created.
-pub const PREVIEW_LINE: usize = FIELD_ROWS * 2;
+// the click handler cannot drift apart. Rows 0..=THEME_ROW each draw a value
+// line plus a dim hint. Immediately under the theme row sits a labelled
+// theme-colour sample (so the preview stays visually tied to `diff_theme`),
+// then the layout row (value + hint), the worktree-location preview, the
+// version line, and the check-for-updates action row.
 /// Label line above the theme colour sample ("diff colours look like").
-pub const THEME_PREVIEW_LABEL_LINE: usize = PREVIEW_LINE + 1;
+/// Sits right after the theme row's hint so the sample reads as part of that
+/// setting rather than as a footer under `worktrees_layout`.
+pub const THEME_PREVIEW_LABEL_LINE: usize = (THEME_ROW + 1) * 2;
 /// Number of sample lines drawn under [`THEME_PREVIEW_LABEL_LINE`].
 /// Kept in sync with `highlight::THEME_PREVIEW_SAMPLE`'s line count.
 pub const THEME_PREVIEW_SAMPLE_LINES: usize = 3;
 /// First sample line of the theme colour preview.
 pub const THEME_PREVIEW_LINE: usize = THEME_PREVIEW_LABEL_LINE + 1;
+/// Value line of the `worktrees_layout` row (after the theme sample).
+pub const LAYOUT_LINE: usize = THEME_PREVIEW_LINE + THEME_PREVIEW_SAMPLE_LINES;
+/// Line showing where worktrees will actually be created.
+pub const PREVIEW_LINE: usize = LAYOUT_LINE + 2;
 /// Line showing the running version and any update found.
-pub const VERSION_LINE: usize = THEME_PREVIEW_LINE + THEME_PREVIEW_SAMPLE_LINES;
+pub const VERSION_LINE: usize = PREVIEW_LINE + 1;
 pub const CHECK_LINE: usize = VERSION_LINE + 1;
 /// Total lines the form occupies.
 pub const FORM_LINES: usize = CHECK_LINE + 1;
@@ -63,10 +68,21 @@ pub const FORM_LINES: usize = CHECK_LINE + 1;
 pub fn row_at_line(line: usize) -> Option<usize> {
     match line {
         CHECK_LINE => Some(CHECK_ROW),
-        // Only a field's value line (the even offset) selects it; its hint line
-        // below is decoration.
-        _ if line < FIELD_ROWS * 2 && line.is_multiple_of(2) => Some(line / 2),
+        // Layout sits after the theme sample, so it is not at `LAYOUT_ROW * 2`.
+        LAYOUT_LINE => Some(LAYOUT_ROW),
+        // Rows 0..=THEME_ROW are contiguous value/hint pairs before the theme
+        // preview block. Only a field's value line (even offset) selects it.
+        _ if line < THEME_PREVIEW_LABEL_LINE && line.is_multiple_of(2) => Some(line / 2),
         _ => None,
+    }
+}
+
+/// Form line of a field row's value, mirroring [`row_at_line`].
+pub fn line_of_row(row: usize) -> usize {
+    if row == LAYOUT_ROW {
+        LAYOUT_LINE
+    } else {
+        row * 2
     }
 }
 
@@ -712,6 +728,17 @@ mod tests {
         assert_eq!(row_at_line(PREVIEW_LINE), None);
         assert_eq!(row_at_line(THEME_PREVIEW_LABEL_LINE), None);
         assert_eq!(row_at_line(THEME_PREVIEW_LINE), None);
+        assert_eq!(row_at_line(LAYOUT_LINE), Some(LAYOUT_ROW));
+        assert_eq!(
+            row_at_line(LAYOUT_LINE + 1),
+            None,
+            "layout hint is not selectable"
+        );
+        // Theme sample sits under the theme row and before the layout row.
+        assert!(THEME_PREVIEW_LABEL_LINE > THEME_ROW * 2 + 1);
+        assert!(THEME_PREVIEW_LINE + THEME_PREVIEW_SAMPLE_LINES - 1 < LAYOUT_LINE);
+        assert_eq!(line_of_row(THEME_ROW), THEME_ROW * 2);
+        assert_eq!(line_of_row(LAYOUT_ROW), LAYOUT_LINE);
         assert_eq!(
             THEME_PREVIEW_SAMPLE_LINES,
             highlight::THEME_PREVIEW_SAMPLE.lines().count(),

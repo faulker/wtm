@@ -34,8 +34,8 @@ pub fn print_list(infos: &[WorktreeInfo]) {
         .unwrap_or(4)
         .max(4);
     println!(
-        "{:<name_w$}  {:<10}  {:<10}  PATH",
-        "NAME", "DIRTY", "UPSTREAM"
+        "{:<name_w$}  {:<10}  {:<10}  {:<28}  PATH",
+        "NAME", "DIRTY", "UPSTREAM", "FLAGS"
     );
     for info in infos {
         let dirty = if info.dirty > 0 {
@@ -51,10 +51,35 @@ pub fn print_list(infos: &[WorktreeInfo]) {
         if info.is_main {
             name.push('*');
         }
+        let flags = worktree_flags(info);
         println!(
-            "{name:<name_w$}  {dirty:<10}  {upstream:<10}  {}",
+            "{name:<name_w$}  {dirty:<10}  {upstream:<10}  {flags:<28}  {}",
             info.path
         );
+    }
+}
+
+/// Concise FLAGS column text for a worktree (same labels as the TUI).
+fn worktree_flags(info: &WorktreeInfo) -> String {
+    let mut parts = Vec::new();
+    if info.changed_from_base {
+        parts.push("changed");
+    } else if info.created_from.is_some() && !info.is_main && !info.behind_base {
+        parts.push("same");
+    }
+    if info.behind_base {
+        parts.push("outdated");
+    }
+    if info.merged {
+        parts.push("merged");
+    }
+    if info.locked {
+        parts.push("locked");
+    }
+    if parts.is_empty() {
+        "-".to_string()
+    } else {
+        parts.join(" ")
     }
 }
 

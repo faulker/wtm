@@ -171,6 +171,10 @@ const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// How long a status/error message stays on screen before auto-clearing.
 const MESSAGE_TIMEOUT: Duration = Duration::from_secs(4);
 
+/// After q/Esc navigates "back", ignore a quit-bound q/Esc for this long so a
+/// key buffered during a slow frame cannot quit once the pop finally lands.
+const QUIT_IGNORE_AFTER_BACK: Duration = Duration::from_millis(400);
+
 /// How commit history is drawn in the log and branch-commit views. `Tree` runs
 /// the log through `git log --graph` so branch and merge topology is visible;
 /// `Flat` is a plain newest-first list. Toggled with `t`, and remembered on the
@@ -1008,8 +1012,25 @@ pub enum WorktreesFocus {
     /// The worktree list on top.
     #[default]
     List,
-    /// The changed-file list at the bottom left.
+    /// The changed-file list at the bottom left (or the commit list when the
+    /// selected worktree is clean).
     Files,
+}
+
+/// Bottom panel of the three-panel Worktrees layout when the selected worktree
+/// has no uncommitted changes: that worktree's branch commit history (same
+/// rows as `View::BranchCommits`, loaded via `branch_log_lines`).
+#[derive(Debug, Clone)]
+pub struct WorktreeCommitsPanel {
+    /// Worktree whose branch history is shown.
+    pub name: String,
+    /// Branch used for the log title and `branch_log_lines` (or the worktree
+    /// name when detached, with rows from `worktree_log_lines` instead).
+    pub branch: String,
+    /// True when `branch` is a real branch ref; false for detached HEAD.
+    pub from_branch: bool,
+    pub lines: Vec<GraphLine>,
+    pub selected: usize,
 }
 
 /// The top-level tabs of the main window. `View::List` renders whichever tab
@@ -1209,10 +1230,14 @@ pub struct App {
     pub worktrees_focus: WorktreesFocus,
     /// Geometry of the three-panel layout's changed-file rows, recorded by the
     /// renderer each frame so clicks and the wheel can be resolved against it.
+    /// When the bottom panel shows commits instead, this is that list's geometry.
     pub files_list: Option<RowList>,
     /// Content of the Changes tab, populated by `open_changes_tab`. Also feeds
     /// the bottom two panels of the three-panel Worktrees layout.
     pub changes: ChangesTab,
+    /// When `Some`, the three-panel bottom area shows this commit list instead
+    /// of the changes/diff panels (selected worktree is clean).
+    pub worktree_commits: Option<WorktreeCommitsPanel>,
     /// Branches shown on the Branches tab, loaded by `load_branches`. Kept
     /// on screen (stale) while a background reload is in flight, so
     /// switching back into the tab is instant instead of flashing empty.
@@ -1319,6 +1344,10 @@ pub struct App {
     /// once the terminal is restored.
     pub restart_exe: Option<PathBuf>,
     pub quit: bool,
+    /// When set, q/Esc will not quit until this instant. Armed by back
+    /// navigation so a duplicate key buffered while a slow tick/draw delayed
+    /// the pop cannot quit the app as a side effect.
+    ignore_quit_until: Option<Instant>,
 }
 
 impl App {
@@ -1355,6 +1384,7 @@ impl App {
             worktrees_focus: WorktreesFocus::default(),
             files_list: None,
             changes: ChangesTab::default(),
+            worktree_commits: None,
             branches: Vec::new(),
             branch_selected: 0,
             branches_pending: None,
@@ -1392,6 +1422,7 @@ impl App {
             update_prompted: false,
             restart_exe: None,
             quit: false,
+            ignore_quit_until: None,
         };
         if initialized {
             app.refresh();
@@ -1536,6 +1567,29 @@ impl App {
         self.view = self.stack.pop().unwrap_or(View::List);
     }
 
+    /// Pops one screen and arms the quit-ignore window so a buffered duplicate
+    /// q/Esc cannot quit once this back navigation lands.
+    fn navigate_back(&mut self) {
+        self.pop_screen();
+        self.arm_ignore_quit();
+    }
+
+    /// Arms a short window during which q/Esc will not quit the app.
+    fn arm_ignore_quit(&mut self) {
+        self.ignore_quit_until = Some(Instant::now() + QUIT_IGNORE_AFTER_BACK);
+    }
+
+    /// Quits unless a recent back navigation armed the ignore window.
+    fn request_quit(&mut self) {
+        if self
+            .ignore_quit_until
+            .is_some_and(|until| Instant::now() < until)
+        {
+            return;
+        }
+        self.quit = true;
+    }
+
     /// Jumps straight back to the root worktree list, discarding the whole
     /// stack. Used by the transient merge/resolve/setup flows, which always
     /// return to the list regardless of how they were reached.
@@ -1558,6 +1612,30 @@ impl App {
         // after this refresh; the next draw will kick off a fresh load.
         self.preview_for = None;
         self.preview_pending = None;
+        // A delete (or external removal) can leave Changes/three-panel pointed
+        // at a ghost name; realign before the next refresh_diff can not_found.
+        self.realign_changes_after_list_reload();
+    }
+
+    /// If `changes.name` no longer exists in the worktree list, clear or
+    /// retarget it so status/diff loads cannot surface `no worktree named…`.
+    fn realign_changes_after_list_reload(&mut self) {
+        if self.changes.name.is_empty() {
+            return;
+        }
+        if self.worktrees.iter().any(|w| w.name == self.changes.name) {
+            return;
+        }
+        let on_changes = self.tab == Tab::Changes;
+        self.changes = ChangesTab::default();
+        if on_changes {
+            match self.worktrees.get(self.selected).map(|w| w.name.clone()) {
+                Some(name) => {
+                    let _ = self.load_changes(name);
+                }
+                None => self.tab = Tab::Worktrees,
+            }
+        }
     }
 
     /// Reloads the visible lists on a timer, so work done outside the app (an
@@ -1935,7 +2013,7 @@ impl App {
             View::List => self.on_list_key(key),
             View::Create { .. } => self.on_create_key(key),
             View::RunCommand { input, .. } => match key.code {
-                KeyCode::Esc => self.pop_screen(),
+                KeyCode::Esc => self.navigate_back(),
                 KeyCode::Enter => {
                     if let View::RunCommand { name, path, input } =
                         std::mem::replace(&mut self.view, View::List)
@@ -1962,7 +2040,7 @@ impl App {
                 }
             },
             View::RenameWorktree { input, .. } => match key.code {
-                KeyCode::Esc => self.pop_screen(),
+                KeyCode::Esc => self.navigate_back(),
                 KeyCode::Enter => {
                     if let View::RenameWorktree { name, input } =
                         std::mem::replace(&mut self.view, View::List)
@@ -1989,7 +2067,7 @@ impl App {
             } => {
                 if *done {
                     if matches!(key.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
-                        self.pop_screen();
+                        self.navigate_back();
                         self.refresh();
                     }
                     return;
@@ -2747,7 +2825,7 @@ impl App {
 
     fn on_worktrees_tab_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Char('q') | KeyCode::Esc => self.request_quit(),
             // Three-panel: the panel below the list is the diff, scrolled
             // remotely with the same keys the Changes tab uses.
             KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) && self.three_panel => {
@@ -2819,13 +2897,71 @@ impl App {
     /// Keys while the changed-file panel of the three-panel Worktrees layout
     /// holds the focus. Identical to the Changes tab, except that q/Esc hand
     /// the keyboard back to the worktree list rather than quitting: the app
-    /// only quits from the list, so focus is never a trap.
+    /// only quits from the list, so focus is never a trap. When the selected
+    /// worktree is clean the panel shows commits instead, with BranchCommits-
+    /// style navigation.
     fn on_worktrees_files_key(&mut self, key: KeyEvent) {
         if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
             self.worktrees_focus = WorktreesFocus::List;
+            self.arm_ignore_quit();
+            return;
+        }
+        if self.worktree_commits.is_some() {
+            self.on_worktree_commits_key(key);
             return;
         }
         self.on_changes_tab_key(key);
+    }
+
+    /// Keys for the three-panel commit list (clean worktree): move the cursor
+    /// and open a commit's file browser, matching `View::BranchCommits`.
+    fn on_worktree_commits_key(&mut self, key: KeyEvent) {
+        let Some(panel) = &mut self.worktree_commits else {
+            return;
+        };
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(i) = seek_commit_row(&panel.lines, panel.selected, true) {
+                    panel.selected = i;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(i) = seek_commit_row(&panel.lines, panel.selected, false) {
+                    panel.selected = i;
+                }
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                panel.selected = first_commit_row(&panel.lines);
+            }
+            KeyCode::Enter | KeyCode::Char('v') | KeyCode::Right => {
+                self.open_commit_diff_from_worktree_commits();
+            }
+            KeyCode::Char('t') => self.toggle_log_mode(),
+            _ => {}
+        }
+    }
+
+    /// Opens the commit browser for the row highlighted in the three-panel
+    /// commits panel, viewed from that worktree (same as the worktree log).
+    fn open_commit_diff_from_worktree_commits(&mut self) {
+        let Some(panel) = &self.worktree_commits else {
+            return;
+        };
+        let Some(entry) = panel
+            .lines
+            .get(panel.selected)
+            .and_then(|l| l.entry.as_ref())
+        else {
+            return;
+        };
+        let name = panel.name.clone();
+        let hash = entry.hash.clone();
+        let label = format!(
+            "{} {}",
+            entry.hash.chars().take(9).collect::<String>(),
+            entry.subject
+        );
+        self.open_commit_diff(name, hash, label);
     }
 
     /// Opens the rename prompt for the selected worktree, prefilled with its
@@ -2898,6 +3034,7 @@ impl App {
                     ..ChangesTab::default()
                 };
                 self.load_diff_content(true);
+                self.sync_worktree_commits_panel();
                 true
             }
             Err(e) => {
@@ -3077,21 +3214,33 @@ impl App {
         // Worktrees tab: the wheel steps the worktree cursor over the table and
         // scrolls the changed-file preview over the panel below it.
         if matches!(self.view, View::List) && self.tab == Tab::Worktrees && self.three_panel {
-            // Three panels, three destinations: the file rows step the file
-            // cursor, the worktree rows step the worktree cursor, and anywhere
-            // else (the diff) scrolls the diff text.
+            // Three panels, three destinations: the file (or commit) rows step
+            // that cursor, the worktree rows step the worktree cursor, and
+            // anywhere else (the diff) scrolls the diff text.
             if self
                 .files_list
                 .is_some_and(|rl| rl.contains(mouse.column, mouse.row))
             {
-                let c = &mut self.changes;
-                let moved = if down {
-                    (c.selected + 1 < c.rows.len()).then(|| c.selected += 1)
+                if let Some(panel) = &mut self.worktree_commits {
+                    if down {
+                        if let Some(i) = seek_commit_row(&panel.lines, panel.selected, true) {
+                            panel.selected = i;
+                        }
+                    } else if let Some(i) =
+                        seek_commit_row(&panel.lines, panel.selected, false)
+                    {
+                        panel.selected = i;
+                    }
                 } else {
-                    (c.selected > 0).then(|| c.selected -= 1)
-                };
-                if moved.is_some() {
-                    self.load_diff_content(true);
+                    let c = &mut self.changes;
+                    let moved = if down {
+                        (c.selected + 1 < c.rows.len()).then(|| c.selected += 1)
+                    } else {
+                        (c.selected > 0).then(|| c.selected -= 1)
+                    };
+                    if moved.is_some() {
+                        self.load_diff_content(true);
+                    }
                 }
             } else if over_list {
                 if down {
@@ -3101,7 +3250,7 @@ impl App {
                 } else if self.selected > 0 {
                     self.selected -= 1;
                 }
-            } else {
+            } else if self.worktree_commits.is_none() {
                 self.changes.scroll = delta(self.changes.scroll);
             }
             return;
@@ -3199,13 +3348,18 @@ impl App {
             return;
         }
         // The three-panel layout's file panel is the Changes tab's list, so a
-        // double click there activates the row the same way.
+        // double click there activates the row the same way. On a clean
+        // worktree that panel is the commit list: open the commit browser.
         let on_files = self.tab == Tab::Changes
             || (self.tab == Tab::Worktrees
                 && self.three_panel
                 && self.worktrees_focus == WorktreesFocus::Files);
         if on_files {
-            self.activate_changes_row();
+            if self.worktree_commits.is_some() {
+                self.open_commit_diff_from_worktree_commits();
+            } else {
+                self.activate_changes_row();
+            }
         }
     }
 
@@ -3294,14 +3448,20 @@ impl App {
             self.last_click = None;
             return;
         }
-        // Three-panel layout: a click in the changed-file panel takes the focus
-        // (the mouse equivalent of Enter) and lands the cursor on that file.
+        // Three-panel layout: a click in the changed-file (or commit) panel
+        // takes the focus (the mouse equivalent of Enter) and lands the cursor.
         if let Some(idx) = self.files_list.and_then(|rl| rl.hit(col, row)) {
             self.worktrees_focus = WorktreesFocus::Files;
-            let c = &mut self.changes;
-            if idx < c.rows.len() && c.selected != idx {
-                c.selected = idx;
-                self.load_diff_content(true);
+            if let Some(panel) = &mut self.worktree_commits {
+                if idx < panel.lines.len() {
+                    panel.selected = idx;
+                }
+            } else {
+                let c = &mut self.changes;
+                if idx < c.rows.len() && c.selected != idx {
+                    c.selected = idx;
+                    self.load_diff_content(true);
+                }
             }
             return;
         }
@@ -3548,8 +3708,14 @@ impl App {
             return;
         }
         match key.code {
-            // Every top-level tab quits on Esc/q; only drill-ins go "back".
-            KeyCode::Esc | KeyCode::Char('q') => self.quit = true,
+            // Enter from the Worktrees list drills into Changes; q/Esc return
+            // there (same idea as three-panel file focus). Quit only from the
+            // Worktrees list, after the ignore window from this back expires.
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.tab = Tab::Worktrees;
+                self.worktrees_focus = WorktreesFocus::List;
+                self.arm_ignore_quit();
+            }
             KeyCode::Char('r') => self.refresh_diff(),
             KeyCode::Down | KeyCode::Char('j') => {
                 if *selected + 1 < rows.len() {
@@ -3875,13 +4041,21 @@ impl App {
                     .and_then(|i| c.files.get(i))
                     .map(|f| f.path.clone());
                 self.load_diff_content(new_path != old_path);
+                // Clean ↔ dirty flips swap the three-panel bottom between the
+                // commit list and the changes/diff panels.
+                self.sync_worktree_commits_panel();
             }
-            // The worktree may have been removed out from under us; surface it
-            // and drop back to the worktree list rather than looping on the
-            // error.
+            // The worktree may have been removed (delete, or out from under us).
+            // A name already gone from `worktrees` is a stale Changes target —
+            // realign quietly. Anything else is a real error.
             Err(e) => {
+                if !self.worktrees.iter().any(|w| w.name == name) {
+                    self.realign_changes_after_list_reload();
+                    return;
+                }
                 self.set_error(format!("{e:#}"));
                 self.changes = ChangesTab::default();
+                self.worktree_commits = None;
                 self.tab = Tab::Worktrees;
                 self.refresh();
             }
@@ -4090,7 +4264,7 @@ impl App {
                 if *base_focus {
                     *base_focus = false;
                 } else {
-                    self.pop_screen();
+                    self.navigate_back();
                 }
             }
             // Tab focuses the base button on the new-branch row; a second Tab (or
@@ -4300,7 +4474,7 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
             KeyCode::Enter => self.confirm_open_command(),
-            KeyCode::Esc | KeyCode::Char('q') => self.pop_screen(),
+            KeyCode::Esc | KeyCode::Char('q') => self.navigate_back(),
             _ => {}
         }
     }
@@ -4411,7 +4585,7 @@ impl App {
         };
         match key.code {
             KeyCode::Esc => {
-                self.pop_screen();
+                self.navigate_back();
                 return;
             }
             KeyCode::Tab => {
@@ -4524,7 +4698,7 @@ impl App {
             // The editor swallows Esc itself while a field is being edited, so
             // `Cancel` only arrives when nothing is in progress — and then Esc/q
             // quits, as on every other tab.
-            EditorOutcome::Cancel => self.quit = true,
+            EditorOutcome::Cancel => self.request_quit(),
             EditorOutcome::Continue => {}
         }
     }
@@ -4563,7 +4737,7 @@ impl App {
         let name = self.stash_name.clone();
         match key.code {
             // Every top-level tab quits on Esc/q; only drill-ins go "back".
-            KeyCode::Esc | KeyCode::Char('q') => self.quit = true,
+            KeyCode::Esc | KeyCode::Char('q') => self.request_quit(),
             KeyCode::Down | KeyCode::Char('j') => {
                 if self.stash_selected + 1 < self.stash_entries.len() {
                     self.stash_selected += 1;
@@ -4648,7 +4822,7 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
             KeyCode::Enter => self.run_stash_target(),
-            KeyCode::Esc | KeyCode::Char('q') => self.pop_screen(),
+            KeyCode::Esc | KeyCode::Char('q') => self.navigate_back(),
             _ => {}
         }
     }
@@ -4812,7 +4986,7 @@ impl App {
                     *filter = TextInput::default();
                     *selected = 0;
                 } else {
-                    self.pop_screen();
+                    self.navigate_back();
                 }
             }
             KeyCode::Down => {
@@ -4931,30 +5105,99 @@ impl App {
     /// changed-file and diff panels, so moving the worktree cursor swaps them
     /// without an `ops::status` on the UI thread. The status itself comes from
     /// the preview loader, which already drops results for a selection the
-    /// cursor has since moved off.
+    /// cursor has since moved off. A clean worktree swaps the bottom area to
+    /// that branch's commit list instead of an empty changes pane.
     fn sync_three_panel_changes(&mut self) {
         if !self.three_panel {
+            self.worktree_commits = None;
             return;
         }
         let Some(name) = self.worktrees.get(self.selected).map(|w| w.name.clone()) else {
             return;
         };
         // Already showing this worktree: leave the cursor, marks, and scroll
-        // alone (the periodic `refresh_diff` keeps the contents current).
-        if self.changes.name == name {
+        // alone (the periodic `refresh_diff` keeps the contents current), but
+        // still reconcile dirty ↔ commits when the panel was cleared.
+        if self.changes.name != name {
+            let files = self.worktree_preview.clone();
+            let marked = vec![true; files.len()];
+            let rows = build_rows(&files, self.file_tree, &self.collapsed_folders);
+            self.changes = ChangesTab {
+                name,
+                files,
+                marked,
+                rows,
+                ..ChangesTab::default()
+            };
+            self.load_diff_content(true);
+        }
+        self.sync_worktree_commits_panel();
+    }
+
+    /// Shows the branch commit list in the three-panel bottom area when the
+    /// current changes pane is empty, or clears it when there are uncommitted
+    /// files again. Reuses `branch_log_lines` (same path as `View::BranchCommits`).
+    fn sync_worktree_commits_panel(&mut self) {
+        if !self.three_panel || self.changes.name.is_empty() {
+            self.worktree_commits = None;
             return;
         }
-        let files = self.worktree_preview.clone();
-        let marked = vec![true; files.len()];
-        let rows = build_rows(&files, self.file_tree, &self.collapsed_folders);
-        self.changes = ChangesTab {
-            name,
-            files,
-            marked,
-            rows,
-            ..ChangesTab::default()
+        if !self.changes.files.is_empty() {
+            self.worktree_commits = None;
+            return;
+        }
+        let Some(wt) = self
+            .worktrees
+            .iter()
+            .find(|w| w.name == self.changes.name)
+        else {
+            self.worktree_commits = None;
+            return;
         };
-        self.load_diff_content(true);
+        let name = wt.name.clone();
+        let from_branch = wt.branch.is_some();
+        let branch = wt.branch.clone().unwrap_or_else(|| name.clone());
+        if let Some(panel) = &self.worktree_commits
+            && panel.name == name
+            && panel.branch == branch
+            && panel.from_branch == from_branch
+        {
+            return;
+        }
+        self.load_worktree_commits_panel(name, branch, from_branch);
+    }
+
+    /// Loads commit rows for the three-panel clean-worktree panel.
+    fn load_worktree_commits_panel(&mut self, name: String, branch: String, from_branch: bool) {
+        let result = if from_branch {
+            self.branch_log_lines(&branch)
+        } else {
+            self.worktree_log_lines(&name)
+        };
+        match result {
+            Ok(lines) => {
+                let selected = first_commit_row(&lines);
+                self.worktree_commits = Some(WorktreeCommitsPanel {
+                    name,
+                    branch,
+                    from_branch,
+                    lines,
+                    selected,
+                });
+            }
+            Err(e) => {
+                // Automatic panel fill: don't raise a modal error (that would
+                // steal the next keypress). Leave the bottom empty and say why.
+                self.worktree_commits = None;
+                self.message = Some(e);
+            }
+        }
+    }
+
+    /// Whether the three-panel bottom area is showing commits for a clean worktree.
+    #[cfg(test)]
+    fn showing_worktree_commits(&self) -> bool {
+        self.three_panel && self.worktree_commits.is_some()
     }
 
     /// Whether the Worktrees tab preview is waiting on status for the current
@@ -5030,7 +5273,7 @@ impl App {
     /// `tab` is `Branches`).
     fn on_branches_tab_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Char('q') | KeyCode::Esc => self.request_quit(),
             KeyCode::Down | KeyCode::Char('j') => {
                 if self.branch_selected + 1 < self.branches.len() {
                     self.branch_selected += 1;
@@ -5149,7 +5392,7 @@ impl App {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 // Back to the Branches tab, keeping the branch highlighted.
-                self.pop_screen();
+                self.navigate_back();
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 if let Some(i) = seek_commit_row(lines, *selected, true) {
@@ -5304,7 +5547,7 @@ impl App {
                 }
                 KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
                 KeyCode::Enter => *mode = Some(0),
-                KeyCode::Esc | KeyCode::Char('q') => self.pop_screen(),
+                KeyCode::Esc | KeyCode::Char('q') => self.navigate_back(),
                 _ => {}
             },
         }
@@ -5419,7 +5662,7 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
             KeyCode::Enter => self.run_merge(),
-            KeyCode::Esc | KeyCode::Char('q') => self.pop_screen(),
+            KeyCode::Esc | KeyCode::Char('q') => self.navigate_back(),
             _ => {}
         }
     }
@@ -5522,7 +5765,7 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
             KeyCode::Enter => self.run_move_changes(),
-            KeyCode::Esc | KeyCode::Char('q') => self.pop_screen(),
+            KeyCode::Esc | KeyCode::Char('q') => self.navigate_back(),
             _ => {}
         }
     }
@@ -5695,6 +5938,7 @@ impl App {
             // Leaving keeps the merge in progress so it can be resumed later.
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.go_root();
+                self.arm_ignore_quit();
                 self.refresh();
             }
             KeyCode::Left | KeyCode::Char('[') | KeyCode::Char('h') => self.resolver_move_file(-1),
@@ -6065,7 +6309,7 @@ impl App {
             return;
         };
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.pop_screen(),
+            KeyCode::Esc | KeyCode::Char('q') => self.navigate_back(),
             // Move the cursor to the next/previous row that holds a commit,
             // skipping the art-only connector rows git draws between them.
             KeyCode::Down | KeyCode::Char('j') => {
@@ -6171,7 +6415,7 @@ impl App {
             return;
         }
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.pop_screen(),
+            KeyCode::Esc | KeyCode::Char('q') => self.navigate_back(),
             KeyCode::Down | KeyCode::Char('j') => {
                 if selected + 1 < rows_len {
                     if let View::CommitDiff { selected, .. } | View::StashDiff { selected, .. } =
@@ -6510,6 +6754,13 @@ impl App {
                     }
                     Err(e) => self.set_error(e),
                 }
+            }
+            View::List if self.worktree_commits.is_some() => {
+                let panel = self.worktree_commits.as_ref().unwrap();
+                let name = panel.name.clone();
+                let branch = panel.branch.clone();
+                let from_branch = panel.from_branch;
+                self.load_worktree_commits_panel(name, branch, from_branch);
             }
             _ => return,
         }
@@ -7029,6 +7280,46 @@ mod tests {
         assert!(app.quit);
     }
 
+    /// From a nested commit-diff view, two rapid q presses must back out (to the
+    /// list), not quit — a second q buffered during a slow frame used to quit.
+    #[test]
+    fn rapid_q_from_commit_diff_backs_out_without_quitting() {
+        let (_tmp, mut app) = test_app();
+        press(&mut app, KeyCode::Char('l'));
+        assert!(matches!(app.view, View::Log { .. }));
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.view, View::CommitDiff { .. }));
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Char('q'));
+        assert!(!app.quit, "second q after back must not quit the app");
+        assert!(
+            matches!(app.view, View::List),
+            "two q presses from CommitDiff should reach the list"
+        );
+        // Intentional quit from the Worktrees list still works once the ignore
+        // window is cleared (or expires).
+        app.ignore_quit_until = None;
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.quit);
+    }
+
+    /// Changes is entered like a drill-in (Enter from Worktrees); q returns
+    /// there, and a buffered duplicate must not quit.
+    #[test]
+    fn rapid_q_from_changes_returns_without_quitting() {
+        let (_tmp, mut app) = test_app();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.tab, Tab::Changes);
+        press(&mut app, KeyCode::Char('q'));
+        assert_eq!(app.tab, Tab::Worktrees);
+        assert!(!app.quit);
+        press(&mut app, KeyCode::Char('q'));
+        assert!(!app.quit, "duplicate q right after back must be ignored");
+        app.ignore_quit_until = None;
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.quit);
+    }
+
     #[test]
     fn help_opens_on_the_tab_for_the_active_view() {
         let (_tmp, mut app) = test_app();
@@ -7493,9 +7784,10 @@ mod tests {
         press(&mut app, KeyCode::Char('K'));
         press_shift(&mut app, KeyCode::Up);
         assert_eq!(app.changes.scroll, 0);
-        // Changes is a top-level tab now, so Esc quits rather than going back.
+        // Esc/q return to the Worktrees list (Enter drills in; quit is from there).
         press(&mut app, KeyCode::Esc);
-        assert!(app.quit);
+        assert!(!app.quit);
+        assert_eq!(app.tab, Tab::Worktrees);
     }
 
     #[test]
@@ -10288,6 +10580,74 @@ mod tests {
         assert!(!app.worktrees.iter().any(|w| w.name == "later"));
     }
 
+    /// After a folder-only delete, Changes/three-panel must not keep the removed
+    /// name and then surface `no worktree named…` on the next diff refresh.
+    #[test]
+    fn delete_realigns_changes_so_refresh_diff_does_not_not_found() {
+        let (_tmp, mut app) = test_app();
+        add_and_select_worktree(&mut app, "ghost");
+        assert!(app.load_changes("ghost".into()));
+        assert_eq!(app.changes.name, "ghost");
+
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+
+        assert!(app.error.is_none(), "delete itself must not error: {:?}", app.error);
+        assert_ne!(app.changes.name, "ghost", "stale Changes target must be cleared");
+        assert!(!app.worktrees.iter().any(|w| w.name == "ghost"));
+
+        // Force the periodic three-panel / Changes refresh path.
+        app.three_panel = true;
+        app.tab = Tab::Worktrees;
+        app.changes.last_refresh = Instant::now() - DIFF_REFRESH_INTERVAL;
+        app.tick();
+        assert!(
+            app.error.is_none(),
+            "refresh after delete must not not_found: {:?}",
+            app.error
+        );
+        assert!(
+            app.changes.name.is_empty()
+                || app.worktrees.iter().any(|w| w.name == app.changes.name),
+            "Changes must point at a living worktree or be empty"
+        );
+    }
+
+    /// Folder+branch delete has the same stale-Changes hazard via DeleteBranch.
+    #[test]
+    fn delete_with_branch_realigns_changes_without_not_found() {
+        let (_tmp, mut app) = test_app();
+        add_and_select_worktree(&mut app, "vanish");
+        assert!(app.load_changes("vanish".into()));
+
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Down); // folder + branch
+        press(&mut app, KeyCode::Char('y'));
+        settle(&mut app);
+
+        assert!(app.error.is_none(), "unexpected error: {:?}", app.error);
+        assert_ne!(app.changes.name, "vanish");
+        app.three_panel = true;
+        app.changes.last_refresh = Instant::now() - DIFF_REFRESH_INTERVAL;
+        app.tick();
+        assert!(
+            app.error.is_none(),
+            "post-delete tick must stay clean: {:?}",
+            app.error
+        );
+    }
+
+    /// A Changes target already missing from the list fails soft, not as a popup.
+    #[test]
+    fn refresh_diff_silently_realigns_a_missing_worktree() {
+        let (_tmp, mut app) = test_app();
+        app.changes.name = "nope".into();
+        app.refresh_diff();
+        assert!(app.error.is_none(), "ghost target must not popup: {:?}", app.error);
+        assert!(app.changes.name.is_empty() || app.changes.name != "nope");
+    }
+
     #[test]
     fn deleting_a_dirty_worktree_prompts_then_discards() {
         let (_tmp, mut app) = test_app();
@@ -11723,6 +12083,25 @@ mod tests {
         (tmp, app)
     }
 
+    /// Three-panel layout with a clean main worktree (no uncommitted changes),
+    /// so the bottom area should show the branch commit list.
+    fn three_panel_clean_app() -> (tempfile::TempDir, App) {
+        let (tmp, mut app) = test_app();
+        app.ctx.config.worktrees_layout = Some(WorktreesLayout::ThreePanel);
+        let root = app.ctx.repo_root.clone();
+        // `.wtm.toml` is written after the seed commit, so commit it (and a
+        // second empty commit) before treating the worktree as clean.
+        git(&root, &["add", ".wtm.toml"]);
+        git(&root, &["commit", "-m", "wtm config"]);
+        git(&root, &["commit", "--allow-empty", "-m", "second"]);
+        app.refresh();
+        app.selected = app.worktrees.iter().position(|w| w.is_main).unwrap();
+        render_app(&mut app, 100, 30);
+        settle_preview(&mut app);
+        render_app(&mut app, 100, 30);
+        (tmp, app)
+    }
+
     /// Enter hands the keyboard to the changed-file panel and q/Esc gives it
     /// back, so the app still only quits from the worktree list.
     #[test]
@@ -11746,7 +12125,9 @@ mod tests {
         assert!(!app.quit);
         assert_eq!(app.worktrees_focus, WorktreesFocus::List);
 
-        // Quit still works from the list.
+        // A q right after back is ignored (debounce for buffered keys). Clear
+        // the window so an intentional quit from the list still works.
+        app.ignore_quit_until = None;
         press(&mut app, KeyCode::Char('q'));
         assert!(app.quit);
     }
@@ -11931,5 +12312,98 @@ mod tests {
         render_app(&mut app, 100, 30);
         assert!(app.three_panel, "the next frame draws three panels");
         assert!(app.tab_hidden(Tab::Changes));
+    }
+
+    /// A clean worktree fills the three-panel bottom with that branch's commit
+    /// history instead of an empty changes list.
+    #[test]
+    fn three_panel_clean_worktree_shows_commit_list() {
+        let (_tmp, app) = three_panel_clean_app();
+        assert!(app.worktree_preview.is_empty());
+        assert!(app.changes.files.is_empty());
+        assert!(app.showing_worktree_commits());
+        let panel = app
+            .worktree_commits
+            .as_ref()
+            .expect("clean worktree shows commits");
+        assert!(!panel.lines.is_empty(), "branch history should load");
+        assert_eq!(panel.name, app.worktrees[app.selected].name);
+        assert_eq!(
+            Some(panel.branch.as_str()),
+            app.worktrees[app.selected].branch.as_deref()
+        );
+        assert!(panel.from_branch);
+        assert!(
+            app.files_list.is_some(),
+            "the commit list records click geometry"
+        );
+    }
+
+    /// A dirty worktree keeps the existing changes + diff bottom panels.
+    #[test]
+    fn three_panel_dirty_worktree_keeps_changes_panel() {
+        let (_tmp, app) = three_panel_app();
+        assert!(!app.showing_worktree_commits());
+        assert!(app.changes.files.iter().any(|f| f.path == "a.txt"));
+    }
+
+    /// With the commit list focused, j/k move the commit cursor and Enter
+    /// opens the commit file browser (BranchCommits-style).
+    #[test]
+    fn three_panel_commits_navigate_and_open_diff() {
+        let (_tmp, mut app) = three_panel_clean_app();
+        let worktree_cursor = app.selected;
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.worktrees_focus, WorktreesFocus::Files);
+        let start = app.worktree_commits.as_ref().unwrap().selected;
+        press(&mut app, KeyCode::Down);
+        let after = app.worktree_commits.as_ref().unwrap().selected;
+        assert_ne!(after, start, "j/↓ moves to another commit");
+        assert_eq!(app.selected, worktree_cursor, "worktree cursor stays");
+
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(app.view, View::CommitDiff { .. }),
+            "Enter opens the commit browser"
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.view, View::List));
+        assert!(app.worktree_commits.is_some());
+    }
+
+    /// Dirty ↔ clean flips swap the three-panel bottom between changes and
+    /// commits without leaving the Worktrees tab.
+    #[test]
+    fn three_panel_switches_between_changes_and_commits() {
+        let (_tmp, mut app) = three_panel_clean_app();
+        assert!(app.worktree_commits.is_some());
+
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("dirty.txt"), "x\n").unwrap();
+        app.refresh_diff();
+        assert!(
+            app.worktree_commits.is_none(),
+            "dirty status drops the commit list"
+        );
+        assert!(app.changes.files.iter().any(|f| f.path == "dirty.txt"));
+
+        std::fs::remove_file(root.join("dirty.txt")).unwrap();
+        app.refresh_diff();
+        assert!(
+            app.worktree_commits.is_some(),
+            "clean status brings the commit list back"
+        );
+        assert!(app.changes.files.is_empty());
+    }
+
+    /// Two-panel layout never fills `worktree_commits`; clean means empty
+    /// Changes tab / preview, not an in-tab commit list.
+    #[test]
+    fn two_panel_clean_worktree_does_not_show_commit_panel() {
+        let (_tmp, mut app) = test_app();
+        render_app(&mut app, 100, 30);
+        settle_preview(&mut app);
+        assert!(!app.three_panel);
+        assert!(app.worktree_commits.is_none());
     }
 }

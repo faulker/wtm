@@ -6,6 +6,7 @@
 //! `~/...`, or relative to the repo root) where `{repo}` expands to the repo
 //! directory name.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -13,6 +14,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
+use toml_edit::{DocumentMut, value as toml_value};
 
 pub const CONFIG_FILE: &str = ".wtm.toml";
 
@@ -153,6 +155,10 @@ pub struct FileConfig {
     /// [`WorktreesLayout::TwoPanel`].
     pub worktrees_layout: Option<WorktreesLayout>,
     pub setup: Option<FileSetup>,
+    /// Runtime map of worktree branch → creation base ref, written by
+    /// `wtm create`. Not a user-facing setting; ignored by [`Config::merge`].
+    #[serde(default)]
+    pub created_from: Option<BTreeMap<String, String>>,
 }
 
 /// The `[setup]` section of one config file.
@@ -411,6 +417,81 @@ pub fn global_config_path() -> Option<PathBuf> {
     })
 }
 
+/// Reads the `[created_from]` map from the repo's `.wtm.toml` (branch → base
+/// ref recorded at create time). Missing file or table yields an empty map.
+pub fn load_created_from(repo_root: &Path) -> Result<BTreeMap<String, String>> {
+    let file = FileConfig::load(&repo_root.join(CONFIG_FILE))?;
+    Ok(file.created_from.unwrap_or_default())
+}
+
+/// Records that worktree branch `branch` was created from `base` in the
+/// repo's `.wtm.toml` `[created_from]` table, preserving other settings.
+pub fn set_created_from(repo_root: &Path, branch: &str, base: &str) -> Result<()> {
+    edit_created_from(repo_root, |map| {
+        map.insert(branch.to_string(), base.to_string());
+    })
+}
+
+/// Drops `branch` from `[created_from]` when a worktree is removed.
+pub fn unset_created_from(repo_root: &Path, branch: &str) -> Result<()> {
+    edit_created_from(repo_root, |map| {
+        map.remove(branch);
+    })
+}
+
+/// Renames a `[created_from]` key when a worktree/branch is renamed.
+pub fn rename_created_from(repo_root: &Path, old: &str, new: &str) -> Result<()> {
+    if old == new {
+        return Ok(());
+    }
+    edit_created_from(repo_root, |map| {
+        if let Some(base) = map.remove(old) {
+            map.insert(new.to_string(), base);
+        }
+    })
+}
+
+/// Loads, mutates, and writes the `[created_from]` table via toml_edit so
+/// comments and unrelated settings survive.
+fn edit_created_from(
+    repo_root: &Path,
+    mutate: impl FnOnce(&mut BTreeMap<String, String>),
+) -> Result<()> {
+    let path = repo_root.join(CONFIG_FILE);
+    let mut doc = if path.exists() {
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        text.parse::<DocumentMut>()
+            .with_context(|| format!("invalid TOML in {}", path.display()))?
+    } else {
+        DocumentMut::new()
+    };
+    let mut map = match doc.get("created_from").and_then(|item| item.as_table()) {
+        Some(table) => table
+            .iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.to_string(), s.to_string())))
+            .collect(),
+        None => BTreeMap::new(),
+    };
+    mutate(&mut map);
+    if map.is_empty() {
+        doc.remove("created_from");
+    } else {
+        let mut table = toml_edit::Table::new();
+        for (branch, base) in &map {
+            table[branch] = toml_value(base.as_str());
+        }
+        doc["created_from"] = toml_edit::Item::Table(table);
+    }
+    let text = doc.to_string();
+    // Refuse to write anything FileConfig couldn't load again (same guard as
+    // settings::save_doc).
+    toml::from_str::<FileConfig>(&text)
+        .with_context(|| format!("refusing to write invalid config to {}", path.display()))?;
+    std::fs::write(&path, text).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,6 +650,48 @@ mod tests {
         let cfg = Config::merge(FileConfig::default(), FileConfig::default());
         assert_eq!(cfg, Config::default());
         assert_eq!(cfg.worktree_dir_source, Source::Default);
+    }
+
+    /// `[created_from]` is accepted in `.wtm.toml` but is not a Config setting.
+    #[test]
+    fn created_from_parses_and_is_ignored_by_merge() {
+        let file: FileConfig = toml::from_str(
+            "worktree_dir = \"inside\"\n\n[created_from]\nfeature = \"main\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            file.created_from.as_ref().unwrap().get("feature"),
+            Some(&"main".to_string())
+        );
+        let cfg = Config::merge(FileConfig::default(), file);
+        assert_eq!(cfg.worktree_dir.as_deref(), Some("inside"));
+    }
+
+    /// set/unset/rename round-trip through the repo `.wtm.toml` without
+    /// clobbering other keys.
+    #[test]
+    fn created_from_helpers_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(CONFIG_FILE), "worktree_dir = \"home\"\n").unwrap();
+        set_created_from(root, "feature", "main").unwrap();
+        set_created_from(root, "other", "develop").unwrap();
+        let map = load_created_from(root).unwrap();
+        assert_eq!(map.get("feature"), Some(&"main".to_string()));
+        assert_eq!(map.get("other"), Some(&"develop".to_string()));
+        rename_created_from(root, "feature", "renamed").unwrap();
+        let map = load_created_from(root).unwrap();
+        assert!(!map.contains_key("feature"));
+        assert_eq!(map.get("renamed"), Some(&"main".to_string()));
+        unset_created_from(root, "renamed").unwrap();
+        unset_created_from(root, "other").unwrap();
+        assert!(load_created_from(root).unwrap().is_empty());
+        let text = std::fs::read_to_string(root.join(CONFIG_FILE)).unwrap();
+        assert!(text.contains("worktree_dir"), "settings preserved: {text}");
+        assert!(
+            !text.contains("created_from"),
+            "empty table removed: {text}"
+        );
     }
 
     #[test]

@@ -216,8 +216,8 @@ pub const WORKTREES_THREE_PANEL: &[Binding] = &[
     help_only("↑/↓ or j/k", "select worktree"),
     both(
         "Enter",
-        "changed files",
-        "focus the changed-file panel below",
+        "panel below",
+        "focus the changed-file panel (or commit list when clean)",
     ),
     both("⇧↑/⇧↓", "scroll diff", "scroll the diff (or J/K)"),
     both("n", "new", "new worktree (new branch or existing branch)"),
@@ -239,6 +239,23 @@ pub const WORKTREE_FILES: &[Binding] = &[
     both("Enter", "open", "open the file in your default app"),
     both("Space", "mark", "mark a file (or folder) for commit"),
     both("c", "commit", "commit the marked files"),
+    both("q/Esc", "worktrees", "focus the worktree list again"),
+];
+
+/// Footer hints for the three-panel Worktrees layout while the bottom panel
+/// shows commits for a clean worktree (BranchCommits-style navigation).
+pub const WORKTREE_COMMITS: &[Binding] = &[
+    help_only("↑/↓ or j/k", "move the commit cursor"),
+    both(
+        "Enter / v / →",
+        "browse files",
+        "view the highlighted commit's changed files and diffs",
+    ),
+    both(
+        "t",
+        "tree/flat",
+        "switch between the commit tree and a flat list",
+    ),
     both("q/Esc", "worktrees", "focus the worktree list again"),
 ];
 
@@ -308,7 +325,7 @@ pub const DIFF: &[Binding] = &[
     both("i", "ignore", "add the file or a glob to .gitignore"),
     both("t", "tree/flat", "toggle folder tree vs. flat file list"),
     both("?", "help", "show this help"),
-    both("q", "quit", "quit"),
+    both("q", "back", "back to the worktrees list"),
 ];
 
 pub const COMMIT_FILES: &[Binding] = &[
@@ -466,13 +483,22 @@ const WORKTREES_SECTIONS: &[Section] = &[
         bindings: WORKTREES_THREE_PANEL,
         notes: &[
             "the Changes tab is hidden in this layout; its files and diff live in the",
-            "panel below the worktree list instead.",
+            "panel below the worktree list instead. A clean worktree shows that",
+            "branch's commit list there instead of an empty changes pane.",
         ],
     },
     Section {
         heading: "changed-file panel  (three-panel layout, after Enter)",
         bindings: WORKTREE_FILES,
         notes: &["q or Esc returns focus to the worktree list; it doesn't quit from here."],
+    },
+    Section {
+        heading: "commit list  (three-panel layout, clean worktree, after Enter)",
+        bindings: WORKTREE_COMMITS,
+        notes: &[
+            "same rows as Branches → Enter on a branch; Enter opens the commit's files.",
+            "q or Esc returns focus to the worktree list.",
+        ],
     },
 ];
 

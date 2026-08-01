@@ -295,6 +295,32 @@ pub fn commits_ahead_of(dir: &Path, base: &str, branch: &str) -> Result<u32> {
     Ok(out.trim().parse().unwrap_or(0))
 }
 
+/// True when `reference` resolves to a commit (branch, tag, remote-tracking
+/// ref, or SHA). Used to degrade gracefully when a creation base was deleted.
+pub fn ref_exists(dir: &Path, reference: &str) -> bool {
+    run_predicate(
+        dir,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{reference}^{{commit}}"),
+        ],
+    )
+    .unwrap_or(false)
+}
+
+/// The branch name HEAD points at in `dir`, or `None` when detached.
+pub fn head_branch(dir: &Path) -> Result<Option<String>> {
+    let name = run(dir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let name = name.trim();
+    if name.is_empty() || name == "HEAD" {
+        Ok(None)
+    } else {
+        Ok(Some(name.to_string()))
+    }
+}
+
 /// The commits on `reference`'s first-parent trunk (`git rev-list
 /// --first-parent`), as a set of full hashes. A branch merged into `reference`
 /// through a merge commit lands on a *second*-parent side line and so is absent

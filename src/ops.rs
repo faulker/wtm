@@ -70,6 +70,19 @@ pub struct WorktreeInfo {
     /// clean up. False for the main worktree, a detached HEAD, the default
     /// branch itself, or a branch with commits not yet on the mainline.
     pub merged: bool,
+    /// Ref this worktree's branch was created from (e.g. `"main"`), recorded
+    /// in `.wtm.toml`'s `[created_from]` at create time. `null` for the main
+    /// worktree, detached HEADs, checkouts of pre-existing branches, or when
+    /// no create-time base was stored.
+    pub created_from: Option<String>,
+    /// True when the branch has commits not reachable from its creation base
+    /// (unique local work since create). Always false for the main worktree,
+    /// when the base is unknown/missing, or when the tip still matches the base.
+    pub changed_from_base: bool,
+    /// True when the creation base has commits not in this branch (base moved
+    /// ahead; the worktree is out of date). Always false for the main worktree
+    /// or when the base is unknown/missing.
+    pub behind_base: bool,
 }
 
 impl WorktreeInfo {
@@ -212,6 +225,8 @@ pub fn list(ctx: &Ctx) -> Result<Vec<WorktreeInfo>> {
         Some(d) => git::first_parent_commits(&ctx.repo_root, d).unwrap_or_default(),
         None => HashSet::new(),
     };
+    // Creation bases recorded by `create` in `.wtm.toml` `[created_from]`.
+    let created_from_map = crate::config::load_created_from(&ctx.repo_root).unwrap_or_default();
     let mut infos = Vec::with_capacity(wts.len());
     for wt in wts {
         if wt.is_bare {
@@ -237,6 +252,17 @@ pub fn list(ctx: &Ctx) -> Result<Vec<WorktreeInfo>> {
             }
             _ => false,
         };
+        let created_from = wt
+            .branch
+            .as_ref()
+            .filter(|_| !is_main)
+            .and_then(|b| created_from_map.get(b).cloned());
+        let (changed_from_base, behind_base) = match (&created_from, &wt.branch) {
+            (Some(base), Some(branch)) if !is_main => {
+                base_status_vs(&ctx.repo_root, base, branch)
+            }
+            _ => (false, false),
+        };
         infos.push(WorktreeInfo {
             name: worktree_name(&wt.branch, &wt.path),
             branch: wt.branch,
@@ -246,9 +272,37 @@ pub fn list(ctx: &Ctx) -> Result<Vec<WorktreeInfo>> {
             ahead_behind,
             locked: wt.is_locked,
             merged,
+            created_from,
+            changed_from_base,
+            behind_base,
         });
     }
     Ok(infos)
+}
+
+/// Compares `branch` to its creation `base`: whether the branch has unique
+/// commits (`changed_from_base`) and whether the base has moved ahead
+/// (`behind_base`). Missing/unresolvable bases degrade to `(false, false)`.
+fn base_status_vs(repo_root: &Path, base: &str, branch: &str) -> (bool, bool) {
+    if !git::ref_exists(repo_root, base) || !git::branch_exists(repo_root, branch) {
+        return (false, false);
+    }
+    let changed = git::commits_ahead_of(repo_root, base, branch).unwrap_or(0) > 0;
+    let behind = git::commits_ahead_of(repo_root, branch, base).unwrap_or(0) > 0;
+    (changed, behind)
+}
+
+/// Resolves the base ref to persist at create time. `HEAD` becomes the current
+/// branch name of the main worktree when attached, so later ahead/behind
+/// checks track that branch as it moves rather than a moving HEAD.
+fn resolve_creation_base(repo_root: &Path, base: &str) -> String {
+    if base != "HEAD" {
+        return base.to_string();
+    }
+    match git::head_branch(repo_root) {
+        Ok(Some(branch)) => branch,
+        _ => git::rev_parse(repo_root, "HEAD").unwrap_or_else(|_| "HEAD".to_string()),
+    }
 }
 
 /// Creates a worktree for `branch` (creating the branch from `from`/HEAD when
@@ -310,6 +364,15 @@ pub fn create(
         None
     };
     git::worktree_add(&ctx.repo_root, &path, branch, base.as_deref())?;
+
+    // Persist the creation base so `list` can flag unique commits / out-of-date
+    // vs the branch this worktree was spun from. Only for newly created
+    // branches (checking out an existing branch has no known create base).
+    if let Some(raw_base) = &base {
+        let stored = resolve_creation_base(&ctx.repo_root, raw_base);
+        // Best-effort: a write failure must not undo a successful worktree add.
+        let _ = crate::config::set_created_from(&ctx.repo_root, branch, &stored);
+    }
 
     let mut setup = Vec::new();
     for file in &ctx.config.setup.copy {
@@ -432,17 +495,19 @@ pub fn remove_target(ctx: &Ctx, path: &Path) -> Result<()> {
     let canon = std::fs::canonicalize(path).ok();
     // Match against the path git actually recorded so removal/unlock target the
     // registration even when `path` is spelled differently (symlinks, etc.).
-    let registered_path = git::list_worktrees(&ctx.repo_root)?
+    let registered = git::list_worktrees(&ctx.repo_root)?
         .into_iter()
-        .find(|w| std::fs::canonicalize(&w.path).ok() == canon && canon.is_some())
-        .map(|w| w.path);
-    if let Some(reg) = &registered_path {
+        .find(|w| std::fs::canonicalize(&w.path).ok() == canon && canon.is_some());
+    if let Some(reg) = &registered {
         // Unlock first so the subsequent remove/prune can reclaim a locked
         // worktree; harmless (and ignored) when it was not locked.
-        let _ = git::worktree_unlock(&ctx.repo_root, reg);
+        let _ = git::worktree_unlock(&ctx.repo_root, &reg.path);
         // Best effort: if git still refuses we fall back to deleting the
         // directory and pruning below.
-        let _ = git::worktree_remove(&ctx.repo_root, reg, true);
+        let _ = git::worktree_remove(&ctx.repo_root, &reg.path, true);
+        if let Some(branch) = &reg.branch {
+            let _ = crate::config::unset_created_from(&ctx.repo_root, branch);
+        }
     }
     if path.exists() {
         std::fs::remove_dir_all(path)
@@ -495,6 +560,9 @@ pub fn remove(ctx: &Ctx, name: &str, force: bool, delete_branch: bool) -> Result
         );
     }
     git::worktree_remove(&ctx.repo_root, Path::new(&info.path), force)?;
+    if let Some(branch) = &info.branch {
+        let _ = crate::config::unset_created_from(&ctx.repo_root, branch);
+    }
     if delete_branch && let Some(branch) = &info.branch {
         git::branch_delete(&ctx.repo_root, branch)?;
     }
@@ -530,6 +598,9 @@ pub fn remove_worktree_only(ctx: &Ctx, name: &str, force: bool) -> Result<Worktr
         );
     }
     git::worktree_remove(&ctx.repo_root, Path::new(&info.path), force)?;
+    if let Some(branch) = &info.branch {
+        let _ = crate::config::unset_created_from(&ctx.repo_root, branch);
+    }
     Ok(info)
 }
 
@@ -1340,6 +1411,7 @@ pub fn rename_worktree(ctx: &Ctx, name: &str, new_name: &str) -> Result<Worktree
                 bail!("branch '{new_name}' already exists");
             }
             git::branch_rename(&ctx.repo_root, branch, new_name)?;
+            let _ = crate::config::rename_created_from(&ctx.repo_root, branch, new_name);
             true
         }
         Some(_) => false,
@@ -2703,6 +2775,100 @@ mod tests {
         assert!(!merged("ahead-branch"), "branch with own commit is not");
         // The main worktree is never flagged.
         assert!(!infos.iter().find(|i| i.is_main).unwrap().merged);
+    }
+
+    /// `create` records the base in `.wtm.toml` `[created_from]`; a fresh
+    /// worktree is unchanged, a commit on it flips `changed_from_base`, and a
+    /// commit on the base flips `behind_base`. The main worktree stays quiet.
+    #[test]
+    fn list_flags_changed_and_outdated_vs_creation_base() {
+        let (_tmp, ctx) = temp_ctx();
+        create(&ctx, "feature", Some("main"), RunMode::Capture, |_| {}).unwrap();
+
+        let map = crate::config::load_created_from(&ctx.repo_root).unwrap();
+        assert_eq!(map.get("feature"), Some(&"main".to_string()));
+
+        let infos = list(&ctx).unwrap();
+        let feature = infos.iter().find(|i| i.name == "feature").unwrap();
+        assert_eq!(feature.created_from.as_deref(), Some("main"));
+        assert!(
+            !feature.changed_from_base,
+            "fresh branch matching main is unchanged"
+        );
+        assert!(!feature.behind_base, "main has not moved ahead yet");
+        let main = infos.iter().find(|i| i.is_main).unwrap();
+        assert!(main.created_from.is_none());
+        assert!(!main.changed_from_base);
+        assert!(!main.behind_base);
+
+        let feature_path = PathBuf::from(&feature.path);
+        std::fs::write(feature_path.join("f.txt"), "x\n").unwrap();
+        git(&feature_path, &["add", "f.txt"]);
+        git(&feature_path, &["commit", "-m", "feature work"]);
+
+        let infos = list(&ctx).unwrap();
+        let feature = infos.iter().find(|i| i.name == "feature").unwrap();
+        assert!(
+            feature.changed_from_base,
+            "unique commits vs creation base"
+        );
+        assert!(!feature.behind_base);
+
+        git(
+            &ctx.repo_root,
+            &["commit", "--allow-empty", "-m", "main moved"],
+        );
+        let infos = list(&ctx).unwrap();
+        let feature = infos.iter().find(|i| i.name == "feature").unwrap();
+        assert!(feature.changed_from_base, "still has unique commits");
+        assert!(
+            feature.behind_base,
+            "creation base main is ahead of feature"
+        );
+    }
+
+    /// A deleted creation base omits the relative flags instead of failing list.
+    #[test]
+    fn list_degrades_when_creation_base_is_gone() {
+        let (_tmp, ctx) = temp_ctx();
+        create(&ctx, "feature", Some("main"), RunMode::Capture, |_| {}).unwrap();
+        crate::config::set_created_from(&ctx.repo_root, "feature", "vanished").unwrap();
+        git(&ctx.repo_root, &["branch", "vanished"]);
+        git(&ctx.repo_root, &["branch", "-D", "vanished"]);
+
+        let infos = list(&ctx).unwrap();
+        let feature = infos.iter().find(|i| i.name == "feature").unwrap();
+        assert_eq!(feature.created_from.as_deref(), Some("vanished"));
+        assert!(!feature.changed_from_base);
+        assert!(!feature.behind_base);
+    }
+
+    /// Removing a worktree clears its `[created_from]` entry; renaming moves it.
+    #[test]
+    fn created_from_follows_rename_and_clears_on_remove() {
+        let (_tmp, ctx) = temp_ctx();
+        create(&ctx, "feature", Some("main"), RunMode::Capture, |_| {}).unwrap();
+        rename_worktree(&ctx, "feature", "renamed").unwrap();
+        let map = crate::config::load_created_from(&ctx.repo_root).unwrap();
+        assert!(!map.contains_key("feature"));
+        assert_eq!(map.get("renamed"), Some(&"main".to_string()));
+
+        remove_worktree_only(&ctx, "renamed", false).unwrap();
+        assert!(
+            crate::config::load_created_from(&ctx.repo_root)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Default create (no `--from`) persists the main worktree's branch, not
+    /// the literal `HEAD`, so later base-ahead checks track that branch.
+    #[test]
+    fn create_without_from_persists_head_branch_name() {
+        let (_tmp, ctx) = temp_ctx();
+        make_worktree(&ctx, "from-head");
+        let map = crate::config::load_created_from(&ctx.repo_root).unwrap();
+        assert_eq!(map.get("from-head"), Some(&"main".to_string()));
     }
 
     /// The Branches tab's merged flag mirrors the worktree merged flag: a branch

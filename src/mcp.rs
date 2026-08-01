@@ -253,7 +253,7 @@ fn json_result<T: serde::Serialize>(value: &T) -> Result<CallToolResult, ErrorDa
 #[tool_router]
 impl WtmServer {
     #[tool(
-        description = "List all git worktrees with branch, path, dirty file count, and ahead/behind upstream counts"
+        description = "List all git worktrees with branch, path, dirty file count, ahead/behind upstream, creation base, and flags (changed/outdated vs creation base, merged, locked)"
     )]
     fn list_worktrees(&self) -> Result<CallToolResult, ErrorData> {
         json_result(&ops::list(&self.ctx()?).map_err(internal)?)
