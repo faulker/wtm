@@ -380,6 +380,10 @@ pub const SETTINGS: &[Binding] = &[
         "cycle auto_update_check, diff_theme, or worktrees_layout on those rows (writes immediately)",
     ),
     help_only(
+        "branches_refresh_mins",
+        "Enter edits how many minutes the Branches tab keeps its list before refreshing (default 10; saved globally)",
+    ),
+    help_only(
         "open_command",
         "Enter opens a list editor: ↑/↓ move, Enter edits the selected command, a adds one, d removes one, Enter on [ done ] saves the list to .wtm.toml, Esc discards the edits",
     ),
@@ -492,7 +496,7 @@ const BASICS_SECTIONS: &[Section] = &[
         bindings: SETTINGS,
         notes: &[
             "edits write to .wtm.toml (and the global config for UI prefs) as soon as you change a row; Esc cancels an in-progress text edit.",
-            "auto_update_check, diff_theme, and worktrees_layout are saved in the global config, so they apply to every repo.",
+            "auto_update_check, diff_theme, worktrees_layout, and branches_refresh_mins are saved in the global config, so they apply to every repo.",
             "open_command holds one command or several, edited as a list; o shows them expanded ({path}, {name}, {branch}, {status}) in a picker.",
         ],
     },

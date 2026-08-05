@@ -12,6 +12,10 @@ pub const ACCENT: Color = Color::Cyan;
 pub const BORDER: Color = Color::DarkGray;
 /// Background of the selected row in lists and tables.
 pub const SELECTION_BG: Color = Color::DarkGray;
+/// Solid fill behind dialog/modal overlays so they read as a card over the UI.
+pub const DIALOG_BG: Color = Color::Black;
+/// Border color for dialog/modal overlays (stronger than panel chrome).
+pub const DIALOG_BORDER: Color = Color::Cyan;
 /// Cycled by graph column so parallel branch lines stay distinguishable as
 /// they run down the commit tree.
 pub const GRAPH_COLORS: [Color; 6] = [

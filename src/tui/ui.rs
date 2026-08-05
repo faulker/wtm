@@ -17,18 +17,19 @@ use super::app::{
     ResolverFile, RowList, Tab, TextInput, View, WorktreesFocus, filtered_candidates,
 };
 use super::config_editor::{
-    CHECK_ROW, ConfigEditor, FIELD_ROWS, FORM_LINES, LAYOUT_ROW, OPEN_COMMAND_ROW,
-    OpenCommandEditor, THEME_ROW, UPDATE_ROW,
+    BRANCHES_REFRESH_ROW, CHECK_ROW, ConfigEditor, FIELD_ROWS, LAYOUT_ROW, OPEN_COMMAND_ROW,
+    OpenCommandEditor, THEME_PREVIEW_SAMPLE_LINES, THEME_ROW, UPDATE_ROW, check_line, form_lines,
+    line_of_row, preview_line,
 };
 use super::help::{self, Binding, HelpTab};
 use super::highlight;
 use super::setup::{
     REVIEW_ROWS, SetupWizard, Step, WELCOME_OPTIONS, location_label, location_preview,
 };
-use super::theme::{self, ACCENT, BORDER, GRAPH_COLORS, SELECTION_BG};
+use super::theme::{self, ACCENT, BORDER, DIALOG_BG, DIALOG_BORDER, GRAPH_COLORS, SELECTION_BG};
 use crate::config::{
-    DEFAULT_AUTO_UPDATE_CHECK, DEFAULT_DIFF_THEME, DEFAULT_LOCATION, LOCATION_PRESETS,
-    OpenCommandVars, WorktreesLayout, expand_open_command, worktrees_layout_label,
+    DEFAULT_AUTO_UPDATE_CHECK, DEFAULT_BRANCHES_REFRESH_MINS, DEFAULT_DIFF_THEME, DEFAULT_LOCATION,
+    LOCATION_PRESETS, OpenCommandVars, WorktreesLayout, expand_open_command, worktrees_layout_label,
 };
 use crate::conflict::{ConflictSegment, ResolutionAction};
 use crate::git::{GraphLine, StatusEntry};
@@ -363,6 +364,24 @@ fn panel(title: impl Into<String>) -> Block<'static> {
         ]))
 }
 
+/// Overlay chrome for dialogs and modals: a solid background and a thick
+/// border so the popup is unmistakable over the screen underneath.
+fn dialog_panel(title: impl Into<String>) -> Block<'static> {
+    Block::bordered()
+        .border_type(BorderType::Thick)
+        .border_style(Style::new().fg(DIALOG_BORDER))
+        .style(Style::new().bg(DIALOG_BG))
+        .padding(Padding::horizontal(1))
+        .title(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                title.into(),
+                Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+        ]))
+}
+
 /// Panel chrome for a focusable list: accent border and bold title when it
 /// owns the keyboard, dim border and title when another panel does. Diff
 /// panes and other non-focus targets keep using [`panel`].
@@ -639,13 +658,44 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) -> Opt
     .highlight_symbol(Span::styled("▌ ", Style::new().fg(cursor_color(focused))));
     let mut state = TableState::default().with_selected(Some(app.selected));
     frame.render_stateful_widget(table, area, &mut state);
+    let offset = state.offset();
+    // Header takes the first inner row; remaining rows are the visible window.
+    let visible = inner.height.saturating_sub(1) as usize;
+    let total = app.worktrees.len();
+    // Overflow arrows on the left border gutter: up when rows sit above the
+    // viewport, down when more sit below (most visible in the three-panel
+    // four-row list).
+    if offset > 0 {
+        let arrow = Rect {
+            x: area.x,
+            y: area.y + 1,
+            width: 1,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled("▲", Style::new().fg(ACCENT).bold())),
+            arrow,
+        );
+    }
+    if visible > 0 && offset + visible < total {
+        let arrow = Rect {
+            x: area.x,
+            y: area.y + area.height.saturating_sub(1),
+            width: 1,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled("▼", Style::new().fg(ACCENT).bold())),
+            arrow,
+        );
+    }
     // The table header occupies the first inner row, so data rows start one
     // line below it.
     Some(RowList {
         inner,
         header: 1,
-        offset: state.offset(),
-        len: app.worktrees.len(),
+        offset,
+        len: total,
     })
 }
 
@@ -1266,7 +1316,7 @@ fn draw_create_dialog(
     let list_rows = (1 + header_rows * 2 + filtered.len()).min(10) as u16;
     let popup = centered(area, 66, 7 + list_rows);
     frame.render_widget(Clear, popup);
-    frame.render_widget(panel("new worktree"), popup);
+    frame.render_widget(dialog_panel("new worktree"), popup);
     let inner = popup.inner(ratatui::layout::Margin::new(2, 1));
     let [name_area, base_area, list_area, base_hint_area, loc_area] = Layout::vertical([
         Constraint::Length(1),
@@ -1412,7 +1462,7 @@ fn draw_base_picker(frame: &mut Frame, area: Rect, all_branches: &[String], sele
     let rows = all_branches.len().min(10) as u16;
     let popup = centered(area, 44, rows + 2);
     frame.render_widget(Clear, popup);
-    frame.render_widget(panel("branch off of"), popup);
+    frame.render_widget(dialog_panel("branch off of"), popup);
     let inner = popup.inner(ratatui::layout::Margin::new(1, 1));
     let items: Vec<ListItem> = all_branches
         .iter()
@@ -1440,9 +1490,9 @@ fn draw_creating(
     let popup = centered(area, 76, height);
     frame.render_widget(Clear, popup);
     let title = if done {
-        // The final ✓/✗ line (pushed right before "press Enter to continue")
-        // says which; the title mirrors it so it's visible even scrolled off.
-        let failed = lines.iter().any(|l| l.starts_with('✗'));
+        // The READY/FAILED banner (pushed at the end) says which; the title
+        // mirrors it so it's visible even when the banner has scrolled off.
+        let failed = lines.iter().any(|l| l.contains("FAILED —"));
         if failed {
             format!("creating {branch} · failed")
         } else {
@@ -1466,7 +1516,7 @@ fn draw_creating(
         }
     }
     let para = Paragraph::new(text)
-        .block(panel(title))
+        .block(dialog_panel(title))
         .wrap(Wrap { trim: false });
     frame.render_widget(para, popup);
 }
@@ -1475,7 +1525,7 @@ fn draw_creating(
 fn draw_run_command(frame: &mut Frame, area: Rect, name: &str, input: &super::app::TextInput) {
     let popup = centered(area, 64, 5);
     frame.render_widget(Clear, popup);
-    frame.render_widget(panel(format!("run in '{name}'")), popup);
+    frame.render_widget(dialog_panel(format!("run in '{name}'")), popup);
     let inner = popup.inner(ratatui::layout::Margin::new(2, 1));
     let [prompt_area, hint_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
@@ -1497,7 +1547,7 @@ fn draw_run_command(frame: &mut Frame, area: Rect, name: &str, input: &super::ap
 fn draw_rename_worktree(frame: &mut Frame, area: Rect, name: &str, input: &super::app::TextInput) {
     let popup = centered(area, 64, 5);
     frame.render_widget(Clear, popup);
-    frame.render_widget(panel(format!("rename '{name}'")), popup);
+    frame.render_widget(dialog_panel(format!("rename '{name}'")), popup);
     let inner = popup.inner(ratatui::layout::Margin::new(2, 1));
     let [prompt_area, hint_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
@@ -1517,12 +1567,16 @@ fn draw_rename_worktree(frame: &mut Frame, area: Rect, name: &str, input: &super
 /// Styles one line of setup output: step results and errors stand out,
 /// echoed user input shows its prompt, plain command output stays dim.
 fn output_line(line: &str) -> Line<'_> {
-    let style = if line.starts_with("[ok]") || line.starts_with('✓') {
+    let style = if line.contains("READY —") || line.starts_with("[ok]") || line.starts_with('✓') {
         Style::new().fg(theme::SUCCESS).bold()
-    } else if line.starts_with("[FAILED]") || line.starts_with("error") || line.starts_with('✗') {
+    } else if line.contains("FAILED —")
+        || line.starts_with("[FAILED]")
+        || line.starts_with("error")
+        || line.starts_with('✗')
+    {
         Style::new().fg(theme::DANGER).bold()
-    } else if line.starts_with("──") {
-        Style::new().fg(ACCENT).dim()
+    } else if line.starts_with('═') || line.starts_with("──") {
+        Style::new().fg(ACCENT).bold()
     } else if line.starts_with("❯ ") {
         Style::new().fg(ACCENT)
     } else if line.starts_with("creating ")
@@ -1646,7 +1700,7 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
     let content_height = text.len() as u16;
     let popup = modal_rect(area, content_height, HELP_WIDTH, CHROME);
     frame.render_widget(Clear, popup);
-    let block = panel("help");
+    let block = dialog_panel("help");
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
@@ -1716,8 +1770,9 @@ fn draw_error_popup(frame: &mut Frame, area: Rect, msg: &str) {
         Style::new().dim(),
     ));
     let block = Block::bordered()
-        .border_type(BorderType::Rounded)
+        .border_type(BorderType::Thick)
         .border_style(Style::new().fg(theme::DANGER))
+        .style(Style::new().bg(DIALOG_BG))
         .padding(Padding::horizontal(1))
         .title(Line::from(vec![
             Span::raw(" "),
@@ -1820,7 +1875,7 @@ fn wizard_screen(
     let gap = if blurb.is_empty() { 0 } else { 1 };
     let popup = centered(area, WIZARD_WIDTH, blurb_height + gap + body_height + 2);
     frame.render_widget(Clear, popup);
-    let block = panel(wizard_title(title, progress));
+    let block = dialog_panel(wizard_title(title, progress));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     if !blurb.is_empty() {
@@ -1946,7 +2001,7 @@ fn draw_browser(
             })
             .collect()
     };
-    let block = panel(wizard_title(&browser.dir.display().to_string(), progress))
+    let block = dialog_panel(wizard_title(&browser.dir.display().to_string(), progress))
         .title_bottom(Line::from(" pick a repo folder or a .wtm.toml ".dim()).right_aligned());
     let inner = block.inner(popup);
     let list = List::new(items)
@@ -2163,12 +2218,11 @@ fn draw_review(
     })
 }
 
-/// The Settings tab: editable rows for the repo settings, the update-check
-/// toggle, a live diff-theme colour sample under the theme row, the Worktrees
-/// layout cycle, a live resolved-location preview, the running version, and a
-/// check-for-updates row. Changes write to disk as soon as they are made. The
-/// form keeps a fixed width inside the full-height panel so long paths don't
-/// stretch it.
+/// The Settings tab: spaced setting blocks with descriptions, grouped into
+/// repo vs all-repos sections, plus a live theme sample, worktree-location
+/// preview, version line, and check-for-updates action. Changes write to disk
+/// as soon as they are made. The form keeps a fixed width and scrolls so the
+/// selected row stays visible on short terminals.
 fn draw_settings_tab(
     frame: &mut Frame,
     area: Rect,
@@ -2176,34 +2230,53 @@ fn draw_settings_tab(
     update_available: Option<&Release>,
 ) -> Option<RowList> {
     let labels = [
-        "worktree_dir     ",
-        "open_command     ",
-        "setup.copy       ",
-        "setup.run        ",
+        "worktree_dir",
+        "open_command",
+        "setup.copy",
+        "setup.run",
         "auto_update_check",
-        "diff_theme       ",
-        "worktrees_layout ",
+        "diff_theme",
+        "worktrees_layout",
+        "branches_refresh_mins",
     ];
-    let hints = [
-        "sibling · inside · home · or a path ({repo} = repo name)",
-        "commands the open key (o) runs; Enter edits the list, [ done ] saves. \
-         {path} {name} {branch} {status}",
-        "files copied into each new worktree, comma separated",
-        "commands run in each new worktree, comma separated",
-        "check GitHub for a newer wtm on start · Enter cycles · saved for all repos",
-        "syntax colours in the diff pane · Enter cycles · saved for all repos",
-        "Worktrees tab layout · three panels adds files + diff · Enter cycles · applies immediately",
+    // Keep each description to one line at the form width (78) so wrapping
+    // cannot desync [`line_of_row`] from what is drawn.
+    let descriptions = [
+        "Where new worktrees go: sibling, inside, home, or a path ({repo} = name).",
+        "Commands the o key runs. Enter edits the list ({path} {name} {branch}).",
+        "Files copied into each new worktree, comma-separated (e.g. .env).",
+        "Commands run in each new worktree after create, comma-separated.",
+        "Check GitHub for a newer wtm when the TUI starts. Enter cycles.",
+        "Syntax colours in the diff pane. Enter cycles themes.",
+        "Worktrees tab layout. Three panels add files + diff. Enter cycles.",
+        "Minutes the Branches tab keeps its list before refreshing.",
     ];
     let mut lines: Vec<Line> = Vec::new();
+
+    let push_section = |lines: &mut Vec<Line>, title: &str| {
+        lines.push(Line::from(Span::styled(
+            format!(" {title} "),
+            Style::new().fg(ACCENT).bold(),
+        )));
+        lines.push(Line::from(""));
+    };
+
+    push_section(&mut lines, "── This repo (.wtm.toml) ──");
+
     for row in 0..FIELD_ROWS {
+        if row == UPDATE_ROW {
+            push_section(&mut lines, "── All repos ──");
+        }
+
         let selected = row == editor.selected;
         let highlight = if selected {
             Style::new().bg(SELECTION_BG)
         } else {
             Style::new()
         };
+        // Pad labels to a shared column so values line up across settings.
         let mut spans = vec![Span::styled(
-            format!(" {} ", labels[row]),
+            format!(" {:<22} ", labels[row]),
             highlight.fg(ACCENT).bold(),
         )];
         match (selected, &editor.editing) {
@@ -2247,6 +2320,14 @@ fn draw_settings_tab(
                 },
                 highlight,
             )),
+            _ if row == BRANCHES_REFRESH_ROW => spans.push(Span::styled(
+                if editor.fields.branches_refresh_mins.is_empty() {
+                    format!("(default: {DEFAULT_BRANCHES_REFRESH_MINS})")
+                } else {
+                    editor.fields.branches_refresh_mins.clone()
+                },
+                highlight,
+            )),
             // The list row shows a one-line summary of its entries; Enter
             // opens the list editor drawn over the form below.
             _ if row == OPEN_COMMAND_ROW && !editor.fields.open_command.is_empty() => {
@@ -2259,12 +2340,12 @@ fn draw_settings_tab(
         }
         lines.push(Line::from(spans));
         lines.push(Line::from(Span::styled(
-            format!("   {}", hints[row]),
+            format!("   {}", descriptions[row]),
             Style::new().dim(),
         )));
 
-        // Live colour sample sits under the theme row (before layout) so
-        // cycling `diff_theme` shows the palette next to that setting.
+        // Live colour sample sits under the theme description so cycling
+        // `diff_theme` shows the palette next to that setting.
         if row == THEME_ROW {
             let theme_id = if editor.fields.diff_theme.is_empty() {
                 DEFAULT_DIFF_THEME
@@ -2278,14 +2359,20 @@ fn draw_settings_tab(
                 ),
                 Style::new().fg(Color::Green),
             )));
-            for sample in highlight::theme_preview_lines(theme_id) {
-                // Indent under the arrow so the sample reads as part of the preview.
+            let samples = highlight::theme_preview_lines(theme_id);
+            debug_assert_eq!(samples.len(), THEME_PREVIEW_SAMPLE_LINES);
+            for sample in samples {
                 let mut spans = vec![Span::raw("   ")];
                 spans.extend(sample.spans);
                 lines.push(Line::from(spans));
             }
         }
+
+        // Blank separator so the next setting (or section) reads as its own block.
+        lines.push(Line::from(""));
     }
+
+    debug_assert_eq!(lines.len(), preview_line(), "form line map drifted from draw");
 
     // Live preview of where worktrees will actually be created.
     let raw_dir = if editor.fields.worktree_dir.trim().is_empty() {
@@ -2327,6 +2414,8 @@ fn draw_settings_tab(
         action_style(CHECK_ROW),
     )));
 
+    debug_assert_eq!(lines.len(), form_lines());
+
     let block = panel("settings");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -2339,7 +2428,24 @@ fn draw_settings_tab(
     ])
     .areas(inner);
     let [_, form] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(form);
-    frame.render_widget(Paragraph::new(lines), form);
+
+    // Keep the selected value line (or check-now action) in view when the form
+    // is taller than the panel.
+    let focus_line = if editor.selected == CHECK_ROW {
+        check_line()
+    } else {
+        line_of_row(editor.selected)
+    };
+    let visible = form.height as usize;
+    let total = form_lines();
+    let mut scroll = 0usize;
+    if visible > 0 && focus_line >= visible {
+        scroll = (focus_line + 1).saturating_sub(visible);
+        let max_scroll = total.saturating_sub(visible);
+        scroll = scroll.min(max_scroll);
+    }
+
+    frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), form);
     // The list editor is modal over the form: it takes every key, so the form
     // reports no clickable rows while it is up.
     if let Some(list) = &editor.open_list {
@@ -2347,12 +2453,13 @@ fn draw_settings_tab(
         return None;
     }
     // The line layout is shared with `config_editor::row_at_line`, which
-    // `on_click` uses to turn a clicked line back into a row.
+    // `on_click` uses to turn a clicked line back into a row. `offset` is the
+    // scroll so a click on the visible viewport maps to the right form line.
     Some(RowList {
         inner: form,
         header: 0,
-        offset: 0,
-        len: FORM_LINES,
+        offset: scroll,
+        len: total,
     })
 }
 
@@ -2363,7 +2470,7 @@ fn draw_open_command_list(frame: &mut Frame, area: Rect, list: &OpenCommandEdito
     let rows = list.rows().clamp(3, 14) as u16;
     let popup = centered(area, 70, rows + 5);
     frame.render_widget(Clear, popup);
-    let block = panel("open commands");
+    let block = dialog_panel("open commands");
     frame.render_widget(&block, popup);
     let inner = block.inner(popup);
     let [head_area, list_area, hint_area] = Layout::vertical([
@@ -2446,7 +2553,7 @@ fn draw_commit(
     let list_rows = (files.len() as u16).clamp(1, 10);
     let popup = centered(area, 72, list_rows + 8);
     frame.render_widget(Clear, popup);
-    frame.render_widget(panel(format!("commit · {name}")), popup);
+    frame.render_widget(dialog_panel(format!("commit · {name}")), popup);
     let inner = popup.inner(ratatui::layout::Margin::new(2, 1));
     let [files_area, label_area, prompt_area, hint_area] = Layout::vertical([
         Constraint::Length(list_rows + 1),
@@ -2734,7 +2841,7 @@ fn draw_switch(
     let rows = matches.len().clamp(1, 12) as u16;
     let popup = centered(area, 52, rows + 4);
     frame.render_widget(Clear, popup);
-    let block = panel(format!("switch '{name}' to branch"));
+    let block = dialog_panel(format!("switch '{name}' to branch"));
     frame.render_widget(&block, popup);
     let inner = block.inner(popup);
     let [filter_area, list_area, hint_area] = Layout::vertical([
@@ -3176,7 +3283,7 @@ fn draw_cherry_pick(
                 Line::from("↑/↓ choose · Enter confirm · Esc back".dim()),
             ];
             frame.render_widget(
-                Paragraph::new(lines).block(panel("cherry-pick mode")),
+                Paragraph::new(lines).block(dialog_panel("cherry-pick mode")),
                 popup,
             );
             None
@@ -3186,7 +3293,7 @@ fn draw_cherry_pick(
             let rows = targets.len().clamp(1, 12) as u16;
             let popup = centered(area, 60, rows + 5);
             frame.render_widget(Clear, popup);
-            let block = panel(format!("cherry-pick {n} {plural} from '{source_branch}'"));
+            let block = dialog_panel(format!("cherry-pick {n} {plural} from '{source_branch}'"));
             frame.render_widget(&block, popup);
             let inner = block.inner(popup);
             let [head_area, list_area, hint_area] = Layout::vertical([
@@ -3290,7 +3397,7 @@ fn draw_worktree_pick(
     let rows = targets.len().clamp(1, 12) as u16;
     let popup = centered(area, 60, rows + 5);
     frame.render_widget(Clear, popup);
-    let block = panel(title.to_string());
+    let block = dialog_panel(title.to_string());
     frame.render_widget(&block, popup);
     let inner = block.inner(popup);
     let [head_area, list_area, hint_area] = Layout::vertical([
@@ -3349,7 +3456,7 @@ fn draw_move_changes_pick(
     let rows = targets.len().clamp(1, 12) as u16;
     let popup = centered(area, 60, rows + 5);
     frame.render_widget(Clear, popup);
-    let block = panel(format!("move changes from '{from}' into…"));
+    let block = dialog_panel(format!("move changes from '{from}' into…"));
     frame.render_widget(&block, popup);
     let inner = block.inner(popup);
     let [head_area, list_area, hint_area] = Layout::vertical([
@@ -3412,7 +3519,7 @@ fn draw_open_command_pick(
     let rows = commands.len().clamp(1, 12) as u16;
     let popup = centered(area, 80, rows + 5);
     frame.render_widget(Clear, popup);
-    let block = panel(format!("open '{name}' with…"));
+    let block = dialog_panel(format!("open '{name}' with…"));
     frame.render_widget(&block, popup);
     let inner = block.inner(popup);
     let [head_area, list_area, hint_area] = Layout::vertical([
@@ -3466,7 +3573,7 @@ fn draw_stash_target_pick(
     let rows = targets.len().clamp(1, 12) as u16;
     let popup = centered(area, 60, rows + 5);
     frame.render_widget(Clear, popup);
-    let block = panel(format!("{verb} {label} into…"));
+    let block = dialog_panel(format!("{verb} {label} into…"));
     frame.render_widget(&block, popup);
     let inner = block.inner(popup);
     let [head_area, list_area, hint_area] = Layout::vertical([
@@ -3760,7 +3867,7 @@ fn draw_hunk_editor(frame: &mut Frame, area: Rect, hunk: usize, editor: &super::
     let popup = centered(area, area.width.saturating_sub(8).min(90), height);
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        panel(format!("edit hunk {} · Ctrl+S save · Esc cancel", hunk + 1)),
+        dialog_panel(format!("edit hunk {} · Ctrl+S save · Esc cancel", hunk + 1)),
         popup,
     );
     let inner = popup.inner(ratatui::layout::Margin::new(2, 1));
@@ -3799,7 +3906,7 @@ fn draw_busy(frame: &mut Frame, area: Rect, label: &str, tick: u64) {
     let popup = centered(area, (text.chars().count() as u16 + 6).min(area.width), 3);
     frame.render_widget(Clear, popup);
     let para = Paragraph::new(Line::styled(text, Style::new().fg(ACCENT).bold()))
-        .block(panel("please wait"));
+        .block(dialog_panel("please wait"));
     frame.render_widget(para, popup);
 }
 
@@ -3837,7 +3944,7 @@ fn draw_modal(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
             let width = modal_width(&lines);
             let popup = modal_rect(area, lines.len() as u16, width, 2);
             frame.render_widget(Clear, popup);
-            let block = panel(title.clone());
+            let block = dialog_panel(title.clone());
             let inner = block.inner(popup);
             frame.render_widget(Paragraph::new(lines).block(block), popup);
             (!options.is_empty()).then_some(RowList {
@@ -3861,7 +3968,7 @@ fn draw_modal(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
                 prompt_line_at(input.as_str(), input.cursor),
                 Line::from(hint.clone().dim()),
             ];
-            frame.render_widget(Paragraph::new(lines).block(panel(title.clone())), popup);
+            frame.render_widget(Paragraph::new(lines).block(dialog_panel(title.clone())), popup);
             None
         }
         Modal::HunkEditor(editor) => {
@@ -3970,8 +4077,8 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::super::config_editor::{
-        CHECK_LINE, LAYOUT_LINE, LAYOUT_ROW, PREVIEW_LINE, THEME_PREVIEW_LABEL_LINE,
-        THEME_PREVIEW_LINE, THEME_ROW, UPDATE_ROW, VERSION_LINE, line_of_row,
+        BRANCHES_REFRESH_ROW, LAYOUT_ROW, THEME_ROW, UPDATE_ROW, check_line, line_of_row,
+        preview_line, theme_preview_label_line, theme_preview_line, version_line,
     };
     use super::*;
     use crate::git::LogEntry;
@@ -4160,7 +4267,7 @@ mod tests {
     #[test]
     fn settings_tab_draws_rows_where_the_click_decoder_expects_them() {
         let editor = settings_editor("false");
-        let out = render(90, 30, |frame, area| {
+        let out = render(90, 48, |frame, area| {
             draw_settings_tab(frame, area, &editor, None);
         });
         // The form starts after the panel border and one blank spacer line.
@@ -4175,6 +4282,7 @@ mod tests {
             (UPDATE_ROW, "auto_update_check"),
             (THEME_ROW, "diff_theme"),
             (LAYOUT_ROW, "worktrees_layout"),
+            (BRANCHES_REFRESH_ROW, "branches_refresh_mins"),
         ] {
             let offset = line_of_row(row);
             assert!(
@@ -4194,60 +4302,80 @@ mod tests {
             line(line_of_row(THEME_ROW))
         );
         assert!(
-            line(LAYOUT_LINE).contains("default: two panels"),
+            line(line_of_row(LAYOUT_ROW)).contains("default: two panels"),
             "{:?}",
-            line(LAYOUT_LINE)
+            line(line_of_row(LAYOUT_ROW))
+        );
+        assert!(
+            line(line_of_row(BRANCHES_REFRESH_ROW)).contains("default: 10"),
+            "{:?}",
+            line(line_of_row(BRANCHES_REFRESH_ROW))
         );
         // Theme preview belongs under the theme row, before layout.
         assert!(
-            THEME_PREVIEW_LABEL_LINE > line_of_row(THEME_ROW),
+            theme_preview_label_line() > line_of_row(THEME_ROW),
             "theme preview must follow the theme row"
         );
         assert!(
-            THEME_PREVIEW_LABEL_LINE < LAYOUT_LINE,
+            theme_preview_label_line() < line_of_row(LAYOUT_ROW),
             "theme preview must sit above the layout row"
         );
         assert!(
-            line(THEME_PREVIEW_LABEL_LINE).contains("diff colours look like"),
+            line(theme_preview_label_line()).contains("diff colours look like"),
             "{:?}",
-            line(THEME_PREVIEW_LABEL_LINE)
+            line(theme_preview_label_line())
         );
         assert!(
-            line(THEME_PREVIEW_LABEL_LINE).contains("Eighties"),
+            line(0).contains("This repo"),
+            "repo section header missing: {:?}",
+            line(0)
+        );
+        assert!(
+            line(line_of_row(UPDATE_ROW) - 2).contains("All repos"),
+            "global section header missing: {:?}",
+            line(line_of_row(UPDATE_ROW) - 2)
+        );
+        assert!(
+            line(line_of_row(0) + 1).contains("Where new worktrees go"),
+            "description missing under worktree_dir: {:?}",
+            line(line_of_row(0) + 1)
+        );
+        assert!(
+            line(theme_preview_label_line()).contains("Eighties"),
             "default theme label should appear: {:?}",
-            line(THEME_PREVIEW_LABEL_LINE)
+            line(theme_preview_label_line())
         );
         assert!(
-            line(THEME_PREVIEW_LINE).contains("@@"),
+            line(theme_preview_line()).contains("@@"),
             "sample hunk header missing: {:?}",
-            line(THEME_PREVIEW_LINE)
+            line(theme_preview_line())
         );
         assert!(
-            line(THEME_PREVIEW_LINE + 1).contains("fn greet"),
+            line(theme_preview_line() + 1).contains("fn greet"),
             "sample removal missing: {:?}",
-            line(THEME_PREVIEW_LINE + 1)
+            line(theme_preview_line() + 1)
         );
         assert!(
-            line(THEME_PREVIEW_LINE + 2).contains("fn greet"),
+            line(theme_preview_line() + 2).contains("fn greet"),
             "sample addition missing: {:?}",
-            line(THEME_PREVIEW_LINE + 2)
+            line(theme_preview_line() + 2)
         );
-        assert!(line(PREVIEW_LINE).contains("new worktrees go in"));
-        assert!(line(VERSION_LINE).contains(CURRENT_VERSION));
-        assert!(line(CHECK_LINE).contains("check for updates"));
+        assert!(line(preview_line()).contains("new worktrees go in"));
+        assert!(line(version_line()).contains(CURRENT_VERSION));
+        assert!(line(check_line()).contains("check for updates"));
     }
 
     #[test]
     fn settings_tab_theme_preview_follows_the_selected_theme() {
         let mut editor = settings_editor("");
         editor.fields.diff_theme = "ocean".to_string();
-        let out = render(90, 30, |frame, area| {
+        let out = render(90, 48, |frame, area| {
             draw_settings_tab(frame, area, &editor, None);
         });
-        let label = &out[2 + THEME_PREVIEW_LABEL_LINE];
+        let label = &out[2 + theme_preview_label_line()];
         assert!(label.contains("Ocean"), "{label}");
         assert!(
-            out[2 + THEME_PREVIEW_LINE + 1].contains("fn greet"),
+            out[2 + theme_preview_line() + 1].contains("fn greet"),
             "{out:#?}"
         );
     }
@@ -4256,14 +4384,14 @@ mod tests {
     fn settings_tab_shows_the_version_and_any_update() {
         let editor = settings_editor("");
         // With nothing newer found, the version line says so.
-        let out = render(90, 30, |frame, area| {
+        let out = render(90, 48, |frame, area| {
             draw_settings_tab(frame, area, &editor, None);
         });
-        let version_line = &out[2 + VERSION_LINE];
-        assert!(version_line.contains(CURRENT_VERSION), "{version_line}");
-        assert!(version_line.contains("up to date"), "{version_line}");
+        let ver = &out[2 + version_line()];
+        assert!(ver.contains(CURRENT_VERSION), "{ver}");
+        assert!(ver.contains("up to date"), "{ver}");
         // The unset toggle spells out which default it inherits.
-        assert!(out[2 + UPDATE_ROW * 2].contains("default"), "{out:#?}");
+        assert!(out[2 + line_of_row(UPDATE_ROW)].contains("default"), "{out:#?}");
 
         // A found release is called out instead.
         let release = Release {
@@ -4271,11 +4399,11 @@ mod tests {
             version: "9.9.9".to_string(),
             url: String::new(),
         };
-        let out = render(90, 30, |frame, area| {
+        let out = render(90, 48, |frame, area| {
             draw_settings_tab(frame, area, &editor, Some(&release));
         });
-        let version_line = &out[2 + VERSION_LINE];
-        assert!(version_line.contains("9.9.9 available"), "{version_line}");
+        let ver = &out[2 + version_line()];
+        assert!(ver.contains("9.9.9 available"), "{ver}");
     }
 
     /// The list editor draws every command, the add row, and the done row, and
@@ -4289,7 +4417,7 @@ mod tests {
         list.selected = 1;
         editor.open_list = Some(list);
         let hit = std::cell::Cell::new(true);
-        let out = render(90, 30, |frame, area| {
+        let out = render(90, 48, |frame, area| {
             hit.set(draw_settings_tab(frame, area, &editor, None).is_some());
         });
         let text = out.join("\n");
@@ -4307,10 +4435,10 @@ mod tests {
     fn settings_tab_summarises_multiple_open_commands() {
         let mut editor = settings_editor("");
         editor.fields.open_command = vec!["cursor {path}".to_string(), "open {path}".to_string()];
-        let out = render(90, 30, |frame, area| {
+        let out = render(90, 48, |frame, area| {
             draw_settings_tab(frame, area, &editor, None);
         });
-        let row = &out[2 + OPEN_COMMAND_ROW * 2];
+        let row = &out[2 + line_of_row(OPEN_COMMAND_ROW)];
         assert!(row.contains("2 commands"), "{row}");
     }
 
@@ -4536,7 +4664,7 @@ mod tests {
         // stay within it rather than bleeding across the border.
         assert!(base_row.chars().count() <= 74, "{base_row}");
         assert!(
-            base_row.trim_end().ends_with('│'),
+            base_row.trim_end().ends_with('┃'),
             "border intact: {base_row}"
         );
     }
@@ -4556,7 +4684,7 @@ mod tests {
         assert!(
             out[header + 1]
                 .chars()
-                .all(|c| c == '│' || c == ' ' || c == '╭' || c == '╰'),
+                .all(|c| c == '┃' || c == ' ' || c == '┏' || c == '┗'),
             "a blank spacer follows the header: {out:#?}"
         );
         // `▌` is the highlight symbol; it must land on the first candidate.

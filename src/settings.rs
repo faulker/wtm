@@ -44,6 +44,10 @@ const KEYS: &[(&str, &str)] = &[
         "layout of the TUI's Worktrees tab: two_panel or three_panel",
     ),
     (
+        "branches_refresh_mins",
+        "minutes the Branches tab keeps its list before refreshing (default 10)",
+    ),
+    (
         "setup.copy",
         "files copied into each new worktree, comma separated",
     ),
@@ -199,11 +203,11 @@ pub fn write_draft(repo_root: &Path, draft: &ConfigDraft) -> Result<PathBuf> {
 /// strings for the TUI config editor. Unset keys come back empty; `copy` and
 /// `run` are comma-joined.
 ///
-/// `auto_update_check`, `diff_theme`, and `worktrees_layout` are the
-/// exceptions: they govern wtm itself rather than one repo, so the editor
-/// shows the *effective* merged value (so a stale repo override cannot make
-/// the row disagree with what the Worktrees tab is drawing) and Settings
-/// save writes them to `global_config`.
+/// `auto_update_check`, `diff_theme`, `worktrees_layout`, and
+/// `branches_refresh_mins` are the exceptions: they govern wtm itself rather
+/// than one repo, so the editor shows the *effective* merged value (so a stale
+/// repo override cannot make the row disagree with what the TUI is drawing)
+/// and Settings save writes them to `global_config`.
 pub fn repo_config_fields(
     repo_root: &Path,
     global_config: Option<&Path>,
@@ -212,6 +216,7 @@ pub fn repo_config_fields(
     let auto_update_check = effective_auto_update_check(global_config, &cfg);
     let diff_theme = effective_diff_theme(global_config, &cfg);
     let worktrees_layout = effective_worktrees_layout(global_config, &cfg);
+    let branches_refresh_mins = effective_branches_refresh_mins(global_config, &cfg);
     let setup = cfg.setup.unwrap_or_default();
     let copy = setup
         .copy
@@ -231,6 +236,7 @@ pub fn repo_config_fields(
         auto_update_check,
         diff_theme,
         worktrees_layout,
+        branches_refresh_mins,
         copy,
         run,
     })
@@ -279,6 +285,16 @@ fn effective_worktrees_layout(global_config: Option<&Path>, repo: &FileConfig) -
     }
 }
 
+/// Effective `branches_refresh_mins` for the editor: `""` when the built-in
+/// default applies, otherwise the configured minutes as a string.
+fn effective_branches_refresh_mins(global_config: Option<&Path>, repo: &FileConfig) -> String {
+    let merged = Config::merge(load_global_file(global_config), repo.clone());
+    match merged.branches_refresh_mins_source {
+        config::Source::Default => String::new(),
+        _ => merged.branches_refresh_mins().to_string(),
+    }
+}
+
 /// The settings the TUI config editor shows, each empty when unset.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RepoConfigFields {
@@ -293,6 +309,9 @@ pub struct RepoConfigFields {
     pub diff_theme: String,
     /// `""`, `"two_panel"`, or `"three_panel"`; lives in the global config.
     pub worktrees_layout: String,
+    /// Minutes the Branches tab caches its list, or `""` for the default;
+    /// lives in the global config.
+    pub branches_refresh_mins: String,
     pub copy: String,
     pub run: String,
 }
@@ -302,10 +321,11 @@ pub struct RepoConfigFields {
 /// value) applies again. Returns the repo file's path.
 ///
 /// Repo settings go to the repo's `.wtm.toml`; `auto_update_check`,
-/// `diff_theme`, and `worktrees_layout` go to `global_config`, since they are
-/// about wtm rather than about this repository. Any repo-level copies of those
-/// three keys are cleared on save so a prior `wtm config set` (without `-g`)
-/// cannot keep overriding the value the user just chose in Settings.
+/// `diff_theme`, `worktrees_layout`, and `branches_refresh_mins` go to
+/// `global_config`, since they are about wtm rather than about this
+/// repository. Any repo-level copies of those keys are cleared on save so a
+/// prior `wtm config set` (without `-g`) cannot keep overriding the value the
+/// user just chose in Settings.
 pub fn save_config_edits(
     repo_root: &Path,
     global_config: Option<&Path>,
@@ -321,11 +341,13 @@ pub fn save_config_edits(
     apply_unset(&mut doc, "auto_update_check")?;
     apply_unset(&mut doc, "diff_theme")?;
     apply_unset(&mut doc, "worktrees_layout")?;
+    apply_unset(&mut doc, "branches_refresh_mins")?;
     save_doc(&file, &doc)?;
     if let Some(path) = global_config {
         save_global_setting(path, "auto_update_check", &fields.auto_update_check)?;
         save_global_setting(path, "diff_theme", &fields.diff_theme)?;
         save_global_setting(path, "worktrees_layout", &fields.worktrees_layout)?;
+        save_global_setting(path, "branches_refresh_mins", &fields.branches_refresh_mins)?;
     }
     Ok(file)
 }
@@ -422,6 +444,10 @@ fn show(cwd: &Path, json: bool) -> Result<()> {
                 "value": cfg.worktrees_layout().as_str(),
                 "source": cfg.worktrees_layout_source,
             },
+            "branches_refresh_mins": {
+                "value": cfg.branches_refresh_mins(),
+                "source": cfg.branches_refresh_mins_source,
+            },
             "version": crate::update::CURRENT_VERSION,
             "setup": {
                 "copy": { "value": cfg.setup.copy, "source": cfg.copy_source },
@@ -461,6 +487,11 @@ fn show(cwd: &Path, json: bool) -> Result<()> {
         cfg.worktrees_layout_source
     );
     println!(
+        "  branches_refresh_mins = {}   ({})",
+        cfg.branches_refresh_mins(),
+        cfg.branches_refresh_mins_source
+    );
+    println!(
         "  setup.copy   = {:?}   ({})",
         cfg.setup.copy, cfg.copy_source
     );
@@ -497,6 +528,7 @@ fn get(cwd: &Path, key: &str, json: bool) -> Result<()> {
         "auto_update_check" => json!(cfg.auto_update_check()),
         "diff_theme" => json!(cfg.diff_theme()),
         "worktrees_layout" => json!(cfg.worktrees_layout().as_str()),
+        "branches_refresh_mins" => json!(cfg.branches_refresh_mins()),
         "setup.copy" => json!(cfg.setup.copy),
         "setup.run" => json!(cfg.setup.run),
         _ => unreachable!("known_key checked"),
@@ -819,6 +851,10 @@ fn apply_set(doc: &mut DocumentMut, key: &str, raw: &str) -> Result<()> {
         "worktrees_layout" => {
             doc["worktrees_layout"] = toml_value(parse_worktrees_layout(raw)?);
         }
+        "branches_refresh_mins" => {
+            let mins = parse_branches_refresh_mins(raw)?;
+            doc["branches_refresh_mins"] = toml_value(mins as i64);
+        }
         "setup.copy" | "setup.run" => {
             let sub = key.strip_prefix("setup.").unwrap();
             let setup = doc
@@ -841,6 +877,7 @@ fn apply_unset(doc: &mut DocumentMut, key: &str) -> Result<bool> {
         "auto_update_check" => doc.remove("auto_update_check").is_some(),
         "diff_theme" => doc.remove("diff_theme").is_some(),
         "worktrees_layout" => doc.remove("worktrees_layout").is_some(),
+        "branches_refresh_mins" => doc.remove("branches_refresh_mins").is_some(),
         "setup.copy" | "setup.run" => {
             let sub = key.strip_prefix("setup.").unwrap();
             let removed = doc
@@ -916,6 +953,18 @@ fn parse_worktrees_layout(raw: &str) -> Result<&'static str> {
             .collect::<Vec<_>>()
             .join(", ")
     )
+}
+
+/// Parses a positive integer (minutes) for the Branches tab cache timeout.
+fn parse_branches_refresh_mins(raw: &str) -> Result<u64> {
+    let trimmed = raw.trim();
+    let mins: u64 = trimmed
+        .parse()
+        .with_context(|| format!("expected a number of minutes, got {raw:?}"))?;
+    if mins == 0 {
+        bail!("branches_refresh_mins must be at least 1");
+    }
+    Ok(mins)
 }
 
 /// Splits a comma-separated value into trimmed, non-empty items.
@@ -1199,6 +1248,7 @@ mod tests {
             auto_update_check: String::new(),
             diff_theme: String::new(),
             worktrees_layout: String::new(),
+            branches_refresh_mins: String::new(),
             copy: copy.to_string(),
             run: run.to_string(),
         }
@@ -1418,6 +1468,54 @@ mod tests {
             .to_string();
         assert!(err.contains("unknown layout"), "{err}");
         assert!(err.contains("two_panel"), "{err}");
+    }
+
+    #[test]
+    fn setting_branches_refresh_mins_writes_an_integer() {
+        let mut doc = DocumentMut::new();
+        apply_set(&mut doc, "branches_refresh_mins", "15").unwrap();
+        assert_eq!(doc.to_string().trim(), "branches_refresh_mins = 15");
+        let cfg: FileConfig = toml::from_str(&doc.to_string()).unwrap();
+        assert_eq!(cfg.branches_refresh_mins, Some(15));
+        assert!(apply_unset(&mut doc, "branches_refresh_mins").unwrap());
+        assert_eq!(doc.to_string().trim(), "");
+
+        let err = apply_set(&mut doc, "branches_refresh_mins", "0")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("at least 1"), "{err}");
+        let err = apply_set(&mut doc, "branches_refresh_mins", "nope")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("number of minutes"), "{err}");
+    }
+
+    #[test]
+    fn branches_refresh_mins_round_trips_through_the_global_config() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(CONFIG_FILE), "worktree_dir = \"sibling\"\n").unwrap();
+        let global = dir.path().join("global.toml");
+
+        let mut edits = fields("", &[], "", "");
+        edits.branches_refresh_mins = "30".to_string();
+        save_config_edits(dir.path(), Some(&global), &edits).unwrap();
+
+        assert_eq!(
+            FileConfig::load(&global).unwrap().branches_refresh_mins,
+            Some(30)
+        );
+        let read = repo_config_fields(dir.path(), Some(&global)).unwrap();
+        assert_eq!(read.branches_refresh_mins, "30");
+
+        edits.branches_refresh_mins = String::new();
+        save_config_edits(dir.path(), Some(&global), &edits).unwrap();
+        assert_eq!(FileConfig::load(&global).unwrap().branches_refresh_mins, None);
+        assert_eq!(
+            repo_config_fields(dir.path(), Some(&global))
+                .unwrap()
+                .branches_refresh_mins,
+            ""
+        );
     }
 
     #[test]

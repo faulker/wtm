@@ -1261,6 +1261,9 @@ pub struct App {
     /// The selection `poll_branches_load` should clamp and apply once the
     /// in-flight `branches_pending` load lands.
     branches_want_selected: usize,
+    /// When the current `branches` cache was last filled. `None` means never
+    /// loaded (or invalidated); the next `ensure_branches` will kick off a load.
+    branches_loaded_at: Option<Instant>,
     /// Worktree the Stash tab's entries belong to. Empty before the tab has
     /// been opened.
     pub stash_name: String,
@@ -1399,6 +1402,7 @@ impl App {
             branch_selected: 0,
             branches_pending: None,
             branches_want_selected: 0,
+            branches_loaded_at: None,
             stash_name: String::new(),
             stash_entries: Vec::new(),
             stash_selected: 0,
@@ -1656,7 +1660,9 @@ impl App {
     /// overlay, prompt, or modal error owns the screen, and it keeps the cursor
     /// on whatever it was on by name rather than by index. A failed reload is
     /// swallowed rather than raised, since an unattended background refresh
-    /// should never interrupt with a popup; `r` still reports errors.
+    /// should never interrupt with a popup; `r` still reports errors. The
+    /// Branches tab uses its own `branches_refresh_mins` cache rather than
+    /// reloading on this shorter interval.
     fn auto_refresh(&mut self) {
         // Never reload while an overlay, prompt, or modal owns the screen: a
         // confirm/prompt (e.g. naming a branch, confirming a delete) reads the
@@ -1681,18 +1687,10 @@ impl App {
             self.preview_for = None;
             self.preview_pending = None;
         }
-        if self.tab == Tab::Branches
-            && let Ok(r) = ops::branch_list(&self.ctx)
-        {
-            let current = self
-                .branches
-                .get(self.branch_selected)
-                .map(|b| b.name.clone());
-            self.branches = r.branches;
-            self.branch_selected = current
-                .and_then(|name| self.branches.iter().position(|b| b.name == name))
-                .unwrap_or(self.branch_selected)
-                .min(self.branches.len().saturating_sub(1));
+        // Branches use their own cache timeout (`branches_refresh_mins`); only
+        // refresh them here when the cache has gone stale while the tab is open.
+        if self.tab == Tab::Branches {
+            self.ensure_branches(self.branch_selected);
         }
     }
 
@@ -1833,6 +1831,7 @@ impl App {
         if *done {
             return;
         }
+        let mut invalidate_branches = false;
         while let Some(msg) = rx.try_recv() {
             match msg {
                 CreateMsg::Progress(line) => lines.push(line),
@@ -1844,27 +1843,36 @@ impl App {
                             lines.push(format!("       {detail}"));
                         }
                     }
-                    // A separator plus an unambiguous ✓/✗ line make it obvious the
-                    // run is over, not just paused between steps.
-                    lines.push("── done ──".to_string());
-                    lines.push(if result.setup_ok {
-                        format!("✓ worktree created and set up: {}", result.path)
+                    // A loud banner after the step log so a long setup run
+                    // still ends with an unmistakable "you're done" signal.
+                    lines.push(String::new());
+                    lines.push("════════════════════════════════════".to_string());
+                    if result.setup_ok {
+                        lines.push("  READY — worktree set up and ready to use".to_string());
+                        lines.push(format!("  {}", result.path));
                     } else {
-                        format!(
-                            "✗ worktree kept at {} but some setup steps failed",
-                            result.path
-                        )
-                    });
-                    lines.push("press Enter to continue".to_string());
+                        lines.push("  FAILED — worktree kept but setup had errors".to_string());
+                        lines.push(format!("  {}", result.path));
+                    }
+                    lines.push("  press Enter to continue".to_string());
+                    lines.push("════════════════════════════════════".to_string());
                     *done = true;
+                    // Branch list may now include the new worktree's branch.
+                    invalidate_branches = true;
                 }
                 CreateMsg::Done(Err(e)) => {
-                    lines.push("── done ──".to_string());
-                    lines.push(format!("✗ worktree creation failed: {e}"));
-                    lines.push("press Enter to continue".to_string());
+                    lines.push(String::new());
+                    lines.push("════════════════════════════════════".to_string());
+                    lines.push("  FAILED — worktree creation failed".to_string());
+                    lines.push(format!("  {e}"));
+                    lines.push("  press Enter to continue".to_string());
+                    lines.push("════════════════════════════════════".to_string());
                     *done = true;
                 }
             }
+        }
+        if invalidate_branches {
+            self.invalidate_branches_cache();
         }
     }
 
@@ -2815,7 +2823,7 @@ impl App {
         self.worktrees_focus = WorktreesFocus::List;
         self.tab = tab;
         match self.tab {
-            Tab::Branches => self.load_branches(0),
+            Tab::Branches => self.ensure_branches(0),
             // Landing on Changes shows whichever worktree is highlighted on the
             // Worktrees tab. Coming back to the same worktree keeps the cursor
             // where it was and just re-reads the working tree.
@@ -3534,9 +3542,9 @@ impl App {
                         self.stash_selected = idx;
                     }
                 }
-                // Non-uniform layout: each field is a value line plus a dim
-                // hint line, with unselectable preview and version lines before
-                // the action rows, so `row_at_line` owns the decoding.
+                // Non-uniform layout: section headers, spaced setting blocks
+                // (value + description + blank), theme sample, and footer
+                // lines, so `row_at_line` owns the decoding.
                 Tab::Settings
                     if self.settings.editing.is_none() && self.settings.open_list.is_none() =>
                 {
@@ -5236,6 +5244,31 @@ impl App {
         self.branches_pending = Some(Task::new(rx));
     }
 
+    /// Loads the Branches tab only when the cache is missing, dirty, or older
+    /// than `branches_refresh_mins`. A load already in flight is left alone.
+    fn ensure_branches(&mut self, selected: usize) {
+        if self.branches_pending.is_some() {
+            self.branches_want_selected = selected;
+            return;
+        }
+        let timeout = Duration::from_secs(self.ctx.config.branches_refresh_mins().saturating_mul(60));
+        let fresh = self
+            .branches_loaded_at
+            .is_some_and(|at| at.elapsed() < timeout);
+        if fresh && !self.branches.is_empty() {
+            self.branch_selected = selected.min(self.branches.len().saturating_sub(1));
+            return;
+        }
+        self.load_branches(selected);
+    }
+
+    /// Drops the Branches tab cache so the next `ensure_branches` reloads.
+    /// Called after creating a worktree (and any other mutation that adds a
+    /// branch without going through the Branches tab's own reload path).
+    fn invalidate_branches_cache(&mut self) {
+        self.branches_loaded_at = None;
+    }
+
     /// Applies a finished background `load_branches` result, if one has
     /// landed. Called each tick so the branch list fills in (or refreshes)
     /// without blocking navigation. Bounces back to the Worktrees tab on
@@ -5254,6 +5287,7 @@ impl App {
                     .branches_want_selected
                     .min(r.branches.len().saturating_sub(1));
                 self.branches = r.branches;
+                self.branches_loaded_at = Some(Instant::now());
             }
             Err(e) => {
                 self.set_error(e);
@@ -7931,6 +7965,20 @@ mod tests {
             _ => panic!("expected creating view"),
         }
         wait_creating(&mut app, |_, done| done);
+        match &app.view {
+            View::Creating { lines, done, .. } => {
+                assert!(*done);
+                assert!(
+                    lines.iter().any(|l| l.contains("READY —")),
+                    "finished create must show a prominent ready banner: {lines:?}"
+                );
+                assert!(
+                    lines.iter().any(|l| l.contains("press Enter to continue")),
+                    "lines: {lines:?}"
+                );
+            }
+            _ => panic!("expected creating view"),
+        }
         press(&mut app, KeyCode::Enter);
         assert!(app.worktrees.iter().any(|w| w.name == "feature"));
     }
@@ -8009,8 +8057,8 @@ mod tests {
     /// Switching to the Branches tab renders immediately (never blocks on the
     /// per-branch git invocations behind `load_branches`): the first visit
     /// shows a loading state until the background load lands, and a later
-    /// visit keeps the previously loaded list on screen while a fresh load
-    /// runs behind it, rather than flashing back to empty.
+    /// visit within the cache window reuses the list without kicking off
+    /// another load.
     #[test]
     fn switching_to_branches_tab_is_instant_with_loading_indicator() {
         let (_tmp, mut app) = test_app();
@@ -8025,22 +8073,52 @@ mod tests {
         assert!(!app.branches_first_load());
         assert!(!app.branches.is_empty());
 
-        // Leave and come back: a reload is kicked off again, but the cached
-        // list from the last visit is still there to show immediately.
+        // Leave and come back within the cache window: no reload, cached list.
         press(&mut app, KeyCode::BackTab);
         press(&mut app, KeyCode::Tab);
         assert_eq!(app.tab, Tab::Branches);
         assert!(
+            !app.branches_loading(),
+            "a fresh cache must not reload on re-entry"
+        );
+        assert!(!app.branches.is_empty(), "the cached list stays visible");
+        assert!(!app.branches_first_load());
+    }
+
+    /// Manual `r` on the Branches tab always reloads, even when the cache is
+    /// still within the timeout window.
+    #[test]
+    fn branches_tab_manual_refresh_reloads_a_fresh_cache() {
+        let (_tmp, mut app) = test_app();
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
+        settle_branches(&mut app);
+        assert!(!app.branches_loading());
+
+        press(&mut app, KeyCode::Char('r'));
+        assert!(
             app.branches_loading(),
-            "re-entering the tab refreshes the list"
+            "manual refresh must bypass the cache"
         );
+        assert!(!app.branches.is_empty(), "stale list stays until the load lands");
+        settle_branches(&mut app);
+    }
+
+    /// Expiring the Branches cache (or invalidating it after a worktree create)
+    /// makes the next visit kick off a reload.
+    #[test]
+    fn branches_tab_reloads_after_cache_invalidation() {
+        let (_tmp, mut app) = test_app();
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Tab);
+        settle_branches(&mut app);
+
+        press(&mut app, KeyCode::BackTab); // Changes
+        app.invalidate_branches_cache();
+        press(&mut app, KeyCode::Tab); // Branches again
         assert!(
-            !app.branches.is_empty(),
-            "the cached list stays visible while the refresh runs"
-        );
-        assert!(
-            !app.branches_first_load(),
-            "a refresh with cached data isn't a first load"
+            app.branches_loading(),
+            "an invalidated cache must reload on the next visit"
         );
         settle_branches(&mut app);
     }
@@ -12944,5 +13022,38 @@ mod tests {
         settle_preview(&mut app);
         assert!(!app.three_panel);
         assert!(app.worktree_commits.is_none());
+    }
+
+    /// With more worktrees than the three-panel list can show, overflow arrows
+    /// appear on the left: ▼ when rows sit below the viewport, ▲ when scrolled.
+    #[test]
+    fn three_panel_worktree_list_shows_scroll_arrows() {
+        let (_tmp, mut app) = three_panel_app();
+        for i in 0..6 {
+            add_and_select_worktree(&mut app, &format!("extra-{i}"));
+        }
+        assert!(
+            app.worktrees.len() > 4,
+            "need more than the four visible rows"
+        );
+
+        // At the top: only a down arrow.
+        app.selected = 0;
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::tui::ui::draw(frame, &mut app))
+            .unwrap();
+        let top = terminal.backend().to_string();
+        assert!(top.contains('▼'), "more below at the top: {top}");
+        assert!(!top.contains('▲'), "nothing above at the top: {top}");
+
+        // Mid-list: both arrows when the selection has scrolled the viewport.
+        app.selected = app.worktrees.len() - 1;
+        terminal
+            .draw(|frame| crate::tui::ui::draw(frame, &mut app))
+            .unwrap();
+        let bottom = terminal.backend().to_string();
+        assert!(bottom.contains('▲'), "more above at the bottom: {bottom}");
     }
 }

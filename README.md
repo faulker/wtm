@@ -20,7 +20,15 @@ The mouse works throughout: clicking a tab switches to it, and clicking a row se
 
 Requires `git` on your PATH.
 
-Prebuilt binaries for macOS (Apple Silicon and Intel) and Linux (x86_64 and ARM64) are attached to every [release](https://github.com/faulker/wtm/releases):
+Install the latest release (macOS Apple Silicon/Intel, Linux x86_64/ARM64):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/faulker/wtm/main/install.sh | bash
+```
+
+That downloads the matching binary from [GitHub Releases](https://github.com/faulker/wtm/releases), verifies its SHA-256 checksum, and installs it to `~/.local/bin/wtm` (override with `WTM_INSTALL_DIR`).
+
+Or unpack a release tarball by hand:
 
 ```sh
 tar -xzf wtm-vX.Y.Z-aarch64-apple-darwin.tar.gz
@@ -50,7 +58,7 @@ wtm init
 
 ![The Settings tab: worktree_dir, open_command, setup.copy, and setup.run, each with a hint line, plus a live preview of where worktrees will land](docs/images/tui-settings.png)
 
-The Settings tab (`o` in the TUI) edits the same fields, with a hint under each one and a live preview of where new worktrees will land. `Enter` edits the selected row (and writes immediately; `Esc` cancels an in-progress edit). Below the location preview it shows a sample of the selected `diff_theme` (cycling the row updates the palette right away), then the running version and whether an update is waiting, with a `[ check for updates now ]` row. The `diff_theme` row cycles the syntax-highlight palette used in the diff pane (Eighties, Mocha, Ocean, Solarized, GitHub) and the `worktrees_layout` row cycles the Worktrees tab between two and three panels; both are saved globally like `auto_update_check`.
+The Settings tab (`o` in the TUI) edits the same fields, with a hint under each one and a live preview of where new worktrees will land. `Enter` edits the selected row (and writes immediately; `Esc` cancels an in-progress edit). Below the location preview it shows a sample of the selected `diff_theme` (cycling the row updates the palette right away), then the running version and whether an update is waiting, with a `[ check for updates now ]` row. The `diff_theme` row cycles the syntax-highlight palette used in the diff pane (Eighties, Mocha, Ocean, Solarized, GitHub) and the `worktrees_layout` row cycles the Worktrees tab between two and three panels; both are saved globally like `auto_update_check`. `branches_refresh_mins` (default 10) controls how long the Branches tab keeps its cached list before refreshing on its own; `r` on that tab always reloads immediately.
 
 To view or change settings later, no TOML editing required:
 
@@ -63,6 +71,7 @@ wtm config set setup.copy ".env, .env.local"
 wtm config set --global auto_update_check false   # stop checking for new releases
 wtm config set --global diff_theme ocean          # Eighties (default), Mocha, Ocean, Solarized, GitHub
 wtm config set --global worktrees_layout three_panel   # Worktrees tab: two_panel (default) or three_panel
+wtm config set --global branches_refresh_mins 10       # Branches tab cache timeout in minutes (default 10)
 wtm config unset setup.copy      # back to the default (or the global value)
 wtm config path                  # where the config files live
 ```

@@ -31,69 +31,123 @@ pub const UPDATE_ROW: usize = TEXT_ROWS;
 pub const THEME_ROW: usize = TEXT_ROWS + 1;
 /// Index of the Worktrees-tab layout cycle row.
 pub const LAYOUT_ROW: usize = TEXT_ROWS + 2;
-/// Number of setting rows, text fields plus the three cycle rows.
-pub const FIELD_ROWS: usize = TEXT_ROWS + 3;
+/// Index of the Branches-tab cache timeout (editable minutes).
+pub const BRANCHES_REFRESH_ROW: usize = TEXT_ROWS + 3;
+/// Number of setting rows, text fields plus the three cycle rows and the
+/// Branches refresh timeout.
+pub const FIELD_ROWS: usize = TEXT_ROWS + 4;
 /// Index of the "check for updates now" row.
 pub const CHECK_ROW: usize = FIELD_ROWS;
 /// Total selectable rows.
 pub const ROWS: usize = FIELD_ROWS + 1;
 
-// Line offsets within the Settings tab's rendered form, so the renderer and
-// the click handler cannot drift apart. Rows 0..=THEME_ROW each draw a value
-// line plus a dim hint. Immediately under the theme row sits a labelled
-// theme-colour sample (so the preview stays visually tied to `diff_theme`),
-// then the layout row (value + hint), the worktree-location preview, the
-// version line, and the check-for-updates action row.
-/// Label line above the theme colour sample ("diff colours look like").
-/// Sits right after the theme row's hint so the sample reads as part of that
-/// setting rather than as a footer under `worktrees_layout`.
-pub const THEME_PREVIEW_LABEL_LINE: usize = (THEME_ROW + 1) * 2;
-/// Number of sample lines drawn under [`THEME_PREVIEW_LABEL_LINE`].
+// Line layout for the Settings form. Each setting is a small block (value,
+// description, blank separator) so neighbouring settings stay visually
+// distinct. Repo settings and global settings each sit under a section
+// header. The theme block inserts a live colour sample between its
+// description and blank. Keep [`line_of_row`] / [`row_at_line`] as the single
+// source of truth so clicks and draws cannot drift apart.
+
+/// Section header plus the blank line under it, before the first setting.
+const SECTION_HEADER_LINES: usize = 2;
+/// Ordinary setting: value, description, trailing blank.
+const SETTING_LINES: usize = 3;
+/// Number of sample lines drawn under the theme preview label.
 /// Kept in sync with `highlight::THEME_PREVIEW_SAMPLE`'s line count.
 pub const THEME_PREVIEW_SAMPLE_LINES: usize = 3;
-/// First sample line of the theme colour preview.
-pub const THEME_PREVIEW_LINE: usize = THEME_PREVIEW_LABEL_LINE + 1;
-/// Value line of the `worktrees_layout` row (after the theme sample).
-pub const LAYOUT_LINE: usize = THEME_PREVIEW_LINE + THEME_PREVIEW_SAMPLE_LINES;
-/// Line showing where worktrees will actually be created.
-pub const PREVIEW_LINE: usize = LAYOUT_LINE + 2;
-/// Line showing the running version and any update found.
-pub const VERSION_LINE: usize = PREVIEW_LINE + 1;
-pub const CHECK_LINE: usize = VERSION_LINE + 1;
-/// Total lines the form occupies.
-pub const FORM_LINES: usize = CHECK_LINE + 1;
 
-/// The row a click on form line `line` selects, or `None` for the hint,
-/// preview, theme sample, and version lines, which are not selectable.
-pub fn row_at_line(line: usize) -> Option<usize> {
-    match line {
-        CHECK_LINE => Some(CHECK_ROW),
-        // Layout sits after the theme sample, so it is not at `LAYOUT_ROW * 2`.
-        LAYOUT_LINE => Some(LAYOUT_ROW),
-        // Rows 0..=THEME_ROW are contiguous value/hint pairs before the theme
-        // preview block. Only a field's value line (even offset) selects it.
-        _ if line < THEME_PREVIEW_LABEL_LINE && line.is_multiple_of(2) => Some(line / 2),
-        _ => None,
+/// Height of one setting block, including its trailing blank.
+fn setting_block_height(row: usize) -> usize {
+    if row == THEME_ROW {
+        // value + description + preview label + samples + blank
+        SETTING_LINES + 1 + THEME_PREVIEW_SAMPLE_LINES
+    } else {
+        SETTING_LINES
     }
 }
 
-/// Form line of a field row's value, mirroring [`row_at_line`].
-#[cfg(test)]
+/// Form line of a field row's value (the selectable line).
 pub fn line_of_row(row: usize) -> usize {
-    if row == LAYOUT_ROW {
-        LAYOUT_LINE
-    } else {
-        row * 2
+    let mut line = SECTION_HEADER_LINES; // "This repo" header + blank
+    for r in 0..FIELD_ROWS {
+        if r == UPDATE_ROW {
+            line += SECTION_HEADER_LINES; // "All repos" header + blank
+        }
+        if r == row {
+            return line;
+        }
+        line += setting_block_height(r);
     }
+    // CHECK_ROW is past the fields; callers use CHECK_LINE for that.
+    line
+}
+
+/// First form line after every setting block (worktree-location preview).
+fn footer_start() -> usize {
+    let mut line = SECTION_HEADER_LINES;
+    for r in 0..FIELD_ROWS {
+        if r == UPDATE_ROW {
+            line += SECTION_HEADER_LINES;
+        }
+        line += setting_block_height(r);
+    }
+    line
+}
+
+/// Label line above the theme colour sample ("diff colours look like").
+#[cfg(test)]
+pub fn theme_preview_label_line() -> usize {
+    line_of_row(THEME_ROW) + 2
+}
+
+/// First sample line of the theme colour preview.
+#[cfg(test)]
+pub fn theme_preview_line() -> usize {
+    theme_preview_label_line() + 1
+}
+
+/// Line showing where worktrees will actually be created.
+pub fn preview_line() -> usize {
+    footer_start()
+}
+
+/// Line showing the running version and any update found.
+#[cfg(test)]
+pub fn version_line() -> usize {
+    footer_start() + 1
+}
+
+/// Line of the "check for updates now" action.
+pub fn check_line() -> usize {
+    footer_start() + 2
+}
+
+/// Total lines the form occupies.
+pub fn form_lines() -> usize {
+    check_line() + 1
+}
+
+/// The row a click on form line `line` selects, or `None` for descriptions,
+/// blanks, section headers, the theme sample, preview, and version lines.
+pub fn row_at_line(line: usize) -> Option<usize> {
+    if line == check_line() {
+        return Some(CHECK_ROW);
+    }
+    for row in 0..FIELD_ROWS {
+        if line_of_row(row) == line {
+            return Some(row);
+        }
+    }
+    None
 }
 
 /// State of the Settings tab's editor.
 pub struct ConfigEditor {
     pub repo_root: PathBuf,
-    /// The global config file `auto_update_check`, `diff_theme`, and
-    /// `worktrees_layout` are read from and written to, resolved once at load
-    /// so a save cannot land somewhere else. `None` on a system with no
-    /// locatable global config.
+    /// The global config file `auto_update_check`, `diff_theme`,
+    /// `worktrees_layout`, and `branches_refresh_mins` are read from and
+    /// written to, resolved once at load so a save cannot land somewhere else.
+    /// `None` on a system with no locatable global config.
     pub global_config: Option<PathBuf>,
     /// The setting values as shown, each empty when unset.
     pub fields: RepoConfigFields,
@@ -284,7 +338,9 @@ impl ConfigEditor {
             3 => &self.fields.run,
             UPDATE_ROW => &self.fields.auto_update_check,
             THEME_ROW => &self.fields.diff_theme,
-            _ => &self.fields.worktrees_layout,
+            LAYOUT_ROW => &self.fields.worktrees_layout,
+            BRANCHES_REFRESH_ROW => &self.fields.branches_refresh_mins,
+            _ => "",
         }
     }
 
@@ -313,6 +369,7 @@ impl ConfigEditor {
             UPDATE_ROW => self.fields.auto_update_check = value,
             THEME_ROW => self.fields.diff_theme = value,
             LAYOUT_ROW => self.fields.worktrees_layout = value,
+            BRANCHES_REFRESH_ROW => self.fields.branches_refresh_mins = value,
             // `open_command` is edited as a list, never as one text value.
             _ => {}
         }
@@ -461,8 +518,17 @@ impl ConfigEditor {
             KeyCode::Enter if self.selected == OPEN_COMMAND_ROW => {
                 self.open_list = Some(OpenCommandEditor::new(self.fields.open_command.clone()))
             }
-            KeyCode::Enter if self.selected < TEXT_ROWS => {
-                self.editing = Some(TextInput::with_value(self.field(self.selected)))
+            KeyCode::Enter if self.selected < TEXT_ROWS || self.selected == BRANCHES_REFRESH_ROW => {
+                // Prefill with the effective default when the field is unset so
+                // the user sees what they are changing from.
+                let initial = if self.selected == BRANCHES_REFRESH_ROW
+                    && self.fields.branches_refresh_mins.is_empty()
+                {
+                    config::DEFAULT_BRANCHES_REFRESH_MINS.to_string()
+                } else {
+                    self.field(self.selected).to_string()
+                };
+                self.editing = Some(TextInput::with_value(&initial))
             }
             _ => {}
         }
@@ -725,25 +791,41 @@ mod tests {
     #[test]
     fn check_row_is_past_the_fields() {
         assert_eq!(CHECK_ROW, FIELD_ROWS);
-        assert_eq!(row_at_line(CHECK_LINE), Some(CHECK_ROW));
-        assert_eq!(row_at_line(PREVIEW_LINE), None);
-        assert_eq!(row_at_line(THEME_PREVIEW_LABEL_LINE), None);
-        assert_eq!(row_at_line(THEME_PREVIEW_LINE), None);
-        assert_eq!(row_at_line(LAYOUT_LINE), Some(LAYOUT_ROW));
+        assert_eq!(row_at_line(check_line()), Some(CHECK_ROW));
+        assert_eq!(row_at_line(preview_line()), None);
+        assert_eq!(row_at_line(theme_preview_label_line()), None);
+        assert_eq!(row_at_line(theme_preview_line()), None);
+        assert_eq!(row_at_line(line_of_row(LAYOUT_ROW)), Some(LAYOUT_ROW));
         assert_eq!(
-            row_at_line(LAYOUT_LINE + 1),
+            row_at_line(line_of_row(LAYOUT_ROW) + 1),
             None,
-            "layout hint is not selectable"
+            "layout description is not selectable"
         );
+        assert_eq!(
+            row_at_line(line_of_row(BRANCHES_REFRESH_ROW)),
+            Some(BRANCHES_REFRESH_ROW)
+        );
+        assert_eq!(
+            row_at_line(line_of_row(BRANCHES_REFRESH_ROW) + 1),
+            None,
+            "branches refresh description is not selectable"
+        );
+        // Section headers and blanks are not selectable.
+        assert_eq!(row_at_line(0), None, "repo section header");
+        assert_eq!(row_at_line(1), None, "blank under repo section");
         // Theme sample sits under the theme row and before the layout row.
-        assert!(THEME_PREVIEW_LABEL_LINE > THEME_ROW * 2 + 1);
-        assert!(THEME_PREVIEW_LINE + THEME_PREVIEW_SAMPLE_LINES - 1 < LAYOUT_LINE);
-        assert_eq!(line_of_row(THEME_ROW), THEME_ROW * 2);
-        assert_eq!(line_of_row(LAYOUT_ROW), LAYOUT_LINE);
+        assert!(theme_preview_label_line() > line_of_row(THEME_ROW));
+        assert!(theme_preview_line() + THEME_PREVIEW_SAMPLE_LINES - 1 < line_of_row(LAYOUT_ROW));
         assert_eq!(
             THEME_PREVIEW_SAMPLE_LINES,
             highlight::THEME_PREVIEW_SAMPLE.lines().count(),
             "sample line count must match the rendered snippet"
+        );
+        // Each ordinary setting leaves a blank before the next value line.
+        assert_eq!(
+            line_of_row(1) - line_of_row(0),
+            SETTING_LINES,
+            "settings are spaced with a blank separator"
         );
     }
 }

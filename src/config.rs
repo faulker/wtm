@@ -30,6 +30,10 @@ pub const DEFAULT_AUTO_UPDATE_CHECK: bool = true;
 /// isn't set. Kept in sync with `tui::highlight::DEFAULT_DIFF_THEME`.
 pub const DEFAULT_DIFF_THEME: &str = "eighties";
 
+/// How long the Branches tab keeps a loaded list before refreshing on its
+/// own, in minutes. Manual `r` and mutations still refresh immediately.
+pub const DEFAULT_BRANCHES_REFRESH_MINS: u64 = 10;
+
 /// How the TUI's Worktrees tab is laid out.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -154,6 +158,9 @@ pub struct FileConfig {
     /// Layout of the TUI's Worktrees tab. Unset means
     /// [`WorktreesLayout::TwoPanel`].
     pub worktrees_layout: Option<WorktreesLayout>,
+    /// Minutes the Branches tab may keep a cached list before refreshing.
+    /// Unset means [`DEFAULT_BRANCHES_REFRESH_MINS`].
+    pub branches_refresh_mins: Option<u64>,
     pub setup: Option<FileSetup>,
     /// Runtime map of worktree branch → creation base ref, written by
     /// `wtm create`. Not a user-facing setting; ignored by [`Config::merge`].
@@ -204,6 +211,10 @@ pub struct Config {
     /// [`WorktreesLayout::TwoPanel`].
     pub worktrees_layout: Option<WorktreesLayout>,
     pub worktrees_layout_source: Source,
+    /// Raw `branches_refresh_mins` setting; `None` means
+    /// [`DEFAULT_BRANCHES_REFRESH_MINS`].
+    pub branches_refresh_mins: Option<u64>,
+    pub branches_refresh_mins_source: Source,
     pub setup: Setup,
     pub copy_source: Source,
     pub run_source: Source,
@@ -231,6 +242,8 @@ impl Default for Config {
             diff_theme_source: Source::Default,
             worktrees_layout: None,
             worktrees_layout_source: Source::Default,
+            branches_refresh_mins: None,
+            branches_refresh_mins_source: Source::Default,
             setup: Setup::default(),
             copy_source: Source::Default,
             run_source: Source::Default,
@@ -268,6 +281,8 @@ impl Config {
         let (diff_theme, diff_theme_source) = pick(global.diff_theme, repo.diff_theme);
         let (worktrees_layout, worktrees_layout_source) =
             pick(global.worktrees_layout, repo.worktrees_layout);
+        let (branches_refresh_mins, branches_refresh_mins_source) =
+            pick(global.branches_refresh_mins, repo.branches_refresh_mins);
         let global_setup = global.setup.unwrap_or_default();
         let repo_setup = repo.setup.unwrap_or_default();
         let (copy, copy_source) = pick(global_setup.copy, repo_setup.copy);
@@ -283,6 +298,8 @@ impl Config {
             diff_theme_source,
             worktrees_layout,
             worktrees_layout_source,
+            branches_refresh_mins,
+            branches_refresh_mins_source,
             setup: Setup {
                 copy: copy.unwrap_or_default(),
                 run: run.unwrap_or_default(),
@@ -309,6 +326,12 @@ impl Config {
     /// otherwise.
     pub fn worktrees_layout(&self) -> WorktreesLayout {
         self.worktrees_layout.unwrap_or_default()
+    }
+
+    /// How long the Branches tab may keep a cached list before refreshing.
+    pub fn branches_refresh_mins(&self) -> u64 {
+        self.branches_refresh_mins
+            .unwrap_or(DEFAULT_BRANCHES_REFRESH_MINS)
     }
 
     /// Absolute directory new worktrees are created under for a repo rooted
