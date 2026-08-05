@@ -173,6 +173,18 @@ struct MergeRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct RebaseRequest {
+    #[schemars(description = "worktree to rebase")]
+    name: String,
+    #[schemars(description = "branch to rebase onto (local branch or remote-tracking ref)")]
+    onto: String,
+    #[schemars(
+        description = "stash local changes for the duration and re-apply them after (default false)"
+    )]
+    autostash: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ReadConflictRequest {
     #[schemars(description = "worktree name (branch name, or directory name when detached)")]
     name: String,
@@ -535,6 +547,39 @@ impl WtmServer {
     }
 
     #[tool(
+        description = "Rebase a worktree onto another branch, replaying the worktree's own commits on top of it. On success returns status \"up_to_date\" or \"clean\" (with the new tip commit); on conflicts returns status \"conflicted\" with the list of conflicted files and leaves the worktree mid-rebase for read_conflict/resolve_file/complete_merge (which continues the rebase), skip_rebase, or abort_merge. IMPORTANT: mid-rebase git swaps the sides, so for resolve_file \"ours\" is the branch being rebased onto and \"theirs\" is the commit being replayed, the opposite of a merge"
+    )]
+    fn rebase(
+        &self,
+        Parameters(req): Parameters<RebaseRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let result = ops::rebase(
+            &self.ctx()?,
+            &req.name,
+            &req.onto,
+            req.autostash.unwrap_or(false),
+        )
+        .map_err(internal)?;
+        json_result(&result)
+    }
+
+    #[tool(
+        description = "Drop the commit an in-progress rebase stopped on and carry on with the rest, discarding that commit's changes. For a commit whose changes are already present in the branch being rebased onto, where continuing would refuse because the result is empty"
+    )]
+    fn skip_rebase(
+        &self,
+        Parameters(req): Parameters<NameRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let ctx = self.ctx()?;
+        let kind = ops::detect_resolve_kind(&ctx, &req.name)
+            .map_err(internal)?
+            .filter(|k| *k == ops::ResolveKind::Rebase)
+            .ok_or_else(|| internal(anyhow::anyhow!("no rebase in progress in '{}'", req.name)))?;
+        ops::skip_resolution(&ctx, &req.name, kind).map_err(internal)?;
+        json_result(&serde_json::json!({ "target": req.name, "skipped": true }))
+    }
+
+    #[tool(
         description = "Refresh the default branch from its upstream, then merge it into a worktree (or fast-forward in place when that worktree is already on the default). Same result shape as merge, plus status fast_forwarded when the default was updated in place"
     )]
     fn update(
@@ -610,7 +655,7 @@ impl WtmServer {
     }
 
     #[tool(
-        description = "Finish an in-progress merge or cherry-pick in a worktree once every conflict has been resolved and staged. Auto-detects which is in progress. Errors if conflicts remain or neither is in progress. To finish a resolved stash pop, drop the stash with stash_drop instead"
+        description = "Finish an in-progress merge, rebase, or cherry-pick in a worktree once every conflict has been resolved and staged. Auto-detects which is in progress. Errors if conflicts remain or none is in progress. To finish a resolved stash pop, drop the stash with stash_drop instead"
     )]
     fn complete_merge(
         &self,
@@ -621,7 +666,7 @@ impl WtmServer {
             .map_err(internal)?
             .ok_or_else(|| {
                 internal(anyhow::anyhow!(
-                    "no merge or cherry-pick in progress in '{}'",
+                    "no merge, rebase, or cherry-pick in progress in '{}'",
                     req.name
                 ))
             })?;
@@ -631,7 +676,7 @@ impl WtmServer {
     }
 
     #[tool(
-        description = "Abandon an in-progress merge or cherry-pick in a worktree, restoring its pre-operation state. Auto-detects which is in progress"
+        description = "Abandon an in-progress merge, rebase, or cherry-pick in a worktree, restoring its pre-operation state. Auto-detects which is in progress"
     )]
     fn abort_merge(
         &self,
@@ -642,7 +687,7 @@ impl WtmServer {
             .map_err(internal)?
             .ok_or_else(|| {
                 internal(anyhow::anyhow!(
-                    "no merge or cherry-pick in progress in '{}'",
+                    "no merge, rebase, or cherry-pick in progress in '{}'",
                     req.name
                 ))
             })?;
@@ -676,9 +721,12 @@ impl ServerHandler for WtmServer {
                 "Manage git worktrees for this repository: create (with automated setup from \
                  .wtm.toml), list, inspect status/diffs, and remove worktrees. Also supports \
                  per-worktree commits, stashes, pulls, and pushes, plus repo-wide fetch and \
-                 branch management (list/create/delete/rename), commit history, and merging \
-                 (merge/update, then list_conflicts/read_conflict/resolve_file/complete_merge \
-                 or abort_merge when a merge stops on conflicts).",
+                 branch management (list/create/delete/rename), commit history, and \
+                 integration (merge/update/rebase/cherry_pick, then \
+                 list_conflicts/read_conflict/resolve_file/complete_merge, or abort_merge \
+                 and skip_rebase, when one stops on conflicts). Note that mid-rebase git \
+                 swaps the two sides: \"ours\" is the branch being rebased onto and \
+                 \"theirs\" is the commit being replayed.",
             );
         info.server_info.name = env!("CARGO_PKG_NAME").into();
         info.server_info.version = env!("CARGO_PKG_VERSION").into();

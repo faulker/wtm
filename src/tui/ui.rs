@@ -242,6 +242,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             targets,
             selected,
         } => overlay_hit = draw_merge_pick(frame, main, source_branch, targets, *selected),
+        View::RebasePick {
+            onto_branch,
+            targets,
+            selected,
+        } => overlay_hit = draw_rebase_pick(frame, main, onto_branch, targets, *selected),
         View::MoveChanges {
             from,
             targets,
@@ -307,6 +312,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         | View::Switch { .. }
         | View::CherryPick { .. }
         | View::MergePick { .. }
+        | View::RebasePick { .. }
         | View::MoveChanges { .. }
         | View::OpenCommand { .. }
         | View::StashTarget { .. }
@@ -362,10 +368,7 @@ fn panel(title: impl Into<String>) -> Block<'static> {
 /// panes and other non-focus targets keep using [`panel`].
 fn focus_panel(title: impl Into<String>, focused: bool) -> Block<'static> {
     let (border, title_style) = if focused {
-        (
-            ACCENT,
-            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )
+        (ACCENT, Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))
     } else {
         (BORDER, Style::new().fg(BORDER))
     };
@@ -409,6 +412,31 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     };
     frame.render_widget(Paragraph::new(left), area);
     frame.render_widget(Paragraph::new(right).alignment(Alignment::Right), area);
+}
+
+/// Shortens `text` to at most `max` characters by eliding its middle with `…`.
+/// Both ends of a branch name carry meaning (the namespace prefix and the
+/// distinguishing tail), so trimming from the middle keeps more signal than a
+/// trailing ellipsis would. Counts characters, not bytes, so a multi-byte name
+/// can't be split mid-codepoint.
+fn truncate_middle(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        return text.to_string();
+    }
+    // Below three characters there is no room for both ends plus the ellipsis.
+    if max <= 1 {
+        return "…".to_string();
+    }
+    // Bias the extra character to the front when the budget is odd: the prefix
+    // is usually the namespace and reads as the more identifying half.
+    let keep = max - 1;
+    let head = keep.div_ceil(2);
+    let tail = keep - head;
+    let mut out: String = chars[..head].iter().collect();
+    out.push('…');
+    out.extend(&chars[chars.len() - tail..]);
+    out
 }
 
 /// Footer as key hints: the key in accent, its label dimmed. Bindings with no
@@ -507,6 +535,22 @@ fn status_flag_spans(labels: &[&str]) -> Vec<Span<'static>> {
     spans
 }
 
+/// `"s"` when `n` is not 1, for pluralising a count inline.
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// Present-tense label for an interrupted operation, as shown in the worktree
+/// list's flags column.
+fn in_progress_label(kind: &ResolveKind) -> &'static str {
+    match kind {
+        ResolveKind::Merge => "merging",
+        ResolveKind::Rebase => "rebasing",
+        ResolveKind::CherryPick => "cherry-picking",
+        ResolveKind::StashPop { .. } => "unstashing",
+    }
+}
+
 /// The worktree table. `focused` is false when another panel owns the keyboard
 /// (the three-panel layout's file list), which dims the row highlight so it is
 /// clear which cursor the arrow keys move.
@@ -523,7 +567,15 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) -> Opt
                     Span::raw("")
                 },
             ]);
-            let changes = if wt.dirty > 0 {
+            // An unmerged file outranks the plain dirty count: it means the
+            // worktree is stopped mid-operation and needs attention, not just
+            // that it has edits.
+            let changes = if wt.conflicted > 0 {
+                Span::styled(
+                    format!("⚠ {} conflict{}", wt.conflicted, plural(wt.conflicted)),
+                    Style::new().fg(theme::DANGER).bold(),
+                )
+            } else if wt.dirty > 0 {
                 Span::styled(
                     format!("{} changed", wt.dirty),
                     Style::new().fg(theme::WARNING),
@@ -538,8 +590,18 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) -> Opt
                 ),
                 None => Span::styled("–".to_string(), Style::new().dim()),
             };
-            // Flags: upstream sync, base-relative status, then cleanup/lock.
-            let flag_spans = status_flag_spans(&wt.flag_labels());
+            // Flags: the interrupted operation first (it decides what the user
+            // can do next), then upstream sync, base-relative status, and
+            // cleanup/lock.
+            let mut flag_spans = Vec::new();
+            if let Some(kind) = &wt.in_progress {
+                flag_spans.push(Span::styled(
+                    in_progress_label(kind).to_string(),
+                    Style::new().fg(theme::DANGER).bold(),
+                ));
+                flag_spans.push(Span::raw(" "));
+            }
+            flag_spans.extend(status_flag_spans(&wt.flag_labels()));
             Row::new(vec![
                 Cell::from(name),
                 Cell::from(changes),
@@ -563,9 +625,9 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) -> Opt
         rows,
         [
             Constraint::Length(name_w),
-            Constraint::Length(12),
+            Constraint::Length(14),
             Constraint::Length(9),
-            Constraint::Length(28),
+            Constraint::Length(30),
             Constraint::Min(20),
         ],
     )
@@ -998,6 +1060,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             hint("Enter", "merge"),
             hint("Esc", "cancel"),
         ],
+        View::RebasePick { .. } => &[
+            hint("↑/↓", "pick worktree"),
+            hint("Enter", "rebase"),
+            hint("Esc", "cancel"),
+        ],
         View::MoveChanges { .. } => &[
             hint("↑/↓", "pick worktree"),
             hint("Enter", "move changes"),
@@ -1192,16 +1259,18 @@ fn draw_create_dialog(
     // matching candidates are shown (and navigable). `filtered` holds indices
     // into `branches`, matching the key handler's `filtered_candidates`.
     let filtered = filtered_candidates(branches, name.as_str());
-    // Rows: the "new branch" action, a section header (only when there are
-    // branches to check out), then one row per matching existing branch.
+    // Rows: the "new branch" action, then (only when there are branches to check
+    // out) a section header, a blank spacer, and one row per matching branch.
+    // The header and spacer come as a pair, hence `* 2`.
     let header_rows = usize::from(!filtered.is_empty());
-    let list_rows = (1 + header_rows + filtered.len()).min(10) as u16;
+    let list_rows = (1 + header_rows * 2 + filtered.len()).min(10) as u16;
     let popup = centered(area, 66, 7 + list_rows);
     frame.render_widget(Clear, popup);
     frame.render_widget(panel("new worktree"), popup);
     let inner = popup.inner(ratatui::layout::Margin::new(2, 1));
-    let [name_area, list_area, base_hint_area, loc_area] = Layout::vertical([
-        Constraint::Length(2),
+    let [name_area, base_area, list_area, base_hint_area, loc_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Length(list_rows + 1),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -1213,35 +1282,60 @@ fn draw_create_dialog(
         name_area,
     );
 
-    // The `[ Base: <branch> ⌄ ]` button: filled and bold when focused, otherwise
-    // a bracketed accent chip. The ⌄ signals it opens a dropdown of branches.
+    // The base branch sits on its own row under the name, so a long branch name
+    // never crowds the field being typed into. The `[ <branch> ⌄ ]` button is
+    // filled and bold when Tab-focused, otherwise a bracketed accent chip; the
+    // ⌄ signals it opens a dropdown of branches.
     let button_style = if base_focus {
         Style::new().fg(Color::Black).bg(ACCENT).bold()
     } else {
         Style::new().fg(ACCENT).bold()
     };
-    let base_button = vec![
+    // On a checkout row the typed text filters existing branches rather than
+    // naming a new one, so the base does not apply: dim the whole row.
+    let base_row_active = selected == 0;
+    let base_hint = if base_focus {
+        "Enter: pick · Esc: back"
+    } else {
+        "⇥ Tab"
+    };
+    // Budget for the branch name itself: the row's width less its own
+    // decoration ("  ↳ off " + "[ " + " ⌄ ]") and the trailing hint.
+    let base_budget = (base_area.width as usize)
+        .saturating_sub(10 + 6 + base_hint.chars().count() + 2)
+        .max(8);
+    let base_display = truncate_middle(base, base_budget);
+    let mut base_row = vec![
+        Span::styled("  ↳ off ", Style::new().dim()),
         Span::styled("[", Style::new().dim()),
-        Span::styled(format!(" Base: {base} ⌄ "), button_style),
+        Span::styled(format!(" {base_display} ⌄ "), button_style),
         Span::styled("]", Style::new().dim()),
     ];
+    if base_row_active {
+        base_row.push(Span::styled(format!("  {base_hint}"), Style::new().dim()));
+    }
+    let base_paragraph = if base_row_active {
+        Paragraph::new(Line::from(base_row))
+    } else {
+        Paragraph::new(Line::from(base_row)).style(Style::new().dim())
+    };
+    frame.render_widget(base_paragraph, base_area);
 
     // Row 0: create a new branch off `base`; the section below checks out an
     // existing branch.
     let mut items: Vec<ListItem> = Vec::new();
     let typed = name.as_str().trim();
-    let mut row0 = if typed.is_empty() {
+    let row0 = if typed.is_empty() {
         vec![
             Span::styled("+ ", Style::new().fg(Color::Green).bold()),
-            Span::styled("type a name above → new branch off ", Style::new().dim()),
+            Span::styled("type a name above to create a branch", Style::new().dim()),
         ]
     } else {
         vec![
             Span::styled("+ ", Style::new().fg(Color::Green).bold()),
-            Span::raw(format!("new branch '{typed}' off ")),
+            Span::raw(format!("new branch '{typed}'")),
         ]
     };
-    row0.extend(base_button);
     items.push(ListItem::new(Line::from(row0)));
     if !filtered.is_empty() {
         let header = if name.as_str().trim().is_empty() {
@@ -1250,6 +1344,9 @@ fn draw_create_dialog(
             format!("  or check out a match ({}):", filtered.len())
         };
         items.push(ListItem::new(Line::styled(header, Style::new().dim())));
+        // Blank spacer so the header reads as a section break rather than as
+        // another entry in the list. Non-selectable, like the header itself.
+        items.push(ListItem::new(Line::from("")));
     }
     for &idx in &filtered {
         let candidate = &branches[idx];
@@ -1267,15 +1364,16 @@ fn draw_create_dialog(
         }
         items.push(ListItem::new(Line::from(spans)));
     }
-    // The section header is a non-selectable row, so shift the highlight past it
-    // for any existing-branch selection. While the base button is focused, drop
-    // the row highlight so only the button reads as selected.
+    // The section header and the spacer beneath it are both non-selectable, so
+    // shift the highlight past the pair for any existing-branch selection.
+    // While the base button is focused, drop the row highlight so only the
+    // button reads as selected.
     let highlight_row = if base_focus {
         None
     } else if selected == 0 {
         Some(0)
     } else {
-        Some(selected + 1)
+        Some(selected + 2)
     };
     let list = List::new(items)
         .highlight_style(Style::new().bg(SELECTION_BG).bold())
@@ -1284,16 +1382,11 @@ fn draw_create_dialog(
     state.select(highlight_row);
     frame.render_stateful_widget(list, list_area, &mut state);
 
-    // Reminder that the base is Tab-reachable, shown while the new-branch row is
-    // in play (either editing the name or with the button focused).
-    if selected == 0 {
-        let hint = if base_focus {
-            "Enter / Space: pick base branch  ·  Esc: back to name"
-        } else {
-            "⇥ Tab: focus the base button ⌄  ·  Enter: create"
-        };
+    // The base-specific guidance now lives inline next to the chip, so this row
+    // only carries what to press to finish.
+    if selected == 0 && !base_focus {
         frame.render_widget(
-            Paragraph::new(Line::styled(hint, Style::new().dim())),
+            Paragraph::new(Line::styled("Enter: create", Style::new().dim())),
             base_hint_area,
         );
     }
@@ -1505,10 +1598,7 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
 /// One help binding as one or more lines, with continuation lines indented
 /// under the description (after the key column).
 fn help_binding_lines(key: &str, label: &str, width: usize) -> Vec<Line<'static>> {
-    let key_span = Span::styled(
-        format!("  {key:<12}"),
-        Style::new().fg(ACCENT).bold(),
-    );
+    let key_span = Span::styled(format!("  {key:<12}"), Style::new().fg(ACCENT).bold());
     let desc_width = width.saturating_sub(HELP_KEY_COL).max(1);
     let chunks = wrap_words(label, desc_width);
     let indent = " ".repeat(HELP_KEY_COL);
@@ -3154,10 +3244,53 @@ fn draw_merge_pick(
     targets: &[CherryTarget],
     selected: usize,
 ) -> Option<RowList> {
+    draw_worktree_pick(
+        frame,
+        area,
+        &format!("merge '{source_branch}' into worktree"),
+        "into which worktree?",
+        "merge",
+        targets,
+        selected,
+    )
+}
+
+/// The rebase picker overlay: choose which worktree to replay onto the selected
+/// branch. Mirrors the merge picker, but the branch is the destination rather
+/// than the source, so the wording is reversed.
+fn draw_rebase_pick(
+    frame: &mut Frame,
+    area: Rect,
+    onto_branch: &str,
+    targets: &[CherryTarget],
+    selected: usize,
+) -> Option<RowList> {
+    draw_worktree_pick(
+        frame,
+        area,
+        &format!("rebase a worktree onto '{onto_branch}'"),
+        "which worktree should be replayed?",
+        "rebase",
+        targets,
+        selected,
+    )
+}
+
+/// Shared body of the merge and rebase pickers: a list of worktrees with the
+/// branch each has checked out, titled and captioned by the caller.
+fn draw_worktree_pick(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    head: &str,
+    verb: &str,
+    targets: &[CherryTarget],
+    selected: usize,
+) -> Option<RowList> {
     let rows = targets.len().clamp(1, 12) as u16;
     let popup = centered(area, 60, rows + 5);
     frame.render_widget(Clear, popup);
-    let block = panel(format!("merge '{source_branch}' into worktree"));
+    let block = panel(title.to_string());
     frame.render_widget(&block, popup);
     let inner = block.inner(popup);
     let [head_area, list_area, hint_area] = Layout::vertical([
@@ -3167,7 +3300,7 @@ fn draw_merge_pick(
     ])
     .areas(inner);
     frame.render_widget(
-        Paragraph::new(Line::from("into which worktree?".dim())),
+        Paragraph::new(Line::from(head.to_string().dim())),
         head_area,
     );
     let items: Vec<ListItem> = targets
@@ -3191,7 +3324,9 @@ fn draw_merge_pick(
         ListState::default().with_selected(Some(selected.min(targets.len().max(1) - 1)));
     frame.render_stateful_widget(list, list_area, &mut state);
     frame.render_widget(
-        Paragraph::new(Line::from("↑/↓ pick · Enter merge · Esc cancel".dim())),
+        Paragraph::new(Line::from(
+            format!("↑/↓ pick · Enter {verb} · Esc cancel").dim(),
+        )),
         hint_area,
     );
     (!targets.is_empty()).then_some(RowList {
@@ -3439,6 +3574,9 @@ fn context_lines(text: &str) -> Vec<String> {
 fn incoming_source(kind: &ResolveKind) -> &'static str {
     match kind {
         ResolveKind::Merge => "the merge",
+        // During a rebase the incoming side is your own commit being replayed,
+        // not someone else's work; see `sides_are_swapped`.
+        ResolveKind::Rebase => "the commit being replayed",
         ResolveKind::CherryPick => "the cherry-pick",
         ResolveKind::StashPop { .. } => "the stash",
     }
@@ -3520,12 +3658,20 @@ fn draw_conflict_resolver(
     };
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    // Spell out which side is which: OURS is what is already in this worktree
-    // (the local/current branch), THEIRS is what is being pulled in.
+    // Spell out which side is which. For a merge, OURS is what is already in
+    // this worktree and THEIRS is what is being pulled in. A rebase reverses
+    // that: it replays your commits on top of the other branch, so git's "ours"
+    // is the branch being rebased onto and "theirs" is your own commit. Saying
+    // "current" for a rebase would send the user the wrong way on every hunk.
+    let ours_role = if kind.sides_are_swapped() {
+        "the branch you're rebasing onto"
+    } else {
+        "current"
+    };
     lines.push(Line::from(vec![
         Span::styled("‹ OURS ", Style::new().fg(theme::SUCCESS).bold()),
         Span::styled(
-            format!("(current · {})", rf.file.ours_label),
+            format!("({ours_role} · {})", rf.file.ours_label),
             Style::new().fg(theme::SUCCESS),
         ),
     ]));
@@ -3540,6 +3686,12 @@ fn draw_conflict_resolver(
             Style::new().fg(Color::Blue),
         ),
     ]));
+    if kind.sides_are_swapped() {
+        lines.push(Line::styled(
+            "  note: a rebase swaps the sides — \"theirs\" is your own work",
+            Style::new().fg(theme::WARNING),
+        ));
+    }
     lines.push(Line::from(""));
 
     let mut hunk_i = 0usize;
@@ -4277,15 +4429,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(40, 4)).unwrap();
         terminal
             .draw(|frame| {
-                draw_worktree_commits(
-                    frame,
-                    frame.area(),
-                    "main",
-                    &rows,
-                    0,
-                    LogMode::Flat,
-                    true,
-                );
+                draw_worktree_commits(frame, frame.area(), "main", &rows, 0, LogMode::Flat, true);
             })
             .unwrap();
         let focused = terminal.backend().buffer().clone();
@@ -4297,15 +4441,7 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                draw_worktree_commits(
-                    frame,
-                    frame.area(),
-                    "main",
-                    &rows,
-                    0,
-                    LogMode::Flat,
-                    false,
-                );
+                draw_worktree_commits(frame, frame.area(), "main", &rows, 0, LogMode::Flat, false);
             })
             .unwrap();
         let idle = terminal.backend().buffer().clone();
@@ -4319,5 +4455,116 @@ mod tests {
             .expect("commits title missing");
         assert_eq!(idle[(title_x, 0)].style().fg, Some(BORDER));
         assert_eq!(focused[(title_x, 0)].style().fg, Some(ACCENT));
+    }
+
+    fn candidate(branch: &str) -> CheckoutCandidate {
+        CheckoutCandidate {
+            branch: branch.to_string(),
+            remote: None,
+        }
+    }
+
+    /// Renders the create dialog with `typed` in the name field. The typed text
+    /// doubles as the filter over the checkout candidates, so it decides which
+    /// of them are on screen.
+    fn create_dialog(typed: &str, selected: usize, base: &str, base_focus: bool) -> Vec<String> {
+        let branches = [candidate("feat/login"), candidate("feat/deps")];
+        let all = ["main".to_string()];
+        let input = super::super::app::TextInput::with_value(typed);
+        render(74, 16, |frame, area| {
+            draw_create_dialog(
+                frame,
+                area,
+                &input,
+                &branches,
+                &all,
+                base,
+                selected,
+                base_focus,
+                None,
+                Some("~/Dev/wt"),
+            );
+        })
+    }
+
+    #[test]
+    fn truncate_middle_keeps_both_ends() {
+        assert_eq!(truncate_middle("main", 20), "main");
+        assert_eq!(truncate_middle("main", 4), "main", "exact fit is untouched");
+        let out = truncate_middle("release/2026-q1-hotfix-rollup", 16);
+        assert_eq!(out.chars().count(), 16, "{out}");
+        assert!(out.starts_with("release/"), "keeps the namespace: {out}");
+        assert!(out.ends_with("llup"), "keeps the tail: {out}");
+        assert!(out.contains('…'), "{out}");
+    }
+
+    #[test]
+    fn truncate_middle_handles_multibyte_and_tiny_budgets() {
+        // Splitting by chars, not bytes, so an accented name can't panic.
+        let out = truncate_middle("fix/café-señor-branch", 10);
+        assert_eq!(out.chars().count(), 10, "{out}");
+        assert_eq!(truncate_middle("anything", 1), "…");
+    }
+
+    /// The base branch gets its own row under the name input, so a long branch
+    /// name can never crowd the field being typed into.
+    #[test]
+    fn create_dialog_puts_the_base_on_its_own_row() {
+        let out = create_dialog("my-feature", 0, "main", false);
+        let name_row = out.iter().position(|l| l.contains("my-feature")).unwrap();
+        let base_row = out.iter().position(|l| l.contains("↳ off")).unwrap();
+        assert_eq!(base_row, name_row + 1, "base sits directly below: {out:#?}");
+        assert!(out[base_row].contains("main"), "{out:#?}");
+        assert!(out[base_row].contains('⌄'), "dropdown affordance: {out:#?}");
+        assert!(out[base_row].contains("⇥ Tab"), "hint is inline: {out:#?}");
+    }
+
+    /// A base branch too long for its row is elided in the middle rather than
+    /// pushing the dialog out of shape.
+    #[test]
+    fn create_dialog_truncates_a_long_base_branch() {
+        let long = "release/2026-q1-hotfix-rollup-candidate-for-the-november-train";
+        let out = create_dialog("my-feature", 0, long, false);
+        let base_row = out.iter().find(|l| l.contains("↳ off")).unwrap();
+        assert!(base_row.contains('…'), "elided: {base_row}");
+        assert!(
+            base_row.contains("release/"),
+            "keeps the namespace: {base_row}"
+        );
+        assert!(base_row.contains("train"), "keeps the tail: {base_row}");
+        // The dialog is a fixed 66 columns inside a 74-wide screen; the row must
+        // stay within it rather than bleeding across the border.
+        assert!(base_row.chars().count() <= 74, "{base_row}");
+        assert!(
+            base_row.trim_end().ends_with('│'),
+            "border intact: {base_row}"
+        );
+    }
+
+    /// The section header and the blank spacer under it are both
+    /// non-selectable, so the highlight has to skip the pair. Off-by-one here
+    /// would highlight the row above the branch the user is actually on.
+    #[test]
+    fn create_dialog_highlights_the_selected_branch_past_the_spacer() {
+        let out = create_dialog("feat", 1, "main", false);
+        let header = out
+            .iter()
+            .position(|l| l.contains("or check out a match"))
+            .unwrap();
+        // A blank spacer separates the header from the candidates; the row
+        // holds nothing but the panel's own borders.
+        assert!(
+            out[header + 1]
+                .chars()
+                .all(|c| c == '│' || c == ' ' || c == '╭' || c == '╰'),
+            "a blank spacer follows the header: {out:#?}"
+        );
+        // `▌` is the highlight symbol; it must land on the first candidate.
+        let marked = out.iter().find(|l| l.contains('▌')).unwrap();
+        assert!(marked.contains("feat/login"), "{out:#?}");
+
+        let out2 = create_dialog("feat", 2, "main", false);
+        let marked2 = out2.iter().find(|l| l.contains('▌')).unwrap();
+        assert!(marked2.contains("feat/deps"), "{out2:#?}");
     }
 }

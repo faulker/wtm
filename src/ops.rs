@@ -86,6 +86,14 @@ pub struct WorktreeInfo {
     /// SHA was available (a merge-base is always an ancestor, so it cannot
     /// signal "outdated").
     pub behind_base: bool,
+    /// Number of files in an unmerged (conflict) state. Counted from the same
+    /// status listing as `dirty`, so it costs nothing extra.
+    pub conflicted: usize,
+    /// The merge/rebase/cherry-pick this worktree is stopped in the middle of,
+    /// if any, so the UI can flag it and offer to resume. `null` when the
+    /// worktree is not mid-operation. A conflicted stash pop leaves no marker
+    /// on disk and so cannot be detected here.
+    pub in_progress: Option<ResolveKind>,
 }
 
 impl WorktreeInfo {
@@ -252,10 +260,20 @@ pub fn list(ctx: &Ctx) -> Result<Vec<WorktreeInfo>> {
         // A worktree directory can disappear out from under git (deleted by
         // hand); report it rather than failing the whole listing.
         let exists = wt.path.exists();
-        let (dirty, ahead_behind) = if exists {
-            (git::status(&wt.path)?.len(), git::ahead_behind(&wt.path)?)
+        let (dirty, conflicted, ahead_behind, in_progress) = if exists {
+            let status = git::status(&wt.path)?;
+            let conflicted = status
+                .iter()
+                .filter(|e| git::is_conflict_code(&e.code))
+                .count();
+            (
+                status.len(),
+                conflicted,
+                git::ahead_behind(&wt.path)?,
+                detect_resolve_kind_in(&wt.path),
+            )
         } else {
-            (0, None)
+            (0, 0, None, None)
         };
         // Whether this worktree's branch has been merged into the default
         // branch. Skip the main worktree and the default branch itself (nothing
@@ -292,6 +310,8 @@ pub fn list(ctx: &Ctx) -> Result<Vec<WorktreeInfo>> {
             created_from,
             changed_from_base,
             behind_base,
+            conflicted,
+            in_progress,
         });
     }
     Ok(infos)
@@ -397,12 +417,7 @@ impl BaseStatus {
 /// Compares `branch` to `base`: unique commits (`changed`) and, for tip bases,
 /// whether the base has moved ahead (`behind`). Merge-base comparisons never
 /// set `behind`. Missing/unresolvable bases degrade to empty flags.
-fn base_status_vs(
-    repo_root: &Path,
-    base: &str,
-    branch: &str,
-    kind: BaseCompareKind,
-) -> BaseStatus {
+fn base_status_vs(repo_root: &Path, base: &str, branch: &str, kind: BaseCompareKind) -> BaseStatus {
     if !git::ref_exists(repo_root, base) {
         return BaseStatus {
             label: None,
@@ -997,6 +1012,10 @@ pub struct PullResult {
     pub already_up_to_date: bool,
     /// Ahead/behind upstream after the pull.
     pub ahead_behind: Option<AheadBehind>,
+    /// Files left in conflict when a `--rebase` pull stopped on one. Empty on a
+    /// clean pull. The worktree is left mid-rebase so these can be resolved.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub conflicted: Vec<String>,
 }
 
 /// Result of `push`.
@@ -1177,18 +1196,41 @@ pub enum MergeOutcome {
 
 /// Which in-progress operation a set of conflicts belongs to, so the resolver's
 /// "complete"/"abort" can dispatch correctly. Merge and cherry-pick leave a
-/// marker in the repo (MERGE_HEAD / CHERRY_PICK_HEAD) and finish by continuing
-/// that sequence; a stash pop leaves no marker, so finishing means dropping the
-/// applied stash entry (no new commit).
+/// marker ref in the repo (MERGE_HEAD / CHERRY_PICK_HEAD) and a rebase leaves a
+/// state directory, so all three can be detected after the fact and finish by
+/// continuing that sequence; a stash pop leaves no marker at all, so finishing
+/// means dropping the applied stash entry (no new commit).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ResolveKind {
     Merge,
+    Rebase,
     CherryPick,
     StashPop {
         /// Stash entry to drop on completion (the one that was popped).
         index: Option<u32>,
     },
+}
+
+impl ResolveKind {
+    /// How the operation is named in messages, e.g. "no rebase in progress".
+    pub fn label(&self) -> &'static str {
+        match self {
+            ResolveKind::Merge => "merge",
+            ResolveKind::Rebase => "rebase",
+            ResolveKind::CherryPick => "cherry-pick",
+            ResolveKind::StashPop { .. } => "stash pop",
+        }
+    }
+
+    /// True when the operation replays your commits on top of someone else's
+    /// work, which swaps what git calls "ours" and "theirs": during a rebase
+    /// "ours" is the branch being rebased *onto* and "theirs" is your own
+    /// commit being replayed, the opposite of a merge. Callers that explain the
+    /// two sides to a human must account for this or they mislead.
+    pub fn sides_are_swapped(&self) -> bool {
+        matches!(self, ResolveKind::Rebase)
+    }
 }
 
 /// Result of `switch`.
@@ -1386,7 +1428,21 @@ pub fn pull(ctx: &Ctx, name: &str, rebase: bool) -> Result<PullResult> {
                 info.name, info.name
             )));
         }
-        Err(e) => return Err(e.into()),
+        // A rebasing pull that stops on a conflict exits non-zero but leaves a
+        // rebase in progress. That is a resolvable state, not a failure, so
+        // report it as one rather than stranding the worktree behind an error.
+        Err(e) => {
+            let conflicted = git::conflicted_files(dir).unwrap_or_default();
+            if rebase && git::is_rebasing(dir) && !conflicted.is_empty() {
+                return Ok(PullResult {
+                    name: info.name,
+                    already_up_to_date: false,
+                    ahead_behind: git::ahead_behind(dir).ok().flatten(),
+                    conflicted,
+                });
+            }
+            return Err(e.into());
+        }
     };
     let already_up_to_date = output.contains("Already up to date");
     let ahead_behind = git::ahead_behind(dir)?;
@@ -1394,6 +1450,7 @@ pub fn pull(ctx: &Ctx, name: &str, rebase: bool) -> Result<PullResult> {
         name: info.name,
         already_up_to_date,
         ahead_behind,
+        conflicted: Vec::new(),
     })
 }
 
@@ -1781,6 +1838,48 @@ pub fn merge(
     }
 }
 
+/// Rebases the worktree named `target` onto `onto`, replaying the worktree's
+/// own commits on top of that branch so its history reads as if it had started
+/// there. `autostash` sets local changes aside for the duration.
+///
+/// Shares [`MergeOutcome`] with `merge`, since the shapes are the same. On a
+/// conflict the worktree is left mid-rebase (see [`MergeOutcome::Conflicted`])
+/// so the listed files can be resolved there, then finished with
+/// [`complete_resolution`], [`skip_resolution`], or [`abort_resolution`].
+pub fn rebase(ctx: &Ctx, target: &str, onto: &str, autostash: bool) -> Result<MergeOutcome> {
+    let info = find(ctx, target)?.ok_or_else(|| not_found(ctx, target))?;
+    let dir = Path::new(&info.path);
+    if let Some(kind) = detect_resolve_kind_in(dir) {
+        bail!(
+            "worktree '{}' already has a {} in progress; finish or abort it first",
+            info.name,
+            kind.label()
+        );
+    }
+    // Accept a local branch or a remote-tracking ref like "origin/main", so a
+    // worktree can be rebased onto an upstream that has no local branch.
+    let onto_ref = if git::branch_exists(&ctx.repo_root, onto) {
+        onto.to_string()
+    } else if let Some(remote_ref) = git::find_remote_ref(dir, onto)? {
+        remote_ref
+    } else {
+        bail!("no local or remote branch named '{onto}'");
+    };
+    if info.branch.as_deref() == Some(onto_ref.as_str()) {
+        bail!(
+            "worktree '{}' already has '{onto_ref}' checked out; nothing to rebase",
+            info.name
+        );
+    }
+    match git::rebase(dir, &onto_ref, autostash)? {
+        git::RebaseStatus::UpToDate => Ok(MergeOutcome::UpToDate),
+        git::RebaseStatus::Rebased => Ok(MergeOutcome::Clean {
+            commit: git::short_hash(dir)?,
+        }),
+        git::RebaseStatus::Conflicted(files) => Ok(MergeOutcome::Conflicted { files }),
+    }
+}
+
 /// Brings the worktree named `target` up to date with the repository's default
 /// branch.
 ///
@@ -1868,9 +1967,15 @@ pub fn read_conflict(ctx: &Ctx, target: &str, path: &str) -> Result<ConflictFile
     let (marker_ours, marker_theirs) = conflict::marker_labels(&text);
     let ours_label =
         marker_ours.unwrap_or_else(|| info.branch.clone().unwrap_or_else(|| "HEAD".to_string()));
+    // Each in-progress operation names the incoming side with a different ref,
+    // so try each in turn rather than assuming a merge.
     let theirs_label = marker_theirs
-        .or_else(|| git::run(dir, &["rev-parse", "--short", "MERGE_HEAD"]).ok())
-        .unwrap_or_else(|| "MERGE_HEAD".to_string());
+        .or_else(|| {
+            ["MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD"]
+                .iter()
+                .find_map(|r| git::run(dir, &["rev-parse", "--short", r]).ok())
+        })
+        .unwrap_or_else(|| "incoming".to_string());
     Ok(ConflictFile {
         path: path.to_string(),
         segments: conflict::parse(&text),
@@ -1886,6 +1991,40 @@ pub fn write_resolution(ctx: &Ctx, target: &str, path: &str, resolved_text: &str
     let dir = Path::new(&info.path);
     let full = dir.join(path);
     std::fs::write(&full, resolved_text).with_context(|| format!("writing {}", full.display()))?;
+    git::stage_paths(dir, &[path.to_string()])?;
+    Ok(())
+}
+
+/// Writes `text` to `path` in the worktree named `target` **without** staging
+/// it. Used to save a partly-resolved file: some hunks settled, the rest still
+/// wrapped in conflict markers, so git rightly still sees the path as unmerged.
+pub fn write_partial_resolution(ctx: &Ctx, target: &str, path: &str, text: &str) -> Result<()> {
+    let info = find(ctx, target)?.ok_or_else(|| not_found(ctx, target))?;
+    let full = Path::new(&info.path).join(path);
+    std::fs::write(&full, text).with_context(|| format!("writing {}", full.display()))
+}
+
+/// Marks the conflicted `path` in the worktree named `target` resolved by
+/// staging whatever is on disk right now, for work done outside wtm (in an
+/// editor, or another terminal). Refuses while conflict markers remain, since
+/// staging those would commit them.
+pub fn stage_resolved(ctx: &Ctx, target: &str, path: &str) -> Result<()> {
+    let info = find(ctx, target)?.ok_or_else(|| not_found(ctx, target))?;
+    let dir = Path::new(&info.path);
+    let full = dir.join(path);
+    let text =
+        std::fs::read_to_string(&full).with_context(|| format!("reading {}", full.display()))?;
+    let segments = conflict::parse(&text);
+    if conflict::has_conflicts(&segments) {
+        let remaining = segments
+            .iter()
+            .filter(|s| matches!(s, conflict::ConflictSegment::Hunk { .. }))
+            .count();
+        bail!(
+            "'{path}' still has {remaining} unresolved conflict hunk(s); \
+             remove the <<<<<<< / ======= / >>>>>>> markers first"
+        );
+    }
     git::stage_paths(dir, &[path.to_string()])?;
     Ok(())
 }
@@ -1917,13 +2056,16 @@ fn checkout_conflict_side(ctx: &Ctx, target: &str, path: &str, ours: bool) -> Re
 /// stash pop is being resolved supply that kind themselves).
 pub fn detect_resolve_kind(ctx: &Ctx, target: &str) -> Result<Option<ResolveKind>> {
     let info = find(ctx, target)?.ok_or_else(|| not_found(ctx, target))?;
-    let dir = Path::new(&info.path);
-    if git::is_merging(dir) {
-        Ok(Some(ResolveKind::Merge))
-    } else if git::is_cherry_picking(dir) {
-        Ok(Some(ResolveKind::CherryPick))
-    } else {
-        Ok(None)
+    Ok(detect_resolve_kind_in(Path::new(&info.path)))
+}
+
+/// Marker-inspection half of [`detect_resolve_kind`], on an already-resolved
+/// worktree directory.
+fn detect_resolve_kind_in(dir: &Path) -> Option<ResolveKind> {
+    match git::detect_in_progress(dir)? {
+        git::InProgress::Merge => Some(ResolveKind::Merge),
+        git::InProgress::Rebase => Some(ResolveKind::Rebase),
+        git::InProgress::CherryPick => Some(ResolveKind::CherryPick),
     }
 }
 
@@ -1961,6 +2103,13 @@ pub fn complete_resolution(
             }
             Some(git::short_hash(dir)?)
         }
+        ResolveKind::Rebase => {
+            if !git::is_rebasing(dir) {
+                bail!("worktree '{}' has no rebase in progress", info.name);
+            }
+            git::rebase_continue(dir)?;
+            Some(git::short_hash(dir)?)
+        }
         ResolveKind::CherryPick => {
             if !git::is_cherry_picking(dir) {
                 bail!("worktree '{}' has no cherry-pick in progress", info.name);
@@ -1990,10 +2139,35 @@ pub fn abort_resolution(ctx: &Ctx, target: &str, kind: ResolveKind) -> Result<()
     let dir = Path::new(&info.path);
     match kind {
         ResolveKind::Merge => git::merge_abort(dir)?,
+        ResolveKind::Rebase => git::rebase_abort(dir)?,
         ResolveKind::CherryPick => git::cherry_pick_abort(dir)?,
         ResolveKind::StashPop { .. } => git::reset_hard(dir)?,
     }
     Ok(())
+}
+
+/// Drops the commit a rebase is currently stopped on and carries on with the
+/// rest, discarding that commit's changes. The escape hatch for a commit whose
+/// changes are already present in the branch being rebased onto, where
+/// `--continue` refuses because the result would be empty. Only meaningful for
+/// a rebase; the other kinds have nothing to skip.
+pub fn skip_resolution(ctx: &Ctx, target: &str, kind: ResolveKind) -> Result<()> {
+    let info = find(ctx, target)?.ok_or_else(|| not_found(ctx, target))?;
+    let dir = Path::new(&info.path);
+    match kind {
+        ResolveKind::Rebase => {
+            if !git::is_rebasing(dir) {
+                bail!("worktree '{}' has no rebase in progress", info.name);
+            }
+            git::rebase_skip(dir)?;
+            Ok(())
+        }
+        other => bail!(
+            "nothing to skip: worktree '{}' is resolving a {}, not a rebase",
+            info.name,
+            other.label()
+        ),
+    }
 }
 
 /// Switches the worktree named `name` to check out `branch`. Resolves `branch`
@@ -2700,6 +2874,220 @@ mod tests {
         assert!(matches!(outcome, MergeOutcome::UpToDate), "{outcome:?}");
     }
 
+    /// Sets up `feature` and `main` with edits to the same line, so any attempt
+    /// to combine them conflicts. Returns the feature worktree's path.
+    fn diverged_worktree(ctx: &Ctx) -> std::path::PathBuf {
+        std::fs::write(ctx.repo_root.join("shared.txt"), "base\n").unwrap();
+        git(&ctx.repo_root, &["add", "."]);
+        git(&ctx.repo_root, &["commit", "-m", "base"]);
+        let path = make_worktree(ctx, "feature");
+        std::fs::write(ctx.repo_root.join("shared.txt"), "main version\n").unwrap();
+        git(&ctx.repo_root, &["commit", "-am", "main edit"]);
+        std::fs::write(path.join("shared.txt"), "feature version\n").unwrap();
+        git(&path, &["commit", "-am", "feature edit"]);
+        path
+    }
+
+    #[test]
+    fn rebase_replays_commits_onto_the_target() {
+        let (_tmp, ctx) = temp_ctx();
+        // Non-overlapping edits, so the replay is clean.
+        std::fs::write(ctx.repo_root.join("a.txt"), "a\n").unwrap();
+        git(&ctx.repo_root, &["add", "."]);
+        git(&ctx.repo_root, &["commit", "-m", "base"]);
+        let path = make_worktree(&ctx, "feature");
+        std::fs::write(ctx.repo_root.join("main-only.txt"), "m\n").unwrap();
+        git(&ctx.repo_root, &["add", "."]);
+        git(&ctx.repo_root, &["commit", "-m", "main work"]);
+        std::fs::write(path.join("feat-only.txt"), "f\n").unwrap();
+        git(&path, &["add", "."]);
+        git(&path, &["commit", "-m", "feature work"]);
+
+        let outcome = rebase(&ctx, "feature", "main", false).unwrap();
+        assert!(matches!(outcome, MergeOutcome::Clean { .. }), "{outcome:?}");
+        assert!(!git::is_rebasing(&path));
+        // The replayed branch now contains main's commit as an ancestor, which
+        // is the whole point of rebasing.
+        assert!(
+            path.join("main-only.txt").exists(),
+            "main work is underneath"
+        );
+        assert!(
+            path.join("feat-only.txt").exists(),
+            "feature work is on top"
+        );
+    }
+
+    #[test]
+    fn rebase_conflict_leaves_tree_mid_rebase_and_abort_recovers() {
+        let (_tmp, ctx) = temp_ctx();
+        let path = diverged_worktree(&ctx);
+
+        let outcome = rebase(&ctx, "feature", "main", false).unwrap();
+        let MergeOutcome::Conflicted { files } = outcome else {
+            panic!("expected a conflict, got {outcome:?}");
+        };
+        assert_eq!(files, vec!["shared.txt".to_string()]);
+        // Left mid-rebase so the resolver can take over, and detected as a
+        // rebase rather than as the cherry-pick its machinery uses.
+        assert!(git::is_rebasing(&path));
+        assert_eq!(
+            detect_resolve_kind(&ctx, "feature").unwrap(),
+            Some(ResolveKind::Rebase)
+        );
+
+        abort_resolution(&ctx, "feature", ResolveKind::Rebase).unwrap();
+        assert!(!git::is_rebasing(&path));
+        assert_eq!(
+            std::fs::read_to_string(path.join("shared.txt")).unwrap(),
+            "feature version\n"
+        );
+    }
+
+    #[test]
+    fn rebase_conflict_resolves_and_continues() {
+        let (_tmp, ctx) = temp_ctx();
+        let path = diverged_worktree(&ctx);
+        assert!(matches!(
+            rebase(&ctx, "feature", "main", false).unwrap(),
+            MergeOutcome::Conflicted { .. }
+        ));
+
+        write_resolution(&ctx, "feature", "shared.txt", "resolved\n").unwrap();
+        let done = complete_resolution(&ctx, "feature", ResolveKind::Rebase, None).unwrap();
+        assert!(done.commit.is_some());
+        assert!(!git::is_rebasing(&path));
+        assert_eq!(
+            std::fs::read_to_string(path.join("shared.txt")).unwrap(),
+            "resolved\n"
+        );
+    }
+
+    #[test]
+    fn rebase_skip_drops_the_stopped_commit() {
+        let (_tmp, ctx) = temp_ctx();
+        let path = diverged_worktree(&ctx);
+        assert!(matches!(
+            rebase(&ctx, "feature", "main", false).unwrap(),
+            MergeOutcome::Conflicted { .. }
+        ));
+
+        skip_resolution(&ctx, "feature", ResolveKind::Rebase).unwrap();
+        assert!(
+            !git::is_rebasing(&path),
+            "only one commit, so skipping ends it"
+        );
+        // The feature commit was dropped, leaving main's version in place.
+        assert_eq!(
+            std::fs::read_to_string(path.join("shared.txt")).unwrap(),
+            "main version\n"
+        );
+    }
+
+    #[test]
+    fn skip_resolution_refuses_for_a_merge() {
+        let (_tmp, ctx) = temp_ctx();
+        diverged_worktree(&ctx);
+        assert!(matches!(
+            merge(&ctx, "feature", "main", false, false).unwrap(),
+            MergeOutcome::Conflicted { .. }
+        ));
+        let err = skip_resolution(&ctx, "feature", ResolveKind::Merge)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a rebase"), "{err}");
+    }
+
+    #[test]
+    fn rebase_refuses_when_another_operation_is_in_progress() {
+        let (_tmp, ctx) = temp_ctx();
+        diverged_worktree(&ctx);
+        assert!(matches!(
+            merge(&ctx, "feature", "main", false, false).unwrap(),
+            MergeOutcome::Conflicted { .. }
+        ));
+        let err = rebase(&ctx, "feature", "main", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("merge in progress"), "{err}");
+    }
+
+    #[test]
+    fn rebase_rejects_an_unknown_branch() {
+        let (_tmp, ctx) = temp_ctx();
+        make_worktree(&ctx, "feature");
+        let err = rebase(&ctx, "feature", "nope", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no local or remote branch"), "{err}");
+    }
+
+    #[test]
+    fn stage_resolved_refuses_while_markers_remain() {
+        let (_tmp, ctx) = temp_ctx();
+        let path = diverged_worktree(&ctx);
+        assert!(matches!(
+            merge(&ctx, "feature", "main", false, false).unwrap(),
+            MergeOutcome::Conflicted { .. }
+        ));
+
+        // Straight from git, the file is still full of markers.
+        let err = stage_resolved(&ctx, "feature", "shared.txt")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unresolved conflict"), "{err}");
+        assert_eq!(git::conflicted_files(&path).unwrap().len(), 1);
+
+        // Resolved by hand outside wtm, it stages as-is.
+        std::fs::write(path.join("shared.txt"), "by hand\n").unwrap();
+        stage_resolved(&ctx, "feature", "shared.txt").unwrap();
+        assert!(git::conflicted_files(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn write_partial_resolution_saves_without_staging() {
+        let (_tmp, ctx) = temp_ctx();
+        let path = diverged_worktree(&ctx);
+        assert!(matches!(
+            merge(&ctx, "feature", "main", false, false).unwrap(),
+            MergeOutcome::Conflicted { .. }
+        ));
+
+        write_partial_resolution(&ctx, "feature", "shared.txt", "half done\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path.join("shared.txt")).unwrap(),
+            "half done\n",
+            "written to disk"
+        );
+        assert_eq!(
+            git::conflicted_files(&path).unwrap(),
+            vec!["shared.txt".to_string()],
+            "but still unmerged, since nothing was staged"
+        );
+    }
+
+    #[test]
+    fn list_reports_conflicts_and_the_operation_in_progress() {
+        let (_tmp, ctx) = temp_ctx();
+        diverged_worktree(&ctx);
+        let before = list(&ctx).unwrap();
+        let feature = before.iter().find(|w| w.name == "feature").unwrap();
+        assert_eq!(feature.conflicted, 0);
+        assert_eq!(feature.in_progress, None);
+
+        assert!(matches!(
+            rebase(&ctx, "feature", "main", false).unwrap(),
+            MergeOutcome::Conflicted { .. }
+        ));
+        let after = list(&ctx).unwrap();
+        let feature = after.iter().find(|w| w.name == "feature").unwrap();
+        assert_eq!(feature.conflicted, 1, "the list flags the unmerged file");
+        assert_eq!(feature.in_progress, Some(ResolveKind::Rebase));
+        // The main worktree is untouched by the feature worktree's rebase.
+        let main = after.iter().find(|w| w.is_main).unwrap();
+        assert_eq!(main.in_progress, None);
+    }
+
     #[test]
     fn merge_conflict_leaves_tree_mid_merge_and_abort_recovers() {
         let (_tmp, ctx) = temp_ctx();
@@ -3009,10 +3397,7 @@ mod tests {
 
         let infos = list(&ctx).unwrap();
         let feature = infos.iter().find(|i| i.name == "feature").unwrap();
-        assert!(
-            feature.changed_from_base,
-            "unique commits vs creation base"
-        );
+        assert!(feature.changed_from_base, "unique commits vs creation base");
         assert!(!feature.behind_base);
 
         git(
@@ -3159,13 +3544,7 @@ mod tests {
         let bare = tmp.path().join("bare.git");
         git(
             tmp.path(),
-            &[
-                "init",
-                "--bare",
-                "-b",
-                "main",
-                bare.to_str().unwrap(),
-            ],
+            &["init", "--bare", "-b", "main", bare.to_str().unwrap()],
         );
         git(
             &ctx.repo_root,

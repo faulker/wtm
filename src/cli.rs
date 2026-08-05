@@ -131,8 +131,8 @@ pub enum Command {
         #[arg(long, short = 'n', default_value_t = 20)]
         count: u32,
     },
-    /// Merge a local branch into a worktree, or continue/abort a merge that
-    /// stopped on conflicts.
+    /// Merge a local branch into a worktree, or continue/abort a merge,
+    /// rebase, or cherry-pick that stopped on conflicts.
     Merge {
         /// Branch to merge in (omit with --continue/--abort).
         source: Option<String>,
@@ -142,15 +142,39 @@ pub enum Command {
         /// Force a merge commit even when a fast-forward would do.
         #[arg(long)]
         no_ff: bool,
-        /// Finish an in-progress merge once every conflict is resolved.
+        /// Finish the in-progress merge, rebase, or cherry-pick once every
+        /// conflict is resolved.
         #[arg(long)]
         r#continue: bool,
-        /// Abandon an in-progress merge, restoring the pre-merge state.
+        /// Abandon the in-progress merge, rebase, or cherry-pick, restoring the
+        /// pre-operation state.
         #[arg(long)]
         abort: bool,
         /// Commit message for --continue (defaults to git's prepared merge message).
         #[arg(long, short = 'm')]
         message: Option<String>,
+    },
+    /// Rebase a worktree onto another branch, replaying its commits on top, or
+    /// continue/skip/abort a rebase that stopped on conflicts.
+    Rebase {
+        /// Worktree to rebase.
+        name: String,
+        /// Branch to rebase onto (omit with --continue/--skip/--abort).
+        #[arg(long)]
+        onto: Option<String>,
+        /// Finish the in-progress rebase once every conflict is resolved.
+        #[arg(long)]
+        r#continue: bool,
+        /// Drop the commit the rebase stopped on and carry on with the rest.
+        #[arg(long)]
+        skip: bool,
+        /// Abandon the in-progress rebase, restoring the pre-rebase state.
+        #[arg(long)]
+        abort: bool,
+        /// Stash local changes for the duration of the rebase and re-apply them
+        /// afterwards.
+        #[arg(long)]
+        autostash: bool,
     },
     /// Refresh the default branch from its upstream, then merge it into a
     /// worktree (or fast-forward in place when that worktree is already on the

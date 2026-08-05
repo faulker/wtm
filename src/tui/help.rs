@@ -108,7 +108,7 @@ impl HelpTab {
             | View::Log { .. }
             | View::CommitDiff { .. }
             | View::StashDiff { .. } => HelpTab::Commits,
-            View::MergePick { .. } => HelpTab::Branches,
+            View::MergePick { .. } | View::RebasePick { .. } => HelpTab::Branches,
             View::MoveChanges { .. } => HelpTab::Worktrees,
             View::OpenCommand { .. } => HelpTab::Worktrees,
             View::StashTarget { .. } => HelpTab::Changes,
@@ -203,6 +203,10 @@ pub const WORKTREES: &[Binding] = &[
         "⇧R",
         "rename the worktree (renames its branch and moves the folder)",
     ),
+    help_only(
+        "x",
+        "resume the conflict resolver for a worktree stopped mid-merge/rebase",
+    ),
     help_only("r", "refresh the list"),
     both("?", "help", "show this help"),
     both("q", "quit", "quit"),
@@ -264,6 +268,7 @@ pub const BRANCHES: &[Binding] = &[
     help_only("↑/↓ or j/k", "select branch"),
     both("Enter", "commits", "view the branch's commits"),
     help_only("m", "merge the branch into a worktree of your choosing"),
+    help_only("b", "rebase a worktree of your choosing onto the branch"),
     both(
         "c",
         "check out in a worktree",
@@ -360,7 +365,11 @@ pub const STASH_LIST: &[Binding] = &[
 ];
 
 pub const SETTINGS: &[Binding] = &[
-    both("↑/↓", "select", "move between settings and the check-for-updates row"),
+    both(
+        "↑/↓",
+        "select",
+        "move between settings and the check-for-updates row",
+    ),
     both(
         "Enter",
         "edit/run",
@@ -423,20 +432,49 @@ pub const RESOLVER: &[Binding] = &[
     both(
         "o/t",
         "ours/theirs",
-        "keep ours (current branch) / theirs (incoming) for the hunk",
+        "keep ours / theirs for the hunk (the pane header names both sides — \
+         mid-rebase they are swapped, so \"theirs\" is your own commit)",
     ),
     both("b/⇧B", "both", "keep both (ours first / theirs first)"),
     both(
         "⇧O/⇧T",
         "whole file",
-        "take the whole file from ours (current) / theirs (incoming)",
+        "take the whole file from ours / theirs",
     ),
-    both("e", "edit", "edit the merged result by hand"),
-    both("w", "stage", "stage the file with your chosen resolutions"),
-    both("c", "complete", "complete the merge (commit)"),
-    both("x", "abort", "abort the merge"),
+    both(
+        "e",
+        "edit",
+        "hand-edit the current hunk; Ctrl+S writes the file to disk (hunks you \
+         haven't decided keep their conflict markers), Esc discards",
+    ),
+    both(
+        "w",
+        "stage",
+        "save the file, and stage it as resolved once every hunk is decided",
+    ),
+    both(
+        "a",
+        "keep on disk",
+        "mark the file resolved using exactly what is on disk — for a conflict \
+         you fixed in your own editor",
+    ),
+    both(
+        "r",
+        "reload",
+        "re-read the conflicts from disk, picking up changes made outside wtm",
+    ),
+    help_only(
+        "s",
+        "skip the commit a rebase stopped on, discarding its changes",
+    ),
+    both("c", "complete", "finish the merge/rebase/cherry-pick"),
+    both("x", "abort", "abort the merge/rebase/cherry-pick"),
     help_only("?", "show this help"),
-    both("q", "back", "back to the list"),
+    both(
+        "q",
+        "back",
+        "back to the list (the operation stays in progress)",
+    ),
 ];
 
 // ---------------------------------------------------------------------------

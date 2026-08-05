@@ -288,12 +288,13 @@ fn run(cli: Cli) -> Result<()> {
                 bail!("--continue and --abort cannot be used together");
             }
             if r#continue {
-                // Auto-detect merge vs cherry-pick from the repo markers so the
-                // same flag finishes either. A stash pop leaves no marker; finish
-                // one with `wtm stash drop` after resolving.
+                // Auto-detect merge vs rebase vs cherry-pick from the repo
+                // markers so the same flag finishes any of them. A stash pop
+                // leaves no marker; finish one with `wtm stash drop` after
+                // resolving.
                 let kind = ops::detect_resolve_kind(&ctx, &into)?.ok_or_else(|| {
                     anyhow!(
-                        "no merge or cherry-pick in progress in '{into}' \
+                        "no merge, rebase, or cherry-pick in progress in '{into}' \
                          (finish a resolved stash pop with `wtm stash drop {into}`)"
                     )
                 })?;
@@ -304,8 +305,9 @@ fn run(cli: Cli) -> Result<()> {
                     output::print_complete_resolution(&result);
                 }
             } else if abort {
-                let kind = ops::detect_resolve_kind(&ctx, &into)?
-                    .ok_or_else(|| anyhow!("no merge or cherry-pick in progress in '{into}'"))?;
+                let kind = ops::detect_resolve_kind(&ctx, &into)?.ok_or_else(|| {
+                    anyhow!("no merge, rebase, or cherry-pick in progress in '{into}'")
+                })?;
                 ops::abort_resolution(&ctx, &into, kind)?;
                 if cli.json {
                     output::print_json(&serde_json::json!({ "target": into, "aborted": true }))?;
@@ -321,6 +323,64 @@ fn run(cli: Cli) -> Result<()> {
                     output::print_json(&result)?;
                 } else {
                     output::print_merge_outcome(&into, &result);
+                }
+            }
+        }
+        Command::Rebase {
+            name,
+            onto,
+            r#continue,
+            skip,
+            abort,
+            autostash,
+        } => {
+            let ctx = Ctx::discover_initialized(&cwd)?;
+            let flags = [r#continue, skip, abort].iter().filter(|f| **f).count();
+            if flags > 1 {
+                bail!("--continue, --skip, and --abort cannot be combined");
+            }
+            if r#continue || skip || abort {
+                if onto.is_some() {
+                    bail!("--onto cannot be combined with --continue/--skip/--abort");
+                }
+                let kind = ops::detect_resolve_kind(&ctx, &name)?
+                    .filter(|k| *k == ops::ResolveKind::Rebase)
+                    .ok_or_else(|| anyhow!("no rebase in progress in '{name}'"))?;
+                if r#continue {
+                    let result = ops::complete_resolution(&ctx, &name, kind, None)?;
+                    if cli.json {
+                        output::print_json(&result)?;
+                    } else {
+                        output::print_complete_resolution(&result);
+                    }
+                } else if skip {
+                    ops::skip_resolution(&ctx, &name, kind)?;
+                    if cli.json {
+                        output::print_json(&serde_json::json!({
+                            "target": name, "skipped": true
+                        }))?;
+                    } else {
+                        println!("{name}: skipped the stopped commit");
+                    }
+                } else {
+                    ops::abort_resolution(&ctx, &name, kind)?;
+                    if cli.json {
+                        output::print_json(&serde_json::json!({
+                            "target": name, "aborted": true
+                        }))?;
+                    } else {
+                        println!("{name}: rebase aborted");
+                    }
+                }
+            } else {
+                let Some(onto) = onto else {
+                    bail!("--onto is required (or use --continue/--skip/--abort)");
+                };
+                let result = ops::rebase(&ctx, &name, &onto, autostash)?;
+                if cli.json {
+                    output::print_json(&result)?;
+                } else {
+                    output::print_rebase_outcome(&name, &onto, &result);
                 }
             }
         }

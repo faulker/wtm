@@ -580,7 +580,10 @@ fn worktrees_layout_switches_the_worktrees_tab_layout() {
         String::from_utf8_lossy(&out.stderr)
     );
     let text = std::fs::read_to_string(repo.join(".wtm.toml")).unwrap();
-    assert!(text.contains("worktrees_layout = \"three_panel\""), "{text}");
+    assert!(
+        text.contains("worktrees_layout = \"three_panel\""),
+        "{text}"
+    );
     let shown = stdout_json(&wtm(&repo, &["config", "--json"]));
     assert_eq!(shown["worktrees_layout"]["value"], "three_panel");
     assert_eq!(shown["worktrees_layout"]["source"], "repo");
@@ -1642,4 +1645,186 @@ fn cherry_pick_conflict_lists_files_then_resolve_and_continue() {
     assert!(conflicts_after["files"].as_array().unwrap().is_empty());
     let target_log = stdout_json(&wtm(&repo, &["log", "target", "--json"]));
     assert_eq!(target_log["entries"][0]["subject"], "feature edit");
+}
+
+/// A clean rebase replays the worktree's commits on top of the target branch.
+#[test]
+fn rebase_replays_commits_onto_a_branch() {
+    let (_tmp, repo) = setup_repo();
+
+    let feat = stdout_json(&wtm(&repo, &["create", "feature", "--json"]));
+    let feat_path = PathBuf::from(feat["path"].as_str().unwrap());
+    std::fs::write(feat_path.join("feature-only.txt"), "f\n").unwrap();
+    git(&feat_path, &["add", "."]);
+    git(&feat_path, &["commit", "-m", "feature work"]);
+
+    // Move main forward with an unrelated file, so there is something to
+    // replay onto.
+    std::fs::write(repo.join("main-only.txt"), "m\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "main work"]);
+
+    let out = stdout_json(&wtm(
+        &repo,
+        &["rebase", "feature", "--onto", "main", "--json"],
+    ));
+    assert_eq!(out["status"], "clean");
+    assert!(
+        feat_path.join("main-only.txt").exists(),
+        "main's commit is now underneath the feature work"
+    );
+    assert!(feat_path.join("feature-only.txt").exists());
+}
+
+/// A conflicting rebase reports the files, leaves the worktree mid-rebase, and
+/// can be finished with --continue after resolving.
+#[test]
+fn rebase_conflict_lists_files_then_resolve_and_continue() {
+    let (_tmp, repo) = setup_repo();
+
+    let feat = stdout_json(&wtm(&repo, &["create", "feature", "--json"]));
+    let feat_path = PathBuf::from(feat["path"].as_str().unwrap());
+    std::fs::write(feat_path.join("README.md"), "from feature\n").unwrap();
+    git(&feat_path, &["commit", "-am", "feature edit"]);
+
+    std::fs::write(repo.join("README.md"), "from main\n").unwrap();
+    git(&repo, &["commit", "-am", "main edit"]);
+
+    let out = stdout_json(&wtm(
+        &repo,
+        &["rebase", "feature", "--onto", "main", "--json"],
+    ));
+    assert_eq!(out["status"], "conflicted");
+    let files: Vec<&str> = out["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f.as_str().unwrap())
+        .collect();
+    assert_eq!(files, vec!["README.md"]);
+
+    // The worktree is left mid-rebase, and `list` says so.
+    let listed = stdout_json(&wtm(&repo, &["list", "--json"]));
+    let feature = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["name"] == "feature")
+        .unwrap();
+    assert_eq!(feature["conflicted"], 1);
+    assert_eq!(feature["in_progress"]["kind"], "rebase");
+
+    // Mid-rebase git swaps the sides: "theirs" is the commit being replayed,
+    // i.e. the feature edit.
+    stdout_json(&wtm(
+        &repo,
+        &["resolve", "feature", "README.md", "--theirs", "--json"],
+    ));
+    assert_eq!(
+        std::fs::read_to_string(feat_path.join("README.md")).unwrap(),
+        "from feature\n"
+    );
+
+    let done = stdout_json(&wtm(&repo, &["rebase", "feature", "--continue", "--json"]));
+    assert_eq!(done["target"], "feature");
+    let after = stdout_json(&wtm(&repo, &["conflicts", "feature", "--json"]));
+    assert!(after["files"].as_array().unwrap().is_empty());
+}
+
+/// --abort backs a conflicting rebase out entirely.
+#[test]
+fn rebase_abort_restores_the_worktree() {
+    let (_tmp, repo) = setup_repo();
+
+    let feat = stdout_json(&wtm(&repo, &["create", "feature", "--json"]));
+    let feat_path = PathBuf::from(feat["path"].as_str().unwrap());
+    std::fs::write(feat_path.join("README.md"), "from feature\n").unwrap();
+    git(&feat_path, &["commit", "-am", "feature edit"]);
+    std::fs::write(repo.join("README.md"), "from main\n").unwrap();
+    git(&repo, &["commit", "-am", "main edit"]);
+
+    let out = stdout_json(&wtm(
+        &repo,
+        &["rebase", "feature", "--onto", "main", "--json"],
+    ));
+    assert_eq!(out["status"], "conflicted");
+
+    let aborted = stdout_json(&wtm(&repo, &["rebase", "feature", "--abort", "--json"]));
+    assert_eq!(aborted["aborted"], true);
+    assert_eq!(
+        std::fs::read_to_string(feat_path.join("README.md")).unwrap(),
+        "from feature\n",
+        "back to the pre-rebase state"
+    );
+    let listed = stdout_json(&wtm(&repo, &["list", "--json"]));
+    let feature = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["name"] == "feature")
+        .unwrap();
+    assert_eq!(feature["conflicted"], 0);
+    assert!(feature["in_progress"].is_null());
+}
+
+/// `merge --continue` auto-detects a rebase, so the same flag finishes either.
+#[test]
+fn merge_continue_finishes_a_rebase_too() {
+    let (_tmp, repo) = setup_repo();
+
+    let feat = stdout_json(&wtm(&repo, &["create", "feature", "--json"]));
+    let feat_path = PathBuf::from(feat["path"].as_str().unwrap());
+    std::fs::write(feat_path.join("README.md"), "from feature\n").unwrap();
+    git(&feat_path, &["commit", "-am", "feature edit"]);
+    std::fs::write(repo.join("README.md"), "from main\n").unwrap();
+    git(&repo, &["commit", "-am", "main edit"]);
+
+    assert_eq!(
+        stdout_json(&wtm(
+            &repo,
+            &["rebase", "feature", "--onto", "main", "--json"]
+        ))["status"],
+        "conflicted"
+    );
+    stdout_json(&wtm(
+        &repo,
+        &["resolve", "feature", "README.md", "--theirs", "--json"],
+    ));
+    let done = stdout_json(&wtm(
+        &repo,
+        &["merge", "--into", "feature", "--continue", "--json"],
+    ));
+    assert_eq!(done["target"], "feature");
+}
+
+/// The rebase flags are mutually exclusive and need something to act on.
+#[test]
+fn rebase_rejects_conflicting_flags_and_missing_onto() {
+    let (_tmp, repo) = setup_repo();
+    wtm(&repo, &["create", "feature", "--json"]);
+
+    let out = wtm(&repo, &["rebase", "feature"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--onto is required"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = wtm(&repo, &["rebase", "feature", "--continue", "--abort"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot be combined"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Nothing in progress to continue.
+    let out = wtm(&repo, &["rebase", "feature", "--continue"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no rebase in progress"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

@@ -353,6 +353,38 @@ pub fn print_merge_outcome(target: &str, result: &MergeOutcome) {
     }
 }
 
+/// Human-readable rebase outcome for the worktree named `target`, replayed
+/// onto `onto`.
+pub fn print_rebase_outcome(target: &str, onto: &str, result: &MergeOutcome) {
+    match result {
+        MergeOutcome::UpToDate => println!("{target}: already up to date with '{onto}'"),
+        MergeOutcome::Clean { commit } => println!("{target}: rebased onto '{onto}' ({commit})"),
+        MergeOutcome::FastForwarded { commit } => {
+            println!("{target}: fast-forwarded ({commit})")
+        }
+        MergeOutcome::Conflicted { files } => {
+            println!(
+                "{target}: rebase stopped on {} conflicted file(s):",
+                files.len()
+            );
+            for f in files {
+                println!("  {f}");
+            }
+            // During a rebase "ours" is the branch being rebased onto and
+            // "theirs" is the commit being replayed, so spell that out rather
+            // than leaving the reader to guess which side is which.
+            println!(
+                "note: mid-rebase, --ours is '{onto}' and --theirs is your commit being replayed"
+            );
+            println!(
+                "resolve each with `wtm resolve {target} <file> --ours|--theirs|--both`, \
+                 then `wtm rebase {target} --continue` \
+                 (or --skip to drop the commit, --abort to back out)"
+            );
+        }
+    }
+}
+
 /// JSON envelope for `conflicts` output when listing files (no file argument).
 pub fn conflicts_json(target: &str, files: &[String]) -> serde_json::Value {
     json!({ "target": target, "files": files })

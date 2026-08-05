@@ -637,6 +637,16 @@ pub enum View {
         /// Cursor into `targets`.
         selected: usize,
     },
+    /// Picks which worktree to rebase onto a chosen branch. The mirror image of
+    /// `MergePick`: there the branch is the source, here it is the destination.
+    RebasePick {
+        /// Branch the worktree's commits will be replayed onto.
+        onto_branch: String,
+        /// Worktrees that can be rebased.
+        targets: Vec<CherryTarget>,
+        /// Cursor into `targets`.
+        selected: usize,
+    },
     /// Move-changes picker: choose which worktree to move the selected
     /// worktree's uncommitted changes into. Reached from the Worktrees tab's
     /// `m` key; runs `ops::move_changes` in the background.
@@ -2105,6 +2115,7 @@ impl App {
             View::BranchCommits { .. } => self.on_branch_commits_key(key),
             View::CherryPick { .. } => self.on_cherry_pick_key(key),
             View::MergePick { .. } => self.on_merge_pick_key(key),
+            View::RebasePick { .. } => self.on_rebase_pick_key(key),
             View::MoveChanges { .. } => self.on_move_changes_key(key),
             View::OpenCommand { .. } => self.on_open_command_key(key),
             View::StashTarget { .. } => self.on_stash_target_key(key),
@@ -2874,6 +2885,9 @@ impl App {
             KeyCode::Char('u') => self.start_update(),
             KeyCode::Char('l') => self.open_log(),
             KeyCode::Char('R') => self.open_rename_worktree(),
+            // Reopens the conflict resolver for a worktree left mid-merge,
+            // mid-rebase, or mid-cherry-pick, including one started outside wtm.
+            KeyCode::Char('x') => self.open_resolver_for_selected(),
             KeyCode::Char('d') => {
                 if let Some(wt) = self.selected_worktree() {
                     if wt.is_main {
@@ -3226,9 +3240,7 @@ impl App {
                         if let Some(i) = seek_commit_row(&panel.lines, panel.selected, true) {
                             panel.selected = i;
                         }
-                    } else if let Some(i) =
-                        seek_commit_row(&panel.lines, panel.selected, false)
-                    {
+                    } else if let Some(i) = seek_commit_row(&panel.lines, panel.selected, false) {
                         panel.selected = i;
                     }
                 } else {
@@ -5146,11 +5158,7 @@ impl App {
             self.worktree_commits = None;
             return;
         }
-        let Some(wt) = self
-            .worktrees
-            .iter()
-            .find(|w| w.name == self.changes.name)
-        else {
+        let Some(wt) = self.worktrees.iter().find(|w| w.name == self.changes.name) else {
             self.worktree_commits = None;
             return;
         };
@@ -5325,6 +5333,9 @@ impl App {
             // `m` merges the selected branch into a worktree of the user's
             // choosing, routing any conflicts into the resolver.
             KeyCode::Char('m') => self.open_merge_pick(),
+            // `b` is the mirror: rebase a worktree of the user's choosing onto
+            // the selected branch, also routing conflicts into the resolver.
+            KeyCode::Char('b') => self.open_rebase_pick(),
             // `c` checks the branch out in a new worktree (the old Enter action).
             KeyCode::Char('c') => {
                 if let Some(b) = self.branches.get(self.branch_selected) {
@@ -5645,6 +5656,106 @@ impl App {
         });
     }
 
+    /// Opens the rebase picker for the branch selected on the Branches tab:
+    /// choose which worktree to replay onto it.
+    fn open_rebase_pick(&mut self) {
+        let Some(onto_branch) = self
+            .branches
+            .get(self.branch_selected)
+            .map(|b| b.name.clone())
+        else {
+            return;
+        };
+        // A worktree already on that branch has nothing to replay, so leave it
+        // out rather than offering a choice git would refuse.
+        let targets: Vec<CherryTarget> = self
+            .worktrees
+            .iter()
+            .filter(|w| w.branch.as_deref() != Some(onto_branch.as_str()))
+            .map(|w| CherryTarget {
+                name: w.name.clone(),
+                branch: w.branch.clone(),
+            })
+            .collect();
+        if targets.is_empty() {
+            self.message = Some(format!("no worktree to rebase onto '{onto_branch}'"));
+            return;
+        }
+        self.push_screen(View::RebasePick {
+            onto_branch,
+            targets,
+            selected: 0,
+        });
+    }
+
+    /// Key handling for the rebase picker: pick the worktree to replay, then
+    /// run the rebase in the background.
+    fn on_rebase_pick_key(&mut self, key: KeyEvent) {
+        let View::RebasePick {
+            targets, selected, ..
+        } = &mut self.view
+        else {
+            return;
+        };
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                if *selected + 1 < targets.len() {
+                    *selected += 1;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+            KeyCode::Enter => self.run_rebase(),
+            KeyCode::Esc | KeyCode::Char('q') => self.navigate_back(),
+            _ => {}
+        }
+    }
+
+    /// Rebases the chosen worktree onto the picked branch on a background
+    /// thread. Conflicts route into the resolver via `BusyThen::Resolve`.
+    fn run_rebase(&mut self) {
+        let picked = match &self.view {
+            View::RebasePick {
+                onto_branch,
+                targets,
+                selected,
+            } => targets
+                .get(*selected)
+                .map(|t| (onto_branch.clone(), t.name.clone())),
+            _ => None,
+        };
+        let Some((onto, target_name)) = picked else {
+            return;
+        };
+        // Owned copies for the background closure (which outlives this frame).
+        let tn = target_name.clone();
+        let ob = onto.clone();
+        self.start_busy(
+            format!("rebasing '{target_name}' onto '{onto}'…"),
+            BusyThen::Resolve {
+                target: target_name,
+                source_label: onto,
+                kind: ops::ResolveKind::Rebase,
+            },
+            move |ctx| {
+                ops::rebase(ctx, &tn, &ob, false)
+                    .map(|outcome| match outcome {
+                        ops::MergeOutcome::UpToDate => {
+                            format!("'{tn}' is already on top of '{ob}'")
+                        }
+                        ops::MergeOutcome::Clean { commit } => {
+                            format!("rebased '{tn}' onto '{ob}' ({commit})")
+                        }
+                        ops::MergeOutcome::FastForwarded { commit } => {
+                            format!("fast-forwarded '{tn}' ({commit})")
+                        }
+                        // The message is unused on conflict; the resolver opens.
+                        ops::MergeOutcome::Conflicted { .. } => "conflicts to resolve".to_string(),
+                    })
+                    .map_err(|e| format!("{e:#}"))
+            },
+        );
+    }
+
     /// Key handling for the merge picker: pick a target worktree, then run the
     /// merge in the background.
     fn on_merge_pick_key(&mut self, key: KeyEvent) {
@@ -5895,6 +6006,40 @@ impl App {
         self.load_resolver_file();
     }
 
+    /// Reopens the resolver for the selected worktree when it is stopped in the
+    /// middle of a merge, rebase, or cherry-pick. This is the way back in after
+    /// leaving with `q`, and the only way to reach a conflict that started
+    /// outside wtm (a `git rebase` in a terminal, say).
+    fn open_resolver_for_selected(&mut self) {
+        let Some(wt) = self.selected_worktree() else {
+            return;
+        };
+        let target = wt.name.clone();
+        let kind = match ops::detect_resolve_kind(&self.ctx, &target) {
+            Ok(Some(kind)) => kind,
+            Ok(None) => {
+                self.message = Some(format!("no merge, rebase, or cherry-pick in '{target}'"));
+                return;
+            }
+            Err(e) => {
+                self.set_error(format!("{e:#}"));
+                return;
+            }
+        };
+        let files = match ops::list_conflicts(&self.ctx, &target) {
+            Ok(files) => files,
+            Err(e) => {
+                self.set_error(format!("{e:#}"));
+                return;
+            }
+        };
+        // An operation with nothing left unmerged still belongs in the
+        // resolver: it needs the "complete" step, and there is nowhere else to
+        // do that from. `q` leaves via `go_root`, so nothing needs pushing.
+        let label = format!("{} in progress", kind.label());
+        self.open_resolver(target, label, kind, files);
+    }
+
     /// Loads (or reloads) the currently selected conflicted file into the
     /// resolver, parsing it into hunks with every hunk left unresolved. A file
     /// with no remaining conflict markers (already resolved) or a read error
@@ -5953,6 +6098,9 @@ impl App {
             KeyCode::Char('T') => self.resolver_whole_file(false),
             KeyCode::Char('e') => self.resolver_edit_hunk(),
             KeyCode::Char('w') | KeyCode::Enter => self.resolver_write_file(),
+            KeyCode::Char('a') => self.resolver_stage_as_is(),
+            KeyCode::Char('r') => self.resolver_reload(),
+            KeyCode::Char('s') => self.resolver_skip_commit(),
             KeyCode::Char('c') => self.resolver_complete(),
             KeyCode::Char('x') => {
                 if let View::ConflictResolver { target, .. } = &self.view {
@@ -6052,13 +6200,22 @@ impl App {
             self.modal = None;
             return;
         }
+        // Any other Ctrl-chord is not an edit: without this guard Ctrl+A and
+        // friends insert their bare letter into the buffer.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return;
+        }
         if let Some(Modal::HunkEditor(ed)) = &mut self.modal {
             ed.on_key(key);
         }
     }
 
-    /// Saves the open manual edit as the current hunk's resolution and closes
-    /// the editor.
+    /// Saves the open manual edit as the current hunk's resolution, closes the
+    /// editor, and writes the file straight out to disk. Persisting immediately
+    /// is the whole point: an edit kept only in memory is invisible to git and
+    /// to any other tool, and used to be silently discarded on moving to
+    /// another file. Undecided hunks keep their conflict markers, so this never
+    /// stages a half-resolved file.
     fn resolver_save_manual_edit(&mut self) {
         let text = match &self.modal {
             Some(Modal::HunkEditor(ed)) => ed.text(),
@@ -6072,12 +6229,17 @@ impl App {
         {
             *slot = Some(ResolutionAction::Manual(text));
         }
+        self.resolver_save_current_file(false);
     }
 
-    /// Renders the current file from its chosen per-hunk actions and stages it,
-    /// then advances to the next unresolved file. Refuses until every hunk has
-    /// a chosen side, so nothing is staged with a hunk left undecided.
-    fn resolver_write_file(&mut self) {
+    /// Writes the current file and, when `stage` is set and every hunk has been
+    /// decided, stages it as resolved and moves to the next file.
+    ///
+    /// A file with hunks still undecided is written back with those hunks
+    /// wrapped in their original conflict markers, so the work done so far
+    /// survives on disk while git rightly still sees the path as unmerged. The
+    /// file is then re-read, which drops the settled hunks from the hunk list.
+    fn resolver_save_current_file(&mut self, stage: bool) {
         let prepared = if let View::ConflictResolver {
             target,
             files,
@@ -6086,33 +6248,142 @@ impl App {
             ..
         } = &self.view
         {
-            current.as_ref().map(|rf| {
-                let text = rf
-                    .actions
-                    .iter()
-                    .cloned()
-                    .collect::<Option<Vec<_>>>()
-                    .map(|actions| conflict::render(&rf.file.segments, &actions));
-                (target.clone(), files[*file].clone(), text)
+            current.as_ref().and_then(|rf| {
+                let path = files.get(*file)?.clone();
+                let text = conflict::render_partial(
+                    &rf.file.segments,
+                    &rf.actions,
+                    &rf.file.ours_label,
+                    &rf.file.theirs_label,
+                );
+                let undecided = rf.actions.iter().filter(|a| a.is_none()).count();
+                Some((target.clone(), path, text, undecided))
             })
         } else {
             None
         };
-        let Some((target, path, text)) = prepared else {
-            self.message = Some("no conflicts to stage in this file".to_string());
+        let Some((target, path, text, undecided)) = prepared else {
+            // No hunks parsed: the file is already free of conflict markers, so
+            // the only thing left to do is mark it resolved.
+            if stage {
+                self.resolver_stage_as_is();
+            }
             return;
         };
-        let Some(text) = text else {
-            self.message = Some("pick a side for every hunk (o/t/b) before staging".to_string());
+        if stage && undecided == 0 {
+            match ops::write_resolution(&self.ctx, &target, &path, &text) {
+                Ok(()) => {
+                    self.message = Some(format!("staged '{path}'"));
+                    self.resolver_mark_resolved_and_advance();
+                }
+                Err(e) => self.set_error(format!("{e:#}")),
+            }
             return;
-        };
-        match ops::write_resolution(&self.ctx, &target, &path, &text) {
+        }
+        match ops::write_partial_resolution(&self.ctx, &target, &path, &text) {
             Ok(()) => {
-                self.message = Some(format!("staged '{path}'"));
+                self.message = Some(if undecided == 0 {
+                    format!("saved '{path}' · press w to stage it as resolved")
+                } else {
+                    format!(
+                        "saved '{path}' · {undecided} hunk(s) still conflicted \
+                         (pick a side with o/t/b, or edit with e)"
+                    )
+                });
+                // Re-read so the hunks just settled drop out of the list and the
+                // remaining ones renumber.
+                self.load_resolver_file();
+            }
+            Err(e) => self.set_error(format!("{e:#}")),
+        }
+    }
+
+    /// Writes the current file from its chosen per-hunk actions and stages it
+    /// as resolved, then advances to the next unresolved file. With hunks still
+    /// undecided the work is saved to disk but the file is left unstaged, since
+    /// staging conflict markers would commit them.
+    fn resolver_write_file(&mut self) {
+        self.resolver_save_current_file(true);
+    }
+
+    /// Marks the current file resolved by staging exactly what is on disk, for
+    /// a conflict fixed outside wtm (in an editor, or another terminal). Fails
+    /// loudly while conflict markers remain rather than staging them.
+    fn resolver_stage_as_is(&mut self) {
+        let target_path = match &self.view {
+            View::ConflictResolver {
+                target,
+                files,
+                file,
+                ..
+            } => files.get(*file).map(|p| (target.clone(), p.clone())),
+            _ => None,
+        };
+        let Some((target, path)) = target_path else {
+            return;
+        };
+        match ops::stage_resolved(&self.ctx, &target, &path) {
+            Ok(()) => {
+                self.message = Some(format!("marked '{path}' resolved"));
                 self.resolver_mark_resolved_and_advance();
             }
             Err(e) => self.set_error(format!("{e:#}")),
         }
+    }
+
+    /// Re-reads the conflict state from disk, so resolutions made outside wtm
+    /// (an editor, a `git add` in another terminal) show up. Files that are no
+    /// longer conflicted drop off the list; the cursor stays on the same path
+    /// when it survives.
+    fn resolver_reload(&mut self) {
+        let target = match &self.view {
+            View::ConflictResolver { target, .. } => target.clone(),
+            _ => return,
+        };
+        let current_path = match &self.view {
+            View::ConflictResolver { files, file, .. } => files.get(*file).cloned(),
+            _ => None,
+        };
+        let files = match ops::list_conflicts(&self.ctx, &target) {
+            Ok(files) => files,
+            Err(e) => {
+                self.set_error(format!("{e:#}"));
+                return;
+            }
+        };
+        if files.is_empty() {
+            if let View::ConflictResolver {
+                files: f,
+                resolved,
+                file,
+                current,
+                ..
+            } = &mut self.view
+            {
+                f.clear();
+                resolved.clear();
+                *file = 0;
+                *current = None;
+            }
+            self.message = Some("every conflict is resolved · press c to finish".to_string());
+            return;
+        }
+        let keep = current_path
+            .and_then(|p| files.iter().position(|f| *f == p))
+            .unwrap_or(0);
+        if let View::ConflictResolver {
+            files: f,
+            resolved,
+            file,
+            ..
+        } = &mut self.view
+        {
+            *resolved = vec![false; files.len()];
+            *f = files;
+            *file = keep;
+        }
+        self.load_resolver_file();
+        self.message = Some("reloaded conflicts from disk".to_string());
     }
 
     /// Takes the whole current file from one side (ours or theirs) and stages
@@ -6183,6 +6454,54 @@ impl App {
                 // resolver was opened from would otherwise still list it.
                 if matches!(kind, ops::ResolveKind::StashPop { .. }) {
                     self.reload_stash_tab(target);
+                }
+            }
+            // The usual reason completing is refused is a file still unmerged,
+            // often one the user fixed in their own editor without staging it.
+            // Point at the keys that deal with that instead of just relaying
+            // git's complaint.
+            Err(e) => {
+                let hint = match ops::list_conflicts(&self.ctx, &target) {
+                    Ok(files) if !files.is_empty() => {
+                        "\n\nstage a file you resolved yourself with a, \
+                         or press r to re-read the conflicts from disk"
+                    }
+                    _ => "",
+                };
+                self.set_error(format!("{e:#}{hint}"));
+            }
+        }
+    }
+
+    /// Drops the commit a rebase stopped on and carries on with the rest.
+    /// Only a rebase has anything to skip; other kinds report why not.
+    fn resolver_skip_commit(&mut self) {
+        let (target, kind) = match &self.view {
+            View::ConflictResolver { target, kind, .. } => (target.clone(), *kind),
+            _ => return,
+        };
+        if kind != ops::ResolveKind::Rebase {
+            self.message = Some(format!(
+                "nothing to skip: this is a {}, not a rebase",
+                kind.label()
+            ));
+            return;
+        }
+        match ops::skip_resolution(&self.ctx, &target, kind) {
+            Ok(()) => {
+                // Skipping either finishes the rebase or stops on the next
+                // commit, so re-read rather than assuming either.
+                if ops::detect_resolve_kind(&self.ctx, &target)
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    self.message = Some("skipped the commit".to_string());
+                    self.resolver_reload();
+                } else {
+                    self.go_root();
+                    self.refresh();
+                    self.message = Some(format!("rebase of '{target}' finished"));
                 }
             }
             Err(e) => self.set_error(format!("{e:#}")),
@@ -6818,9 +7137,17 @@ impl App {
     /// Retries a refused fast-forward pull with a rebase, from the
     /// `ConfirmPullRebase` prompt.
     fn start_pull_rebase(&mut self, name: String) {
+        // A rebasing pull can stop on a conflict, which leaves the worktree
+        // mid-rebase rather than failing. Route through `Resolve` so that lands
+        // in the resolver instead of an error popup with no way forward.
+        let then = BusyThen::Resolve {
+            target: name.clone(),
+            source_label: "its upstream".to_string(),
+            kind: ops::ResolveKind::Rebase,
+        };
         self.start_busy(
             format!("rebasing {name} onto its upstream…"),
-            BusyThen::List,
+            then,
             move |ctx| {
                 ops::pull(ctx, &name, true)
                     .map(|r| format!("pulled '{}' with rebase", r.name))
@@ -9164,10 +9491,18 @@ mod tests {
         assert!(matches!(app.view, View::BranchCommits { .. }));
     }
 
-    /// Builds a main-vs-feature conflict on `shared.txt` and drives the UI into
-    /// the conflict resolver, returning the feature worktree's path.
-    fn into_conflict_resolver(app: &mut App) -> std::path::PathBuf {
-        std::fs::write(app.ctx.repo_root.join("shared.txt"), "base\n").unwrap();
+    /// Builds a main-vs-feature merge conflict and drives the UI into the
+    /// conflict resolver, returning the feature worktree's path.
+    ///
+    /// Each entry of `files` is `(path, base, main version, feature version)`;
+    /// the two sides diverge from the base so git has to stop.
+    fn conflict_resolver_with(
+        app: &mut App,
+        files: &[(&str, &str, &str, &str)],
+    ) -> std::path::PathBuf {
+        for (path, base, _, _) in files {
+            std::fs::write(app.ctx.repo_root.join(path), base).unwrap();
+        }
         git(&app.ctx.repo_root, &["add", "."]);
         git(&app.ctx.repo_root, &["commit", "-m", "base"]);
         add_and_select_worktree(app, "feature");
@@ -9179,10 +9514,13 @@ mod tests {
                 .path
                 .clone(),
         );
-        // Divergent edits to the same line make a merge conflict.
-        std::fs::write(app.ctx.repo_root.join("shared.txt"), "main version\n").unwrap();
+        for (path, _, main_version, _) in files {
+            std::fs::write(app.ctx.repo_root.join(path), main_version).unwrap();
+        }
         git(&app.ctx.repo_root, &["commit", "-am", "main edit"]);
-        std::fs::write(feat.join("shared.txt"), "feature version\n").unwrap();
+        for (path, _, _, feature_version) in files {
+            std::fs::write(feat.join(path), feature_version).unwrap();
+        }
         git(&feat, &["commit", "-am", "feature edit"]);
         // Merge main into the feature worktree through the UI.
         press(app, KeyCode::Tab);
@@ -9204,6 +9542,45 @@ mod tests {
         press(app, KeyCode::Enter);
         settle(app);
         feat
+    }
+
+    /// The common case: one conflicted file with a single hunk.
+    fn into_conflict_resolver(app: &mut App) -> std::path::PathBuf {
+        conflict_resolver_with(
+            app,
+            &[(
+                "shared.txt",
+                "base\n",
+                "main version\n",
+                "feature version\n",
+            )],
+        )
+    }
+
+    /// Two conflicted files, for testing that state survives moving between
+    /// them.
+    fn into_conflict_resolver_two_files(app: &mut App) -> std::path::PathBuf {
+        conflict_resolver_with(
+            app,
+            &[
+                ("a.txt", "base\n", "main a\n", "feature a\n"),
+                ("b.txt", "base\n", "main b\n", "feature b\n"),
+            ],
+        )
+    }
+
+    /// One file with two conflict hunks, separated by enough untouched context
+    /// that git keeps them apart. Used to test partial resolution.
+    fn into_conflict_resolver_multi_hunk(app: &mut App) -> std::path::PathBuf {
+        conflict_resolver_with(
+            app,
+            &[(
+                "multi.txt",
+                "top\np1\np2\np3\np4\np5\np6\np7\np8\nbottom\n",
+                "MAIN top\np1\np2\np3\np4\np5\np6\np7\np8\nMAIN bottom\n",
+                "FEAT top\np1\np2\np3\np4\np5\np6\np7\np8\nFEAT bottom\n",
+            )],
+        )
     }
 
     #[test]
@@ -9486,32 +9863,184 @@ mod tests {
         let feat = into_conflict_resolver(&mut app);
 
         // `e` opens the manual editor seeded with both sides; inserting a
-        // character and Ctrl+S records a Manual resolution for the hunk.
+        // character and Ctrl+S resolves the hunk and writes the file.
         press(&mut app, KeyCode::Char('e'));
         assert!(matches!(app.modal, Some(Modal::HunkEditor(_))));
         press(&mut app, KeyCode::Char('Z'));
         app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
         assert!(app.modal.is_none(), "editor closes on save");
+
+        // Ctrl+S must reach the disk, not just app state: an edit held only in
+        // memory is invisible to git and to the user's own editor. Ours is the
+        // feature side; the seed was ours-then-theirs with a 'Z' at the front.
+        assert_eq!(
+            std::fs::read_to_string(feat.join("shared.txt")).unwrap(),
+            "Zfeature version\nmain version\n",
+            "the edit is on disk before anything is staged"
+        );
+        // That was the only hunk, so re-reading the file finds nothing left to
+        // resolve.
         match &app.view {
-            View::ConflictResolver {
-                current: Some(rf), ..
-            } => {
-                assert!(matches!(rf.actions[0], Some(ResolutionAction::Manual(_))));
+            View::ConflictResolver { current, .. } => {
+                assert!(current.is_none(), "no conflict hunks remain");
             }
             _ => panic!("expected the conflict resolver"),
         }
 
-        // Stage the manual result and complete the merge.
+        // Saving does not stage: git still sees the path as unmerged until the
+        // user says so with `w`.
+        assert_eq!(
+            crate::git::conflicted_files(&feat).unwrap(),
+            vec!["shared.txt".to_string()]
+        );
+
         press(&mut app, KeyCode::Char('w'));
         press(&mut app, KeyCode::Char('c'));
         assert!(matches!(app.view, View::List));
         assert!(!crate::git::is_merging(&feat));
-        // Ours is the feature side; the seed was ours-then-theirs with a 'Z'
-        // inserted at the very front.
         assert_eq!(
             std::fs::read_to_string(feat.join("shared.txt")).unwrap(),
             "Zfeature version\nmain version\n"
         );
+    }
+
+    /// The old editor kept manual edits in memory only, so moving to another
+    /// file silently threw them away. Saving writes through to disk, so the
+    /// edit has to survive the round trip.
+    #[test]
+    fn resolver_manual_edit_survives_moving_between_files() {
+        let (_tmp, mut app) = test_app();
+        let feat = into_conflict_resolver_two_files(&mut app);
+
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Char('Z'));
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+        let first = match &app.view {
+            View::ConflictResolver { files, file, .. } => files[*file].clone(),
+            _ => panic!("expected the conflict resolver"),
+        };
+        let saved = std::fs::read_to_string(feat.join(&first)).unwrap();
+        assert!(saved.starts_with('Z'), "edit landed on disk: {saved}");
+
+        // Move to the other conflicted file and back.
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(
+            std::fs::read_to_string(feat.join(&first)).unwrap(),
+            saved,
+            "the edit is still there after navigating away and back"
+        );
+    }
+
+    /// A file with several hunks can be saved with only some of them decided:
+    /// the settled ones are written out resolved, the rest keep their markers.
+    #[test]
+    fn resolver_saves_partial_resolutions_without_staging() {
+        let (_tmp, mut app) = test_app();
+        let feat = into_conflict_resolver_multi_hunk(&mut app);
+
+        // Decide only the first of the two hunks, then save.
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Char('w'));
+
+        let text = std::fs::read_to_string(feat.join("multi.txt")).unwrap();
+        assert_eq!(
+            text.matches("<<<<<<<").count(),
+            1,
+            "one hunk resolved, one still marked: {text}"
+        );
+        // Still unmerged, because it would be wrong to stage conflict markers.
+        assert_eq!(
+            crate::git::conflicted_files(&feat).unwrap(),
+            vec!["multi.txt".to_string()],
+            "a partly-resolved file is saved but not staged"
+        );
+        assert!(matches!(app.view, View::ConflictResolver { .. }));
+
+        // Decide the one that is left; now `w` stages it.
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Char('w'));
+        assert!(
+            crate::git::conflicted_files(&feat).unwrap().is_empty(),
+            "fully resolved, so staged"
+        );
+    }
+
+    /// `a` is the escape hatch for a conflict fixed in the user's own editor:
+    /// stage exactly what is on disk. It must refuse while markers remain.
+    #[test]
+    fn resolver_stages_an_externally_resolved_file() {
+        let (_tmp, mut app) = test_app();
+        let feat = into_conflict_resolver(&mut app);
+
+        // Markers still present: refuse rather than commit them.
+        press(&mut app, KeyCode::Char('a'));
+        assert!(app.error.is_some(), "refuses while markers remain");
+        assert!(
+            app.error.as_ref().unwrap().contains("unresolved conflict"),
+            "{:?}",
+            app.error
+        );
+        press(&mut app, KeyCode::Esc); // dismiss the error popup
+
+        // Resolve it "in another editor", then mark it resolved.
+        std::fs::write(feat.join("shared.txt"), "hand written\n").unwrap();
+        press(&mut app, KeyCode::Char('a'));
+        assert!(app.error.is_none(), "{:?}", app.error);
+        assert!(
+            crate::git::conflicted_files(&feat).unwrap().is_empty(),
+            "staged what was on disk"
+        );
+
+        press(&mut app, KeyCode::Char('c'));
+        assert!(matches!(app.view, View::List));
+        assert!(!crate::git::is_merging(&feat));
+        assert_eq!(
+            std::fs::read_to_string(feat.join("shared.txt")).unwrap(),
+            "hand written\n"
+        );
+    }
+
+    /// `r` re-reads the conflict list, so a file resolved and staged outside
+    /// wtm drops off without needing a restart.
+    #[test]
+    fn resolver_reload_picks_up_external_resolutions() {
+        let (_tmp, mut app) = test_app();
+        let feat = into_conflict_resolver(&mut app);
+
+        std::fs::write(feat.join("shared.txt"), "fixed elsewhere\n").unwrap();
+        crate::git::stage_paths(&feat, &["shared.txt".to_string()]).unwrap();
+
+        press(&mut app, KeyCode::Char('r'));
+        match &app.view {
+            View::ConflictResolver { files, .. } => {
+                assert!(files.is_empty(), "resolved file dropped off: {files:?}");
+            }
+            _ => panic!("expected the conflict resolver"),
+        }
+        press(&mut app, KeyCode::Char('c'));
+        assert!(matches!(app.view, View::List));
+        assert!(!crate::git::is_merging(&feat));
+    }
+
+    /// Ctrl-chords other than Ctrl+S are not text: they must not leave stray
+    /// letters in the buffer.
+    #[test]
+    fn hunk_editor_ignores_other_control_chords() {
+        let (_tmp, mut app) = test_app();
+        into_conflict_resolver(&mut app);
+        press(&mut app, KeyCode::Char('e'));
+        let before = match &app.modal {
+            Some(Modal::HunkEditor(ed)) => ed.text(),
+            _ => panic!("expected the hunk editor"),
+        };
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        match &app.modal {
+            Some(Modal::HunkEditor(ed)) => assert_eq!(ed.text(), before),
+            _ => panic!("editor should still be open"),
+        }
     }
 
     #[test]
@@ -10593,8 +11122,15 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         settle(&mut app);
 
-        assert!(app.error.is_none(), "delete itself must not error: {:?}", app.error);
-        assert_ne!(app.changes.name, "ghost", "stale Changes target must be cleared");
+        assert!(
+            app.error.is_none(),
+            "delete itself must not error: {:?}",
+            app.error
+        );
+        assert_ne!(
+            app.changes.name, "ghost",
+            "stale Changes target must be cleared"
+        );
         assert!(!app.worktrees.iter().any(|w| w.name == "ghost"));
 
         // Force the periodic three-panel / Changes refresh path.
@@ -10608,8 +11144,7 @@ mod tests {
             app.error
         );
         assert!(
-            app.changes.name.is_empty()
-                || app.worktrees.iter().any(|w| w.name == app.changes.name),
+            app.changes.name.is_empty() || app.worktrees.iter().any(|w| w.name == app.changes.name),
             "Changes must point at a living worktree or be empty"
         );
     }
@@ -10644,7 +11179,11 @@ mod tests {
         let (_tmp, mut app) = test_app();
         app.changes.name = "nope".into();
         app.refresh_diff();
-        assert!(app.error.is_none(), "ghost target must not popup: {:?}", app.error);
+        assert!(
+            app.error.is_none(),
+            "ghost target must not popup: {:?}",
+            app.error
+        );
         assert!(app.changes.name.is_empty() || app.changes.name != "nope");
     }
 

@@ -1146,13 +1146,20 @@ pub fn merge(dir: &Path, source_ref: &str, no_ff: bool, autostash: bool) -> Resu
 /// Paths currently in an unmerged (conflict) state, i.e. porcelain codes
 /// UU, AA, DD, AU, UA, DU, or UD.
 pub fn conflicted_files(dir: &Path) -> Result<Vec<String>> {
-    const CONFLICT_CODES: [&str; 7] = ["UU", "AA", "DD", "AU", "UA", "DU", "UD"];
     let out = run(dir, &["status", "--porcelain"])?;
     Ok(parse_status_porcelain(&out)
         .into_iter()
-        .filter(|e| CONFLICT_CODES.contains(&e.code.as_str()))
+        .filter(|e| is_conflict_code(&e.code))
         .map(|e| e.path)
         .collect())
+}
+
+/// True when a porcelain status code marks an unmerged (conflicted) path.
+/// Shared so callers that already hold a `status` listing can count conflicts
+/// without paying for a second `git status`.
+pub fn is_conflict_code(code: &str) -> bool {
+    const CONFLICT_CODES: [&str; 7] = ["UU", "AA", "DD", "AU", "UA", "DU", "UD"];
+    CONFLICT_CODES.contains(&code)
 }
 
 /// True while a merge is in progress in `dir` (MERGE_HEAD exists).
@@ -1170,6 +1177,128 @@ pub fn merge_abort(dir: &Path) -> Result<()> {
 /// keeping the merge message git prepared (`--no-edit`).
 pub fn merge_continue(dir: &Path) -> Result<()> {
     run(dir, &["commit", "--no-edit"])?;
+    Ok(())
+}
+
+/// Outcome of a `git rebase` invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RebaseStatus {
+    /// The branch was already on top of the target; nothing was replayed.
+    UpToDate,
+    /// Every commit replayed cleanly.
+    Rebased,
+    /// A replayed commit stopped on conflicts; the paths of the conflicted
+    /// files.
+    Conflicted(Vec<String>),
+}
+
+/// Absolute path of the git dir belonging to the worktree at `dir`. For a
+/// linked worktree this is the per-worktree directory under the main repo's
+/// `.git/worktrees/`, not the shared common dir, so the in-progress operation
+/// markers found inside it belong to this worktree alone.
+pub fn git_dir(dir: &Path) -> Result<PathBuf> {
+    let out = run(dir, &["rev-parse", "--path-format=absolute", "--git-dir"])?;
+    Ok(PathBuf::from(out))
+}
+
+/// Which sequencing operation the worktree at `dir` is stopped in the middle
+/// of, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InProgress {
+    Merge,
+    Rebase,
+    CherryPick,
+}
+
+/// Detects an interrupted merge, rebase, or cherry-pick from the marker files
+/// git leaves in the worktree's git dir, using a single git invocation to
+/// locate that directory and plain filesystem checks for the markers. `list`
+/// calls this per worktree on every refresh, so it is deliberately cheaper than
+/// asking git about each marker in turn.
+///
+/// Rebase is reported ahead of cherry-pick: an interactive rebase replays
+/// commits with the cherry-pick machinery and can leave CHERRY_PICK_HEAD set,
+/// so checking cherry-pick first would misidentify it.
+pub fn detect_in_progress(dir: &Path) -> Option<InProgress> {
+    let git_dir = git_dir(dir).ok()?;
+    // A rebase writes `rebase-merge` (the default/interactive machinery) or
+    // `rebase-apply` (`--apply`, and `git am`); merge and cherry-pick each
+    // write a marker ref file.
+    if git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists() {
+        Some(InProgress::Rebase)
+    } else if git_dir.join("MERGE_HEAD").exists() {
+        Some(InProgress::Merge)
+    } else if git_dir.join("CHERRY_PICK_HEAD").exists() {
+        Some(InProgress::CherryPick)
+    } else {
+        None
+    }
+}
+
+/// True while a rebase is in progress in `dir`.
+pub fn is_rebasing(dir: &Path) -> bool {
+    detect_in_progress(dir) == Some(InProgress::Rebase)
+}
+
+/// Rebases the branch checked out in `dir` onto `onto_ref`, replaying the
+/// branch's own commits on top of it. On a conflict the rebase is deliberately
+/// left in progress (conflict markers in the files) so a resolver can take
+/// over; use `rebase_abort`, `rebase_continue`, or `rebase_skip` to finish. Any
+/// other failure is surfaced as an error after cleaning up the half-finished
+/// rebase, matching `cherry_pick`.
+pub fn rebase(dir: &Path, onto_ref: &str, autostash: bool) -> Result<RebaseStatus> {
+    let mut args = vec!["rebase"];
+    // Git holds the stash through a conflicted rebase and re-applies it on
+    // `rebase --continue`/`--abort`, so no extra bookkeeping is needed here.
+    if autostash {
+        args.push("--autostash");
+    }
+    args.push(onto_ref);
+    match run(dir, &args) {
+        Ok(out) => {
+            if out.contains("is up to date") {
+                Ok(RebaseStatus::UpToDate)
+            } else {
+                Ok(RebaseStatus::Rebased)
+            }
+        }
+        Err(e) => {
+            let files = conflicted_files(dir).unwrap_or_default();
+            if is_rebasing(dir) && !files.is_empty() {
+                Ok(RebaseStatus::Conflicted(files))
+            } else {
+                // Not a conflict: a dirty tree, an unknown ref, or a rebase that
+                // stopped for some other reason. Don't strand the worktree.
+                if is_rebasing(dir) {
+                    let _ = run(dir, &["rebase", "--abort"]);
+                }
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Continues an in-progress rebase once the current commit's conflicts are
+/// resolved and staged, keeping the replayed commit's own message.
+/// `core.editor=true` suppresses the editor so it is accepted
+/// non-interactively, as in `cherry_pick_continue`.
+pub fn rebase_continue(dir: &Path) -> Result<()> {
+    run(dir, &["-c", "core.editor=true", "rebase", "--continue"])?;
+    Ok(())
+}
+
+/// Aborts an in-progress rebase, restoring the pre-rebase state.
+pub fn rebase_abort(dir: &Path) -> Result<()> {
+    run(dir, &["rebase", "--abort"])?;
+    Ok(())
+}
+
+/// Drops the commit the rebase is currently stopped on and carries on with the
+/// rest. The escape hatch for a commit whose changes are already present in the
+/// branch being rebased onto, where `--continue` would refuse with an empty
+/// commit.
+pub fn rebase_skip(dir: &Path) -> Result<()> {
+    run(dir, &["rebase", "--skip"])?;
     Ok(())
 }
 
@@ -1348,6 +1477,118 @@ mod tests {
             assert!(out.status.success(), "git {args:?} failed");
         }
         (tmp, repo)
+    }
+
+    /// Sets up a conflict between `main` and `feature` in `repo`, leaving
+    /// `feature` checked out, so any attempt to combine them stops.
+    fn diverge(repo: &Path) {
+        std::fs::write(repo.join("shared.txt"), "base\n").unwrap();
+        run(repo, &["add", "."]).unwrap();
+        run(repo, &["commit", "-m", "base"]).unwrap();
+        run(repo, &["checkout", "-b", "feature"]).unwrap();
+        std::fs::write(repo.join("shared.txt"), "feature version\n").unwrap();
+        run(repo, &["commit", "-am", "feature edit"]).unwrap();
+        run(repo, &["checkout", "main"]).unwrap();
+        std::fs::write(repo.join("shared.txt"), "main version\n").unwrap();
+        run(repo, &["commit", "-am", "main edit"]).unwrap();
+        run(repo, &["checkout", "feature"]).unwrap();
+    }
+
+    #[test]
+    fn rebase_conflict_is_detected_and_abort_recovers() {
+        let (_tmp, repo) = temp_repo();
+        diverge(&repo);
+        assert!(!is_rebasing(&repo), "clean repo is not mid-rebase");
+        assert_eq!(detect_in_progress(&repo), None);
+
+        let status = rebase(&repo, "main", false).unwrap();
+        assert_eq!(
+            status,
+            RebaseStatus::Conflicted(vec!["shared.txt".to_string()])
+        );
+        assert!(is_rebasing(&repo));
+        // A rebase replays commits with the cherry-pick machinery, so this must
+        // still report Rebase rather than CherryPick or the wrong command gets
+        // used to finish it.
+        assert_eq!(detect_in_progress(&repo), Some(InProgress::Rebase));
+
+        rebase_abort(&repo).unwrap();
+        assert!(!is_rebasing(&repo));
+        assert_eq!(detect_in_progress(&repo), None);
+        assert_eq!(
+            std::fs::read_to_string(repo.join("shared.txt")).unwrap(),
+            "feature version\n"
+        );
+    }
+
+    #[test]
+    fn rebase_replays_cleanly_when_nothing_overlaps() {
+        let (_tmp, repo) = temp_repo();
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        run(&repo, &["add", "."]).unwrap();
+        run(&repo, &["commit", "-m", "base"]).unwrap();
+        run(&repo, &["checkout", "-b", "feature"]).unwrap();
+        std::fs::write(repo.join("feature.txt"), "f\n").unwrap();
+        run(&repo, &["add", "."]).unwrap();
+        run(&repo, &["commit", "-m", "feature"]).unwrap();
+        run(&repo, &["checkout", "main"]).unwrap();
+        std::fs::write(repo.join("main.txt"), "m\n").unwrap();
+        run(&repo, &["add", "."]).unwrap();
+        run(&repo, &["commit", "-m", "main"]).unwrap();
+        run(&repo, &["checkout", "feature"]).unwrap();
+
+        assert_eq!(rebase(&repo, "main", false).unwrap(), RebaseStatus::Rebased);
+        assert!(!is_rebasing(&repo));
+        assert!(repo.join("main.txt").exists(), "replayed on top of main");
+    }
+
+    #[test]
+    fn detect_in_progress_distinguishes_merge_from_cherry_pick() {
+        let (_tmp, repo) = temp_repo();
+        diverge(&repo);
+
+        assert!(matches!(
+            merge(&repo, "main", false, false).unwrap(),
+            MergeStatus::Conflicted(_)
+        ));
+        assert_eq!(detect_in_progress(&repo), Some(InProgress::Merge));
+        merge_abort(&repo).unwrap();
+
+        let main_tip = rev_parse(&repo, "main").unwrap();
+        assert!(matches!(
+            cherry_pick(&repo, &[main_tip], false).unwrap(),
+            CherryPickStatus::Conflicted(_)
+        ));
+        assert_eq!(detect_in_progress(&repo), Some(InProgress::CherryPick));
+        cherry_pick_abort(&repo).unwrap();
+        assert_eq!(detect_in_progress(&repo), None);
+    }
+
+    #[test]
+    fn rebase_skip_drops_the_conflicting_commit() {
+        let (_tmp, repo) = temp_repo();
+        diverge(&repo);
+        assert!(matches!(
+            rebase(&repo, "main", false).unwrap(),
+            RebaseStatus::Conflicted(_)
+        ));
+        rebase_skip(&repo).unwrap();
+        assert!(!is_rebasing(&repo), "the only commit was skipped");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("shared.txt")).unwrap(),
+            "main version\n",
+            "the feature commit was dropped"
+        );
+    }
+
+    #[test]
+    fn is_conflict_code_matches_the_unmerged_codes() {
+        for code in ["UU", "AA", "DD", "AU", "UA", "DU", "UD"] {
+            assert!(is_conflict_code(code), "{code}");
+        }
+        for code in [" M", "??", "A ", "M ", "R "] {
+            assert!(!is_conflict_code(code), "{code}");
+        }
     }
 
     #[test]
