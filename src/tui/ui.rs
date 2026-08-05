@@ -740,6 +740,18 @@ fn draw_worktrees_three_panel(frame: &mut Frame, area: Rect, app: &mut App) -> O
             app.log_mode,
             files_focused,
         );
+    } else if app.commits_loading() {
+        app.diff_path_hit = None;
+        app.files_list = None;
+        let title = match app.worktrees.get(app.selected) {
+            Some(wt) => format!(
+                "commits · {}",
+                wt.branch.as_deref().unwrap_or(wt.name.as_str())
+            ),
+            None => "commits".to_string(),
+        };
+        let para = Paragraph::new(Line::from("loading…".dim())).block(panel(title));
+        frame.render_widget(para, changes_area);
     } else {
         app.files_list = draw_diff(
             frame,

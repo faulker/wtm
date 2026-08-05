@@ -202,6 +202,47 @@ impl LogMode {
     }
 }
 
+/// Commit-history rows for a branch or worktree, honouring `log_mode`. Free
+/// function so background threads can load the three-panel commits list without
+/// borrowing `App`.
+fn commit_log_lines(
+    ctx: &Ctx,
+    name: &str,
+    branch: &str,
+    from_branch: bool,
+    mode: LogMode,
+) -> Result<Vec<GraphLine>, String> {
+    match (from_branch, mode) {
+        (true, LogMode::Tree) => {
+            ops::branch_log_graph(ctx, branch, 200).map_err(|e| format!("{e:#}"))
+        }
+        (true, LogMode::Flat) => ops::branch_log(ctx, branch, 200)
+            .map(|r| flat_lines(r.entries))
+            .map_err(|e| format!("{e:#}")),
+        (false, LogMode::Tree) => {
+            ops::log_graph(ctx, name, 100).map_err(|e| format!("{e:#}"))
+        }
+        (false, LogMode::Flat) => ops::log(ctx, name, 100)
+            .map(|r| flat_lines(r.entries))
+            .map_err(|e| format!("{e:#}")),
+    }
+}
+
+/// Identity of a three-panel commits-panel load, used to drop stale background
+/// results when the selection, branch, or log mode has since changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommitsLoadKey {
+    name: String,
+    branch: String,
+    from_branch: bool,
+    log_mode: LogMode,
+}
+
+type CommitsPending = Option<(CommitsLoadKey, Task<Result<Vec<GraphLine>, String>>)>;
+type StatusRefreshPending =
+    Option<(u64, String, bool, Task<Result<Vec<StatusEntry>, String>>)>;
+type StashPending = Option<(String, Task<Result<Vec<StashEntry>, String>>)>;
+
 /// Index of the first row holding a commit, skipping any leading art-only rows.
 /// 0 when there are none (an empty list has nothing to select anyway).
 fn first_commit_row(lines: &[GraphLine]) -> usize {
@@ -1248,6 +1289,20 @@ pub struct App {
     /// When `Some`, the three-panel bottom area shows this commit list instead
     /// of the changes/diff panels (selected worktree is clean).
     pub worktree_commits: Option<WorktreeCommitsPanel>,
+    /// Background load for `worktree_commits`. The key identifies which
+    /// worktree/branch/mode the result belongs to; `poll_commits_load` drops
+    /// mismatches so ↑/↓ never applies another row's history.
+    commits_pending: CommitsPending,
+    /// Background `ops::status` for `refresh_diff` / async `load_changes`. The
+    /// `u64` is a generation token, `String` the worktree name, and `bool`
+    /// whether to preserve commit marks. Drained by `poll_status_refresh`.
+    status_refresh_pending: StatusRefreshPending,
+    /// Bumped whenever a status refresh or async `load_changes` starts; results
+    /// with a stale token are ignored.
+    status_refresh_gen: u64,
+    /// Background `ops::stash_list` for the Stash tab. The `String` is the
+    /// worktree name the result belongs to.
+    stash_pending: StashPending,
     /// Branches shown on the Branches tab, loaded by `load_branches`. Kept
     /// on screen (stale) while a background reload is in flight, so
     /// switching back into the tab is instant instead of flashing empty.
@@ -1398,6 +1453,10 @@ impl App {
             files_list: None,
             changes: ChangesTab::default(),
             worktree_commits: None,
+            commits_pending: None,
+            status_refresh_pending: None,
+            status_refresh_gen: 0,
+            stash_pending: None,
             branches: Vec::new(),
             branch_selected: 0,
             branches_pending: None,
@@ -1723,6 +1782,9 @@ impl App {
         // Same for the Worktrees tab's changed-file preview: status is loaded
         // off-thread so selection changes stay responsive.
         self.poll_preview_load();
+        self.poll_commits_load();
+        self.poll_status_refresh();
+        self.poll_stash_load();
         if let View::Busy { rx, .. } = &self.view {
             if let Some(result) = rx.poll_latest() {
                 // Pull the follow-up out of the view so we can mutate self, then
@@ -3040,30 +3102,28 @@ impl App {
     }
 
     /// Points the changes pane (the Changes tab, or the bottom two panels of
-    /// the three-panel Worktrees layout) at the worktree named `name`, reading
-    /// its status now. Returns false when status failed, having already put the
-    /// error on screen.
+    /// the three-panel Worktrees layout) at the worktree named `name`. Uses the
+    /// cached Worktrees-tab preview when it already matches so Enter / tab
+    /// switches never block on `ops::status`; otherwise status loads in the
+    /// background. Returns false only when the name is immediately known to be
+    /// missing from the worktree list.
     fn load_changes(&mut self, name: String) -> bool {
-        match ops::status(&self.ctx, &name) {
-            Ok((_, files)) => {
-                let marked = vec![true; files.len()];
-                let rows = build_rows(&files, self.file_tree, &self.collapsed_folders);
-                self.changes = ChangesTab {
-                    name,
-                    files,
-                    marked,
-                    rows,
-                    ..ChangesTab::default()
-                };
-                self.load_diff_content(true);
-                self.sync_worktree_commits_panel();
-                true
-            }
-            Err(e) => {
-                self.set_error(format!("{e:#}"));
-                false
-            }
+        if !self.worktrees.iter().any(|w| w.name == name) {
+            self.set_error(format!("no worktree named '{name}'"));
+            return false;
         }
+        // Fast path: the Worktrees preview already holds this worktree's status.
+        if self.preview_for.is_some_and(|i| {
+            self.worktrees
+                .get(i)
+                .is_some_and(|w| w.name == name)
+        }) {
+            let files = self.worktree_preview.clone();
+            self.apply_changes_files(name, files, false);
+            return true;
+        }
+        self.start_status_refresh(name, false);
+        true
     }
 
     /// Opens the Changes tab for `name` with the cursor on `path`. Used by the
@@ -4022,64 +4082,139 @@ impl App {
 
     /// Rebuilds the changed-file list and the selected file's diff in place,
     /// preserving commit marks by path and clamping the cursor. No-op until the
-    /// Changes tab has been opened on a worktree.
+    /// Changes tab has been opened on a worktree. Status runs off the UI thread
+    /// so the 1s auto-refresh and `r` never hitch navigation.
     fn refresh_diff(&mut self) {
         if self.changes.name.is_empty() {
             return;
         }
         let name = self.changes.name.clone();
-        let tree = self.file_tree;
-        // Remember which file is under the cursor so we can tell whether the
-        // refresh lands on the same file (keep scroll) or a different one
-        // because the list shifted (reset scroll).
-        let old_path = {
-            let c = &self.changes;
-            current_file_index(&c.rows, c.selected)
-                .and_then(|i| c.files.get(i))
-                .map(|f| f.path.clone())
+        // A name already gone from `worktrees` is a stale Changes target —
+        // realign quietly before spawning any git work.
+        if !self.worktrees.iter().any(|w| w.name == name) {
+            self.realign_changes_after_list_reload();
+            return;
+        }
+        self.start_status_refresh(name, true);
+    }
+
+    /// Starts a background `ops::status` for `name`. When `preserve_marks` is
+    /// true (periodic refresh / `r`), commit marks and cursor survive; when
+    /// false (switching worktree), the pane is reset to all-marked.
+    /// Throttles via `last_refresh` and skips when a refresh for the same name
+    /// is already in flight.
+    fn start_status_refresh(&mut self, name: String, preserve_marks: bool) {
+        // Stamp the throttle now so tick doesn't re-kick every frame while
+        // status is in flight. Bump the generation so any older in-flight
+        // result is ignored when it lands.
+        self.changes.last_refresh = Instant::now();
+        self.status_refresh_gen = self.status_refresh_gen.wrapping_add(1);
+        let token = self.status_refresh_gen;
+        if !preserve_marks {
+            // Switching worktree: clear the previous pane immediately so we
+            // never show another worktree's files under the new name.
+            self.changes = ChangesTab {
+                name: name.clone(),
+                last_refresh: Instant::now(),
+                ..ChangesTab::default()
+            };
+            self.worktree_commits = None;
+            self.commits_pending = None;
+        } else if self.changes.name != name {
+            self.changes.name = name.clone();
+        }
+        let (tx, rx) = channel();
+        let ctx = self.ctx.clone();
+        let name_for_thread = name.clone();
+        std::thread::spawn(move || {
+            let result = ops::status(&ctx, &name_for_thread)
+                .map(|(_, files)| files)
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+        });
+        self.status_refresh_pending = Some((token, name, preserve_marks, Task::new(rx)));
+    }
+
+    /// Applies a finished background status refresh when its generation still
+    /// matches. Called each tick.
+    fn poll_status_refresh(&mut self) {
+        let Some((token, name, preserve, task)) = &self.status_refresh_pending else {
+            return;
         };
-        match ops::status(&self.ctx, &name) {
-            Ok((_, new_files)) => {
-                let c = &mut self.changes;
-                // Carry commit marks over to files that still exist.
-                let old: std::collections::HashMap<&str, bool> = c
-                    .files
-                    .iter()
-                    .zip(c.marked.iter())
-                    .map(|(f, m)| (f.path.as_str(), *m))
-                    .collect();
-                let new_marked = new_files
-                    .iter()
-                    .map(|f| old.get(f.path.as_str()).copied().unwrap_or(true))
-                    .collect();
-                c.rows = build_rows(&new_files, tree, &self.collapsed_folders);
-                c.files = new_files;
-                c.marked = new_marked;
-                c.selected = c.selected.min(c.rows.len().saturating_sub(1));
-                c.last_refresh = Instant::now();
-                let new_path = current_file_index(&c.rows, c.selected)
-                    .and_then(|i| c.files.get(i))
-                    .map(|f| f.path.clone());
-                self.load_diff_content(new_path != old_path);
-                // Clean ↔ dirty flips swap the three-panel bottom between the
-                // commit list and the changes/diff panels.
-                self.sync_worktree_commits_panel();
-            }
-            // The worktree may have been removed (delete, or out from under us).
-            // A name already gone from `worktrees` is a stale Changes target —
-            // realign quietly. Anything else is a real error.
+        let token = *token;
+        let name = name.clone();
+        let preserve = *preserve;
+        let Some(result) = task.poll_latest() else {
+            return;
+        };
+        self.status_refresh_pending = None;
+        if token != self.status_refresh_gen || self.changes.name != name {
+            return;
+        }
+        match result {
+            Ok(files) => self.apply_changes_files(name, files, preserve),
             Err(e) => {
                 if !self.worktrees.iter().any(|w| w.name == name) {
                     self.realign_changes_after_list_reload();
                     return;
                 }
-                self.set_error(format!("{e:#}"));
+                self.set_error(e);
                 self.changes = ChangesTab::default();
                 self.worktree_commits = None;
+                self.commits_pending = None;
                 self.tab = Tab::Worktrees;
                 self.refresh();
             }
         }
+    }
+
+    /// Installs `files` into the changes pane for `name`. When `preserve_marks`
+    /// is true, keeps marks/cursor/scroll semantics of `refresh_diff`; otherwise
+    /// resets like a fresh `load_changes`.
+    fn apply_changes_files(&mut self, name: String, files: Vec<StatusEntry>, preserve_marks: bool) {
+        let tree = self.file_tree;
+        if preserve_marks {
+            let old_path = {
+                let c = &self.changes;
+                current_file_index(&c.rows, c.selected)
+                    .and_then(|i| c.files.get(i))
+                    .map(|f| f.path.clone())
+            };
+            let c = &mut self.changes;
+            let old: std::collections::HashMap<&str, bool> = c
+                .files
+                .iter()
+                .zip(c.marked.iter())
+                .map(|(f, m)| (f.path.as_str(), *m))
+                .collect();
+            let new_marked = files
+                .iter()
+                .map(|f| old.get(f.path.as_str()).copied().unwrap_or(true))
+                .collect();
+            c.rows = build_rows(&files, tree, &self.collapsed_folders);
+            c.files = files;
+            c.marked = new_marked;
+            c.selected = c.selected.min(c.rows.len().saturating_sub(1));
+            c.name = name;
+            c.last_refresh = Instant::now();
+            let new_path = current_file_index(&c.rows, c.selected)
+                .and_then(|i| c.files.get(i))
+                .map(|f| f.path.clone());
+            self.load_diff_content(new_path != old_path);
+        } else {
+            let marked = vec![true; files.len()];
+            let rows = build_rows(&files, tree, &self.collapsed_folders);
+            self.changes = ChangesTab {
+                name,
+                files,
+                marked,
+                rows,
+                last_refresh: Instant::now(),
+                ..ChangesTab::default()
+            };
+            self.load_diff_content(true);
+        }
+        self.sync_worktree_commits_panel();
     }
 
     /// Stashes a single file from the Changes tab, then reloads it.
@@ -4737,19 +4872,58 @@ impl App {
         self.reload_stash_tab(name);
     }
 
-    /// Re-reads the stash list for `name` into the tab, keeping the cursor on a
-    /// valid row (used on tab entry and after a background stash op).
+    /// Re-reads the stash list for `name` into the tab on a background thread,
+    /// keeping the cursor on a valid row once the result lands. Used on tab
+    /// entry and after a background stash op.
     fn reload_stash_tab(&mut self, name: String) {
-        match ops::stash_list(&self.ctx, &name) {
-            Ok(r) => {
-                self.stash_name = name;
-                self.stash_entries = r.entries;
+        // A different worktree than last time starts at the top and clears the
+        // old list so we never show another worktree's stashes under the new name.
+        if name != self.stash_name {
+            self.stash_selected = 0;
+            self.stash_entries.clear();
+        }
+        self.stash_name = name.clone();
+        let (tx, rx) = channel();
+        let ctx = self.ctx.clone();
+        let name_for_thread = name.clone();
+        std::thread::spawn(move || {
+            let result = ops::stash_list(&ctx, &name_for_thread)
+                .map(|r| r.entries)
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+        });
+        self.stash_pending = Some((name, Task::new(rx)));
+    }
+
+    /// Applies a finished background stash-list load when it still matches the
+    /// Stash tab's worktree. Called each tick.
+    fn poll_stash_load(&mut self) {
+        let Some((name, task)) = &self.stash_pending else {
+            return;
+        };
+        let name = name.clone();
+        let Some(result) = task.poll_latest() else {
+            return;
+        };
+        self.stash_pending = None;
+        if name != self.stash_name {
+            return;
+        }
+        match result {
+            Ok(entries) => {
+                self.stash_entries = entries;
                 self.stash_selected = self
                     .stash_selected
                     .min(self.stash_entries.len().saturating_sub(1));
             }
-            Err(e) => self.set_error(format!("{e:#}")),
+            Err(e) => self.set_error(e),
         }
+    }
+
+    /// Whether the Stash tab is waiting on a background list load.
+    #[cfg(test)]
+    fn stash_loading(&self) -> bool {
+        self.stash_pending.is_some()
     }
 
     fn on_stash_tab_key(&mut self, key: KeyEvent) {
@@ -5156,18 +5330,21 @@ impl App {
 
     /// Shows the branch commit list in the three-panel bottom area when the
     /// current changes pane is empty, or clears it when there are uncommitted
-    /// files again. Reuses `branch_log_lines` (same path as `View::BranchCommits`).
+    /// files again. Reuses `commit_log_lines` (same path as `View::BranchCommits`).
     fn sync_worktree_commits_panel(&mut self) {
         if !self.three_panel || self.changes.name.is_empty() {
             self.worktree_commits = None;
+            self.commits_pending = None;
             return;
         }
         if !self.changes.files.is_empty() {
             self.worktree_commits = None;
+            self.commits_pending = None;
             return;
         }
         let Some(wt) = self.worktrees.iter().find(|w| w.name == self.changes.name) else {
             self.worktree_commits = None;
+            self.commits_pending = None;
             return;
         };
         let name = wt.name.clone();
@@ -5183,31 +5360,100 @@ impl App {
         self.load_worktree_commits_panel(name, branch, from_branch);
     }
 
-    /// Loads commit rows for the three-panel clean-worktree panel.
+    /// Loads commit rows for the three-panel clean-worktree panel off-thread so
+    /// selection changes never block on `git log --graph`.
     fn load_worktree_commits_panel(&mut self, name: String, branch: String, from_branch: bool) {
-        let result = if from_branch {
-            self.branch_log_lines(&branch)
-        } else {
-            self.worktree_log_lines(&name)
+        let key = CommitsLoadKey {
+            name,
+            branch,
+            from_branch,
+            log_mode: self.log_mode,
         };
+        if self
+            .commits_pending
+            .as_ref()
+            .is_some_and(|(k, _)| k == &key)
+        {
+            return;
+        }
+        // Drop a mismatched panel immediately so we never flash another
+        // worktree's history while the new load runs.
+        if self
+            .worktree_commits
+            .as_ref()
+            .is_some_and(|p| p.name != key.name || p.branch != key.branch)
+        {
+            self.worktree_commits = None;
+        }
+        let (tx, rx) = channel();
+        let ctx = self.ctx.clone();
+        let name = key.name.clone();
+        let branch = key.branch.clone();
+        let from_branch = key.from_branch;
+        let mode = key.log_mode;
+        std::thread::spawn(move || {
+            let _ = tx.send(commit_log_lines(&ctx, &name, &branch, from_branch, mode));
+        });
+        self.commits_pending = Some((key, Task::new(rx)));
+    }
+
+    /// Applies a finished three-panel commits load when it still matches the
+    /// current clean worktree / log mode. Called each tick.
+    fn poll_commits_load(&mut self) {
+        let Some((key, task)) = &self.commits_pending else {
+            return;
+        };
+        let key = key.clone();
+        let Some(result) = task.poll_latest() else {
+            return;
+        };
+        self.commits_pending = None;
+        // Selection or mode moved while the thread ran.
+        let current = CommitsLoadKey {
+            name: self.changes.name.clone(),
+            branch: self
+                .worktrees
+                .iter()
+                .find(|w| w.name == self.changes.name)
+                .and_then(|w| w.branch.clone())
+                .unwrap_or_else(|| self.changes.name.clone()),
+            from_branch: self
+                .worktrees
+                .iter()
+                .find(|w| w.name == self.changes.name)
+                .is_some_and(|w| w.branch.is_some()),
+            log_mode: self.log_mode,
+        };
+        if key != current || !self.changes.files.is_empty() || !self.three_panel {
+            return;
+        }
         match result {
             Ok(lines) => {
                 let selected = first_commit_row(&lines);
                 self.worktree_commits = Some(WorktreeCommitsPanel {
-                    name,
-                    branch,
-                    from_branch,
+                    name: key.name,
+                    branch: key.branch,
+                    from_branch: key.from_branch,
                     lines,
                     selected,
                 });
             }
             Err(e) => {
-                // Automatic panel fill: don't raise a modal error (that would
-                // steal the next keypress). Leave the bottom empty and say why.
                 self.worktree_commits = None;
                 self.message = Some(e);
             }
         }
+    }
+
+    /// Whether the three-panel commits panel is waiting on a background log.
+    pub fn commits_loading(&self) -> bool {
+        self.commits_pending.is_some()
+            && (self.worktree_commits.is_none()
+                || self.commits_pending.as_ref().is_some_and(|(k, _)| {
+                    self.worktree_commits
+                        .as_ref()
+                        .is_some_and(|p| p.name != k.name || p.branch != k.branch)
+                }))
     }
 
     /// Whether the three-panel bottom area is showing commits for a clean worktree.
@@ -5412,14 +5658,7 @@ impl App {
 
     /// Commit history of a branch as graph rows, honouring `log_mode`.
     fn branch_log_lines(&self, branch: &str) -> Result<Vec<GraphLine>, String> {
-        match self.log_mode {
-            LogMode::Tree => {
-                ops::branch_log_graph(&self.ctx, branch, 200).map_err(|e| format!("{e:#}"))
-            }
-            LogMode::Flat => ops::branch_log(&self.ctx, branch, 200)
-                .map(|r| flat_lines(r.entries))
-                .map_err(|e| format!("{e:#}")),
-        }
+        commit_log_lines(&self.ctx, branch, branch, true, self.log_mode)
     }
 
     /// Key handling for the branch commit-history view: move the cursor, toggle
@@ -6646,12 +6885,7 @@ impl App {
 
     /// Commit history of a worktree as graph rows, honouring `log_mode`.
     fn worktree_log_lines(&self, name: &str) -> Result<Vec<GraphLine>, String> {
-        match self.log_mode {
-            LogMode::Tree => ops::log_graph(&self.ctx, name, 100).map_err(|e| format!("{e:#}")),
-            LogMode::Flat => ops::log(&self.ctx, name, 100)
-                .map(|r| flat_lines(r.entries))
-                .map_err(|e| format!("{e:#}")),
-        }
+        commit_log_lines(&self.ctx, name, name, false, self.log_mode)
     }
 
     fn on_log_key(&mut self, key: KeyEvent) {
@@ -7108,11 +7342,25 @@ impl App {
                     Err(e) => self.set_error(e),
                 }
             }
-            View::List if self.worktree_commits.is_some() => {
-                let panel = self.worktree_commits.as_ref().unwrap();
-                let name = panel.name.clone();
-                let branch = panel.branch.clone();
-                let from_branch = panel.from_branch;
+            View::List if self.worktree_commits.is_some() || self.commits_pending.is_some() => {
+                let (name, branch, from_branch) = if let Some(panel) = &self.worktree_commits {
+                    (
+                        panel.name.clone(),
+                        panel.branch.clone(),
+                        panel.from_branch,
+                    )
+                } else if let Some((key, _)) = &self.commits_pending {
+                    (
+                        key.name.clone(),
+                        key.branch.clone(),
+                        key.from_branch,
+                    )
+                } else {
+                    return;
+                };
+                // Clear so the UI shows loading rather than the other mode's rows.
+                self.worktree_commits = None;
+                self.commits_pending = None;
                 self.load_worktree_commits_panel(name, branch, from_branch);
             }
             _ => return,
@@ -7447,11 +7695,31 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode) {
         app.on_key(KeyEvent::from(code));
+        // Drain background loads the event loop's tick would pick up, so tests
+        // that assert right after a key don't race in-flight status/stash/log.
+        settle_background(app);
+    }
+
+    /// Polls every non-busy background load until idle (status, commits, stash).
+    fn settle_background(app: &mut App) {
+        settle_status_refresh(app);
+        settle_commits(app);
+        settle_stash(app);
     }
 
     /// Opens the Settings tab the same way the tab bar / `select_tab` does.
     fn goto_settings(app: &mut App) {
         app.select_tab(Tab::Settings);
+    }
+
+    /// Switches tabs and drains any background load that entry kicked off
+    /// (status, stash, commits, branches), matching what a real frame would see.
+    fn goto_tab(app: &mut App, tab: Tab) {
+        app.select_tab(tab);
+        settle_background(app);
+        if tab == Tab::Branches {
+            settle_branches(app);
+        }
     }
 
     /// Waits out an in-flight background branch-list load (item 4 made
@@ -7471,17 +7739,64 @@ mod tests {
 
     /// Waits out an in-flight Worktrees-tab preview status load so tests can
     /// assert on `app.worktree_preview` after a selection change or refresh.
+    /// Also drains a follow-on three-panel commits load and any status refresh
+    /// kicked off by syncing the changes pane.
     fn settle_preview(app: &mut App) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             app.ensure_worktree_preview();
             app.poll_preview_load();
-            if app.preview_for == Some(app.selected) {
+            app.poll_commits_load();
+            app.poll_status_refresh();
+            if app.preview_for == Some(app.selected)
+                && app.commits_pending.is_none()
+                && app.status_refresh_pending.is_none()
+            {
                 break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
                 "worktree preview load timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// Waits out an in-flight `refresh_diff` / `load_changes` status load.
+    fn settle_status_refresh(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.status_refresh_pending.is_some() {
+            app.poll_status_refresh();
+            app.poll_commits_load();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "status refresh timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// Waits out an in-flight three-panel commits-panel log load.
+    fn settle_commits(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.commits_pending.is_some() {
+            app.poll_commits_load();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "commits panel load timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// Waits out an in-flight Stash tab list load.
+    fn settle_stash(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.stash_loading() {
+            app.poll_stash_load();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stash list load timed out"
             );
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
@@ -7496,10 +7811,14 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "busy op timed out");
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        // Busy follow-ups (stash reload, refresh_diff) start more background
+        // work; drain those too before the caller asserts.
+        settle_background(app);
     }
 
     fn press_shift(app: &mut App, code: KeyCode) {
         app.on_key(KeyEvent::new(code, KeyModifiers::SHIFT));
+        settle_background(app);
     }
 
     /// Waits out an in-flight background diff load (item 1 made file diffs
@@ -7564,6 +7883,7 @@ mod tests {
             row,
             modifiers: KeyModifiers::empty(),
         });
+        settle_background(app);
     }
 
     fn ctrl_c(app: &mut App) {
@@ -7574,6 +7894,7 @@ mod tests {
     /// panicking if it isn't in the list. Skips over folder rows.
     fn select_diff_file(app: &mut App, path: &str) {
         assert_eq!(app.tab, Tab::Changes, "expected the Changes tab");
+        settle_status_refresh(app);
         loop {
             let c = &app.changes;
             if let Some(i) = current_file_index(&c.rows, c.selected)
@@ -8658,6 +8979,7 @@ mod tests {
             .checked_sub(DIFF_REFRESH_INTERVAL * 2)
             .unwrap();
         app.tick();
+        settle_status_refresh(&mut app);
         select_diff_file(&mut app, "file.txt");
         assert!(
             app.changes.content.contains("four"),
@@ -8690,6 +9012,7 @@ mod tests {
             .checked_sub(DIFF_REFRESH_INTERVAL * 2)
             .unwrap();
         app.tick();
+        settle_status_refresh(&mut app);
         assert_eq!(
             app.changes.scroll, before,
             "auto-refresh must not reset scroll"
@@ -12352,7 +12675,7 @@ mod tests {
         std::fs::write(root.join("hello.txt"), "hi\n").unwrap();
         app.refresh();
         app.selected = app.worktrees.iter().position(|w| w.is_main).unwrap();
-        app.select_tab(Tab::Changes);
+        goto_tab(app, Tab::Changes);
         settle_diff(app);
         let idx = current_file_index(&app.changes.rows, app.changes.selected)
             .expect("the cursor sits on the changed file");
@@ -12382,7 +12705,7 @@ mod tests {
         std::fs::write(root.join("new.txt"), "untracked\n").unwrap();
         app.refresh();
         app.selected = app.worktrees.iter().position(|w| w.is_main).unwrap();
-        app.select_tab(Tab::Changes);
+        goto_tab(&mut app, Tab::Changes);
         settle_diff(&mut app);
 
         press(&mut app, KeyCode::Char('U'));
@@ -12426,7 +12749,7 @@ mod tests {
         std::fs::write(root.join("pkg/a.txt"), "a\n").unwrap();
         app.refresh();
         app.selected = app.worktrees.iter().position(|w| w.is_main).unwrap();
-        app.select_tab(Tab::Changes);
+        goto_tab(&mut app, Tab::Changes);
         settle_diff(&mut app);
         // Put the cursor on the "pkg/" folder row.
         app.changes.selected = app
@@ -12468,7 +12791,7 @@ mod tests {
         std::fs::remove_file(root.join("gone.txt")).unwrap();
         app.refresh();
         app.selected = app.worktrees.iter().position(|w| w.is_main).unwrap();
-        app.select_tab(Tab::Changes);
+        goto_tab(&mut app, Tab::Changes);
         settle_diff(&mut app);
         app.changes.selected = app
             .changes
@@ -12551,7 +12874,7 @@ mod tests {
         std::fs::write(root.join("pkg/a.txt"), "a\n").unwrap();
         app.refresh();
         app.selected = app.worktrees.iter().position(|w| w.is_main).unwrap();
-        app.select_tab(Tab::Changes);
+        goto_tab(&mut app, Tab::Changes);
         settle_diff(&mut app);
         app.changes.selected = app
             .changes
@@ -12576,7 +12899,7 @@ mod tests {
         std::fs::write(root.join("wide.txt"), format!("{}\n", "x".repeat(200))).unwrap();
         app.refresh();
         app.selected = app.worktrees.iter().position(|w| w.is_main).unwrap();
-        app.select_tab(Tab::Changes);
+        goto_tab(&mut app, Tab::Changes);
         select_diff_file(&mut app, "wide.txt");
         assert_eq!(app.changes.h_scroll, 0);
 
@@ -12655,7 +12978,7 @@ mod tests {
     fn changes_tab_pull_and_push_use_the_open_worktree() {
         let (_tmp, mut app) = test_app();
         add_and_select_worktree(&mut app, "feature");
-        app.select_tab(Tab::Changes);
+        goto_tab(&mut app, Tab::Changes);
         assert_eq!(app.changes.name, "feature");
         // Park the Worktrees-tab cursor elsewhere: it must not be consulted.
         app.selected = app.worktrees.iter().position(|w| w.is_main).unwrap();
@@ -12788,7 +13111,7 @@ mod tests {
 
         // Asking for it anyway (a click, or code calling `select_tab`) lands on
         // the file panel of the Worktrees tab.
-        app.select_tab(Tab::Changes);
+        goto_tab(&mut app, Tab::Changes);
         assert_eq!(app.tab, Tab::Worktrees);
         assert_eq!(app.worktrees_focus, WorktreesFocus::Files);
     }
@@ -12998,6 +13321,7 @@ mod tests {
         let root = app.ctx.repo_root.clone();
         std::fs::write(root.join("dirty.txt"), "x\n").unwrap();
         app.refresh_diff();
+        settle_status_refresh(&mut app);
         assert!(
             app.worktree_commits.is_none(),
             "dirty status drops the commit list"
@@ -13006,6 +13330,8 @@ mod tests {
 
         std::fs::remove_file(root.join("dirty.txt")).unwrap();
         app.refresh_diff();
+        settle_status_refresh(&mut app);
+        settle_commits(&mut app);
         assert!(
             app.worktree_commits.is_some(),
             "clean status brings the commit list back"
@@ -13022,6 +13348,83 @@ mod tests {
         settle_preview(&mut app);
         assert!(!app.three_panel);
         assert!(app.worktree_commits.is_none());
+    }
+
+    /// Moving the worktree cursor kicks off a background commits load rather
+    /// than blocking the UI thread on `git log --graph`.
+    #[test]
+    fn three_panel_selection_loads_commits_in_the_background() {
+        let (_tmp, mut app) = three_panel_clean_app();
+        assert!(app.showing_worktree_commits());
+        add_and_select_worktree(&mut app, "other");
+        // Make the new worktree clean with its own history.
+        let other = app.worktrees.iter().find(|w| w.name == "other").unwrap();
+        let path = PathBuf::from(&other.path);
+        git(&path, &["commit", "--allow-empty", "-m", "on other"]);
+        app.refresh();
+        app.selected = app.worktrees.iter().position(|w| w.name == "other").unwrap();
+        app.preview_for = None;
+        app.worktree_commits = None;
+        app.commits_pending = None;
+
+        app.ensure_worktree_preview();
+        assert!(app.preview_loading());
+        // Preview landing starts the commits load without filling the panel yet.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.preview_pending.is_some() {
+            app.poll_preview_load();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            app.commits_pending.is_some() || app.worktree_commits.is_some(),
+            "clean worktree should start or finish a commits load"
+        );
+        // If still pending, the panel must not already show the previous tree.
+        if app.commits_pending.is_some() {
+            assert!(
+                app.worktree_commits
+                    .as_ref()
+                    .is_none_or(|p| p.name == "other"),
+                "must not flash another worktree's commits"
+            );
+        }
+        settle_commits(&mut app);
+        assert!(app.showing_worktree_commits());
+        assert_eq!(app.worktree_commits.as_ref().unwrap().name, "other");
+    }
+
+    /// q from the commits panel only moves focus back to the list; it does not
+    /// reload the commit history.
+    #[test]
+    fn three_panel_q_returns_focus_without_reloading_commits() {
+        let (_tmp, mut app) = three_panel_clean_app();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.worktrees_focus, WorktreesFocus::Files);
+        let before = app.worktree_commits.as_ref().unwrap().lines.len();
+        press(&mut app, KeyCode::Char('q'));
+        assert_eq!(app.worktrees_focus, WorktreesFocus::List);
+        assert!(app.commits_pending.is_none());
+        assert_eq!(
+            app.worktree_commits.as_ref().unwrap().lines.len(),
+            before,
+            "q must not reload the commit list"
+        );
+    }
+
+    /// Opening the Stash tab starts a background list load so Tab cycling never
+    /// blocks on `git stash list`.
+    #[test]
+    fn stash_tab_loads_in_the_background() {
+        let (_tmp, mut app) = test_app();
+        app.refresh();
+        app.selected = 0;
+        // Call the loader directly so press()'s settle doesn't hide the pending state.
+        app.open_stash_tab();
+        assert_eq!(app.tab, Tab::Stash);
+        assert!(app.stash_loading(), "stash list must load off-thread");
+        settle_stash(&mut app);
+        assert!(!app.stash_loading());
     }
 
     /// With more worktrees than the three-panel list can show, overflow arrows

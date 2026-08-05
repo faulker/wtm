@@ -133,12 +133,7 @@ pub fn row_at_line(line: usize) -> Option<usize> {
     if line == check_line() {
         return Some(CHECK_ROW);
     }
-    for row in 0..FIELD_ROWS {
-        if line_of_row(row) == line {
-            return Some(row);
-        }
-    }
-    None
+    (0..FIELD_ROWS).find(|&row| line_of_row(row) == line)
 }
 
 /// State of the Settings tab's editor.
