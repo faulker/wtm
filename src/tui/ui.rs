@@ -13,8 +13,9 @@ use ratatui::widgets::{
 };
 
 use super::app::{
-    App, CheckoutCandidate, CherryTarget, CommitFocus, ConfirmOption, DiffRow, LogMode, Modal,
-    ResolverFile, RowList, Tab, TextInput, View, WorktreesFocus, filtered_candidates,
+    App, CheckoutCandidate, CherryTarget, CommitFocus, ConfirmOption, CreateOutcome, DiffRow,
+    LogMode, Modal, ResolverFile, RowList, Tab, TextInput, View, WorktreesFocus,
+    filtered_candidates,
 };
 use super::config_editor::{
     BRANCHES_REFRESH_ROW, CHECK_ROW, ConfigEditor, FIELD_ROWS, LAYOUT_ROW, OPEN_COMMAND_ROW,
@@ -29,7 +30,8 @@ use super::setup::{
 use super::theme::{self, ACCENT, BORDER, DIALOG_BG, DIALOG_BORDER, GRAPH_COLORS, SELECTION_BG};
 use crate::config::{
     DEFAULT_AUTO_UPDATE_CHECK, DEFAULT_BRANCHES_REFRESH_MINS, DEFAULT_DIFF_THEME, DEFAULT_LOCATION,
-    LOCATION_PRESETS, OpenCommandVars, WorktreesLayout, expand_open_command, worktrees_layout_label,
+    LOCATION_PRESETS, OpenCommandVars, WorktreesLayout, expand_open_command,
+    worktrees_layout_label,
 };
 use crate::conflict::{ConflictSegment, ResolutionAction};
 use crate::git::{GraphLine, StatusEntry};
@@ -197,11 +199,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         View::Creating {
             branch,
             lines,
-            done,
+            outcome,
             input,
             kill_armed,
             ..
-        } => draw_creating(frame, main, branch, lines, *done, input, *kill_armed),
+        } => draw_creating(
+            frame,
+            main,
+            branch,
+            lines,
+            outcome.as_ref(),
+            input,
+            *kill_armed,
+        ),
         View::Setup(wizard) => overlay_hit = draw_setup(frame, main, wizard),
         View::Commit {
             name,
@@ -209,8 +219,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             marked,
             cursor,
             input,
+            body,
             focus,
-        } => overlay_hit = draw_commit(frame, main, name, files, marked, *cursor, input, focus),
+        } => {
+            overlay_hit = draw_commit(
+                frame, main, name, files, marked, *cursor, input, body, focus,
+            )
+        }
         View::Switch {
             name,
             branches,
@@ -1147,8 +1162,15 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             CommitFocus::Files => help::COMMIT_FILES,
             CommitFocus::Message => &[
                 hint("type", "commit message"),
-                hint("Tab", "pick files"),
+                hint("Tab", "body"),
                 hint("Enter", "commit"),
+                hint("Esc", "cancel"),
+            ],
+            CommitFocus::Body => &[
+                hint("type", "commit body"),
+                hint("Enter", "new line"),
+                hint("Tab", "pick files"),
+                hint("^S", "commit"),
                 hint("Esc", "cancel"),
             ],
         },
@@ -1200,7 +1222,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             hint("type + Enter", "answer a prompt"),
             hint("Ctrl+C ×2", "kill setup"),
         ],
-        View::Creating { .. } => &[hint("Enter", "continue")],
+        View::Creating { .. } => &[hint("Enter", "done · back to worktrees")],
         View::Setup(wizard) => match &wizard.step {
             Step::Welcome { .. } => &[
                 hint("↑/↓", "choose"),
@@ -1270,6 +1292,75 @@ fn push_cursor_spans(spans: &mut Vec<Span<'static>>, value: &str, cursor: usize,
         }
         None => spans.push(Span::styled("▏".to_string(), base.fg(ACCENT))),
     }
+}
+
+/// Picks the visible character window for a single-line field that has `slot`
+/// columns for text, keeping the cell at `cursor` inside it. `len` is the
+/// character count; `cursor` may be `len` (the block cursor past the last
+/// character), which is why the window may end one short of the text.
+///
+/// Returns the half-open character range to render.
+fn cursor_window(len: usize, cursor: usize, slot: usize) -> (usize, usize) {
+    let slot = slot.max(1);
+    let cursor = cursor.min(len);
+    // Scrolling right pins the cursor to the last column; the clamp stops the
+    // window sliding past the end once the tail is on screen.
+    let max_start = (len + 1).saturating_sub(slot);
+    let start = cursor.saturating_sub(slot - 1).min(max_start);
+    (start, (start + slot).min(len))
+}
+
+/// One editable line with a block cursor, limited to `width` columns: when the
+/// text is longer, the visible window follows the cursor and `‹`/`›` mark the
+/// clipped side, so typing past the field's width stays visible instead of
+/// running off the edge with the cursor.
+fn cursor_line_windowed(input: &str, cursor: usize, width: u16) -> Line<'static> {
+    let chars: Vec<char> = input.chars().collect();
+    let len = chars.len();
+    // One column beyond the text for the block cursor past the last character.
+    let budget = width as usize;
+    if len < budget {
+        let mut spans = Vec::new();
+        push_cursor_spans(&mut spans, input, cursor, Style::new());
+        return Line::from(spans);
+    }
+    // A column at each end carries the elision marker (blank when that side
+    // isn't clipped), so the text window doesn't jump as the cursor moves.
+    let slot = budget.saturating_sub(2).max(1);
+    let (start, end) = cursor_window(len, cursor, slot);
+    let cursor = cursor.min(len);
+    let marker = |clipped: bool, glyph: &str| {
+        if clipped {
+            Span::styled(glyph.to_string(), Style::new().fg(ACCENT).dim())
+        } else {
+            Span::raw(" ")
+        }
+    };
+    let take = |range: std::ops::Range<usize>| chars[range].iter().collect::<String>();
+    let mut spans = vec![
+        marker(start > 0, "‹"),
+        Span::raw(take(start..cursor.min(end))),
+    ];
+    if cursor < end {
+        spans.push(Span::styled(
+            chars[cursor].to_string(),
+            Style::new().bg(ACCENT).fg(Color::Black),
+        ));
+        spans.push(Span::raw(take(cursor + 1..end)));
+    } else {
+        spans.push(Span::styled("▏", Style::new().fg(ACCENT)));
+    }
+    spans.push(marker(end < len, "›"));
+    Line::from(spans)
+}
+
+/// `cursor_line_windowed` behind the `❯ ` prompt prefix, for the dialogs whose
+/// input is a full-width row.
+fn prompt_line_windowed(input: &str, cursor: usize, width: u16) -> Line<'static> {
+    let mut line = cursor_line_windowed(input, cursor, width.saturating_sub(2));
+    line.spans
+        .insert(0, Span::styled("❯ ", Style::new().fg(ACCENT).bold()));
+    line
 }
 
 /// The typed input with a block cursor at the end, styled as a prompt line.
@@ -1487,35 +1578,54 @@ fn draw_base_picker(frame: &mut Frame, area: Rect, all_branches: &[String], sele
     frame.render_stateful_widget(list, inner, &mut state);
 }
 
+/// Rows the finished-state banner occupies: headline, path (or error), and
+/// the "press Enter" line.
+const CREATING_BANNER_ROWS: u16 = 3;
+
 fn draw_creating(
     frame: &mut Frame,
     area: Rect,
     branch: &str,
     lines: &[String],
-    done: bool,
+    outcome: Option<&CreateOutcome>,
     input: &str,
     kill_armed: bool,
 ) {
+    let done = outcome.is_some();
     let input_rows = u16::from(!done);
-    let height =
-        (lines.len() as u16 + 2 + input_rows).clamp(4, area.height.saturating_sub(2).max(4));
+    let banner_rows = if done { CREATING_BANNER_ROWS } else { 0 };
+    let min_height = 4 + banner_rows;
+    let height = (lines.len() as u16 + 2 + input_rows + banner_rows)
+        .clamp(min_height, area.height.saturating_sub(2).max(min_height));
     let popup = centered(area, 76, height);
     frame.render_widget(Clear, popup);
-    let title = if done {
-        // The READY/FAILED banner (pushed at the end) says which; the title
-        // mirrors it so it's visible even when the banner has scrolled off.
-        let failed = lines.iter().any(|l| l.contains("FAILED —"));
-        if failed {
-            format!("creating {branch} · failed")
-        } else {
-            format!("creating {branch} · ready")
-        }
-    } else {
-        format!("creating {branch} · running…")
+    let title = match outcome {
+        // The banner below says the same thing; the title mirrors it so the
+        // state is legible even at a glance.
+        Some(o) if o.ok => format!("creating {branch} · ready"),
+        Some(_) => format!("creating {branch} · failed"),
+        None => format!("creating {branch} · running…"),
     };
-    // Keep the tail visible when output exceeds the popup.
-    let capacity = (height - 2 - input_rows) as usize;
-    let skip = lines.len().saturating_sub(capacity);
+    frame.render_widget(dialog_panel(title), popup);
+    let inner = popup.inner(ratatui::layout::Margin::new(1, 1));
+    let [log_area, banner_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(banner_rows)]).areas(inner);
+
+    // Keep the tail visible when output exceeds the popup. Long lines wrap, so
+    // budget by rendered rows rather than by entries: counting entries lets a
+    // few wrapped lines overflow the area and pin the log to its *head*.
+    let capacity = log_area.height.saturating_sub(input_rows) as usize;
+    let width = log_area.width.max(1) as usize;
+    let mut used = 0;
+    let mut skip = lines.len();
+    for (i, line) in lines.iter().enumerate().rev() {
+        let rows = line.chars().count().div_ceil(width).max(1);
+        if used + rows > capacity {
+            break;
+        }
+        used += rows;
+        skip = i;
+    }
     let mut text: Vec<Line> = lines[skip..].iter().map(|l| output_line(l)).collect();
     if !done {
         if kill_armed {
@@ -1527,10 +1637,41 @@ fn draw_creating(
             text.push(prompt_line(input));
         }
     }
-    let para = Paragraph::new(text)
-        .block(dialog_panel(title))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(para, popup);
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), log_area);
+
+    // A filled banner pinned to the bottom of the popup: unlike a line pushed
+    // into the log above, a long `npm install` can't scroll it away.
+    if let Some(outcome) = outcome {
+        let (bg, headline, detail) = if outcome.ok {
+            (
+                theme::SUCCESS,
+                "  ✓  READY — worktree set up and ready to use",
+                outcome.path.clone(),
+            )
+        } else if outcome.path.is_empty() {
+            (
+                theme::DANGER,
+                "  ✗  FAILED — worktree creation failed",
+                outcome.detail.clone().unwrap_or_default(),
+            )
+        } else {
+            (
+                theme::DANGER,
+                "  ✗  FAILED — worktree created, but setup had errors",
+                outcome.path.clone(),
+            )
+        };
+        // The banner is fixed-height, so elide the middle of a long path
+        // rather than letting the right edge cut off the worktree name.
+        let detail = truncate_middle(&detail, banner_area.width.saturating_sub(2) as usize);
+        let banner = Paragraph::new(vec![
+            Line::styled(headline, Style::new().bold()),
+            Line::raw(format!("  {detail}")),
+            Line::styled("  press Enter to continue", Style::new().bold()),
+        ])
+        .style(Style::new().bg(bg).fg(Color::Black));
+        frame.render_widget(banner, banner_area);
+    }
 }
 
 /// Prompt for a one-off command to run in a worktree's directory.
@@ -1579,13 +1720,9 @@ fn draw_rename_worktree(frame: &mut Frame, area: Rect, name: &str, input: &super
 /// Styles one line of setup output: step results and errors stand out,
 /// echoed user input shows its prompt, plain command output stays dim.
 fn output_line(line: &str) -> Line<'_> {
-    let style = if line.contains("READY —") || line.starts_with("[ok]") || line.starts_with('✓') {
+    let style = if line.starts_with("[ok]") || line.starts_with('✓') {
         Style::new().fg(theme::SUCCESS).bold()
-    } else if line.contains("FAILED —")
-        || line.starts_with("[FAILED]")
-        || line.starts_with("error")
-        || line.starts_with('✗')
-    {
+    } else if line.starts_with("[FAILED]") || line.starts_with("error") || line.starts_with('✗') {
         Style::new().fg(theme::DANGER).bold()
     } else if line.starts_with('═') || line.starts_with("──") {
         Style::new().fg(ACCENT).bold()
@@ -2384,7 +2521,11 @@ fn draw_settings_tab(
         lines.push(Line::from(""));
     }
 
-    debug_assert_eq!(lines.len(), preview_line(), "form line map drifted from draw");
+    debug_assert_eq!(
+        lines.len(),
+        preview_line(),
+        "form line map drifted from draw"
+    );
 
     // Live preview of where worktrees will actually be created.
     let raw_dir = if editor.fields.worktree_dir.trim().is_empty() {
@@ -2549,8 +2690,12 @@ fn draw_open_command_list(frame: &mut Frame, area: Rect, list: &OpenCommandEdito
     frame.render_widget(Paragraph::new(Line::from(hint.dim())), hint_area);
 }
 
+/// Rows the commit dialog's body box occupies, borders included.
+const COMMIT_BODY_ROWS: u16 = 7;
+
 /// Commit dialog: a checklist of changed files (all ticked by default) above a
-/// clearly labelled commit-message input. Focus moves between the two panes.
+/// clearly labelled subject input and an optional multi-line body. Focus
+/// cycles through the three panes.
 #[allow(clippy::too_many_arguments)]
 fn draw_commit(
     frame: &mut Frame,
@@ -2560,17 +2705,37 @@ fn draw_commit(
     marked: &[bool],
     cursor: usize,
     input: &super::app::TextInput,
+    body: &super::app::TextArea,
     focus: &CommitFocus,
 ) -> Option<RowList> {
+    /// The four single-row fields: the two labels, the subject, and the hint.
+    const CHROME: u16 = 4;
     let list_rows = (files.len() as u16).clamp(1, 10);
-    let popup = centered(area, 72, list_rows + 8);
+    let popup = centered(area, 72, list_rows + 1 + CHROME + COMMIT_BODY_ROWS + 2);
     frame.render_widget(Clear, popup);
     frame.render_widget(dialog_panel(format!("commit · {name}")), popup);
     let inner = popup.inner(ratatui::layout::Margin::new(2, 1));
-    let [files_area, label_area, prompt_area, hint_area] = Layout::vertical([
-        Constraint::Length(list_rows + 1),
+    // A short terminal clamps the popup, so budget the rows explicitly rather
+    // than letting fixed constraints push the lower fields off: the body box
+    // gives way first, then the file list (which scrolls to its cursor).
+    let body_rows = inner
+        .height
+        .saturating_sub(CHROME + 2)
+        .min(COMMIT_BODY_ROWS);
+    let files_rows = inner.height.saturating_sub(CHROME + body_rows);
+    let [
+        files_area,
+        label_area,
+        prompt_area,
+        body_label_area,
+        body_area,
+        hint_area,
+    ] = Layout::vertical([
+        Constraint::Length(files_rows),
         Constraint::Length(1),
         Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(body_rows),
         Constraint::Length(1),
     ])
     .areas(inner);
@@ -2612,26 +2777,44 @@ fn draw_commit(
         len: files.len().min(10),
     };
 
-    // A label makes it obvious the prompt below is the commit message.
-    let label_style = if files_focused {
-        Style::new().dim()
-    } else {
-        Style::new().fg(ACCENT).bold()
+    // Labels make it obvious which field is which, and which one is live.
+    let label_style = |on: bool| {
+        if on {
+            Style::new().fg(ACCENT).bold()
+        } else {
+            Style::new().dim()
+        }
     };
     frame.render_widget(
-        Paragraph::new(Line::styled("Commit message:", label_style)),
+        Paragraph::new(Line::styled(
+            "Commit message:",
+            label_style(*focus == CommitFocus::Message),
+        )),
         label_area,
     );
+    // Windowed so a subject longer than the dialog scrolls with the cursor
+    // instead of running off the right edge.
     frame.render_widget(
-        Paragraph::new(prompt_line_at(input.as_str(), input.cursor)),
+        Paragraph::new(prompt_line_windowed(
+            input.as_str(),
+            input.cursor,
+            prompt_area.width,
+        )),
         prompt_area,
     );
+
+    let body_focused = *focus == CommitFocus::Body;
+    frame.render_widget(
+        Paragraph::new(Line::styled("Body (optional):", label_style(body_focused))),
+        body_label_area,
+    );
+    draw_commit_body(frame, body_area, body, body_focused);
 
     let selected_count = marked.iter().filter(|m| **m).count();
     frame.render_widget(
         Paragraph::new(Line::styled(
             format!(
-                "{selected_count}/{} file{} · Tab switches pane · Space toggles · Enter commits",
+                "{selected_count}/{} file{} · Tab switches pane · Space toggles · ^S commits",
                 files.len(),
                 if files.len() == 1 { "" } else { "s" }
             ),
@@ -2640,6 +2823,37 @@ fn draw_commit(
         hint_area,
     );
     Some(list_hit)
+}
+
+/// The commit dialog's body box: a bordered multi-line field that scrolls
+/// vertically to keep the cursor row on screen, with the cursor row itself
+/// windowed horizontally the same way the subject line is.
+fn draw_commit_body(frame: &mut Frame, area: Rect, body: &super::app::TextArea, focused: bool) {
+    let block = Block::bordered().border_style(if focused {
+        Style::new().fg(ACCENT)
+    } else {
+        Style::new().fg(theme::BORDER)
+    });
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = inner.height as usize;
+    // Vertical window: scroll only once the cursor passes the last row.
+    let (top, _) = cursor_window(body.lines.len(), body.row, rows.max(1));
+    let text: Vec<Line> = body
+        .lines
+        .iter()
+        .enumerate()
+        .skip(top)
+        .take(rows)
+        .map(|(i, line)| {
+            if focused && i == body.row {
+                cursor_line_windowed(line, body.col, inner.width)
+            } else {
+                Line::raw(line.clone())
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(text), inner);
 }
 
 /// Colors a porcelain status code: green when staged, red when only in the
@@ -3870,7 +4084,7 @@ fn draw_conflict_resolver(
 
 /// Floating multi-line editor for hand-editing one hunk's resolved text, with a
 /// visible block cursor. Saved with Ctrl+S, discarded with Esc.
-fn draw_hunk_editor(frame: &mut Frame, area: Rect, hunk: usize, editor: &super::app::HunkEditor) {
+fn draw_hunk_editor(frame: &mut Frame, area: Rect, hunk: usize, editor: &super::app::TextArea) {
     // Clamp bounds carefully: on a tiny terminal the available height can fall
     // below the preferred minimum, and `clamp` panics when min > max.
     let max_h = area.height.saturating_sub(2).max(3);
@@ -3980,7 +4194,10 @@ fn draw_modal(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
                 prompt_line_at(input.as_str(), input.cursor),
                 Line::from(hint.clone().dim()),
             ];
-            frame.render_widget(Paragraph::new(lines).block(dialog_panel(title.clone())), popup);
+            frame.render_widget(
+                Paragraph::new(lines).block(dialog_panel(title.clone())),
+                popup,
+            );
             None
         }
         Modal::HunkEditor(editor) => {
@@ -4403,7 +4620,10 @@ mod tests {
         assert!(ver.contains(CURRENT_VERSION), "{ver}");
         assert!(ver.contains("up to date"), "{ver}");
         // The unset toggle spells out which default it inherits.
-        assert!(out[2 + line_of_row(UPDATE_ROW)].contains("default"), "{out:#?}");
+        assert!(
+            out[2 + line_of_row(UPDATE_ROW)].contains("default"),
+            "{out:#?}"
+        );
 
         // A found release is called out instead.
         let release = Release {
@@ -4706,5 +4926,155 @@ mod tests {
         let out2 = create_dialog("feat", 2, "main", false);
         let marked2 = out2.iter().find(|l| l.contains('▌')).unwrap();
         assert!(marked2.contains("feat/deps"), "{out2:#?}");
+    }
+
+    /// A subject longer than the field must scroll with the cursor: the tail
+    /// stays visible and `‹` marks what scrolled off, instead of the cursor
+    /// running off the right edge.
+    #[test]
+    fn prompt_line_windowed_follows_the_cursor() {
+        let text = "abcdefghijklmnopqrstuvwxyz";
+        let width = 12;
+        let at = |cursor: usize| {
+            render(width, 1, |frame, area| {
+                frame.render_widget(
+                    Paragraph::new(prompt_line_windowed(text, cursor, width)),
+                    area,
+                );
+            })
+            .remove(0)
+        };
+
+        let end = at(text.chars().count());
+        assert!(end.contains('‹'), "text scrolled off the left: {end}");
+        assert!(end.contains('z'), "the cursor end must be visible: {end}");
+        assert!(
+            !end.contains('a'),
+            "the head must have scrolled away: {end}"
+        );
+
+        let start = at(0);
+        assert!(start.contains('a'), "{start}");
+        assert!(
+            start.contains('›'),
+            "text continues past the right: {start}"
+        );
+        assert!(!start.contains('z'), "{start}");
+    }
+
+    /// Short values are untouched: no markers, no window.
+    #[test]
+    fn prompt_line_windowed_leaves_short_values_alone() {
+        let out = render(20, 1, |frame, area| {
+            frame.render_widget(Paragraph::new(prompt_line_windowed("hi", 2, 20)), area);
+        })
+        .remove(0);
+        assert_eq!(out, "❯ hi▏");
+    }
+
+    /// The finished-create banner is pinned, so a setup run that produced more
+    /// output than the popup can hold still ends with a visible "ready".
+    #[test]
+    fn creating_banner_survives_a_long_log() {
+        let lines: Vec<String> = (0..200).map(|i| format!("line {i}")).collect();
+        let outcome = CreateOutcome {
+            ok: true,
+            path: "/tmp/wt/feature".to_string(),
+            detail: None,
+        };
+        let out = render(90, 20, |frame, area| {
+            draw_creating(frame, area, "feature", &lines, Some(&outcome), "", false);
+        });
+        assert!(out.iter().any(|r| r.contains("READY")), "{out:#?}");
+        assert!(
+            out.iter().any(|r| r.contains("/tmp/wt/feature")),
+            "{out:#?}"
+        );
+        assert!(
+            out.iter().any(|r| r.contains("press Enter to continue")),
+            "{out:#?}"
+        );
+        // The log is still there, tailing.
+        assert!(out.iter().any(|r| r.contains("line 199")), "{out:#?}");
+    }
+
+    /// A failed create says so in the same pinned spot, with the error.
+    #[test]
+    fn creating_banner_reports_failure() {
+        let outcome = CreateOutcome {
+            ok: false,
+            path: String::new(),
+            detail: Some("branch already checked out".to_string()),
+        };
+        let out = render(90, 12, |frame, area| {
+            draw_creating(frame, area, "feature", &[], Some(&outcome), "", false);
+        });
+        assert!(out.iter().any(|r| r.contains("FAILED")), "{out:#?}");
+        assert!(
+            out.iter().any(|r| r.contains("branch already checked out")),
+            "{out:#?}"
+        );
+    }
+
+    /// The commit dialog shows the body field, with its content.
+    #[test]
+    fn commit_dialog_draws_the_body_field() {
+        let files = vec![StatusEntry {
+            code: "M ".to_string(),
+            path: "src/main.rs".to_string(),
+        }];
+        let body = super::super::app::TextArea::new("why this change\nsecond line");
+        let out = render(100, 30, |frame, area| {
+            draw_commit(
+                frame,
+                area,
+                "feature",
+                &files,
+                &[true],
+                0,
+                &TextInput::with_value("subject"),
+                &body,
+                &CommitFocus::Body,
+            );
+        });
+        assert!(
+            out.iter().any(|r| r.contains("Body (optional)")),
+            "{out:#?}"
+        );
+        assert!(
+            out.iter().any(|r| r.contains("why this change")),
+            "{out:#?}"
+        );
+        assert!(out.iter().any(|r| r.contains("second line")), "{out:#?}");
+        assert!(out.iter().any(|r| r.contains("^S commits")), "{out:#?}");
+    }
+
+    /// On a terminal too short for the whole dialog the body box gives way
+    /// first; the subject line and the hint must never be squeezed out.
+    #[test]
+    fn commit_dialog_survives_a_short_terminal() {
+        let files: Vec<StatusEntry> = (0..10)
+            .map(|i| StatusEntry {
+                code: "M ".to_string(),
+                path: format!("src/file{i}.rs"),
+            })
+            .collect();
+        let marked = vec![true; files.len()];
+        let out = render(100, 16, |frame, area| {
+            draw_commit(
+                frame,
+                area,
+                "feature",
+                &files,
+                &marked,
+                0,
+                &TextInput::with_value("subject here"),
+                &super::super::app::TextArea::default(),
+                &CommitFocus::Message,
+            );
+        });
+        assert!(out.iter().any(|r| r.contains("Commit message")), "{out:#?}");
+        assert!(out.iter().any(|r| r.contains("subject here")), "{out:#?}");
+        assert!(out.iter().any(|r| r.contains("^S commits")), "{out:#?}");
     }
 }

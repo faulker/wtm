@@ -114,10 +114,11 @@ fn run(cli: Cli) -> Result<()> {
         Command::Commit {
             name,
             message,
+            body,
             paths,
         } => {
             let ctx = Ctx::discover_initialized(&cwd)?;
-            let result = ops::commit(&ctx, &name, &message, paths.as_deref())?;
+            let result = ops::commit(&ctx, &name, &message, body.as_deref(), paths.as_deref())?;
             if cli.json {
                 output::print_json(&result)?;
             } else {

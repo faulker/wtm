@@ -17,7 +17,8 @@ Two-state focus only (`WorktreesFocus { List, Files }`). Diff never takes focus;
 | --- | --- | --- |
 | List focused | Enter | Focus file list (replaces open Changes tab) |
 | Files focused | q / Esc | Return focus to worktree list (quit only from List) |
-| Files focused | other keys | Same as `on_changes_tab_key` |
+| Files focused | other keys | Same as `on_changes_tab_key`; keys it leaves unbound fall through to `on_worktrees_tab_key` |
+| Commits panel | other keys | Panel's own keys (j/k, g, Enter/v/→, t) win; everything else falls through to `on_worktrees_tab_key` |
 | List focused | other keys | Same as `on_worktrees_tab_key` |
 | Either | mouse click on panel | Steal focus to that panel |
 

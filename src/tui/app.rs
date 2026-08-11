@@ -36,7 +36,7 @@ pub struct TextInput {
 
 /// Byte offset of character index `idx` in `s`, or `s.len()` when past the end.
 /// Keeps single-line edits on UTF-8 char boundaries. Shared by `TextInput` and
-/// the multi-line `HunkEditor` so the boundary math lives in one place.
+/// the multi-line `TextArea` so the boundary math lives in one place.
 fn char_byte(s: &str, idx: usize) -> usize {
     s.char_indices().nth(idx).map(|(b, _)| b).unwrap_or(s.len())
 }
@@ -119,6 +119,18 @@ impl TextInput {
         let cursor = value.chars().count();
         Self { value, cursor }
     }
+}
+
+/// How a worktree create finished. Drives the pinned banner in
+/// `View::Creating` instead of being appended to the scrolling log, so a long
+/// `npm install` can't push the "ready" signal off screen.
+pub struct CreateOutcome {
+    /// True only when the worktree exists *and* every setup step succeeded.
+    pub ok: bool,
+    /// Worktree path, empty when the create itself failed.
+    pub path: String,
+    /// Error text when the create failed outright.
+    pub detail: Option<String>,
 }
 
 /// Message from the background create thread.
@@ -219,9 +231,7 @@ fn commit_log_lines(
         (true, LogMode::Flat) => ops::branch_log(ctx, branch, 200)
             .map(|r| flat_lines(r.entries))
             .map_err(|e| format!("{e:#}")),
-        (false, LogMode::Tree) => {
-            ops::log_graph(ctx, name, 100).map_err(|e| format!("{e:#}"))
-        }
+        (false, LogMode::Tree) => ops::log_graph(ctx, name, 100).map_err(|e| format!("{e:#}")),
         (false, LogMode::Flat) => ops::log(ctx, name, 100)
             .map(|r| flat_lines(r.entries))
             .map_err(|e| format!("{e:#}")),
@@ -239,8 +249,7 @@ struct CommitsLoadKey {
 }
 
 type CommitsPending = Option<(CommitsLoadKey, Task<Result<Vec<GraphLine>, String>>)>;
-type StatusRefreshPending =
-    Option<(u64, String, bool, Task<Result<Vec<StatusEntry>, String>>)>;
+type StatusRefreshPending = Option<(u64, String, bool, Task<Result<Vec<StatusEntry>, String>>)>;
 type StashPending = Option<(String, Task<Result<Vec<StashEntry>, String>>)>;
 
 /// Index of the first row holding a commit, skipping any leading art-only rows.
@@ -334,7 +343,7 @@ pub enum Modal {
     /// The manual conflict-hunk editor. Unlike the others it edits in place and
     /// saves back into the `ConflictResolver` screen underneath on Ctrl+S,
     /// rather than producing a `ModalResult`.
-    HunkEditor(HunkEditor),
+    HunkEditor(TextArea),
 }
 
 /// One selectable row of a `Modal::Confirm`.
@@ -517,6 +526,10 @@ pub enum View {
         lines: Vec<String>,
         rx: Task<CreateMsg>,
         done: bool,
+        /// Set once the create thread reports back. Rendered as a banner
+        /// pinned to the bottom of the popup, so it survives the log's
+        /// tail-trim no matter how much output the setup commands produced.
+        outcome: Option<CreateOutcome>,
         /// Handle for sending input to / killing the running setup command.
         control: SetupControl,
         /// Pending line of user input for a prompting setup command.
@@ -559,7 +572,8 @@ pub enum View {
     /// First-run setup wizard, shown until `.wtm.toml` exists.
     Setup(Box<SetupWizard>),
     /// Commit flow: pick which changed files to include (all by default) and
-    /// type a message. Focus toggles between the file list and the message.
+    /// type a message. Focus cycles between the file list, the subject line,
+    /// and the optional body.
     Commit {
         name: String,
         files: Vec<StatusEntry>,
@@ -568,6 +582,8 @@ pub enum View {
         /// Cursor into `files` while the file list has focus.
         cursor: usize,
         input: TextInput,
+        /// Optional commit body, below the subject line.
+        body: TextArea,
         focus: CommitFocus,
     },
     /// Picker for switching the selected worktree onto a different branch: any
@@ -762,11 +778,11 @@ pub struct ResolverFile {
     pub hunk: usize,
 }
 
-/// A minimal multi-line text editor for hand-editing one conflict hunk's
-/// resolved text. Lines are stored without their trailing newline; the seed's
-/// trailing newline is remembered and restored on save so line-based hunks
-/// round-trip exactly.
-pub struct HunkEditor {
+/// A minimal multi-line text editor, used for hand-editing a conflict hunk's
+/// resolved text and for the commit dialog's message body. Lines are stored
+/// without their trailing newline; the seed's trailing newline is remembered
+/// and restored by `text` so line-based hunks round-trip exactly.
+pub struct TextArea {
     /// The edited text, one entry per line, without line endings.
     pub lines: Vec<String>,
     /// Cursor row into `lines`.
@@ -777,7 +793,15 @@ pub struct HunkEditor {
     trailing_newline: bool,
 }
 
-impl HunkEditor {
+/// An empty editor still holds one (empty) line: `on_key` indexes the cursor's
+/// line directly, so `lines` is never allowed to be empty.
+impl Default for TextArea {
+    fn default() -> Self {
+        Self::new("")
+    }
+}
+
+impl TextArea {
     /// Seeds the editor from `text`, splitting it into editable lines.
     pub fn new(text: &str) -> Self {
         let trailing_newline = text.ends_with('\n');
@@ -1037,12 +1061,15 @@ pub fn current_file_index(rows: &[DiffRow], cursor: usize) -> Option<usize> {
 }
 
 /// Which part of the commit dialog has keyboard focus.
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum CommitFocus {
     /// The changed-file list: ↑/↓ move, Space toggles, `a` toggles all.
     Files,
     /// The commit message input: typing edits the message.
     Message,
+    /// The commit body: typing edits it and Enter inserts a newline, so
+    /// Ctrl+S is what commits from here.
+    Body,
 }
 
 /// Why a branch could not be safely deleted after its worktree was removed,
@@ -1885,7 +1912,11 @@ impl App {
             return;
         }
         let View::Creating {
-            lines, rx, done, ..
+            lines,
+            rx,
+            done,
+            outcome,
+            ..
         } = &mut self.view
         else {
             return;
@@ -1905,30 +1936,21 @@ impl App {
                             lines.push(format!("       {detail}"));
                         }
                     }
-                    // A loud banner after the step log so a long setup run
-                    // still ends with an unmistakable "you're done" signal.
-                    lines.push(String::new());
-                    lines.push("════════════════════════════════════".to_string());
-                    if result.setup_ok {
-                        lines.push("  READY — worktree set up and ready to use".to_string());
-                        lines.push(format!("  {}", result.path));
-                    } else {
-                        lines.push("  FAILED — worktree kept but setup had errors".to_string());
-                        lines.push(format!("  {}", result.path));
-                    }
-                    lines.push("  press Enter to continue".to_string());
-                    lines.push("════════════════════════════════════".to_string());
+                    *outcome = Some(CreateOutcome {
+                        ok: result.setup_ok,
+                        path: result.path.clone(),
+                        detail: None,
+                    });
                     *done = true;
                     // Branch list may now include the new worktree's branch.
                     invalidate_branches = true;
                 }
                 CreateMsg::Done(Err(e)) => {
-                    lines.push(String::new());
-                    lines.push("════════════════════════════════════".to_string());
-                    lines.push("  FAILED — worktree creation failed".to_string());
-                    lines.push(format!("  {e}"));
-                    lines.push("  press Enter to continue".to_string());
-                    lines.push("════════════════════════════════════".to_string());
+                    *outcome = Some(CreateOutcome {
+                        ok: false,
+                        path: String::new(),
+                        detail: Some(e),
+                    });
                     *done = true;
                 }
             }
@@ -1981,7 +2003,7 @@ impl App {
                 ..
             } => true,
             View::Commit {
-                focus: CommitFocus::Message,
+                focus: CommitFocus::Message | CommitFocus::Body,
                 ..
             } => true,
             View::Switch { .. } | View::RunCommand { .. } | View::RenameWorktree { .. } => true,
@@ -2994,6 +3016,24 @@ impl App {
             self.on_worktree_commits_key(key);
             return;
         }
+        // Worktree-level commands the changed-file keymap leaves unbound, so
+        // the file panel isn't a dead end for them either. Keys the file panel
+        // binds to something else (u = revert, s/S = stash, c = commit,
+        // t = layout, p/P = pull/push) are deliberately not in this list.
+        if matches!(
+            key.code,
+            KeyCode::Char('f')
+                | KeyCode::Char('b')
+                | KeyCode::Char('l')
+                | KeyCode::Char('m')
+                | KeyCode::Char('R')
+                | KeyCode::Char('x')
+                | KeyCode::Char('d')
+                | KeyCode::Char('n')
+        ) {
+            self.on_worktrees_tab_key(key);
+            return;
+        }
         self.on_changes_tab_key(key);
     }
 
@@ -3021,7 +3061,11 @@ impl App {
                 self.open_commit_diff_from_worktree_commits();
             }
             KeyCode::Char('t') => self.toggle_log_mode(),
-            _ => {}
+            // The panel belongs to the selected worktree, so anything it
+            // doesn't bind itself falls through to the worktree list's keymap
+            // (pull, push, fetch, update, commit, …). q/Esc never reach here:
+            // `on_worktrees_files_key` intercepts them above.
+            _ => self.on_worktrees_tab_key(key),
         }
     }
 
@@ -3113,11 +3157,10 @@ impl App {
             return false;
         }
         // Fast path: the Worktrees preview already holds this worktree's status.
-        if self.preview_for.is_some_and(|i| {
-            self.worktrees
-                .get(i)
-                .is_some_and(|w| w.name == name)
-        }) {
+        if self
+            .preview_for
+            .is_some_and(|i| self.worktrees.get(i).is_some_and(|w| w.name == name))
+        {
             let files = self.worktree_preview.clone();
             self.apply_changes_files(name, files, false);
             return true;
@@ -4302,6 +4345,7 @@ impl App {
             marked: c.marked.clone(),
             cursor: 0,
             input: TextInput::default(),
+            body: TextArea::default(),
             focus: CommitFocus::Message,
         });
     }
@@ -4570,6 +4614,7 @@ impl App {
             lines: Vec::new(),
             rx: Task::new(rx),
             done: false,
+            outcome: None,
             control,
             input: String::new(),
             kill_armed: false,
@@ -4717,6 +4762,7 @@ impl App {
                     marked,
                     cursor: 0,
                     input: TextInput::default(),
+                    body: TextArea::default(),
                     focus: CommitFocus::Message,
                 });
             }
@@ -4732,6 +4778,7 @@ impl App {
             marked,
             cursor,
             input,
+            body,
             focus,
             ..
         } = &mut self.view
@@ -4746,11 +4793,29 @@ impl App {
             KeyCode::Tab => {
                 *focus = match focus {
                     CommitFocus::Files => CommitFocus::Message,
-                    CommitFocus::Message => CommitFocus::Files,
+                    CommitFocus::Message => CommitFocus::Body,
+                    CommitFocus::Body => CommitFocus::Files,
                 };
                 return;
             }
-            KeyCode::Enter => {
+            KeyCode::BackTab => {
+                *focus = match focus {
+                    CommitFocus::Files => CommitFocus::Body,
+                    CommitFocus::Message => CommitFocus::Files,
+                    CommitFocus::Body => CommitFocus::Message,
+                };
+                return;
+            }
+            // Enter inserts a newline in the body, so committing from there
+            // needs its own key; it works from the other panes too.
+            KeyCode::Char('s') | KeyCode::Char('d')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.do_commit();
+                return;
+            }
+            // Enter still commits from the file list and the subject line.
+            KeyCode::Enter if *focus != CommitFocus::Body => {
                 self.do_commit();
                 return;
             }
@@ -4778,6 +4843,7 @@ impl App {
             CommitFocus::Message => {
                 input.on_key(key);
             }
+            CommitFocus::Body => body.on_key(key),
         }
     }
 
@@ -4789,11 +4855,14 @@ impl App {
             files,
             marked,
             input,
+            body,
             ..
         } = &self.view
         else {
             return;
         };
+        let body = body.text().trim().to_string();
+        let body = (!body.is_empty()).then_some(body);
         let message = input.trimmed();
         if message.is_empty() {
             self.message = Some("commit message must not be empty".to_string());
@@ -4814,7 +4883,7 @@ impl App {
             format!("committing '{name}'…"),
             BusyThen::List,
             move |ctx| {
-                ops::commit(ctx, &name, &message, Some(&paths))
+                ops::commit(ctx, &name, &message, body.as_deref(), Some(&paths))
                     .map(|r| {
                         format!(
                             "committed {} · {} ({} file{})",
@@ -5497,7 +5566,8 @@ impl App {
             self.branches_want_selected = selected;
             return;
         }
-        let timeout = Duration::from_secs(self.ctx.config.branches_refresh_mins().saturating_mul(60));
+        let timeout =
+            Duration::from_secs(self.ctx.config.branches_refresh_mins().saturating_mul(60));
         let fresh = self
             .branches_loaded_at
             .is_some_and(|at| at.elapsed() < timeout);
@@ -6457,7 +6527,7 @@ impl App {
                     },
                 );
             if let Some(text) = seed {
-                self.modal = Some(Modal::HunkEditor(HunkEditor::new(&text)));
+                self.modal = Some(Modal::HunkEditor(TextArea::new(&text)));
             }
         }
     }
@@ -7344,17 +7414,9 @@ impl App {
             }
             View::List if self.worktree_commits.is_some() || self.commits_pending.is_some() => {
                 let (name, branch, from_branch) = if let Some(panel) = &self.worktree_commits {
-                    (
-                        panel.name.clone(),
-                        panel.branch.clone(),
-                        panel.from_branch,
-                    )
+                    (panel.name.clone(), panel.branch.clone(), panel.from_branch)
                 } else if let Some((key, _)) = &self.commits_pending {
-                    (
-                        key.name.clone(),
-                        key.branch.clone(),
-                        key.from_branch,
-                    )
+                    (key.name.clone(), key.branch.clone(), key.from_branch)
                 } else {
                     return;
                 };
@@ -8287,16 +8349,19 @@ mod tests {
         }
         wait_creating(&mut app, |_, done| done);
         match &app.view {
-            View::Creating { lines, done, .. } => {
+            View::Creating { done, outcome, .. } => {
                 assert!(*done);
+                // The pinned banner is driven by `outcome`, not by a line
+                // pushed into the log that a long setup run could scroll away.
+                let outcome = outcome
+                    .as_ref()
+                    .expect("finished create must report an outcome");
+                assert!(outcome.ok, "setup should have succeeded");
                 assert!(
-                    lines.iter().any(|l| l.contains("READY —")),
-                    "finished create must show a prominent ready banner: {lines:?}"
+                    !outcome.path.is_empty(),
+                    "banner must show the worktree path"
                 );
-                assert!(
-                    lines.iter().any(|l| l.contains("press Enter to continue")),
-                    "lines: {lines:?}"
-                );
+                assert!(outcome.detail.is_none());
             }
             _ => panic!("expected creating view"),
         }
@@ -8421,7 +8486,10 @@ mod tests {
             app.branches_loading(),
             "manual refresh must bypass the cache"
         );
-        assert!(!app.branches.is_empty(), "stale list stays until the load lands");
+        assert!(
+            !app.branches.is_empty(),
+            "stale list stays until the load lands"
+        );
         settle_branches(&mut app);
     }
 
@@ -9583,6 +9651,76 @@ mod tests {
         assert!(app.message.as_deref().unwrap().contains("clean"));
     }
 
+    /// Tab reaches the body, where Enter makes a new line instead of
+    /// committing, and Ctrl+S writes subject + blank line + body.
+    #[test]
+    fn commit_body_is_written_below_the_subject() {
+        let (_tmp, mut app) = test_app();
+        dirty_main(&mut app);
+        let dir = app.worktrees[0].path.clone();
+        press(&mut app, KeyCode::Char('c'));
+        type_str(&mut app, "add scratch");
+
+        press(&mut app, KeyCode::Tab); // message -> body
+        match &app.view {
+            View::Commit { focus, .. } => assert_eq!(*focus, CommitFocus::Body),
+            _ => panic!("expected the commit dialog"),
+        }
+        type_str(&mut app, "why it matters");
+        press(&mut app, KeyCode::Enter);
+        type_str(&mut app, "second line");
+        match &app.view {
+            View::Commit { body, .. } => {
+                assert!(
+                    matches!(app.view, View::Commit { .. }),
+                    "Enter must not commit"
+                );
+                assert_eq!(body.lines, vec!["why it matters", "second line"]);
+            }
+            _ => panic!("Enter in the body must not commit"),
+        }
+
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        settle(&mut app);
+        assert!(matches!(app.view, View::List), "message: {:?}", app.message);
+        let full = String::from_utf8(
+            Command::new("git")
+                .args(["log", "-1", "--format=%B"])
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        assert_eq!(
+            full.trim_end(),
+            "add scratch\n\nwhy it matters\nsecond line",
+            "git must separate subject and body with a blank line"
+        );
+    }
+
+    /// An untouched body field commits exactly as before: subject only.
+    #[test]
+    fn commit_without_a_body_stays_subject_only() {
+        let (_tmp, mut app) = test_app();
+        dirty_main(&mut app);
+        let dir = app.worktrees[0].path.clone();
+        press(&mut app, KeyCode::Char('c'));
+        type_str(&mut app, "just a subject");
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        let full = String::from_utf8(
+            Command::new("git")
+                .args(["log", "-1", "--format=%B"])
+                .current_dir(&dir)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        assert_eq!(full.trim_end(), "just a subject");
+    }
+
     #[test]
     fn commit_empty_message_is_rejected() {
         let (_tmp, mut app) = test_app();
@@ -10469,7 +10607,7 @@ mod tests {
     #[test]
     fn hunk_editor_edits_and_round_trips() {
         // Seed with two lines; the trailing newline must survive.
-        let mut ed = HunkEditor::new("ab\ncd\n");
+        let mut ed = TextArea::new("ab\ncd\n");
         assert_eq!(ed.lines, vec!["ab", "cd"]);
         // Insert at the front of line 0.
         ed.on_key(KeyEvent::from(KeyCode::Char('X')));
@@ -13311,6 +13449,68 @@ mod tests {
         assert!(app.worktree_commits.is_some());
     }
 
+    /// The commits panel shows the *selected worktree's* history, so the
+    /// worktree keymap (pull/push/fetch/update/…) has to work from there too,
+    /// without shadowing the panel's own keys.
+    #[test]
+    fn three_panel_commits_panel_runs_worktree_commands() {
+        let (_tmp, mut app) = three_panel_clean_app();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.worktrees_focus, WorktreesFocus::Files);
+        assert!(app.worktree_commits.is_some());
+
+        // The panel's own binding still wins over the worktree list's.
+        let before = app.log_mode;
+        press(&mut app, KeyCode::Char('t'));
+        assert_ne!(app.log_mode, before, "t still toggles the log mode");
+
+        // A key the panel doesn't bind falls through to the worktree keymap.
+        press(&mut app, KeyCode::Char('p'));
+        assert!(
+            matches!(app.view, View::Busy { .. }),
+            "p must start a pull from the commits panel"
+        );
+        settle(&mut app);
+        app.error = None;
+
+        press(&mut app, KeyCode::Char('f'));
+        assert!(
+            matches!(app.view, View::Busy { .. }),
+            "f must fetch from the commits panel"
+        );
+        settle(&mut app);
+        app.error = None;
+
+        // Dialogs open from here as well.
+        press(&mut app, KeyCode::Char('n'));
+        assert!(matches!(app.view, View::Create { .. }), "n opens create");
+    }
+
+    /// The changed-file panel gets the worktree commands its own keymap leaves
+    /// unbound, without disturbing the ones it does bind (`u` reverts a file,
+    /// it does not update the worktree).
+    #[test]
+    fn three_panel_files_panel_reaches_unbound_worktree_keys() {
+        let (_tmp, mut app) = three_panel_app();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.worktrees_focus, WorktreesFocus::Files);
+        assert!(app.worktree_commits.is_none(), "dirty worktree: file panel");
+
+        press(&mut app, KeyCode::Char('f'));
+        assert!(
+            matches!(app.view, View::Busy { .. }),
+            "f must fetch from the file panel"
+        );
+        settle(&mut app);
+        app.error = None;
+
+        press(&mut app, KeyCode::Char('u'));
+        assert!(
+            !matches!(app.view, View::Busy { .. }),
+            "u still means revert-file here, not update"
+        );
+    }
+
     /// Dirty ↔ clean flips swap the three-panel bottom between changes and
     /// commits without leaving the Worktrees tab.
     #[test]
@@ -13362,7 +13562,11 @@ mod tests {
         let path = PathBuf::from(&other.path);
         git(&path, &["commit", "--allow-empty", "-m", "on other"]);
         app.refresh();
-        app.selected = app.worktrees.iter().position(|w| w.name == "other").unwrap();
+        app.selected = app
+            .worktrees
+            .iter()
+            .position(|w| w.name == "other")
+            .unwrap();
         app.preview_for = None;
         app.worktree_commits = None;
         app.commits_pending = None;

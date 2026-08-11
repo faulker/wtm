@@ -926,6 +926,58 @@ fn commit_paths_flag_stages_only_selected_files() {
     assert_eq!(changes[0]["path"], "other.txt");
 }
 
+/// `--body` lands below the subject, separated by the blank line git inserts
+/// between two `-m` values. `summary` stays subject-only.
+#[test]
+fn commit_body_flag_writes_a_message_body() {
+    let (_tmp, repo) = setup_repo();
+    let created = stdout_json(&wtm(&repo, &["create", "feat", "--json"]));
+    let wt_path = PathBuf::from(created["path"].as_str().unwrap());
+    std::fs::write(wt_path.join("README.md"), "changed\n").unwrap();
+
+    let result = stdout_json(&wtm(
+        &repo,
+        &[
+            "commit",
+            "feat",
+            "-m",
+            "do the thing",
+            "-b",
+            "because of the reason\nand another line",
+            "--json",
+        ],
+    ));
+    assert_eq!(result["summary"], "do the thing");
+
+    let full = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["log", "-1", "--format=%B"])
+            .current_dir(&wt_path)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(
+        full.trim_end(),
+        "do the thing\n\nbecause of the reason\nand another line"
+    );
+
+    // Without --body the message is unchanged: subject only.
+    std::fs::write(wt_path.join("README.md"), "changed again\n").unwrap();
+    wtm(&repo, &["commit", "feat", "-m", "no body", "--json"]);
+    let full = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["log", "-1", "--format=%B"])
+            .current_dir(&wt_path)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(full.trim_end(), "no body");
+}
+
 #[test]
 fn stash_push_list_apply_pop_drop_roundtrip() {
     let (_tmp, repo) = setup_repo();

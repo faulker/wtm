@@ -12,7 +12,7 @@ Three ways to use it:
 
 The Worktrees tab is the home screen: every worktree with how many files it has changed, how far it is ahead of or behind its upstream, and any flags (`unpushed`/`behind` vs upstream, `same`/`changed`/`outdated` vs its creation base or the default branch, `✓merged`, `locked`). The panel underneath lists the changed files of whichever worktree you have selected, so you can see what an agent has been up to without leaving the list. Every changed file is listed: when there are more than fit, `⇧↑`/`⇧↓` or the mouse wheel over the panel scroll it, and the border shows your position (`10-18/27`). Clicking a file there opens it on the Changes tab.
 
-If you'd rather read the diff without leaving the tab, `wtm config set --global worktrees_layout three_panel` (or the `worktrees_layout` row on the Settings tab) swaps that in for a **three-panel** Worktrees tab: a compact scrollable worktree list on top, and the Changes tab's file list and syntax-highlighted diff filling the space below it. When the highlighted worktree is clean, that bottom area shows the branch's commit list instead (navigate and open a commit the same way as Branches → Enter). `Enter` hands the keyboard to the panel below and `q`/`Esc` gives it back, so the app still only quits from the worktree list. The Changes tab is folded away while this layout is on (it's already on screen), and a terminal too short for three panels falls back to two so the diff stays reachable. The default is `two_panel`.
+If you'd rather read the diff without leaving the tab, `wtm config set --global worktrees_layout three_panel` (or the `worktrees_layout` row on the Settings tab) swaps that in for a **three-panel** Worktrees tab: a compact scrollable worktree list on top, and the Changes tab's file list and syntax-highlighted diff filling the space below it. When the highlighted worktree is clean, that bottom area shows the branch's commit list instead (navigate and open a commit the same way as Branches → Enter). `Enter` hands the keyboard to the panel below and `q`/`Esc` gives it back, so the app still only quits from the worktree list. The bottom panel is the selected worktree's, so the worktree keys (`p` pull, `P` push, `f` fetch, `u` update, `c` commit, and the rest) keep working while it holds the keyboard. The Changes tab is folded away while this layout is on (it's already on screen), and a terminal too short for three panels falls back to two so the diff stays reachable. The default is `two_panel`.
 
 The mouse works throughout: clicking a tab switches to it, and clicking a row selects it.
 
@@ -144,7 +144,7 @@ wtm mcp                               # MCP server over stdio
 Everyday git, addressed by worktree name:
 
 ```sh
-wtm commit <name> -m <msg> [--paths a,b]   # stage (everything, or just --paths) and commit
+wtm commit <name> -m <msg> [-b <body>] [--paths a,b]   # stage (everything, or just --paths) and commit
 wtm stash push <name> [-m <msg>]           # stash changes, untracked files included
 wtm stash list|pop|apply|drop <name> [--index N]
 wtm move-changes <from> <to>               # move uncommitted changes into another worktree (destination must be clean)
@@ -196,7 +196,7 @@ The same conflict flow covers five sources: `merge`, `rebase`, `update`, `cherry
 Everyday git operations, each scoped to one worktree addressed by name:
 
 ```sh
-wtm commit <name> -m <msg> [--paths a,b]   # stage (all, or just these paths) and commit
+wtm commit <name> -m <msg> [-b <body>] [--paths a,b]   # stage (all, or just these paths) and commit
 wtm log <name> [-n <count>]                # recent commits (default 20)
 wtm pull <name> [--rebase]                 # fast-forward pull, or rebase; errors if no upstream
 wtm push <name> [--force-with-lease]       # push; publishes to origin with -u if no upstream

@@ -10,8 +10,10 @@ use ratatui::style::Color;
 pub const ACCENT: Color = Color::Cyan;
 /// Border color for all panels.
 pub const BORDER: Color = Color::DarkGray;
-/// Background of the selected row in lists and tables.
-pub const SELECTION_BG: Color = Color::DarkGray;
+/// Background of the selected row in lists and tables. Deliberately a dark
+/// grey rather than `Color::DarkGray`, which many terminals render bright
+/// enough to wash out the row's own colors (commit hashes, graph art).
+pub const SELECTION_BG: Color = Color::Indexed(236);
 /// Solid fill behind dialog/modal overlays so they read as a card over the UI.
 pub const DIALOG_BG: Color = Color::Black;
 /// Border color for dialog/modal overlays (stronger than panel chrome).

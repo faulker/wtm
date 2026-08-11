@@ -59,9 +59,12 @@ pub enum Command {
     Commit {
         /// Worktree name.
         name: String,
-        /// Commit message.
+        /// Commit message (the subject line).
         #[arg(long, short)]
         message: String,
+        /// Commit body, placed below the subject line.
+        #[arg(long, short)]
+        body: Option<String>,
         /// Only stage these paths (comma-separated); default stages everything.
         #[arg(long, value_delimiter = ',')]
         paths: Option<Vec<String>>,

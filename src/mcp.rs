@@ -44,8 +44,10 @@ struct NameRequest {
 struct CommitRequest {
     #[schemars(description = "worktree name (branch name, or directory name when detached)")]
     name: String,
-    #[schemars(description = "commit message")]
+    #[schemars(description = "commit message (the subject line)")]
     message: String,
+    #[schemars(description = "optional commit body, placed below the subject line")]
+    body: Option<String>,
     #[schemars(description = "only stage these paths; defaults to staging every change")]
     paths: Option<Vec<String>>,
 }
@@ -332,8 +334,14 @@ impl WtmServer {
         &self,
         Parameters(req): Parameters<CommitRequest>,
     ) -> Result<CallToolResult, ErrorData> {
-        let result = ops::commit(&self.ctx()?, &req.name, &req.message, req.paths.as_deref())
-            .map_err(internal)?;
+        let result = ops::commit(
+            &self.ctx()?,
+            &req.name,
+            &req.message,
+            req.body.as_deref(),
+            req.paths.as_deref(),
+        )
+        .map_err(internal)?;
         json_result(&result)
     }
 

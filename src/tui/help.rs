@@ -244,6 +244,11 @@ pub const WORKTREE_FILES: &[Binding] = &[
     both("Space", "mark", "mark a file (or folder) for commit"),
     both("c", "commit", "commit the marked files"),
     both("q/Esc", "worktrees", "focus the worktree list again"),
+    help_only(
+        "f/b/l/m/d/n",
+        "worktree commands the file keymap doesn't bind (fetch, switch \
+         branch, log, move changes, delete, new) still work from here",
+    ),
 ];
 
 /// Footer hints for the three-panel Worktrees layout while the bottom panel
@@ -260,7 +265,20 @@ pub const WORKTREE_COMMITS: &[Binding] = &[
         "tree/flat",
         "switch between the commit tree and a flat list",
     ),
+    both("p/⇧P", "pull/push", "pull or push the worktree's branch"),
+    both("f", "fetch", "fetch from the remote"),
+    both("u", "update", "update the worktree from the default branch"),
+    both(
+        "c",
+        "commit",
+        "commit (pick files, all selected by default)",
+    ),
     both("q/Esc", "worktrees", "focus the worktree list again"),
+    help_only(
+        "n/d/r/b/l/m/s",
+        "every other worktree-list key works from here too (see the \
+         Worktrees section)",
+    ),
 ];
 
 pub const BRANCHES: &[Binding] = &[

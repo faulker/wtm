@@ -575,9 +575,15 @@ pub fn has_staged_changes(dir: &Path) -> Result<bool> {
     Ok(!run_predicate(dir, &["diff", "--cached", "--quiet"])?)
 }
 
-/// Commits the staged changes with `message`.
-pub fn commit(dir: &Path, message: &str) -> Result<()> {
-    run(dir, &["commit", "-m", message])?;
+/// Commits the staged changes with `message` as the subject and an optional
+/// `body`. The body goes in its own `-m`, which is what makes git insert the
+/// blank line between subject and body.
+pub fn commit(dir: &Path, message: &str, body: Option<&str>) -> Result<()> {
+    let mut args = vec!["commit", "-m", message];
+    if let Some(body) = body {
+        args.extend_from_slice(&["-m", body]);
+    }
+    run(dir, &args)?;
     Ok(())
 }
 

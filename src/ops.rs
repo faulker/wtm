@@ -556,6 +556,9 @@ pub fn create(
 
     let mut setup = Vec::new();
     for file in &ctx.config.setup.copy {
+        // Report each copy as it happens; otherwise the progress log sits
+        // empty until the first setup command runs and the UI looks stalled.
+        progress(&format!("copying: {}", file.display()));
         setup.push(copy_step(&ctx.repo_root, &path, file));
     }
     for cmd in &ctx.config.setup.run {
@@ -1245,11 +1248,13 @@ pub struct SwitchResult {
 }
 
 /// Stages and commits changes in the worktree named `name`. Stages everything
-/// by default, or only `paths` when given. Refuses when nothing is staged.
+/// by default, or only `paths` when given. `body` becomes the commit body
+/// below the subject line. Refuses when nothing is staged.
 pub fn commit(
     ctx: &Ctx,
     name: &str,
     message: &str,
+    body: Option<&str>,
     paths: Option<&[String]>,
 ) -> Result<CommitResult> {
     if message.trim().is_empty() {
@@ -1264,7 +1269,8 @@ pub fn commit(
     if !git::has_staged_changes(dir)? {
         bail!("nothing to commit in worktree '{}'", info.name);
     }
-    git::commit(dir, message)?;
+    let body = body.map(str::trim).filter(|b| !b.is_empty());
+    git::commit(dir, message, body)?;
     Ok(CommitResult {
         name: info.name,
         hash: git::short_hash(dir)?,
@@ -2098,7 +2104,7 @@ pub fn complete_resolution(
                 bail!("worktree '{}' has no merge in progress", info.name);
             }
             match message {
-                Some(msg) => git::commit(dir, msg)?,
+                Some(msg) => git::commit(dir, msg, None)?,
                 None => git::merge_continue(dir)?,
             }
             Some(git::short_hash(dir)?)
