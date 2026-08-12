@@ -24,8 +24,9 @@ use app::App;
 
 /// Runs the interactive TUI until the user quits.
 ///
-/// A self-update sets `App::restart_exe`; that hand-off happens here, after the
-/// terminal has been restored, so the new binary starts from a clean terminal.
+/// A self-update sets `App::restart_exe` and a terminal-mode open command sets
+/// `App::exec_on_exit`; both hand-offs happen here, after the terminal has been
+/// restored, so the program that takes over starts from a clean terminal.
 pub fn run(ctx: Ctx) -> Result<()> {
     let mut app = App::new(ctx)?;
     let mut terminal = ratatui::init();
@@ -52,7 +53,24 @@ pub fn run(ctx: Ctx) -> Result<()> {
         println!("restarting {}", exe.display());
         crate::update::restart(exe)?;
     }
+    if let Some((cmd, dir)) = &app.exec_on_exit {
+        return exec_in_terminal(cmd, dir);
+    }
     Ok(())
+}
+
+/// Runs a `CommandMode::Terminal` open command in place of the TUI, inheriting
+/// this (already restored) terminal so an interactive program can use it. wtm
+/// exits with the command's own status.
+fn exec_in_terminal(cmd: &str, dir: &str) -> Result<()> {
+    use anyhow::Context;
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(dir)
+        .status()
+        .with_context(|| format!("failed to run '{cmd}' in {dir}"))?;
+    std::process::exit(status.code().unwrap_or(0));
 }
 
 /// Draw/input loop. Polls with a timeout so background create progress keeps

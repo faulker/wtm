@@ -8,8 +8,8 @@ use crate::conflict::ConflictSegment;
 use crate::git::StatusEntry;
 use crate::ops::{
     BranchCreateResult, BranchDeleteResult, BranchListResult, BranchRenameResult,
-    CherryPickOutcome, CommitResult, CompleteResolutionResult, ConflictFile, CreateResult,
-    FetchResult, LogResult, MergeOutcome, MoveChangesResult, PullResult, PushResult,
+    BranchUpstreamResult, CherryPickOutcome, CommitResult, CompleteResolutionResult, ConflictFile,
+    CreateResult, FetchResult, LogResult, MergeOutcome, MoveChangesResult, PullResult, PushResult,
     StashListResult, StashPopOutcome, StashResult, SwitchResult, WorktreeInfo,
     WorktreeRenameResult,
 };
@@ -258,6 +258,21 @@ pub fn print_branch_delete(result: &BranchDeleteResult) {
 /// Human-readable branch-rename confirmation.
 pub fn print_branch_rename(result: &BranchRenameResult) {
     println!("renamed branch '{}' to '{}'", result.old, result.new);
+}
+
+/// Human-readable upstream-change confirmation, naming the previous upstream
+/// so a change reads as a change rather than as a fresh setting.
+pub fn print_branch_upstream(result: &BranchUpstreamResult) {
+    match (&result.upstream, &result.previous) {
+        (Some(now), Some(before)) if now != before => {
+            println!("'{}' now tracks {now} (was {before})", result.name)
+        }
+        (Some(now), _) => println!("'{}' now tracks {now}", result.name),
+        (None, Some(before)) => {
+            println!("'{}' no longer tracks {before}", result.name)
+        }
+        (None, None) => println!("'{}' has no upstream", result.name),
+    }
 }
 
 /// Human-readable worktree-rename confirmation.

@@ -266,6 +266,26 @@ fn run(cli: Cli) -> Result<()> {
                         output::print_branch_rename(&result);
                     }
                 }
+                BranchAction::Upstream {
+                    name,
+                    upstream,
+                    unset,
+                } => {
+                    // `--unset` and a target are contradictory; refusing beats
+                    // silently preferring one of them.
+                    if unset && upstream.is_some() {
+                        anyhow::bail!("pass either an upstream or --unset, not both");
+                    }
+                    if !unset && upstream.is_none() {
+                        anyhow::bail!("pass an upstream to track, or --unset to stop tracking");
+                    }
+                    let result = ops::branch_set_upstream(&ctx, &name, upstream.as_deref())?;
+                    if cli.json {
+                        output::print_json(&result)?;
+                    } else {
+                        output::print_branch_upstream(&result);
+                    }
+                }
                 BranchAction::Log { name, count } => {
                     let result = ops::branch_log(&ctx, &name, count)?;
                     if cli.json {

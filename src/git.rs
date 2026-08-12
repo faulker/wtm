@@ -816,6 +816,48 @@ pub fn branch_upstream(dir: &Path, branch: &str) -> Result<Option<(String, Strin
     Ok(Some((remote.to_string(), merge.to_string())))
 }
 
+/// Points `branch` at the remote-tracking ref `upstream` (e.g. `origin/main`),
+/// without checking `branch` out. git verifies `upstream` exists and fails with
+/// its own message when it doesn't.
+pub fn set_upstream(dir: &Path, branch: &str, upstream: &str) -> Result<()> {
+    run(
+        dir,
+        &["branch", &format!("--set-upstream-to={upstream}"), branch],
+    )?;
+    Ok(())
+}
+
+/// Removes `branch`'s upstream tracking, leaving the branch itself alone. git
+/// fails when the branch has no upstream to begin with, so callers check first.
+pub fn unset_upstream(dir: &Path, branch: &str) -> Result<()> {
+    run(dir, &["branch", "--unset-upstream", branch])?;
+    Ok(())
+}
+
+/// Every remote-tracking ref (`origin/main`, …), newest commit first. These are
+/// the candidates a branch can track.
+///
+/// `refs/remotes/origin/HEAD` shortens to a bare `origin`, which is a remote
+/// rather than a branch and cannot be tracked, so entries with no `<remote>/`
+/// prefix are dropped along with any explicit `…/HEAD`.
+pub fn remote_tracking_refs(dir: &Path) -> Result<Vec<String>> {
+    let out = run(
+        dir,
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname:short)",
+            "refs/remotes",
+        ],
+    )?;
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.ends_with("/HEAD") && remote_short_name(l).is_some())
+        .map(str::to_string)
+        .collect())
+}
+
 /// Fast-forwards the local `branch` to `remote`'s `src` branch without checking
 /// it out, by fetching straight into the local ref. git refuses the update when
 /// it would not be a fast-forward, which is exactly the guarantee we want, and
@@ -1244,6 +1286,46 @@ pub fn detect_in_progress(dir: &Path) -> Option<InProgress> {
 /// True while a rebase is in progress in `dir`.
 pub fn is_rebasing(dir: &Path) -> bool {
     detect_in_progress(dir) == Some(InProgress::Rebase)
+}
+
+/// Names of the two sides of a stopped rebase in `dir`, as (ours, theirs):
+/// the branch being rebased onto, and the branch whose commits are being
+/// replayed. Both are `None` when the state files aren't there or can't be
+/// named.
+///
+/// This exists because git labels a rebase's conflict markers `HEAD` and a bare
+/// commit hash, and the worktree is on a detached HEAD while it runs, so
+/// neither the markers nor the checked-out branch name the sides. The state
+/// files git keeps for `rebase --continue` do.
+pub fn rebase_side_names(dir: &Path) -> (Option<String>, Option<String>) {
+    let Ok(git_dir) = git_dir(dir) else {
+        return (None, None);
+    };
+    // `rebase-merge` is the default/interactive machinery, `rebase-apply` the
+    // `--apply` backend; both keep the same two files.
+    let state = [git_dir.join("rebase-merge"), git_dir.join("rebase-apply")]
+        .into_iter()
+        .find(|p| p.exists());
+    let Some(state) = state else {
+        return (None, None);
+    };
+    let read = |name: &str| {
+        std::fs::read_to_string(state.join(name))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    // `onto` is a raw commit, so ask git for a branch name pointing at it and
+    // fall back to the short hash. `head-name` is already a full ref name.
+    let ours = read("onto").map(|onto| {
+        run(dir, &["describe", "--all", "--exact-match", &onto])
+            .ok()
+            .map(|s| s.trim_start_matches("heads/").to_string())
+            .or_else(|| run(dir, &["rev-parse", "--short", &onto]).ok())
+            .unwrap_or(onto)
+    });
+    let theirs = read("head-name").map(|r| r.trim_start_matches("refs/heads/").to_string());
+    (ours, theirs)
 }
 
 /// Rebases the branch checked out in `dir` onto `onto_ref`, replaying the

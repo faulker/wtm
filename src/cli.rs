@@ -323,6 +323,17 @@ pub enum BranchAction {
         /// New branch name.
         new: String,
     },
+    /// Change (or remove) the remote branch a branch tracks.
+    Upstream {
+        /// Branch name.
+        name: String,
+        /// Remote-tracking ref to follow, e.g. `origin/main`. Omit with
+        /// `--unset` to stop tracking anything.
+        upstream: Option<String>,
+        /// Remove the branch's upstream instead of setting one.
+        #[arg(long)]
+        unset: bool,
+    },
     /// Show a branch's commit history (without checking it out).
     Log {
         /// Branch name.

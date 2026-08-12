@@ -1107,6 +1107,17 @@ pub struct BranchRenameResult {
     pub new: String,
 }
 
+/// Result of `branch upstream`: what the branch tracks now and what it tracked
+/// before, so a caller can report the change rather than just the new state.
+#[derive(Debug, Clone, Serialize)]
+pub struct BranchUpstreamResult {
+    pub name: String,
+    /// The remote-tracking ref it now follows; `None` when tracking was removed.
+    pub upstream: Option<String>,
+    /// What it tracked before, if anything.
+    pub previous: Option<String>,
+}
+
 /// Result of `rename` (a worktree): the branch was renamed and the directory
 /// moved to match.
 #[derive(Debug, Clone, Serialize)]
@@ -1637,6 +1648,55 @@ pub fn branch_delete(ctx: &Ctx, name: &str, force: bool) -> Result<BranchDeleteR
     })
 }
 
+/// Points local branch `name` at the remote-tracking ref `upstream`, or drops
+/// its tracking entirely when `upstream` is `None`.
+///
+/// Only local branches have an upstream to change, so a remote-only row is
+/// refused rather than silently doing nothing. Clearing tracking on a branch
+/// that has none is likewise refused: git errors there anyway, and saying so
+/// plainly beats passing its message through.
+pub fn branch_set_upstream(
+    ctx: &Ctx,
+    name: &str,
+    upstream: Option<&str>,
+) -> Result<BranchUpstreamResult> {
+    if !git::branch_exists(&ctx.repo_root, name) {
+        bail!("'{name}' is not a local branch, so it has no upstream to change");
+    }
+    let previous = git::branch_upstream(&ctx.repo_root, name)?
+        .map(|(remote, branch)| format!("{remote}/{branch}"));
+    match upstream {
+        Some(upstream) => {
+            let upstream = upstream.trim();
+            if upstream.is_empty() {
+                bail!("upstream must not be empty");
+            }
+            git::set_upstream(&ctx.repo_root, name, upstream)?;
+            Ok(BranchUpstreamResult {
+                name: name.to_string(),
+                upstream: Some(upstream.to_string()),
+                previous,
+            })
+        }
+        None => {
+            if previous.is_none() {
+                bail!("branch '{name}' has no upstream to remove");
+            }
+            git::unset_upstream(&ctx.repo_root, name)?;
+            Ok(BranchUpstreamResult {
+                name: name.to_string(),
+                upstream: None,
+                previous,
+            })
+        }
+    }
+}
+
+/// Remote-tracking refs a branch can be set to track (`origin/main`, …).
+pub fn upstream_candidates(ctx: &Ctx) -> Result<Vec<String>> {
+    Ok(git::remote_tracking_refs(&ctx.repo_root)?)
+}
+
 /// Renames branch `old` to `new`.
 pub fn branch_rename(ctx: &Ctx, old: &str, new: &str) -> Result<BranchRenameResult> {
     git::branch_rename(&ctx.repo_root, old, new)?;
@@ -1971,11 +2031,25 @@ pub fn read_conflict(ctx: &Ctx, target: &str, path: &str) -> Result<ConflictFile
     let text =
         std::fs::read_to_string(&full).with_context(|| format!("reading {}", full.display()))?;
     let (marker_ours, marker_theirs) = conflict::marker_labels(&text);
-    let ours_label =
-        marker_ours.unwrap_or_else(|| info.branch.clone().unwrap_or_else(|| "HEAD".to_string()));
+    // Git's own labels are the first choice, but on a merge it writes the
+    // useless "HEAD" for our side, and on a rebase it writes "HEAD" plus a bare
+    // commit hash while the worktree sits on a detached HEAD. The side labels
+    // are the whole basis for deciding which change to keep, so name them from
+    // the rebase state files first, then the checked-out branch.
+    let (rebase_ours, rebase_theirs) = if git::is_rebasing(dir) {
+        git::rebase_side_names(dir)
+    } else {
+        (None, None)
+    };
+    let ours_label = marker_ours
+        .filter(|l| l != "HEAD")
+        .or(rebase_ours)
+        .or_else(|| info.branch.clone())
+        .unwrap_or_else(|| "HEAD".to_string());
     // Each in-progress operation names the incoming side with a different ref,
     // so try each in turn rather than assuming a merge.
-    let theirs_label = marker_theirs
+    let theirs_label = rebase_theirs
+        .or(marker_theirs)
         .or_else(|| {
             ["MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD"]
                 .iter()
@@ -2004,6 +2078,16 @@ pub fn write_resolution(ctx: &Ctx, target: &str, path: &str, resolved_text: &str
 /// Writes `text` to `path` in the worktree named `target` **without** staging
 /// it. Used to save a partly-resolved file: some hunks settled, the rest still
 /// wrapped in conflict markers, so git rightly still sees the path as unmerged.
+/// Reads `path` (relative to the worktree root) in the worktree named `target`
+/// verbatim, conflict markers and all. This is what the resolver's whole-file
+/// editor loads, so the user edits exactly the bytes git is looking at rather
+/// than a re-rendering of the parsed hunks.
+pub fn read_worktree_file(ctx: &Ctx, target: &str, path: &str) -> Result<String> {
+    let info = find(ctx, target)?.ok_or_else(|| not_found(ctx, target))?;
+    let full = Path::new(&info.path).join(path);
+    std::fs::read_to_string(&full).with_context(|| format!("reading {}", full.display()))
+}
+
 pub fn write_partial_resolution(ctx: &Ctx, target: &str, path: &str, text: &str) -> Result<()> {
     let info = find(ctx, target)?.ok_or_else(|| not_found(ctx, target))?;
     let full = Path::new(&info.path).join(path);
@@ -3841,8 +3925,9 @@ mod tests {
                 base: None,
             }]
         );
-        // Default markers label ours as HEAD and theirs as the merged branch.
-        assert_eq!(file.ours_label, "HEAD");
+        // Git's markers label ours "HEAD", which names nothing; the label
+        // reported is the branch actually checked out there.
+        assert_eq!(file.ours_label, "feature");
         assert_eq!(file.theirs_label, "main");
 
         // Resolve by keeping both, in order, then finish the merge.

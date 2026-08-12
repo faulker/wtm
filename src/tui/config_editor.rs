@@ -15,7 +15,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
 use super::app::TextInput;
 use super::highlight::{self, DIFF_THEMES};
-use crate::config;
+use crate::config::{self, OpenCommand};
 use crate::settings::{self, RepoConfigFields};
 
 /// Rows holding an editable value (worktree_dir, open_command, setup.copy,
@@ -33,9 +33,11 @@ pub const THEME_ROW: usize = TEXT_ROWS + 1;
 pub const LAYOUT_ROW: usize = TEXT_ROWS + 2;
 /// Index of the Branches-tab cache timeout (editable minutes).
 pub const BRANCHES_REFRESH_ROW: usize = TEXT_ROWS + 3;
-/// Number of setting rows, text fields plus the three cycle rows and the
-/// Branches refresh timeout.
-pub const FIELD_ROWS: usize = TEXT_ROWS + 4;
+/// Index of the diff line-number gutter toggle.
+pub const DIFF_LINE_NUMBERS_ROW: usize = TEXT_ROWS + 4;
+/// Number of setting rows, text fields plus the cycle rows, the Branches
+/// refresh timeout, and the diff line-number toggle.
+pub const FIELD_ROWS: usize = TEXT_ROWS + 5;
 /// Index of the "check for updates now" row.
 pub const CHECK_ROW: usize = FIELD_ROWS;
 /// Total selectable rows.
@@ -162,10 +164,13 @@ pub struct ConfigEditor {
 /// and only hands it back when the user confirms.
 ///
 /// Rows are the commands, then an "add" row, then a "done" row, so every
-/// action is reachable by arrow keys as well as by its shortcut.
+/// action is reachable by arrow keys as well as by its shortcut. Each command
+/// row carries two toggles beside its text: `g` saves the command globally
+/// (every repo offers it) and `t` switches it between running in the
+/// background and taking over the terminal.
 pub struct OpenCommandEditor {
-    /// Working copy of the list, one shell template per entry.
-    pub commands: Vec<String>,
+    /// Working copy of the list, one entry per configured command.
+    pub commands: Vec<OpenCommand>,
     /// Cursor over the rows: `0..commands.len()`, then add, then done.
     pub selected: usize,
     /// Buffer while typing a command; `None` while navigating.
@@ -185,7 +190,7 @@ enum ListOutcome {
 
 impl OpenCommandEditor {
     /// Opens the editor on a copy of `commands`, with the first row selected.
-    pub fn new(commands: Vec<String>) -> OpenCommandEditor {
+    pub fn new(commands: Vec<OpenCommand>) -> OpenCommandEditor {
         OpenCommandEditor {
             commands,
             selected: 0,
@@ -219,7 +224,24 @@ impl OpenCommandEditor {
     /// Starts rewriting the command at `index`.
     fn start_edit(&mut self, index: usize) {
         self.editing_index = Some(index);
-        self.input = Some(TextInput::with_value(&self.commands[index]));
+        self.input = Some(TextInput::with_value(&self.commands[index].command));
+    }
+
+    /// Flips whether the command under the cursor is saved globally, so the
+    /// same toggle works while creating (the new entry is selected) and while
+    /// editing an existing one.
+    fn toggle_global(&mut self) {
+        if let Some(cmd) = self.commands.get_mut(self.selected) {
+            cmd.global = !cmd.global;
+        }
+    }
+
+    /// Flips the command under the cursor between running in the background
+    /// and taking over the terminal.
+    fn toggle_mode(&mut self) {
+        if let Some(cmd) = self.commands.get_mut(self.selected) {
+            cmd.mode = cmd.mode.toggled();
+        }
     }
 
     /// Drops the command at `index`, keeping the cursor on a valid row.
@@ -239,9 +261,11 @@ impl OpenCommandEditor {
                 KeyCode::Enter => {
                     let value = input.trimmed();
                     match (self.editing_index.take(), value.is_empty()) {
-                        (Some(index), false) => self.commands[index] = value,
+                        (Some(index), false) => self.commands[index].command = value,
                         (None, false) => {
-                            self.commands.push(value);
+                            self.commands.push(OpenCommand::new(value));
+                            // Land the cursor on the entry just created so its
+                            // global/terminal toggles are right there.
                             self.selected = self.commands.len() - 1;
                         }
                         _ => {}
@@ -267,6 +291,8 @@ impl OpenCommandEditor {
             KeyCode::Char('d') | KeyCode::Delete if self.selected < self.commands.len() => {
                 self.remove(self.selected)
             }
+            KeyCode::Char('g') if self.selected < self.commands.len() => self.toggle_global(),
+            KeyCode::Char('t') if self.selected < self.commands.len() => self.toggle_mode(),
             _ => {}
         }
         ListOutcome::Continue
@@ -335,6 +361,7 @@ impl ConfigEditor {
             THEME_ROW => &self.fields.diff_theme,
             LAYOUT_ROW => &self.fields.worktrees_layout,
             BRANCHES_REFRESH_ROW => &self.fields.branches_refresh_mins,
+            DIFF_LINE_NUMBERS_ROW => &self.fields.diff_line_numbers,
             _ => "",
         }
     }
@@ -343,10 +370,16 @@ impl ConfigEditor {
     /// there is one, otherwise a count followed by the commands. Empty when
     /// nothing is configured, so the row falls back to "(default)".
     pub fn open_command_summary(&self) -> String {
-        match self.fields.open_command.len() {
+        let commands: Vec<&str> = self
+            .fields
+            .open_command
+            .iter()
+            .map(|c| c.command.as_str())
+            .collect();
+        match commands.len() {
             0 => String::new(),
-            1 => self.fields.open_command[0].clone(),
-            n => format!("{n} commands: {}", self.fields.open_command.join(" · ")),
+            1 => commands[0].to_string(),
+            n => format!("{n} commands: {}", commands.join(" · ")),
         }
     }
 
@@ -365,6 +398,7 @@ impl ConfigEditor {
             THEME_ROW => self.fields.diff_theme = value,
             LAYOUT_ROW => self.fields.worktrees_layout = value,
             BRANCHES_REFRESH_ROW => self.fields.branches_refresh_mins = value,
+            DIFF_LINE_NUMBERS_ROW => self.fields.diff_line_numbers = value,
             // `open_command` is edited as a list, never as one text value.
             _ => {}
         }
@@ -374,6 +408,16 @@ impl ConfigEditor {
     /// inherited default stays reachable rather than being a one-way door.
     fn cycle_auto_update_check(&mut self) {
         self.fields.auto_update_check = match self.fields.auto_update_check.as_str() {
+            "true" => "false".to_string(),
+            "false" => String::new(),
+            _ => "true".to_string(),
+        };
+    }
+
+    /// Cycles the diff line-number gutter through default → on → off, so the
+    /// inherited default (on) stays reachable rather than being a one-way door.
+    fn cycle_diff_line_numbers(&mut self) {
+        self.fields.diff_line_numbers = match self.fields.diff_line_numbers.as_str() {
             "true" => "false".to_string(),
             "false" => String::new(),
             _ => "true".to_string(),
@@ -504,6 +548,10 @@ impl ConfigEditor {
                 self.cycle_diff_theme();
                 return self.save_fields(message);
             }
+            KeyCode::Enter | KeyCode::Char(' ') if self.selected == DIFF_LINE_NUMBERS_ROW => {
+                self.cycle_diff_line_numbers();
+                return self.save_fields(message);
+            }
             KeyCode::Enter | KeyCode::Char(' ') if self.selected == LAYOUT_ROW => {
                 self.cycle_worktrees_layout();
                 return self.save_fields(message);
@@ -513,7 +561,9 @@ impl ConfigEditor {
             KeyCode::Enter if self.selected == OPEN_COMMAND_ROW => {
                 self.open_list = Some(OpenCommandEditor::new(self.fields.open_command.clone()))
             }
-            KeyCode::Enter if self.selected < TEXT_ROWS || self.selected == BRANCHES_REFRESH_ROW => {
+            KeyCode::Enter
+                if self.selected < TEXT_ROWS || self.selected == BRANCHES_REFRESH_ROW =>
+            {
                 // Prefill with the effective default when the field is unset so
                 // the user sees what they are changing from.
                 let initial = if self.selected == BRANCHES_REFRESH_ROW
@@ -548,6 +598,12 @@ mod tests {
             editing: None,
             open_list: None,
         }
+    }
+
+    /// Just the templates of a command list, so an assertion can name the
+    /// commands without spelling out each entry's mode and scope.
+    fn texts(commands: &[OpenCommand]) -> Vec<String> {
+        commands.iter().map(|c| c.command.clone()).collect()
     }
 
     fn press(ed: &mut ConfigEditor, code: KeyCode) -> EditorOutcome {
@@ -631,7 +687,7 @@ mod tests {
     /// The editor sitting on the open_command row with `commands` configured.
     fn list_editor(commands: &[&str]) -> ConfigEditor {
         let mut ed = editor();
-        ed.fields.open_command = commands.iter().map(|c| c.to_string()).collect();
+        ed.fields.open_command = commands.iter().map(|c| OpenCommand::new(*c)).collect();
         ed.selected = OPEN_COMMAND_ROW;
         ed
     }
@@ -641,7 +697,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(config::CONFIG_FILE), "").unwrap();
         let fields = RepoConfigFields {
-            open_command: commands.iter().map(|c| c.to_string()).collect(),
+            open_command: commands.iter().map(|c| OpenCommand::new(*c)).collect(),
             ..RepoConfigFields::default()
         };
         settings::save_config_edits(dir.path(), None, &fields).unwrap();
@@ -671,7 +727,7 @@ mod tests {
         press(&mut ed, KeyCode::Enter);
         assert!(ed.editing.is_none(), "the list row has no single value");
         let list = ed.open_list.as_ref().expect("list editor open");
-        assert_eq!(list.commands, ["cursor {path}"]);
+        assert_eq!(texts(&list.commands), ["cursor {path}"]);
         assert_eq!(list.add_row(), 1);
         assert_eq!(list.done_row(), 2);
     }
@@ -686,7 +742,10 @@ mod tests {
         let outcome = finish_list(&mut ed);
         assert!(matches!(outcome, EditorOutcome::Saved(_)));
         assert!(ed.open_list.is_none());
-        assert_eq!(ed.fields.open_command, ["cursor {path}", "open {path}"]);
+        assert_eq!(
+            texts(&ed.fields.open_command),
+            ["cursor {path}", "open {path}"]
+        );
     }
 
     #[test]
@@ -701,7 +760,7 @@ mod tests {
         let outcome = finish_list(&mut ed);
         assert!(matches!(outcome, EditorOutcome::Saved(_)));
         assert_eq!(
-            ed.fields.open_command,
+            texts(&ed.fields.open_command),
             ["cursor {path}", "open {path} -a Finder"]
         );
     }
@@ -713,7 +772,7 @@ mod tests {
         press(&mut ed, KeyCode::Char('d')); // remove the first command
         let outcome = finish_list(&mut ed);
         assert!(matches!(outcome, EditorOutcome::Saved(_)));
-        assert_eq!(ed.fields.open_command, ["open {path}"]);
+        assert_eq!(texts(&ed.fields.open_command), ["open {path}"]);
     }
 
     #[test]
@@ -726,7 +785,7 @@ mod tests {
         let outcome = finish_list(&mut ed);
         assert!(matches!(outcome, EditorOutcome::Saved(_)));
         assert_eq!(
-            ed.fields.open_command,
+            texts(&ed.fields.open_command),
             ["sh -c 'cd {path}, npm start'"],
             "a comma inside a command must not split it"
         );
@@ -743,7 +802,7 @@ mod tests {
         press(&mut ed, KeyCode::Esc); // discard the whole session
         assert!(ed.open_list.is_none());
         assert_eq!(
-            ed.fields.open_command,
+            texts(&ed.fields.open_command),
             ["cursor {path}"],
             "Esc leaves the saved list untouched"
         );
@@ -758,7 +817,7 @@ mod tests {
         press(&mut ed, KeyCode::Esc); // abandon just this entry
         let list = ed.open_list.as_ref().expect("still open");
         assert!(list.input.is_none());
-        assert_eq!(list.commands, ["cursor {path}"]);
+        assert_eq!(texts(&list.commands), ["cursor {path}"]);
     }
 
     #[test]

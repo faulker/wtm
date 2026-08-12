@@ -3,4 +3,3 @@
 # [setup] copy = files copied into new worktrees, run = commands run in them.
 
 worktree_dir = "sibling"
-open_command = "zed {path}"

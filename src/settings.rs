@@ -15,7 +15,8 @@ use toml_edit::{Array, DocumentMut, value as toml_value};
 
 use crate::cli::ConfigAction;
 use crate::config::{
-    self, CONFIG_FILE, Config, DEFAULT_LOCATION, FileConfig, LOCATION_PRESETS, OpenCommandList,
+    self, CONFIG_FILE, CommandMode, Config, DEFAULT_LOCATION, FileConfig, LOCATION_PRESETS,
+    OpenCommand, OpenCommandList,
 };
 use crate::git;
 use crate::output;
@@ -46,6 +47,10 @@ const KEYS: &[(&str, &str)] = &[
     (
         "branches_refresh_mins",
         "minutes the Branches tab keeps its list before refreshing (default 10)",
+    ),
+    (
+        "diff_line_numbers",
+        "show a line-number gutter in the diff pane (true/false, default true)",
     ),
     (
         "setup.copy",
@@ -217,7 +222,8 @@ pub fn repo_config_fields(
     let diff_theme = effective_diff_theme(global_config, &cfg);
     let worktrees_layout = effective_worktrees_layout(global_config, &cfg);
     let branches_refresh_mins = effective_branches_refresh_mins(global_config, &cfg);
-    let setup = cfg.setup.unwrap_or_default();
+    let diff_line_numbers = effective_diff_line_numbers(global_config, &cfg);
+    let setup = cfg.setup.clone().unwrap_or_default();
     let copy = setup
         .copy
         .unwrap_or_default()
@@ -226,10 +232,22 @@ pub fn repo_config_fields(
         .collect::<Vec<_>>()
         .join(", ");
     let run = setup.run.unwrap_or_default().join(", ");
-    let open_command = cfg
+    // Both layers are shown in one list, each entry flagged with the file it
+    // came from, so the editor can move a command between global and repo by
+    // flipping that flag.
+    let open_command: Vec<OpenCommand> = load_global_file(global_config)
         .open_command
         .map(|OpenCommandList(cmds)| cmds)
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| c.global(true))
+        .chain(
+            cfg.open_command
+                .clone()
+                .map(|OpenCommandList(cmds)| cmds)
+                .unwrap_or_default(),
+        )
+        .collect();
     Ok(RepoConfigFields {
         worktree_dir: cfg.worktree_dir.unwrap_or_default(),
         open_command,
@@ -237,6 +255,7 @@ pub fn repo_config_fields(
         diff_theme,
         worktrees_layout,
         branches_refresh_mins,
+        diff_line_numbers,
         copy,
         run,
     })
@@ -295,14 +314,25 @@ fn effective_branches_refresh_mins(global_config: Option<&Path>, repo: &FileConf
     }
 }
 
+/// Effective `diff_line_numbers` for the editor: `""` when the built-in default
+/// applies, otherwise `"true"`/`"false"`.
+fn effective_diff_line_numbers(global_config: Option<&Path>, repo: &FileConfig) -> String {
+    let merged = Config::merge(load_global_file(global_config), repo.clone());
+    match merged.diff_line_numbers_source {
+        config::Source::Default => String::new(),
+        _ => merged.diff_line_numbers().to_string(),
+    }
+}
+
 /// The settings the TUI config editor shows, each empty when unset.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RepoConfigFields {
     pub worktree_dir: String,
-    /// One entry per configured open command. Kept as a list rather than a
-    /// joined string so a command containing a comma survives a round trip
-    /// through the TUI's list editor.
-    pub open_command: Vec<String>,
+    /// One entry per configured open command, from both config layers. Kept as
+    /// a list rather than a joined string so a command containing a comma
+    /// survives a round trip through the TUI's list editor, and so each entry
+    /// can carry its run mode and which file it belongs in.
+    pub open_command: Vec<OpenCommand>,
     /// `""`, `"true"`, or `"false"`; lives in the global config.
     pub auto_update_check: String,
     /// Diff theme short id, or `""` for the default; lives in the global config.
@@ -312,6 +342,8 @@ pub struct RepoConfigFields {
     /// Minutes the Branches tab caches its list, or `""` for the default;
     /// lives in the global config.
     pub branches_refresh_mins: String,
+    /// `""`, `"true"`, or `"false"`; lives in the global config.
+    pub diff_line_numbers: String,
     pub copy: String,
     pub run: String,
 }
@@ -334,7 +366,11 @@ pub fn save_config_edits(
     let file = repo_root.join(CONFIG_FILE);
     let mut doc = load_doc(&file)?;
     set_or_unset(&mut doc, "worktree_dir", &fields.worktree_dir)?;
-    set_or_unset_items(&mut doc, "open_command", &fields.open_command)?;
+    // Commands are split by their `global` flag: the ones marked global belong
+    // in the user-wide file so they show up in every repo, the rest here.
+    let (global_cmds, repo_cmds): (Vec<_>, Vec<_>) =
+        fields.open_command.iter().partition(|c| c.global);
+    set_or_unset_commands(&mut doc, &repo_cmds)?;
     set_or_unset(&mut doc, "setup.copy", &fields.copy)?;
     set_or_unset(&mut doc, "setup.run", &fields.run)?;
     // Drop repo overrides of UI prefs; Settings owns them at the global layer.
@@ -342,14 +378,30 @@ pub fn save_config_edits(
     apply_unset(&mut doc, "diff_theme")?;
     apply_unset(&mut doc, "worktrees_layout")?;
     apply_unset(&mut doc, "branches_refresh_mins")?;
+    apply_unset(&mut doc, "diff_line_numbers")?;
     save_doc(&file, &doc)?;
     if let Some(path) = global_config {
         save_global_setting(path, "auto_update_check", &fields.auto_update_check)?;
         save_global_setting(path, "diff_theme", &fields.diff_theme)?;
         save_global_setting(path, "worktrees_layout", &fields.worktrees_layout)?;
         save_global_setting(path, "branches_refresh_mins", &fields.branches_refresh_mins)?;
+        save_global_setting(path, "diff_line_numbers", &fields.diff_line_numbers)?;
+        save_global_commands(path, &global_cmds)?;
     }
     Ok(file)
+}
+
+/// Writes the globally-saved open commands to the user-wide config at `path`,
+/// clearing the key when none are marked global. A save with nothing to write
+/// and nothing to clear leaves the file alone, so using Settings in a repo with
+/// only repo-level commands never creates an empty global config.
+fn save_global_commands(path: &Path, commands: &[&OpenCommand]) -> Result<()> {
+    let mut doc = load_doc(path)?;
+    if commands.is_empty() && doc.get("open_command").is_none() {
+        return Ok(());
+    }
+    set_or_unset_commands(&mut doc, commands)?;
+    save_doc(path, &doc)
 }
 
 /// Writes (or clears) one wtm-wide `key` in the global config at `path`,
@@ -378,22 +430,40 @@ fn set_or_unset(doc: &mut DocumentMut, key: &str, raw: &str) -> Result<()> {
     Ok(())
 }
 
-/// Like [`set_or_unset`], but for an already-split list: writes a single item
-/// as a TOML string and several as a TOML array (matching how `open_command`
-/// is loaded). Items are taken verbatim, so one containing a comma stays one
-/// entry.
-fn set_or_unset_items(doc: &mut DocumentMut, key: &str, items: &[String]) -> Result<()> {
-    let items: Vec<String> = items
+/// Writes the `open_command` key for `commands`, or unsets it when there are
+/// none. A single background command still writes as a bare TOML string (the
+/// long-standing shape); anything else writes an array whose entries are bare
+/// strings for background commands and `{ command, mode }` tables for the
+/// rest, so a plain list stays readable. Commands are taken verbatim, so one
+/// containing a comma stays a single entry.
+fn set_or_unset_commands(doc: &mut DocumentMut, commands: &[&OpenCommand]) -> Result<()> {
+    let commands: Vec<&OpenCommand> = commands
         .iter()
-        .map(|item| item.trim().to_string())
-        .filter(|item| !item.is_empty())
+        .copied()
+        .filter(|c| !c.command.trim().is_empty())
         .collect();
-    if items.is_empty() {
-        apply_unset(doc, key)?;
-    } else if items.len() == 1 {
-        doc[key] = toml_value(&items[0]);
-    } else {
-        doc[key] = toml_value(to_array(&items));
+    match commands.as_slice() {
+        [] => {
+            apply_unset(doc, "open_command")?;
+        }
+        [one] if one.mode == CommandMode::Background => {
+            doc["open_command"] = toml_value(one.command.trim());
+        }
+        many => {
+            let mut array = toml_edit::Array::new();
+            for cmd in many {
+                let command = cmd.command.trim();
+                if cmd.mode == CommandMode::Background {
+                    array.push(command);
+                } else {
+                    let mut table = toml_edit::InlineTable::new();
+                    table.insert("command", command.into());
+                    table.insert("mode", cmd.mode.as_str().into());
+                    array.push(table);
+                }
+            }
+            doc["open_command"] = toml_value(array);
+        }
     }
     Ok(())
 }
@@ -448,6 +518,10 @@ fn show(cwd: &Path, json: bool) -> Result<()> {
                 "value": cfg.branches_refresh_mins(),
                 "source": cfg.branches_refresh_mins_source,
             },
+            "diff_line_numbers": {
+                "value": cfg.diff_line_numbers(),
+                "source": cfg.diff_line_numbers_source,
+            },
             "version": crate::update::CURRENT_VERSION,
             "setup": {
                 "copy": { "value": cfg.setup.copy, "source": cfg.copy_source },
@@ -467,10 +541,17 @@ fn show(cwd: &Path, json: bool) -> Result<()> {
         cfg.worktree_dir_source
     );
     println!("      new worktrees go in {}", resolved.display());
-    println!(
-        "  open_command = {:?}   ({})",
-        cfg.open_command, cfg.open_command_source
-    );
+    // Commands layer rather than override, and each carries a scope and a run
+    // mode, so they get a line each instead of one squashed value.
+    if cfg.open_command.is_empty() {
+        println!("  open_command = []   ({})", cfg.open_command_source);
+    } else {
+        println!("  open_command:");
+        for cmd in &cfg.open_command {
+            let scope = if cmd.global { "global" } else { "repo" };
+            println!("      {:?}   ({scope}, {})", cmd.command, cmd.mode.as_str());
+        }
+    }
     println!(
         "  auto_update_check = {}   ({})",
         cfg.auto_update_check(),
@@ -490,6 +571,11 @@ fn show(cwd: &Path, json: bool) -> Result<()> {
         "  branches_refresh_mins = {}   ({})",
         cfg.branches_refresh_mins(),
         cfg.branches_refresh_mins_source
+    );
+    println!(
+        "  diff_line_numbers = {}   ({})",
+        cfg.diff_line_numbers(),
+        cfg.diff_line_numbers_source
     );
     println!(
         "  setup.copy   = {:?}   ({})",
@@ -524,11 +610,19 @@ fn get(cwd: &Path, key: &str, json: bool) -> Result<()> {
                 .clone()
                 .unwrap_or_else(|| DEFAULT_LOCATION.to_string())
         ),
-        "open_command" => json!(cfg.open_command.clone()),
+        // `get` prints one value per line, so a command list reduces to its
+        // templates; `--json` above keeps the full entries.
+        "open_command" => json!(
+            cfg.open_command
+                .iter()
+                .map(|c| c.command.clone())
+                .collect::<Vec<_>>()
+        ),
         "auto_update_check" => json!(cfg.auto_update_check()),
         "diff_theme" => json!(cfg.diff_theme()),
         "worktrees_layout" => json!(cfg.worktrees_layout().as_str()),
         "branches_refresh_mins" => json!(cfg.branches_refresh_mins()),
+        "diff_line_numbers" => json!(cfg.diff_line_numbers()),
         "setup.copy" => json!(cfg.setup.copy),
         "setup.run" => json!(cfg.setup.run),
         _ => unreachable!("known_key checked"),
@@ -855,6 +949,9 @@ fn apply_set(doc: &mut DocumentMut, key: &str, raw: &str) -> Result<()> {
             let mins = parse_branches_refresh_mins(raw)?;
             doc["branches_refresh_mins"] = toml_value(mins as i64);
         }
+        "diff_line_numbers" => {
+            doc["diff_line_numbers"] = toml_value(parse_bool(raw)?);
+        }
         "setup.copy" | "setup.run" => {
             let sub = key.strip_prefix("setup.").unwrap();
             let setup = doc
@@ -878,6 +975,7 @@ fn apply_unset(doc: &mut DocumentMut, key: &str) -> Result<bool> {
         "diff_theme" => doc.remove("diff_theme").is_some(),
         "worktrees_layout" => doc.remove("worktrees_layout").is_some(),
         "branches_refresh_mins" => doc.remove("branches_refresh_mins").is_some(),
+        "diff_line_numbers" => doc.remove("diff_line_numbers").is_some(),
         "setup.copy" | "setup.run" => {
             let sub = key.strip_prefix("setup.").unwrap();
             let removed = doc
@@ -1235,6 +1333,16 @@ mod tests {
         assert!(transcript.contains("starting from scratch"), "{transcript}");
     }
 
+    /// Just the templates of a fields value's commands, for asserting on the
+    /// list without spelling out each entry's mode and scope.
+    fn command_texts(fields: &RepoConfigFields) -> Vec<String> {
+        fields
+            .open_command
+            .iter()
+            .map(|c| c.command.clone())
+            .collect()
+    }
+
     /// Editor fields with everything unset, for building one-field cases.
     fn fields(
         worktree_dir: &str,
@@ -1244,11 +1352,12 @@ mod tests {
     ) -> RepoConfigFields {
         RepoConfigFields {
             worktree_dir: worktree_dir.to_string(),
-            open_command: open_command.iter().map(|c| c.to_string()).collect(),
+            open_command: open_command.iter().map(|c| OpenCommand::new(*c)).collect(),
             auto_update_check: String::new(),
             diff_theme: String::new(),
             worktrees_layout: String::new(),
             branches_refresh_mins: String::new(),
+            diff_line_numbers: String::new(),
             copy: copy.to_string(),
             run: run.to_string(),
         }
@@ -1306,7 +1415,72 @@ mod tests {
             ]))
         );
         let fields = repo_config_fields(dir.path(), None).unwrap();
-        assert_eq!(fields.open_command, ["open {path}", "cursor {path}"]);
+        assert_eq!(command_texts(&fields), ["open {path}", "cursor {path}"]);
+    }
+
+    /// A command marked global is written to the user-wide config, not the
+    /// repo's, and comes back marked global so the checkbox stays ticked.
+    #[test]
+    fn save_writes_global_commands_to_the_global_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.toml");
+        let mut fields = fields("", &["npm run dev"], "", "");
+        fields
+            .open_command
+            .push(OpenCommand::new("cursor {path}").global(true));
+        save_config_edits(dir.path(), Some(&global), &fields).unwrap();
+
+        let repo_cfg = FileConfig::load(&dir.path().join(CONFIG_FILE)).unwrap();
+        assert_eq!(
+            repo_cfg.open_command,
+            Some(OpenCommandList(vec![OpenCommand::new("npm run dev")])),
+            "the repo file keeps only the repo-level command"
+        );
+        let global_cfg = FileConfig::load(&global).unwrap();
+        assert_eq!(
+            global_cfg.open_command,
+            Some(OpenCommandList(vec![OpenCommand::new("cursor {path}")])),
+            "the global command lands in the global file"
+        );
+
+        let reloaded = repo_config_fields(dir.path(), Some(&global)).unwrap();
+        assert_eq!(
+            reloaded
+                .open_command
+                .iter()
+                .map(|c| (c.command.as_str(), c.global))
+                .collect::<Vec<_>>(),
+            [("cursor {path}", true), ("npm run dev", false)]
+        );
+    }
+
+    /// A terminal-mode command round-trips as a `{ command, mode }` table
+    /// while its background neighbours stay bare strings.
+    #[test]
+    fn save_writes_a_mode_table_only_for_terminal_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fields = fields("", &["cursor {path}"], "", "");
+        fields
+            .open_command
+            .push(OpenCommand::new("nvim {path}").with_mode(CommandMode::Terminal));
+        save_config_edits(dir.path(), None, &fields).unwrap();
+
+        let text = std::fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap();
+        assert!(text.contains(r#""cursor {path}""#), "{text}");
+        assert!(text.contains(r#"mode = "terminal""#), "{text}");
+
+        let reloaded = repo_config_fields(dir.path(), None).unwrap();
+        assert_eq!(
+            reloaded
+                .open_command
+                .iter()
+                .map(|c| (c.command.as_str(), c.mode))
+                .collect::<Vec<_>>(),
+            [
+                ("cursor {path}", CommandMode::Background),
+                ("nvim {path}", CommandMode::Terminal),
+            ]
+        );
     }
 
     /// The editor path takes the list as-is, so a command with a comma in it
@@ -1317,7 +1491,7 @@ mod tests {
         let commands = ["sh -c 'cd {path}, npm start'", "code --goto {path}:1,1"];
         save_config_edits(dir.path(), None, &fields("", &commands, "", "")).unwrap();
         let fields = repo_config_fields(dir.path(), None).unwrap();
-        assert_eq!(fields.open_command, commands);
+        assert_eq!(command_texts(&fields), commands);
     }
 
     #[test]
@@ -1509,7 +1683,10 @@ mod tests {
 
         edits.branches_refresh_mins = String::new();
         save_config_edits(dir.path(), Some(&global), &edits).unwrap();
-        assert_eq!(FileConfig::load(&global).unwrap().branches_refresh_mins, None);
+        assert_eq!(
+            FileConfig::load(&global).unwrap().branches_refresh_mins,
+            None
+        );
         assert_eq!(
             repo_config_fields(dir.path(), Some(&global))
                 .unwrap()

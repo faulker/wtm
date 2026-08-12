@@ -303,6 +303,11 @@ pub const BRANCHES: &[Binding] = &[
         "fetch all remotes (refreshes every ahead/behind)",
     ),
     both("p", "pull", "fast-forward the branch onto its upstream"),
+    both(
+        "u",
+        "upstream",
+        "change which remote branch this one tracks, or stop tracking",
+    ),
     both("d", "delete", "delete the selected branch (F to force)"),
     both("⇧R", "rename", "rename the selected branch"),
     both("?", "help", "show this help"),
@@ -403,7 +408,7 @@ pub const SETTINGS: &[Binding] = &[
     ),
     help_only(
         "open_command",
-        "Enter opens a list editor: ↑/↓ move, Enter edits the selected command, a adds one, d removes one, Enter on [ done ] saves the list to .wtm.toml, Esc discards the edits",
+        "Enter opens a list editor: ↑/↓ move, Enter edits the selected command, a adds one, d removes one, g saves that command globally (offered in every repo) instead of in this repo's .wtm.toml, t switches it between running in the background and taking over this terminal (wtm closes), Enter on [ done ] writes the list, Esc discards the edits",
     ),
     both("q", "quit", "quit"),
 ];
@@ -454,10 +459,15 @@ pub const RESOLVER: &[Binding] = &[
     both(
         "o/t",
         "ours/theirs",
-        "keep ours / theirs for the hunk (the pane header names both sides — \
-         mid-rebase they are swapped, so \"theirs\" is your own commit)",
+        "keep ours / theirs for the hunk (each hunk names both sides and the \
+         branch each came from — mid-rebase they are swapped, so \"theirs\" is \
+         your own commit)",
     ),
-    both("b/⇧B", "both", "keep both (ours first / theirs first)"),
+    both(
+        "b/⇧B",
+        "both",
+        "keep both sides of the hunk (ours first / theirs first)",
+    ),
     both(
         "⇧O/⇧T",
         "whole file",
@@ -465,9 +475,15 @@ pub const RESOLVER: &[Binding] = &[
     ),
     both(
         "e",
-        "edit",
+        "edit hunk",
         "hand-edit the current hunk; Ctrl+S writes the file to disk (hunks you \
          haven't decided keep their conflict markers), Esc discards",
+    ),
+    both(
+        "⇧E",
+        "edit file",
+        "edit the whole file with its conflict markers, for fixes the per-hunk \
+         choices can't express; Ctrl+S saves to disk and re-reads it, Esc discards",
     ),
     both(
         "w",

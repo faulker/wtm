@@ -137,6 +137,16 @@ struct BranchRenameRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BranchUpstreamRequest {
+    #[schemars(description = "local branch whose upstream is changing")]
+    name: String,
+    #[schemars(
+        description = "remote-tracking ref to follow, e.g. \"origin/main\". Omit to remove the branch's upstream entirely"
+    )]
+    upstream: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct WorktreeRenameRequest {
     #[schemars(
         description = "current worktree name (branch name, or directory name when detached)"
@@ -499,6 +509,18 @@ impl WtmServer {
         Parameters(req): Parameters<BranchRenameRequest>,
     ) -> Result<CallToolResult, ErrorData> {
         let result = ops::branch_rename(&self.ctx()?, &req.old, &req.new).map_err(internal)?;
+        json_result(&result)
+    }
+
+    #[tool(
+        description = "Set which remote branch a local branch tracks, or remove its tracking by omitting upstream. Returns the new upstream and the previous one"
+    )]
+    fn set_branch_upstream(
+        &self,
+        Parameters(req): Parameters<BranchUpstreamRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let result = ops::branch_set_upstream(&self.ctx()?, &req.name, req.upstream.as_deref())
+            .map_err(internal)?;
         json_result(&result)
     }
 

@@ -34,6 +34,11 @@ pub const DEFAULT_DIFF_THEME: &str = "eighties";
 /// own, in minutes. Manual `r` and mutations still refresh immediately.
 pub const DEFAULT_BRANCHES_REFRESH_MINS: u64 = 10;
 
+/// Whether the diff pane draws a line-number gutter when `diff_line_numbers`
+/// isn't set anywhere. On by default: the numbers make it possible to talk
+/// about a diff by line, and the gutter is narrow.
+pub const DEFAULT_DIFF_LINE_NUMBERS: bool = true;
+
 /// How the TUI's Worktrees tab is laid out.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -59,10 +64,8 @@ impl WorktreesLayout {
 /// The `worktrees_layout` values `wtm config` accepts and the TUI's Settings
 /// row cycles through, each with a human-readable label. The first entry is
 /// the default.
-pub const WORKTREES_LAYOUTS: &[(&str, &str)] = &[
-    ("two_panel", "two panels"),
-    ("three_panel", "three panels"),
-];
+pub const WORKTREES_LAYOUTS: &[(&str, &str)] =
+    &[("two_panel", "two panels"), ("three_panel", "three panels")];
 
 /// Human-readable label for a `worktrees_layout` value, falling back to the
 /// raw value for anything unrecognised.
@@ -102,38 +105,134 @@ impl fmt::Display for Source {
     }
 }
 
+/// How a configured open command takes over (or doesn't) when it runs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandMode {
+    /// Spawned detached with its stdio discarded; the TUI stays open. The right
+    /// mode for GUI tools (`cursor {path}`) that don't need this terminal.
+    #[default]
+    Background,
+    /// The TUI shuts down and hands this terminal to the command, so an
+    /// interactive program (`nvim {path}`, `claude`) can use it directly.
+    Terminal,
+}
+
+impl CommandMode {
+    /// The config-file spelling of this mode, matching the serde renaming.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CommandMode::Background => "background",
+            CommandMode::Terminal => "terminal",
+        }
+    }
+
+    /// The other mode, for the editor's toggle.
+    pub fn toggled(self) -> CommandMode {
+        match self {
+            CommandMode::Background => CommandMode::Terminal,
+            CommandMode::Terminal => CommandMode::Background,
+        }
+    }
+}
+
+/// One configured open command: a shell template plus how it should be run.
+///
+/// `global` is not stored in the entry itself; it records which config file the
+/// command came from (the user-wide one, so it is offered in every repo, or
+/// this repo's `.wtm.toml`) and which file a save should write it back to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct OpenCommand {
+    /// Shell template, before `{path}`/`{name}`/`{branch}`/`{status}` expand.
+    pub command: String,
+    pub mode: CommandMode,
+    /// True when this command lives in the user-wide config rather than in the
+    /// repo's `.wtm.toml`.
+    pub global: bool,
+}
+
+impl OpenCommand {
+    /// A background command, the shape a bare TOML string loads as.
+    pub fn new(command: impl Into<String>) -> OpenCommand {
+        OpenCommand {
+            command: command.into(),
+            mode: CommandMode::Background,
+            global: false,
+        }
+    }
+
+    pub fn with_mode(mut self, mode: CommandMode) -> OpenCommand {
+        self.mode = mode;
+        self
+    }
+
+    pub fn global(mut self, global: bool) -> OpenCommand {
+        self.global = global;
+        self
+    }
+}
+
+impl From<&str> for OpenCommand {
+    /// A bare template is a background, repo-level command: the shape a plain
+    /// TOML string loads as, and the default for a newly typed one.
+    fn from(command: &str) -> OpenCommand {
+        OpenCommand::new(command)
+    }
+}
+
+/// The TOML table form of an entry: `{ command = "…", mode = "terminal" }`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenCommandTable {
+    command: String,
+    #[serde(default)]
+    mode: CommandMode,
+}
+
 /// One or more open-command templates. A TOML string still loads as a
 /// single-entry list so existing configs keep working; an array holds several
-/// commands the TUI's `o` key can pick from.
+/// commands the TUI's `o` key can pick from, each either a bare string or a
+/// `{ command = "…", mode = "…" }` table.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct OpenCommandList(pub Vec<String>);
+pub struct OpenCommandList(pub Vec<OpenCommand>);
 
 impl<'de> Deserialize<'de> for OpenCommandList {
-    /// Accepts either `"cursor ."` or `["open {path}", "cursor {path}"]`.
+    /// Accepts `"cursor ."`, `["open {path}", "cursor {path}"]`, or an array
+    /// mixing strings with `{ command, mode }` tables.
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct OpenCommandVisitor;
         impl<'de> Visitor<'de> for OpenCommandVisitor {
             type Value = OpenCommandList;
 
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("a string or an array of strings")
+                f.write_str("a string, or an array of strings and { command, mode } tables")
             }
 
             fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-                Ok(OpenCommandList(vec![v.to_string()]))
+                Ok(OpenCommandList(vec![OpenCommand::new(v)]))
             }
 
             fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
-                Ok(OpenCommandList(vec![v]))
+                Ok(OpenCommandList(vec![OpenCommand::new(v)]))
             }
 
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
                 let mut out = Vec::new();
-                while let Some(item) = seq.next_element::<String>()? {
-                    out.push(item);
+                while let Some(item) = seq.next_element::<OpenCommandEntry>()? {
+                    out.push(match item {
+                        OpenCommandEntry::Plain(command) => OpenCommand::new(command),
+                        OpenCommandEntry::Table(t) => OpenCommand::new(t.command).with_mode(t.mode),
+                    });
                 }
                 Ok(OpenCommandList(out))
             }
+        }
+        /// One array element: a bare template or a table with a mode.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum OpenCommandEntry {
+            Plain(String),
+            Table(OpenCommandTable),
         }
         deserializer.deserialize_any(OpenCommandVisitor)
     }
@@ -161,6 +260,9 @@ pub struct FileConfig {
     /// Minutes the Branches tab may keep a cached list before refreshing.
     /// Unset means [`DEFAULT_BRANCHES_REFRESH_MINS`].
     pub branches_refresh_mins: Option<u64>,
+    /// Whether the diff pane draws a line-number gutter. Unset means
+    /// [`DEFAULT_DIFF_LINE_NUMBERS`].
+    pub diff_line_numbers: Option<bool>,
     pub setup: Option<FileSetup>,
     /// Runtime map of worktree branch → creation base ref, written by
     /// `wtm create`. Not a user-facing setting; ignored by [`Config::merge`].
@@ -197,8 +299,10 @@ pub struct Config {
     /// Raw `worktree_dir` setting; `None` means the `sibling` preset.
     pub worktree_dir: Option<String>,
     pub worktree_dir_source: Source,
-    /// Commands the TUI runs from the open key (`o`); empty when unset.
-    pub open_command: Vec<String>,
+    /// Commands the TUI runs from the open key (`o`); empty when unset. Unlike
+    /// the other settings these layer additively: the global config's commands
+    /// come first (they are offered in every repo), then this repo's own.
+    pub open_command: Vec<OpenCommand>,
     pub open_command_source: Source,
     /// Raw `auto_update_check` setting; `None` means
     /// [`DEFAULT_AUTO_UPDATE_CHECK`].
@@ -215,6 +319,10 @@ pub struct Config {
     /// [`DEFAULT_BRANCHES_REFRESH_MINS`].
     pub branches_refresh_mins: Option<u64>,
     pub branches_refresh_mins_source: Source,
+    /// Raw `diff_line_numbers` setting; `None` means
+    /// [`DEFAULT_DIFF_LINE_NUMBERS`].
+    pub diff_line_numbers: Option<bool>,
+    pub diff_line_numbers_source: Source,
     pub setup: Setup,
     pub copy_source: Source,
     pub run_source: Source,
@@ -244,6 +352,8 @@ impl Default for Config {
             worktrees_layout_source: Source::Default,
             branches_refresh_mins: None,
             branches_refresh_mins_source: Source::Default,
+            diff_line_numbers: None,
+            diff_line_numbers_source: Source::Default,
             setup: Setup::default(),
             copy_source: Source::Default,
             run_source: Source::Default,
@@ -272,10 +382,23 @@ impl Config {
             }
         }
         let (worktree_dir, worktree_dir_source) = pick(global.worktree_dir, repo.worktree_dir);
-        let (open_command_raw, open_command_source) = pick(global.open_command, repo.open_command);
-        let open_command = open_command_raw
-            .map(|OpenCommandList(cmds)| cmds)
-            .unwrap_or_default();
+        // Open commands are the one additive setting: a command saved globally
+        // is meant to be available in every repo, so a repo's own list adds to
+        // it rather than replacing it. Each entry remembers which file it came
+        // from so the editor can save it back to the right one.
+        let global_cmds = global.open_command.map(|OpenCommandList(c)| c);
+        let repo_cmds = repo.open_command.map(|OpenCommandList(c)| c);
+        let open_command_source = match (&global_cmds, &repo_cmds) {
+            (_, Some(_)) => Source::Repo,
+            (Some(_), None) => Source::Global,
+            (None, None) => Source::Default,
+        };
+        let open_command: Vec<OpenCommand> = global_cmds
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| c.global(true))
+            .chain(repo_cmds.unwrap_or_default())
+            .collect();
         let (auto_update_check, auto_update_check_source) =
             pick(global.auto_update_check, repo.auto_update_check);
         let (diff_theme, diff_theme_source) = pick(global.diff_theme, repo.diff_theme);
@@ -283,6 +406,8 @@ impl Config {
             pick(global.worktrees_layout, repo.worktrees_layout);
         let (branches_refresh_mins, branches_refresh_mins_source) =
             pick(global.branches_refresh_mins, repo.branches_refresh_mins);
+        let (diff_line_numbers, diff_line_numbers_source) =
+            pick(global.diff_line_numbers, repo.diff_line_numbers);
         let global_setup = global.setup.unwrap_or_default();
         let repo_setup = repo.setup.unwrap_or_default();
         let (copy, copy_source) = pick(global_setup.copy, repo_setup.copy);
@@ -300,6 +425,8 @@ impl Config {
             worktrees_layout_source,
             branches_refresh_mins,
             branches_refresh_mins_source,
+            diff_line_numbers,
+            diff_line_numbers_source,
             setup: Setup {
                 copy: copy.unwrap_or_default(),
                 run: run.unwrap_or_default(),
@@ -332,6 +459,11 @@ impl Config {
     pub fn branches_refresh_mins(&self) -> u64 {
         self.branches_refresh_mins
             .unwrap_or(DEFAULT_BRANCHES_REFRESH_MINS)
+    }
+
+    /// Whether the diff pane draws its line-number gutter.
+    pub fn diff_line_numbers(&self) -> bool {
+        self.diff_line_numbers.unwrap_or(DEFAULT_DIFF_LINE_NUMBERS)
     }
 
     /// Absolute directory new worktrees are created under for a repo rooted
@@ -537,6 +669,61 @@ mod tests {
         );
     }
 
+    /// A `{ command, mode }` table carries its run mode; a bare string beside
+    /// it still loads as a background command, so old configs keep working.
+    #[test]
+    fn parses_open_command_tables_with_a_run_mode() {
+        let cfg: FileConfig = toml::from_str(
+            r#"open_command = ["cursor {path}", { command = "nvim {path}", mode = "terminal" }]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.open_command,
+            Some(OpenCommandList(vec![
+                OpenCommand::new("cursor {path}"),
+                OpenCommand::new("nvim {path}").with_mode(CommandMode::Terminal),
+            ]))
+        );
+    }
+
+    /// A table with no `mode` falls back to the safe default rather than
+    /// failing to parse.
+    #[test]
+    fn open_command_table_defaults_to_background() {
+        let cfg: FileConfig =
+            toml::from_str(r#"open_command = [{ command = "cursor {path}" }]"#).unwrap();
+        let OpenCommandList(commands) = cfg.open_command.unwrap();
+        assert_eq!(commands[0].mode, CommandMode::Background);
+    }
+
+    /// Open commands are the one additive setting: a repo's list adds to the
+    /// global one instead of replacing it, and each entry remembers where it
+    /// came from so a save can put it back in the right file.
+    #[test]
+    fn open_commands_from_both_layers_are_offered_together() {
+        let global: FileConfig = toml::from_str(r#"open_command = "cursor {path}""#).unwrap();
+        let repo: FileConfig = toml::from_str(r#"open_command = "npm run dev""#).unwrap();
+        let merged = Config::merge(global, repo);
+        assert_eq!(
+            merged
+                .open_command
+                .iter()
+                .map(|c| (c.command.as_str(), c.global))
+                .collect::<Vec<_>>(),
+            [("cursor {path}", true), ("npm run dev", false)],
+            "global commands come first, each flagged with its layer"
+        );
+    }
+
+    #[test]
+    fn diff_line_numbers_defaults_to_on() {
+        assert!(Config::default().diff_line_numbers());
+        let repo: FileConfig = toml::from_str("diff_line_numbers = false").unwrap();
+        let merged = Config::merge(FileConfig::default(), repo);
+        assert!(!merged.diff_line_numbers());
+        assert_eq!(merged.diff_line_numbers_source, Source::Repo);
+    }
+
     #[test]
     fn expands_open_command_placeholders() {
         let expanded = expand_open_command(
@@ -678,10 +865,9 @@ mod tests {
     /// `[created_from]` is accepted in `.wtm.toml` but is not a Config setting.
     #[test]
     fn created_from_parses_and_is_ignored_by_merge() {
-        let file: FileConfig = toml::from_str(
-            "worktree_dir = \"inside\"\n\n[created_from]\nfeature = \"main\"\n",
-        )
-        .unwrap();
+        let file: FileConfig =
+            toml::from_str("worktree_dir = \"inside\"\n\n[created_from]\nfeature = \"main\"\n")
+                .unwrap();
         assert_eq!(
             file.created_from.as_ref().unwrap().get("feature"),
             Some(&"main".to_string())

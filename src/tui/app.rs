@@ -17,7 +17,7 @@ use super::help::HelpTab;
 use super::highlight;
 use super::setup::{self, SetupWizard, WizardOutcome};
 use super::theme;
-use crate::config::WorktreesLayout;
+use crate::config::{CommandMode, OpenCommand, WorktreesLayout};
 use crate::conflict::{self, ConflictSegment, ResolutionAction};
 use crate::git::{self, GraphLine, LogEntry, StashEntry, StatusEntry};
 use crate::ops::{self, BranchListItem, ConflictFile, Ctx, SetupControl, WorktreeInfo};
@@ -314,6 +314,83 @@ pub fn filtered_candidates(branches: &[CheckoutCandidate], filter: &str) -> Vec<
         .collect()
 }
 
+/// One row of the upstream picker: either "stop tracking" or a remote ref.
+/// Shared by the key handling and the renderer so the cursor and what's drawn
+/// cannot disagree about which row means what.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamRow {
+    /// Clears the branch's upstream. Only present when it has one to clear.
+    Unset,
+    /// Track this remote-tracking ref (an index into the picker's candidates).
+    Candidate(usize),
+}
+
+/// The picker's visible rows for `candidates` narrowed by `filter`, with the
+/// "stop tracking" row first when `has_upstream`. An empty filter matches
+/// everything.
+pub fn upstream_rows(candidates: &[String], filter: &str, has_upstream: bool) -> Vec<UpstreamRow> {
+    let needle = filter.trim().to_lowercase();
+    let mut rows: Vec<UpstreamRow> = has_upstream
+        .then_some(UpstreamRow::Unset)
+        .into_iter()
+        .collect();
+    rows.extend(
+        candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| needle.is_empty() || c.to_lowercase().contains(&needle))
+            .map(|(i, _)| UpstreamRow::Candidate(i)),
+    );
+    rows
+}
+
+/// One row of the Branches tab's table: a group heading or a branch.
+///
+/// Local and remote-only branches are drawn as two labelled groups, so the
+/// table has rows the cursor never lands on. `branch_display_rows` is the one
+/// place that mapping is computed; the renderer and the click handler both go
+/// through it so a click can't select a heading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchRow {
+    /// A group heading; carries the group's label.
+    Header(&'static str),
+    /// A branch, by its index into `App::branches`.
+    Branch(usize),
+}
+
+/// The Branches tab's display rows for `branches`: the local branches under a
+/// "local" heading, then the remote-only ones under a "remote" heading. A group
+/// with no branches contributes no heading, so a repo with no remotes looks the
+/// same as it always did.
+///
+/// `branches` is expected to arrive local-first (see `ops::branch_list`), but
+/// this groups by each row's own `remote` flag rather than trusting the order,
+/// so a stale or re-sorted list still renders under the right heading.
+pub fn branch_display_rows(branches: &[BranchListItem]) -> Vec<BranchRow> {
+    let mut rows = Vec::with_capacity(branches.len() + 2);
+    for (label, remote) in [("LOCAL BRANCHES", false), ("REMOTE BRANCHES", true)] {
+        let group: Vec<usize> = branches
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.remote.is_some() == remote)
+            .map(|(i, _)| i)
+            .collect();
+        if group.is_empty() {
+            continue;
+        }
+        rows.push(BranchRow::Header(label));
+        rows.extend(group.into_iter().map(BranchRow::Branch));
+    }
+    rows
+}
+
+/// The display row showing branch `index`, for placing the table's selection.
+pub fn branch_row_of(rows: &[BranchRow], index: usize) -> usize {
+    rows.iter()
+        .position(|r| *r == BranchRow::Branch(index))
+        .unwrap_or(0)
+}
+
 /// A modal overlay drawn on top of the active screen: a confirmation, a
 /// single-line prompt, or the manual hunk editor. Only one is ever open at a
 /// time (`App::modal`); the screen underneath stays put and reappears when the
@@ -344,6 +421,11 @@ pub enum Modal {
     /// saves back into the `ConflictResolver` screen underneath on Ctrl+S,
     /// rather than producing a `ModalResult`.
     HunkEditor(TextArea),
+    /// The whole-file editor: the conflicted file exactly as it sits on disk,
+    /// conflict markers included, for the cases the per-hunk choices can't
+    /// express (interleaving both sides, fixing up an import list, deleting a
+    /// stray line). Ctrl+S writes it straight back to disk and re-reads it.
+    FileEditor { path: String, editor: TextArea },
 }
 
 /// One selectable row of a `Modal::Confirm`.
@@ -556,8 +638,9 @@ pub enum View {
         branch: String,
         /// Expanded `{status}` value for the templates.
         status: String,
-        /// Configured command templates (before `{…}` expansion).
-        commands: Vec<String>,
+        /// Configured commands (templates before `{…}` expansion, each with the
+        /// run mode that decides whether the TUI stays open).
+        commands: Vec<OpenCommand>,
         /// Cursor into `commands`.
         selected: usize,
     },
@@ -730,6 +813,23 @@ pub enum View {
         /// Worktrees the stash can be applied into.
         targets: Vec<CherryTarget>,
         /// Cursor into `targets`.
+        selected: usize,
+    },
+    /// Picker for the remote branch a local branch tracks, opened by `u` on the
+    /// Branches tab. Row 0 removes tracking (only offered when there is some);
+    /// the rows below are the repo's remote-tracking refs, narrowed live by
+    /// `filter` since a busy repo can have dozens.
+    UpstreamPick {
+        /// Local branch whose upstream is being changed.
+        branch: String,
+        /// What it tracks now, shown so the change reads as a change.
+        current: Option<String>,
+        /// Every remote-tracking ref (`origin/main`, …), newest commit first.
+        candidates: Vec<String>,
+        /// Live type-to-filter text over `candidates`.
+        filter: TextInput,
+        /// Cursor over the visible rows (see `upstream_rows`), not over
+        /// `candidates` directly.
         selected: usize,
     },
     /// Friendly conflict resolver for a worktree left mid-merge. Lists the
@@ -1393,6 +1493,14 @@ pub struct App {
     /// `message`, it does not auto-expire; any key press dismisses it (see
     /// `on_key`).
     pub error: Option<String>,
+    /// Scroll offset into the error popup's message, in rendered lines. A git
+    /// error can run well past a screenful, so the popup scrolls rather than
+    /// truncating; reset every time a new error is shown.
+    pub error_scroll: u16,
+    /// Largest useful `error_scroll`, recorded by the renderer each frame (it
+    /// is the only place that knows the wrapped height and the popup's size).
+    /// Keys clamp against it so scrolling stops at the last line.
+    pub error_max_scroll: u16,
     /// Where new worktrees will be created, shown in the create dialog.
     pub worktree_base: Option<String>,
     /// Advances once per event-loop tick; drives the busy-overlay spinner.
@@ -1438,6 +1546,10 @@ pub struct App {
     /// Set by a completed self-update: the binary `tui::run` should hand over to
     /// once the terminal is restored.
     pub restart_exe: Option<PathBuf>,
+    /// Set by a `CommandMode::Terminal` open command: the shell command and the
+    /// worktree directory to run it in. `tui::run` executes it after restoring
+    /// the terminal, so an interactive program gets this terminal to itself.
+    pub exec_on_exit: Option<(String, String)>,
     pub quit: bool,
     /// When set, q/Esc will not quit until this instant. Armed by back
     /// navigation so a duplicate key buffered while a slow tick/draw delayed
@@ -1507,6 +1619,8 @@ impl App {
             message_at: None,
             message_shown: None,
             error: None,
+            error_scroll: 0,
+            error_max_scroll: 0,
             worktree_base,
             tick_count: 0,
             log_mode: LogMode::Tree,
@@ -1521,6 +1635,7 @@ impl App {
             update_available: None,
             update_prompted: false,
             restart_exe: None,
+            exec_on_exit: None,
             quit: false,
             ignore_quit_until: None,
         };
@@ -1780,9 +1895,35 @@ impl App {
         }
     }
 
-    /// Shows `msg` as a modal error popup (see `App::error`).
+    /// Key handling for the modal error popup: q/Esc (or Enter) dismiss it,
+    /// everything else scrolls the message so a long error can be read in full.
+    fn on_error_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => {
+                self.error = None;
+                self.error_scroll = 0;
+            }
+            KeyCode::Down | KeyCode::Char('j') => self.scroll_error(1),
+            KeyCode::Up | KeyCode::Char('k') => self.scroll_error(-1),
+            KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_error(10),
+            KeyCode::PageUp => self.scroll_error(-10),
+            KeyCode::Home | KeyCode::Char('g') => self.error_scroll = 0,
+            KeyCode::End | KeyCode::Char('G') => self.error_scroll = self.error_max_scroll,
+            _ => {}
+        }
+    }
+
+    /// Moves the error popup by `delta` lines, clamped to the message.
+    fn scroll_error(&mut self, delta: i32) {
+        let next = (self.error_scroll as i32 + delta).max(0) as u16;
+        self.error_scroll = next.min(self.error_max_scroll);
+    }
+
+    /// Shows `msg` as a modal error popup (see `App::error`), scrolled to the
+    /// top so a long message always starts at its first line.
     fn set_error(&mut self, msg: impl Into<String>) {
         self.error = Some(msg.into());
+        self.error_scroll = 0;
     }
 
     fn selected_worktree(&self) -> Option<&WorktreeInfo> {
@@ -1989,7 +2130,7 @@ impl App {
         // it as a literal rather than opening help.
         if matches!(
             self.modal,
-            Some(Modal::Prompt { .. } | Modal::HunkEditor(_))
+            Some(Modal::Prompt { .. } | Modal::HunkEditor(_) | Modal::FileEditor { .. })
         ) {
             return true;
         }
@@ -2061,10 +2202,12 @@ impl App {
 
     pub fn on_key(&mut self, key: KeyEvent) {
         self.message = None;
-        // A modal error popup swallows the very next key press, dismissing
-        // itself rather than reaching Ctrl+C handling or the view underneath.
+        // A modal error popup owns every key until it is dismissed, so nothing
+        // reaches Ctrl+C handling or the view underneath. Only q/Esc close it:
+        // a long git error is scrollable, and a stray key press must not throw
+        // it away before it has been read.
         if self.error.is_some() {
-            self.error = None;
+            self.on_error_key(key);
             return;
         }
         // Ctrl+C: while setup runs it must be pressed twice to kill the
@@ -2133,6 +2276,9 @@ impl App {
                                     )
                                 })
                                 .unwrap_or_default();
+                            // A one-off command typed here has no saved mode,
+                            // so it runs the safe way: detached, TUI stays up.
+                            let cmd = OpenCommand::new(cmd);
                             self.spawn_open_command(&cmd, &name, &path, &branch, &status);
                         }
                     }
@@ -2210,6 +2356,7 @@ impl App {
             View::RebasePick { .. } => self.on_rebase_pick_key(key),
             View::MoveChanges { .. } => self.on_move_changes_key(key),
             View::OpenCommand { .. } => self.on_open_command_key(key),
+            View::UpstreamPick { .. } => self.on_upstream_pick_key(key),
             View::StashTarget { .. } => self.on_stash_target_key(key),
             View::ConflictResolver { .. } => self.on_resolver_key(key),
             // A background op owns the screen until tick() drains its result.
@@ -2258,6 +2405,11 @@ impl App {
         // The hunk editor edits in place and saves back into the resolver.
         if matches!(self.modal, Some(Modal::HunkEditor(_))) {
             self.on_hunk_editor_key(key);
+            return;
+        }
+        // The whole-file editor writes straight to disk instead.
+        if matches!(self.modal, Some(Modal::FileEditor { .. })) {
+            self.on_file_editor_key(key);
             return;
         }
         let result = match self.modal.as_mut() {
@@ -3627,11 +3779,9 @@ impl App {
                         self.preview_scroll = 0;
                     }
                 }
-                Tab::Branches => {
-                    if idx < self.branches.len() {
-                        self.branch_selected = idx;
-                    }
-                }
+                // The branch table's rows include group headings, so a click
+                // index is a display row, not a branch index.
+                Tab::Branches => self.select_branch_row(idx),
                 Tab::Changes => {
                     let c = &mut self.changes;
                     if idx >= c.rows.len() || c.selected == idx {
@@ -4633,13 +4783,13 @@ impl App {
         let path = wt.path.clone();
         let branch = wt.branch.clone().unwrap_or_default();
         let status = wt.open_status().to_string();
-        let commands: Vec<String> = self
+        let commands: Vec<OpenCommand> = self
             .ctx
             .config
             .open_command
             .iter()
-            .map(|c| c.trim().to_string())
-            .filter(|c| !c.is_empty())
+            .filter(|c| !c.command.trim().is_empty())
+            .cloned()
             .collect();
         match commands.as_slice() {
             [] => self.push_screen(View::RunCommand {
@@ -4701,17 +4851,20 @@ impl App {
         self.spawn_open_command(&cmd, &name, &path, &branch, &status);
     }
 
-    /// Expands placeholders in `template` and spawns it detached in `path`.
+    /// Expands placeholders in `command` and runs it according to its mode:
+    /// background commands are spawned detached and leave the TUI up, terminal
+    /// commands quit the TUI so `tui::run` can hand this terminal over once it
+    /// is restored.
     fn spawn_open_command(
         &mut self,
-        template: &str,
+        command: &OpenCommand,
         name: &str,
         path: &str,
         branch: &str,
         status: &str,
     ) {
         let cmd = crate::config::expand_open_command(
-            template,
+            &command.command,
             &crate::config::OpenCommandVars {
                 path,
                 name,
@@ -4719,7 +4872,13 @@ impl App {
                 status,
             },
         );
-        self.spawn_in_dir(&cmd, path, name);
+        match command.mode {
+            CommandMode::Background => self.spawn_in_dir(&cmd, path, name),
+            CommandMode::Terminal => {
+                self.exec_on_exit = Some((cmd, path.to_string()));
+                self.quit = true;
+            }
+        }
     }
 
     /// Spawns `cmd` through the shell, detached, in `dir`. Stdio is detached so
@@ -5070,6 +5229,110 @@ impl App {
 
     /// Key handling for the stash target picker: pick a worktree, then apply
     /// or pop the stash into it.
+    /// Opens the upstream picker for the branch under the cursor on the
+    /// Branches tab. Refuses on a remote-only row (there is no local branch to
+    /// give an upstream) and when the repo has no remote-tracking refs at all.
+    fn open_upstream_pick(&mut self) {
+        let Some(branch) = self.branches.get(self.branch_selected) else {
+            return;
+        };
+        if branch.remote.is_some() {
+            self.message = Some(format!(
+                "'{}' only exists on a remote; check it out first to give it an upstream",
+                branch.name
+            ));
+            return;
+        }
+        let (name, current) = (branch.name.clone(), branch.upstream.clone());
+        let candidates = match ops::upstream_candidates(&self.ctx) {
+            Ok(c) => c,
+            Err(e) => return self.set_error(format!("{e:#}")),
+        };
+        if candidates.is_empty() && current.is_none() {
+            self.message = Some("no remote branches to track · fetch first".to_string());
+            return;
+        }
+        self.push_screen(View::UpstreamPick {
+            branch: name,
+            current,
+            candidates,
+            filter: TextInput::default(),
+            selected: 0,
+        });
+    }
+
+    /// Key handling for the upstream picker: typing narrows the list, Enter
+    /// applies the highlighted row.
+    fn on_upstream_pick_key(&mut self, key: KeyEvent) {
+        let View::UpstreamPick {
+            current,
+            candidates,
+            filter,
+            selected,
+            ..
+        } = &mut self.view
+        else {
+            return;
+        };
+        let row_count = |filter: &TextInput, selected: usize| {
+            let rows = upstream_rows(candidates, filter.as_str(), current.is_some());
+            selected.min(rows.len().saturating_sub(1))
+        };
+        match key.code {
+            KeyCode::Down => {
+                let rows = upstream_rows(candidates, filter.as_str(), current.is_some());
+                if *selected + 1 < rows.len() {
+                    *selected += 1;
+                }
+            }
+            KeyCode::Up => *selected = selected.saturating_sub(1),
+            KeyCode::Enter => self.confirm_upstream_pick(),
+            KeyCode::Esc => self.navigate_back(),
+            _ => {
+                // Every other key types into the filter, so a branch name with
+                // a `j`/`k` in it narrows rather than moving the cursor.
+                filter.on_key(key);
+                *selected = row_count(filter, *selected);
+            }
+        }
+    }
+
+    /// Applies the highlighted upstream row to the branch and reloads the list.
+    fn confirm_upstream_pick(&mut self) {
+        let View::UpstreamPick {
+            branch,
+            current,
+            candidates,
+            filter,
+            selected,
+        } = &self.view
+        else {
+            return;
+        };
+        let rows = upstream_rows(candidates, filter.as_str(), current.is_some());
+        let (branch, upstream) = match rows.get(*selected) {
+            Some(UpstreamRow::Unset) => (branch.clone(), None),
+            Some(UpstreamRow::Candidate(i)) => match candidates.get(*i) {
+                Some(c) => (branch.clone(), Some(c.clone())),
+                None => return,
+            },
+            None => return,
+        };
+        self.pop_screen();
+        match ops::branch_set_upstream(&self.ctx, &branch, upstream.as_deref()) {
+            Ok(result) => {
+                self.message = Some(match &result.upstream {
+                    Some(now) => format!("'{branch}' now tracks {now}"),
+                    None => format!("'{branch}' no longer tracks a remote branch"),
+                });
+                // The row's tracking column and ahead/behind counts both change,
+                // so the cached list is stale until it reloads.
+                self.load_branches(self.branch_selected);
+            }
+            Err(e) => self.set_error(format!("{e:#}")),
+        }
+    }
+
     fn on_stash_target_key(&mut self, key: KeyEvent) {
         let View::StashTarget {
             targets, selected, ..
@@ -5627,6 +5890,16 @@ impl App {
         self.branches_pending.is_some()
     }
 
+    /// Selects the branch drawn at display row `row` of the Branches table.
+    /// A click on a group heading selects nothing: headings are chrome, and
+    /// moving the cursor to a neighbour would be a click landing somewhere the
+    /// user didn't aim.
+    fn select_branch_row(&mut self, row: usize) {
+        if let Some(BranchRow::Branch(index)) = branch_display_rows(&self.branches).get(row) {
+            self.branch_selected = *index;
+        }
+    }
+
     /// Key handling for the Branches tab (active when `view` is `List` and
     /// `tab` is `Branches`).
     fn on_branches_tab_key(&mut self, key: KeyEvent) {
@@ -5686,6 +5959,8 @@ impl App {
             // `b` is the mirror: rebase a worktree of the user's choosing onto
             // the selected branch, also routing conflicts into the resolver.
             KeyCode::Char('b') => self.open_rebase_pick(),
+            // `u` changes (or clears) which remote branch this one tracks.
+            KeyCode::Char('u') => self.open_upstream_pick(),
             // `c` checks the branch out in a new worktree (the old Enter action).
             KeyCode::Char('c') => {
                 if let Some(b) = self.branches.get(self.branch_selected) {
@@ -6440,6 +6715,7 @@ impl App {
             KeyCode::Char('O') => self.resolver_whole_file(true),
             KeyCode::Char('T') => self.resolver_whole_file(false),
             KeyCode::Char('e') => self.resolver_edit_hunk(),
+            KeyCode::Char('E') => self.resolver_edit_file(),
             KeyCode::Char('w') | KeyCode::Enter => self.resolver_write_file(),
             KeyCode::Char('a') => self.resolver_stage_as_is(),
             KeyCode::Char('r') => self.resolver_reload(),
@@ -6529,6 +6805,103 @@ impl App {
             if let Some(text) = seed {
                 self.modal = Some(Modal::HunkEditor(TextArea::new(&text)));
             }
+        }
+    }
+
+    /// Opens the whole conflicted file in the editor, conflict markers and all,
+    /// for the fixes per-hunk choices can't express. Decisions already made in
+    /// the resolver are flushed to disk first, so the text on screen is the
+    /// file as it really stands rather than a stale copy that would silently
+    /// throw that work away on save.
+    fn resolver_edit_file(&mut self) {
+        // Only when there is something to flush: writing the file back
+        // unprompted would relabel every conflict marker for no reason.
+        let pending = matches!(
+            &self.view,
+            View::ConflictResolver { current: Some(rf), .. } if rf.actions.iter().any(Option::is_some)
+        );
+        if pending {
+            self.resolver_save_current_file(false);
+        }
+        let target_path = match &self.view {
+            View::ConflictResolver {
+                target,
+                files,
+                file,
+                ..
+            } => files.get(*file).map(|p| (target.clone(), p.clone())),
+            _ => None,
+        };
+        let Some((target, path)) = target_path else {
+            return;
+        };
+        match ops::read_worktree_file(&self.ctx, &target, &path) {
+            Ok(text) => {
+                self.modal = Some(Modal::FileEditor {
+                    path,
+                    editor: TextArea::new(&text),
+                });
+                self.message = Some(
+                    "editing the whole file · Ctrl+S saves, Esc discards \
+                     (delete the <<<<<<< / ======= / >>>>>>> markers as you go)"
+                        .to_string(),
+                );
+            }
+            Err(e) => self.set_error(format!("{e:#}")),
+        }
+    }
+
+    /// Key handling while the whole-file editor is open: Ctrl+S writes the file
+    /// to disk and re-reads it, Esc discards, everything else edits.
+    fn on_file_editor_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            self.resolver_save_file_edit();
+            return;
+        }
+        if key.code == KeyCode::Esc {
+            self.modal = None;
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return;
+        }
+        if let Some(Modal::FileEditor { editor, .. }) = &mut self.modal {
+            editor.on_key(key);
+        }
+    }
+
+    /// Writes the whole-file edit to disk (without staging) and re-reads the
+    /// file, so hunks the edit settled drop out of the resolver and any left
+    /// behind renumber. Staging stays a separate, deliberate step (`w`/`a`).
+    fn resolver_save_file_edit(&mut self) {
+        let edit = match &self.modal {
+            Some(Modal::FileEditor { path, editor, .. }) => Some((path.clone(), editor.text())),
+            _ => None,
+        };
+        let Some((path, text)) = edit else {
+            return;
+        };
+        let target = match &self.view {
+            View::ConflictResolver { target, .. } => target.clone(),
+            _ => return,
+        };
+        match ops::write_partial_resolution(&self.ctx, &target, &path, &text) {
+            Ok(()) => {
+                self.modal = None;
+                self.load_resolver_file();
+                let remaining = match &self.view {
+                    View::ConflictResolver {
+                        current: Some(rf), ..
+                    } => rf.actions.len(),
+                    _ => 0,
+                };
+                self.message = Some(if remaining == 0 {
+                    format!("saved '{path}' · no conflict markers left, press w to stage it")
+                } else {
+                    format!("saved '{path}' · {remaining} hunk(s) still conflicted")
+                });
+            }
+            Err(e) => self.set_error(format!("{e:#}")),
         }
     }
 
@@ -7718,6 +8091,12 @@ mod tests {
         (tmp, app)
     }
 
+    /// Just the templates of a command list, for asserting on what is
+    /// configured without spelling out each entry's mode and scope.
+    fn command_texts(commands: &[OpenCommand]) -> Vec<String> {
+        commands.iter().map(|c| c.command.clone()).collect()
+    }
+
     fn test_app() -> (tempfile::TempDir, App) {
         build_app(true)
     }
@@ -8158,14 +8537,48 @@ mod tests {
         assert_eq!(name.value, "fix/what?");
     }
 
+    /// A long error must be readable, so only q/Esc/Enter close it; every
+    /// other key scrolls the message instead of throwing it away unread.
     #[test]
-    fn any_key_dismisses_the_error_popup() {
+    fn only_quit_keys_dismiss_the_error_popup() {
         let (_tmp, mut app) = test_app();
         app.set_error("boom");
         assert!(app.error.is_some());
-        // Any key closes the popup instead of reaching the view underneath.
         press(&mut app, KeyCode::Char('x'));
+        assert!(app.error.is_some(), "a stray key must not close the error");
+        press(&mut app, KeyCode::Char('q'));
         assert!(app.error.is_none());
+
+        app.set_error("boom");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.error.is_none(), "Esc closes it too");
+    }
+
+    /// Scrolling is clamped to the message: the renderer records how far it can
+    /// go, and the keys never move past either end of that range.
+    #[test]
+    fn error_popup_scrolls_within_its_message() {
+        let (_tmp, mut app) = test_app();
+        app.set_error("line one\nline two\nline three");
+        assert_eq!(app.error_scroll, 0);
+        // Nothing has been drawn yet, so there is no room to scroll.
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.error_scroll, 0, "clamped to the recorded maximum");
+
+        app.error_max_scroll = 2;
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.error_scroll, 1);
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(app.error_scroll, 2, "stops at the last line");
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.error_scroll, 1);
+        press(&mut app, KeyCode::PageUp);
+        assert_eq!(app.error_scroll, 0, "stops at the first line");
+
+        // A new error always starts at the top of its own message.
+        app.error_scroll = 2;
+        app.set_error("something else");
+        assert_eq!(app.error_scroll, 0);
     }
 
     #[test]
@@ -9942,6 +10355,123 @@ mod tests {
         assert!(!crate::git::branch_exists(&app.ctx.repo_root, "feature"));
     }
 
+    /// A `BranchListItem` reduced to what the display grouping cares about.
+    fn branch_item(name: &str, remote: Option<&str>) -> BranchListItem {
+        BranchListItem {
+            name: name.to_string(),
+            checked_out_path: None,
+            upstream: None,
+            ahead: 0,
+            behind: 0,
+            subject: String::new(),
+            date: String::new(),
+            merged: false,
+            remote: remote.map(str::to_string),
+            created_from: None,
+            changed_from_base: false,
+            behind_base: false,
+        }
+    }
+
+    /// The Branches tab draws two labelled groups, local first. Both groups
+    /// only appear when they have branches, so a repo with no remotes looks
+    /// exactly as it did before grouping existed.
+    #[test]
+    fn branch_rows_group_local_before_remote() {
+        let branches = [
+            branch_item("main", None),
+            branch_item("upstream-only", Some("origin/upstream-only")),
+            branch_item("feature", None),
+        ];
+        assert_eq!(
+            branch_display_rows(&branches),
+            [
+                BranchRow::Header("LOCAL BRANCHES"),
+                BranchRow::Branch(0),
+                BranchRow::Branch(2),
+                BranchRow::Header("REMOTE BRANCHES"),
+                BranchRow::Branch(1),
+            ],
+            "locals group first even when the list interleaves them"
+        );
+
+        let local_only = [branch_item("main", None)];
+        assert_eq!(
+            branch_display_rows(&local_only),
+            [BranchRow::Header("LOCAL BRANCHES"), BranchRow::Branch(0)],
+            "an empty group contributes no heading"
+        );
+        assert!(branch_display_rows(&[]).is_empty());
+    }
+
+    /// Clicks arrive as display rows, so they have to be mapped back through
+    /// the grouping; a click on a heading selects nothing.
+    #[test]
+    fn clicking_a_branch_row_maps_past_the_group_headings() {
+        let (_tmp, mut app) = test_app();
+        app.branches = vec![
+            branch_item("main", None),
+            branch_item("published", Some("origin/published")),
+        ];
+        let rows = branch_display_rows(&app.branches);
+        assert_eq!(
+            branch_row_of(&rows, 1),
+            3,
+            "remote row sits under 2 headings"
+        );
+
+        app.select_branch_row(3);
+        assert_eq!(app.branch_selected, 1);
+        app.select_branch_row(2); // the REMOTE BRANCHES heading
+        assert_eq!(app.branch_selected, 1, "a heading click changes nothing");
+        app.select_branch_row(99);
+        assert_eq!(app.branch_selected, 1, "an out-of-range click is ignored");
+    }
+
+    /// The upstream picker only offers "stop tracking" when there is tracking
+    /// to stop, and typing narrows the remote refs.
+    #[test]
+    fn upstream_picker_rows_filter_and_offer_unset() {
+        let candidates = ["origin/main".to_string(), "origin/feature".to_string()];
+        assert_eq!(
+            upstream_rows(&candidates, "", true),
+            [
+                UpstreamRow::Unset,
+                UpstreamRow::Candidate(0),
+                UpstreamRow::Candidate(1),
+            ]
+        );
+        assert_eq!(
+            upstream_rows(&candidates, "", false),
+            [UpstreamRow::Candidate(0), UpstreamRow::Candidate(1)],
+            "nothing to unset when the branch tracks nothing"
+        );
+        assert_eq!(
+            upstream_rows(&candidates, "FEAT", true),
+            [UpstreamRow::Unset, UpstreamRow::Candidate(1)],
+            "the filter is case-insensitive and keeps the unset row reachable"
+        );
+    }
+
+    /// `u` on a remote-only row has no local branch to give an upstream, so it
+    /// says so instead of opening a picker that could not apply.
+    #[test]
+    fn upstream_key_refuses_a_remote_only_branch() {
+        let (_tmp, mut app) = test_app();
+        app.branches = vec![branch_item("published", Some("origin/published"))];
+        app.branch_selected = 0;
+        app.open_upstream_pick();
+        assert!(matches!(app.view, View::List), "no picker opens");
+        assert!(
+            app.message
+                .as_deref()
+                .unwrap()
+                .contains("only exists on a remote"),
+            "{:?}",
+            app.message
+        );
+    }
+
     #[test]
     fn branches_tab_d_key_opens_confirm_delete() {
         let (_tmp, mut app) = test_app();
@@ -10174,6 +10704,75 @@ mod tests {
         assert!(marker.exists(), "expanded open_command should have run");
     }
 
+    /// A terminal-mode command doesn't spawn anything from inside the TUI: it
+    /// records what to run and quits, so `tui::run` can hand this terminal over
+    /// once ratatui has restored it.
+    #[test]
+    fn a_terminal_mode_command_quits_and_hands_over_the_terminal() {
+        let (_tmp, mut app) = test_app();
+        add_and_select_worktree(&mut app, "feature");
+        let path = app.worktrees[app.selected].path.clone();
+        app.ctx.config.open_command =
+            vec![OpenCommand::new("nvim {path}").with_mode(CommandMode::Terminal)];
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.quit, "the TUI stands down for a terminal command");
+        assert_eq!(
+            app.exec_on_exit,
+            Some((format!("nvim {path}"), path.clone())),
+            "the expanded command and its directory are handed off"
+        );
+    }
+
+    /// A background command is the opposite: it spawns detached and the TUI
+    /// stays up, which is what a GUI editor needs.
+    #[test]
+    fn a_background_mode_command_leaves_the_tui_running() {
+        let (_tmp, mut app) = test_app();
+        add_and_select_worktree(&mut app, "feature");
+        app.ctx.config.open_command = vec![OpenCommand::new("true")];
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.quit);
+        assert!(app.exec_on_exit.is_none());
+    }
+
+    /// `g` and `t` in the command editor flip the two per-command toggles, and
+    /// `[ done ]` saves a global command to the global file while the repo's
+    /// own `.wtm.toml` keeps only its own.
+    #[test]
+    fn command_editor_toggles_global_and_terminal_then_saves_to_the_right_file() {
+        let (tmp, mut app) = test_app();
+        goto_settings(&mut app);
+        press(&mut app, KeyCode::Down); // open_command row
+        press(&mut app, KeyCode::Enter); // open the list editor
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "cursor {path}");
+        press(&mut app, KeyCode::Enter); // commit the entry, cursor lands on it
+        press(&mut app, KeyCode::Char('g')); // save it globally
+        press(&mut app, KeyCode::Char('t')); // and run it in the terminal
+        let list = app.settings.open_list.as_ref().unwrap();
+        assert!(list.commands[0].global);
+        assert_eq!(list.commands[0].mode, CommandMode::Terminal);
+
+        for _ in list.selected..list.done_row() {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Enter); // [ done ] writes both files
+
+        let repo_text = std::fs::read_to_string(app.ctx.repo_root.join(".wtm.toml")).unwrap();
+        assert!(
+            !repo_text.contains("open_command"),
+            "a global command must not land in the repo file: {repo_text}"
+        );
+        let global_text = std::fs::read_to_string(tmp.path().join("global.toml")).unwrap();
+        assert!(global_text.contains("cursor {path}"), "{global_text}");
+        assert!(
+            global_text.contains(r#"mode = "terminal""#),
+            "{global_text}"
+        );
+    }
+
     #[test]
     fn open_key_picks_among_multiple_open_commands() {
         let (_tmp, mut app) = test_app();
@@ -10237,7 +10836,7 @@ mod tests {
         assert_eq!(name, &selected.name);
         assert_eq!(path, &selected.path);
         let preview = crate::config::expand_open_command(
-            &commands[0],
+            &commands[0].command,
             &crate::config::OpenCommandVars {
                 path,
                 name,
@@ -10561,6 +11160,95 @@ mod tests {
         press(&mut app, KeyCode::Char('c'));
         assert!(matches!(app.view, View::List));
         assert!(!crate::git::is_merging(&feat));
+    }
+
+    /// `⇧E` hands the user the whole file, markers and all, for the fixes the
+    /// per-hunk choices can't express. Ctrl+S has to land on disk and re-read
+    /// the file, without staging it.
+    #[test]
+    fn resolver_file_editor_writes_the_whole_file_to_disk() {
+        let (_tmp, mut app) = test_app();
+        let feat = into_conflict_resolver(&mut app);
+
+        press(&mut app, KeyCode::Char('E'));
+        match &app.modal {
+            Some(Modal::FileEditor { path, editor }) => {
+                assert_eq!(path, "shared.txt");
+                assert!(
+                    editor.text().contains("<<<<<<<"),
+                    "the editor gets the raw file, markers included: {}",
+                    editor.text()
+                );
+            }
+            _ => panic!("expected the whole-file editor"),
+        }
+
+        // Stand in for the user typing a hand-merged result.
+        if let Some(Modal::FileEditor { editor, .. }) = &mut app.modal {
+            *editor = TextArea::new("feature version\nmain version\n");
+        }
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+
+        assert!(app.modal.is_none(), "editor closes on save");
+        assert_eq!(
+            std::fs::read_to_string(feat.join("shared.txt")).unwrap(),
+            "feature version\nmain version\n",
+            "the edit is on disk"
+        );
+        match &app.view {
+            View::ConflictResolver { current, .. } => {
+                assert!(current.is_none(), "no conflict hunks remain");
+            }
+            _ => panic!("expected the conflict resolver"),
+        }
+        // Saving is not staging: git still sees the path as unmerged until `w`.
+        assert_eq!(
+            crate::git::conflicted_files(&feat).unwrap(),
+            vec!["shared.txt".to_string()]
+        );
+
+        press(&mut app, KeyCode::Char('w'));
+        press(&mut app, KeyCode::Char('c'));
+        assert!(matches!(app.view, View::List));
+        assert!(!crate::git::is_merging(&feat));
+    }
+
+    /// Opening the whole-file editor must not hand back a stale copy: choices
+    /// already made in the resolver are flushed to disk first, or saving the
+    /// edit would silently undo them.
+    #[test]
+    fn resolver_file_editor_starts_from_choices_already_made() {
+        let (_tmp, mut app) = test_app();
+        into_conflict_resolver(&mut app);
+
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Char('E'));
+        match &app.modal {
+            Some(Modal::FileEditor { editor, .. }) => assert_eq!(
+                editor.text(),
+                "feature version\n",
+                "the kept side is already applied in the text being edited"
+            ),
+            _ => panic!("expected the whole-file editor"),
+        }
+    }
+
+    #[test]
+    fn resolver_file_editor_esc_discards() {
+        let (_tmp, mut app) = test_app();
+        let feat = into_conflict_resolver(&mut app);
+        let before = std::fs::read_to_string(feat.join("shared.txt")).unwrap();
+
+        press(&mut app, KeyCode::Char('E'));
+        press(&mut app, KeyCode::Char('Z'));
+        press(&mut app, KeyCode::Esc);
+
+        assert!(app.modal.is_none());
+        assert_eq!(
+            std::fs::read_to_string(feat.join("shared.txt")).unwrap(),
+            before,
+            "a discarded edit never reaches the file"
+        );
     }
 
     /// Ctrl-chords other than Ctrl+S are not text: they must not leave stray
@@ -11905,18 +12593,15 @@ mod tests {
             app.message
         );
         assert_eq!(
-            app.ctx.config.open_command,
-            vec![
-                "cursor {path}".to_string(),
-                "sh -c 'cd {path}, npm start'".to_string(),
-            ]
+            command_texts(&app.ctx.config.open_command),
+            ["cursor {path}", "sh -c 'cd {path}, npm start'"]
         );
         // Leaving and re-entering the tab reloads from disk; the list must
         // still be there ( [ done ] already wrote it ).
         app.select_tab(Tab::Worktrees);
         goto_settings(&mut app);
         assert_eq!(
-            app.settings.fields.open_command,
+            command_texts(&app.settings.fields.open_command),
             ["cursor {path}", "sh -c 'cd {path}, npm start'"]
         );
     }
@@ -11937,17 +12622,23 @@ mod tests {
             press(&mut app, KeyCode::Down);
         }
         press(&mut app, KeyCode::Enter);
-        assert_eq!(app.settings.fields.open_command, ["cursor {path}"]);
+        assert_eq!(
+            command_texts(&app.settings.fields.open_command),
+            ["cursor {path}"]
+        );
 
         press(&mut app, KeyCode::Tab); // leave Settings
         assert_ne!(app.tab, Tab::Settings);
         goto_settings(&mut app);
         assert_eq!(
-            app.settings.fields.open_command,
+            command_texts(&app.settings.fields.open_command),
             ["cursor {path}"],
             "reload after a tab switch must still see the saved command"
         );
-        assert_eq!(app.ctx.config.open_command, ["cursor {path}"]);
+        assert_eq!(
+            command_texts(&app.ctx.config.open_command),
+            ["cursor {path}"]
+        );
     }
 
     /// The whole multi-command path in one go: build the list in Settings
@@ -11986,7 +12677,7 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Char('d'));
         assert_eq!(
-            app.settings.open_list.as_ref().unwrap().commands,
+            command_texts(&app.settings.open_list.as_ref().unwrap().commands),
             ["touch {path}/a.txt", "touch {path}/b.txt"]
         );
 
@@ -11998,7 +12689,7 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert!(app.settings.open_list.is_none());
         assert_eq!(
-            app.ctx.config.open_command,
+            command_texts(&app.ctx.config.open_command),
             ["touch {path}/a.txt", "touch {path}/b.txt"]
         );
 
@@ -12020,7 +12711,7 @@ mod tests {
         // what `Enter` then runs.
         assert_eq!(
             crate::config::expand_open_command(
-                &commands[1],
+                &commands[1].command,
                 &crate::config::OpenCommandVars {
                     path: picked,
                     name,

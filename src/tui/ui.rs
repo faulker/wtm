@@ -13,14 +13,14 @@ use ratatui::widgets::{
 };
 
 use super::app::{
-    App, CheckoutCandidate, CherryTarget, CommitFocus, ConfirmOption, CreateOutcome, DiffRow,
-    LogMode, Modal, ResolverFile, RowList, Tab, TextInput, View, WorktreesFocus,
-    filtered_candidates,
+    App, BranchRow, CheckoutCandidate, CherryTarget, CommitFocus, ConfirmOption, CreateOutcome,
+    DiffRow, LogMode, Modal, ResolverFile, RowList, Tab, TextInput, UpstreamRow, View,
+    WorktreesFocus, branch_display_rows, branch_row_of, filtered_candidates, upstream_rows,
 };
 use super::config_editor::{
-    BRANCHES_REFRESH_ROW, CHECK_ROW, ConfigEditor, FIELD_ROWS, LAYOUT_ROW, OPEN_COMMAND_ROW,
-    OpenCommandEditor, THEME_PREVIEW_SAMPLE_LINES, THEME_ROW, UPDATE_ROW, check_line, form_lines,
-    line_of_row, preview_line,
+    BRANCHES_REFRESH_ROW, CHECK_ROW, ConfigEditor, DIFF_LINE_NUMBERS_ROW, FIELD_ROWS, LAYOUT_ROW,
+    OPEN_COMMAND_ROW, OpenCommandEditor, THEME_PREVIEW_SAMPLE_LINES, THEME_ROW, UPDATE_ROW,
+    check_line, form_lines, line_of_row, preview_line,
 };
 use super::help::{self, Binding, HelpTab};
 use super::highlight;
@@ -29,9 +29,9 @@ use super::setup::{
 };
 use super::theme::{self, ACCENT, BORDER, DIALOG_BG, DIALOG_BORDER, GRAPH_COLORS, SELECTION_BG};
 use crate::config::{
-    DEFAULT_AUTO_UPDATE_CHECK, DEFAULT_BRANCHES_REFRESH_MINS, DEFAULT_DIFF_THEME, DEFAULT_LOCATION,
-    LOCATION_PRESETS, OpenCommandVars, WorktreesLayout, expand_open_command,
-    worktrees_layout_label,
+    CommandMode, DEFAULT_AUTO_UPDATE_CHECK, DEFAULT_BRANCHES_REFRESH_MINS,
+    DEFAULT_DIFF_LINE_NUMBERS, DEFAULT_DIFF_THEME, DEFAULT_LOCATION, LOCATION_PRESETS, OpenCommand,
+    OpenCommandVars, WorktreesLayout, expand_open_command, worktrees_layout_label,
 };
 use crate::conflict::{ConflictSegment, ResolutionAction};
 use crate::git::{GraphLine, StatusEntry};
@@ -81,6 +81,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             *loading_new,
             *scroll,
             *h_scroll,
+            app.ctx.config.diff_line_numbers(),
         ),
         View::StashDiff {
             label,
@@ -103,6 +104,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             *loading_new,
             *scroll,
             *h_scroll,
+            app.ctx.config.diff_line_numbers(),
         ),
         View::BranchCommits {
             branch,
@@ -162,6 +164,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     app.changes.h_scroll,
                     true,
                     &mut app.diff_path_hit,
+                    app.ctx.config.diff_line_numbers(),
                 ),
                 Tab::Stash => draw_stash_tab(frame, body, app),
                 Tab::Settings => {
@@ -290,6 +293,23 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 *selected,
             )
         }
+        View::UpstreamPick {
+            branch,
+            current,
+            candidates,
+            filter,
+            selected,
+        } => {
+            overlay_hit = draw_upstream_pick(
+                frame,
+                main,
+                branch,
+                current.as_deref(),
+                candidates,
+                filter,
+                *selected,
+            )
+        }
         View::StashTarget {
             pop,
             label,
@@ -331,6 +351,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         | View::RebasePick { .. }
         | View::MoveChanges { .. }
         | View::OpenCommand { .. }
+        | View::UpstreamPick { .. }
         | View::StashTarget { .. }
         | View::Setup(_) => overlay_hit,
         _ => None,
@@ -356,7 +377,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // help overlay, and suppresses clicks on whatever is behind it. Cloned so
     // drawing it doesn't hold an immutable borrow while `row_list` is reset.
     if let Some(err) = app.error.clone() {
-        draw_error_popup(frame, main, &err);
+        app.error_max_scroll = draw_error_popup(frame, main, &err, app.error_scroll);
+        app.error_scroll = app.error_scroll.min(app.error_max_scroll);
         app.row_list = None;
         app.tab_hits.clear();
         app.preview_list = None;
@@ -782,6 +804,7 @@ fn draw_worktrees_three_panel(frame: &mut Frame, area: Rect, app: &mut App) -> O
             app.changes.h_scroll,
             files_focused,
             &mut app.diff_path_hit,
+            app.ctx.config.diff_line_numbers(),
         );
     }
     row_list
@@ -857,6 +880,49 @@ fn draw_worktree_preview(frame: &mut Frame, area: Rect, app: &mut App) {
     });
 }
 
+/// The highlighted diff for `path`, with a line-number gutter down the left
+/// when `numbered`. Numbers come from the diff's own hunk headers, so a removed
+/// line shows its position in the pre-image; those are dimmed to say so. The
+/// gutter is as narrow as the largest number allows, so a short file doesn't
+/// pay for a five-digit column.
+fn diff_lines_with_gutter(path: &str, content: &str, numbered: bool) -> Vec<Line<'static>> {
+    let lines = highlight::diff_lines(path, content);
+    if !numbered {
+        return lines;
+    }
+    let numbers = highlight::gutter_numbers(content);
+    let width = numbers
+        .iter()
+        .filter_map(|n| n.map(|(num, _)| num))
+        .max()
+        .map(|max| max.to_string().len())
+        .unwrap_or(0);
+    // No numbers at all (a binary or status-only diff): skip the empty gutter.
+    if width == 0 {
+        return lines;
+    }
+    lines
+        .into_iter()
+        .zip(numbers)
+        .map(|(line, number)| {
+            let (text, style) = match number {
+                Some((num, highlight::GutterSide::New)) => {
+                    (format!("{num:>width$} "), Style::new().fg(BORDER))
+                }
+                // A removed line's number points at the old file, so it is
+                // dimmed further to distinguish it from a live line number.
+                Some((num, highlight::GutterSide::Old)) => {
+                    (format!("{num:>width$} "), Style::new().fg(BORDER).dim())
+                }
+                None => (" ".repeat(width + 1), Style::new()),
+            };
+            let mut spans = vec![Span::styled(text, style)];
+            spans.extend(line.spans);
+            Line::from(spans)
+        })
+        .collect()
+}
+
 /// Path of the changed file under the cursor row, or "" on a folder row.
 fn current_diff_path<'a>(rows: &[DiffRow], files: &'a [StatusEntry], selected: usize) -> &'a str {
     super::app::current_file_index(rows, selected)
@@ -888,6 +954,8 @@ fn draw_diff(
     // title, so a click there can copy the path, or cleared when the cursor
     // isn't on a file.
     path_hit: &mut Option<Rect>,
+    // Whether the diff pane draws its line-number gutter (`diff_line_numbers`).
+    numbered: bool,
 ) -> Option<RowList> {
     *path_hit = None;
     if files.is_empty() {
@@ -999,7 +1067,7 @@ fn draw_diff(
             } else if content.is_empty() {
                 vec![Line::from("no textual diff (binary or empty)".dim())]
             } else {
-                highlight::diff_lines(path, content)
+                diff_lines_with_gutter(path, content, numbered)
             };
             let title = format!("diff · {path}");
             // The title doubles as a click-to-copy target for the path. `panel`
@@ -1037,11 +1105,15 @@ fn draw_diff(
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     // The error popup is modal and sits on top of everything else, so the
-    // footer only shows how to dismiss it.
+    // footer only shows how to read and dismiss it.
     if app.error.is_some() {
         frame.render_widget(
             Paragraph::new(hint_line_fitting(
-                &[hint("any key", "dismiss error")],
+                &[
+                    hint("↑/↓", "scroll"),
+                    hint("PgUp/PgDn", "page"),
+                    hint("q/Esc", "dismiss"),
+                ],
                 Some(area.width),
             )),
             area,
@@ -1102,6 +1174,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 hint("Enter", "edit"),
                 hint("a", "add"),
                 hint("d", "remove"),
+                hint("g", "save globally"),
+                hint("t", "run in terminal"),
                 hint("[ done ]", "save"),
                 hint("Esc", "discard"),
             ],
@@ -1150,6 +1224,12 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         View::OpenCommand { .. } => &[
             hint("↑/↓", "pick command"),
             hint("Enter", "run"),
+            hint("Esc", "cancel"),
+        ],
+        View::UpstreamPick { .. } => &[
+            hint("type", "filter"),
+            hint("↑/↓", "pick"),
+            hint("Enter", "set"),
             hint("Esc", "cancel"),
         ],
         View::StashTarget { .. } => &[
@@ -1897,9 +1977,13 @@ fn draw_help_tabs(frame: &mut Frame, area: Rect, active: HelpTab) {
 }
 
 /// A centered, red-bordered popup for `app.error`: unlike the one-line status
-/// message in the header, this can show a full multi-line git error and is
-/// only dismissed by an explicit key press (see `App::error`, `on_key`).
-fn draw_error_popup(frame: &mut Frame, area: Rect, msg: &str) {
+/// message in the header, this shows a full multi-line git error, scrolls when
+/// the message is taller than the popup, and is dismissed only by q/Esc/Enter
+/// (see `App::error`, `App::on_error_key`).
+///
+/// Returns the largest useful scroll offset, which the caller stores on the app
+/// so the scroll keys can clamp against it.
+fn draw_error_popup(frame: &mut Frame, area: Rect, msg: &str, scroll: u16) -> u16 {
     let width = 70.min(area.width);
     // Inner content width, accounting for the block's border and padding, used
     // to estimate how many visual lines the wrapped message will take.
@@ -1909,15 +1993,24 @@ fn draw_error_popup(frame: &mut Frame, area: Rect, msg: &str) {
         .map(|line| line.chars().count().div_ceil(inner_width).max(1))
         .sum();
     // +2 for the border, +2 for the blank line and dismiss hint below the
-    // message.
+    // message. `modal_rect` clamps the height, so a long error becomes a
+    // scrollable popup rather than one that overflows the frame.
     let popup = modal_rect(area, wrapped_lines as u16, width, 4);
+    // Rows actually available to the message inside the popup, i.e. its height
+    // less the border and the blank + hint that always stay pinned at the end.
+    let visible = popup.height.saturating_sub(4).max(1);
+    let max_scroll = (wrapped_lines as u16).saturating_sub(visible);
+    let scroll = scroll.min(max_scroll);
     frame.render_widget(Clear, popup);
-    let mut lines: Vec<Line> = msg.lines().map(Line::from).collect();
-    lines.push(Line::from(""));
-    lines.push(Line::styled(
-        "Esc / Enter / any key to dismiss",
-        Style::new().dim(),
-    ));
+    let lines: Vec<Line> = msg.lines().map(Line::from).collect();
+    let title_suffix = if max_scroll > 0 {
+        // Which slice of the message is on screen, so a truncated-looking
+        // popup reads as "there is more" rather than as the whole error.
+        let last = (scroll + visible).min(wrapped_lines as u16);
+        format!(" {}-{} of {} ", scroll + 1, last, wrapped_lines)
+    } else {
+        String::new()
+    };
     let block = Block::bordered()
         .border_type(BorderType::Thick)
         .border_style(Style::new().fg(theme::DANGER))
@@ -1929,12 +2022,37 @@ fn draw_error_popup(frame: &mut Frame, area: Rect, msg: &str) {
                 "error",
                 Style::new().fg(theme::DANGER).add_modifier(Modifier::BOLD),
             ),
+            Span::styled(title_suffix, Style::new().dim()),
             Span::raw(" "),
         ]));
-    let para = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false });
-    frame.render_widget(para, popup);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    // The hint stays pinned to the bottom of the popup: only the message
+    // scrolls, so "how do I close this" never scrolls out of view.
+    let [msg_area, _, hint_area] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        msg_area,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            if max_scroll > 0 {
+                "↑/↓ scroll · q / Esc to dismiss"
+            } else {
+                "q / Esc to dismiss"
+            },
+            Style::new().dim(),
+        )),
+        hint_area,
+    );
+    max_scroll
 }
 
 /// Renders the current screen of the first-run setup wizard. Every screen is a
@@ -2387,6 +2505,7 @@ fn draw_settings_tab(
         "diff_theme",
         "worktrees_layout",
         "branches_refresh_mins",
+        "diff_line_numbers",
     ];
     // Keep each description to one line at the form width (78) so wrapping
     // cannot desync [`line_of_row`] from what is drawn.
@@ -2399,6 +2518,7 @@ fn draw_settings_tab(
         "Syntax colours in the diff pane. Enter cycles themes.",
         "Worktrees tab layout. Three panels add files + diff. Enter cycles.",
         "Minutes the Branches tab keeps its list before refreshing.",
+        "Show a line-number gutter beside the diff. Enter cycles.",
     ];
     let mut lines: Vec<Line> = Vec::new();
 
@@ -2466,6 +2586,21 @@ fn draw_settings_tab(
                     )
                 } else {
                     worktrees_layout_label(&editor.fields.worktrees_layout).to_string()
+                },
+                highlight,
+            )),
+            _ if row == DIFF_LINE_NUMBERS_ROW => spans.push(Span::styled(
+                match editor.fields.diff_line_numbers.as_str() {
+                    "true" => "on".to_string(),
+                    "false" => "off".to_string(),
+                    _ => format!(
+                        "(default: {})",
+                        if DEFAULT_DIFF_LINE_NUMBERS {
+                            "on"
+                        } else {
+                            "off"
+                        }
+                    ),
                 },
                 highlight,
             )),
@@ -2621,7 +2756,7 @@ fn draw_settings_tab(
 /// typed shows the live buffer with a movable cursor.
 fn draw_open_command_list(frame: &mut Frame, area: Rect, list: &OpenCommandEditor) {
     let rows = list.rows().clamp(3, 14) as u16;
-    let popup = centered(area, 70, rows + 5);
+    let popup = centered(area, 84, rows + 5);
     frame.render_widget(Clear, popup);
     let block = dialog_panel("open commands");
     frame.render_widget(&block, popup);
@@ -2649,12 +2784,31 @@ fn draw_open_command_list(frame: &mut Frame, area: Rect, list: &OpenCommandEdito
     let mut lines: Vec<Line> = Vec::new();
     for (index, command) in list.commands.iter().enumerate() {
         let style = row_style(index);
-        let mut spans = vec![Span::styled(" ● ", style.fg(Color::Green))];
+        // Both toggles sit in fixed-width columns *before* the command, so a
+        // long template truncates on the right instead of pushing them off
+        // screen (and the columns stay aligned down the list).
+        let (scope, scope_style) = if command.global {
+            ("global", style.fg(theme::INFO))
+        } else {
+            ("repo  ", style.dim())
+        };
+        let (mode, mode_style) = if command.mode == CommandMode::Terminal {
+            ("terminal  ", style.fg(theme::WARNING))
+        } else {
+            ("background", style.dim())
+        };
+        let mut spans = vec![
+            Span::styled(" ● ", style.fg(Color::Green)),
+            Span::styled(scope, scope_style),
+            Span::styled(" · ", style.dim()),
+            Span::styled(mode, mode_style),
+            Span::styled("  ", style),
+        ];
         match &list.input {
             Some(input) if list.editing_index == Some(index) => {
                 push_cursor_spans(&mut spans, input.as_str(), input.cursor, style)
             }
-            _ => spans.push(Span::styled(command.clone(), style)),
+            _ => spans.push(Span::styled(command.command.clone(), style)),
         }
         lines.push(Line::from(spans));
     }
@@ -2685,7 +2839,7 @@ fn draw_open_command_list(frame: &mut Frame, area: Rect, list: &OpenCommandEdito
     let hint = if list.input.is_some() {
         "Enter save · Esc cancel entry"
     } else {
-        "↑/↓ move · Enter edit · a add · d remove · [ done ] saves · Esc discard"
+        "Enter edit · a add · d remove · g global · t terminal · [ done ] saves"
     };
     frame.render_widget(Paragraph::new(Line::from(hint.dim())), hint_area);
 }
@@ -2969,9 +3123,11 @@ fn draw_tab_bar(frame: &mut Frame, area: Rect, app: &mut App) {
     app.tab_hits = hits;
 }
 
-/// The Branches tab: a full-width table of local branches, with the inline
-/// new-branch and confirm-delete popups floating on top. Returns the clickable
-/// row list (suppressed while a popup is up).
+/// The Branches tab: a full-width table of branches in two labelled groups,
+/// local first and remote-only second, with the inline new-branch and
+/// confirm-delete popups floating on top. Returns the clickable row list
+/// (suppressed while a popup is up); its indices are display rows, so
+/// `App::select_branch_row` maps a click back to a branch.
 fn draw_branches(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
     let title = if app.branches_loading() && !app.branches.is_empty() {
         "branches · refreshing…".to_string()
@@ -2991,10 +3147,30 @@ fn draw_branches(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
         frame.render_widget(block, area);
         return None;
     }
-    let rows: Vec<Row> = app
-        .branches
+    let display_rows = branch_display_rows(&app.branches);
+    let rows: Vec<Row> = display_rows
         .iter()
-        .map(|b| {
+        .map(|row| {
+            let index = match row {
+                // A group heading names the group and says how the branches
+                // under it differ, so "local" vs "remote" doesn't rest on the
+                // checked-out column alone. A table cell can't span columns, so
+                // the label and its note go in the first two cells and each is
+                // kept short enough for that column's width.
+                BranchRow::Header(label) => {
+                    let note = if *label == "LOCAL BRANCHES" {
+                        "in this repo"
+                    } else {
+                        "on a remote only"
+                    };
+                    return Row::new(vec![
+                        Cell::from(Line::styled(*label, Style::new().fg(ACCENT).bold())),
+                        Cell::from(Line::styled(note, Style::new().dim())),
+                    ]);
+                }
+                BranchRow::Branch(index) => *index,
+            };
+            let b = &app.branches[index];
             let name = Span::styled(b.name.clone(), Style::new().bold());
             let checkout = match (&b.checked_out_path, &b.remote) {
                 (Some(p), _) => Span::styled(format!("● {p}"), Style::new().fg(theme::SUCCESS)),
@@ -3039,7 +3215,8 @@ fn draw_branches(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
     .block(block)
     .row_highlight_style(Style::new().bg(SELECTION_BG).bold())
     .highlight_symbol(Span::styled("▌ ", Style::new().fg(ACCENT)));
-    let mut state = TableState::default().with_selected(Some(app.branch_selected));
+    let mut state = TableState::default()
+        .with_selected(Some(branch_row_of(&display_rows, app.branch_selected)));
     frame.render_stateful_widget(table, area, &mut state);
 
     // The create/rename/delete prompts are modals now, drawn over this list.
@@ -3047,7 +3224,7 @@ fn draw_branches(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
         inner,
         header: 1,
         offset: state.offset(),
-        len: app.branches.len(),
+        len: display_rows.len(),
     })
 }
 
@@ -3262,6 +3439,8 @@ fn draw_commit_diff(
     loading_new: bool,
     scroll: u16,
     h_scroll: u16,
+    // Whether the diff pane draws its line-number gutter (`diff_line_numbers`).
+    numbered: bool,
 ) -> Option<RowList> {
     if files.is_empty() {
         let para = Paragraph::new(Line::from("this commit changed no files".dim()))
@@ -3346,7 +3525,7 @@ fn draw_commit_diff(
             } else if content.is_empty() {
                 vec![Line::from("no textual diff (binary or empty)".dim())]
             } else {
-                highlight::diff_lines(path, content)
+                diff_lines_with_gutter(path, content, numbered)
             };
             (format!("diff · {path}"), lines)
         }
@@ -3737,7 +3916,7 @@ fn draw_open_command_pick(
     area: Rect,
     name: &str,
     vars: &OpenCommandVars<'_>,
-    commands: &[String],
+    commands: &[OpenCommand],
     selected: usize,
 ) -> Option<RowList> {
     // Expanded commands carry absolute paths, so this picker is wider than the
@@ -3755,15 +3934,24 @@ fn draw_open_command_pick(
     ])
     .areas(inner);
     frame.render_widget(
-        Paragraph::new(Line::from("this is what will run".dim())),
+        Paragraph::new(Line::from(
+            "this is what will run · ▶ closes wtm and runs in this terminal".dim(),
+        )),
         head_area,
     );
     let items: Vec<ListItem> = commands
         .iter()
         .map(|cmd| {
+            // The mode marker leads the row so a command that will close wtm
+            // says so before the (long, absolute-path) command itself.
+            let marker = if cmd.mode == CommandMode::Terminal {
+                Span::styled("▶ ", Style::new().fg(theme::WARNING))
+            } else {
+                Span::styled("● ", Style::new().fg(Color::Green))
+            };
             ListItem::new(Line::from(vec![
-                Span::styled("● ", Style::new().fg(Color::Green)),
-                Span::raw(expand_open_command(cmd, vars)),
+                marker,
+                Span::raw(expand_open_command(&cmd.command, vars)),
             ]))
         })
         .collect();
@@ -3846,41 +4034,231 @@ fn draw_stash_target_pick(
     })
 }
 
-/// Short label and color for a hunk's chosen resolution action.
+/// The upstream picker: a type-to-filter prompt over the repo's
+/// remote-tracking refs, with a "stop tracking" row on top when the branch
+/// already has an upstream. The branch's current upstream is named in the
+/// header, and marked in the list, so setting it reads as a change.
+fn draw_upstream_pick(
+    frame: &mut Frame,
+    area: Rect,
+    branch: &str,
+    current: Option<&str>,
+    candidates: &[String],
+    filter: &TextInput,
+    selected: usize,
+) -> Option<RowList> {
+    let rows = upstream_rows(candidates, filter.as_str(), current.is_some());
+    // +4 rows: the header, the filter prompt, and the hint line below the list.
+    let visible = rows.len().clamp(1, 12) as u16;
+    let popup = centered(area, 60, visible + 6);
+    frame.render_widget(Clear, popup);
+    let block = dialog_panel(format!("upstream for '{branch}'"));
+    frame.render_widget(&block, popup);
+    let inner = block.inner(popup);
+    let [head_area, filter_area, list_area, hint_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(
+            match current {
+                Some(up) => format!("currently tracks {up}"),
+                None => "not tracking anything yet".to_string(),
+            }
+            .dim(),
+        )),
+        head_area,
+    );
+    frame.render_widget(
+        Paragraph::new(prompt_line_at(filter.as_str(), filter.cursor)),
+        filter_area,
+    );
+    if rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "no remote branch matches".to_string(),
+                Style::new().dim(),
+            )),
+            list_area,
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from("type to filter · Esc cancel".dim())),
+            hint_area,
+        );
+        return None;
+    }
+    let items: Vec<ListItem> = rows
+        .iter()
+        .map(|row| match row {
+            UpstreamRow::Unset => ListItem::new(Line::from(vec![
+                Span::styled("✕ ", Style::new().fg(theme::DANGER)),
+                Span::raw("stop tracking a remote branch"),
+            ])),
+            UpstreamRow::Candidate(i) => {
+                let name = candidates[*i].as_str();
+                let mut spans = vec![
+                    Span::styled("☁ ", Style::new().fg(theme::INFO)),
+                    Span::raw(name.to_string()),
+                ];
+                if current == Some(name) {
+                    spans.push(Span::styled("  (current)", Style::new().dim()));
+                }
+                ListItem::new(Line::from(spans))
+            }
+        })
+        .collect();
+    let list = List::new(items)
+        .highlight_style(Style::new().bg(SELECTION_BG).bold())
+        .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
+    let mut state = ListState::default().with_selected(Some(selected.min(rows.len() - 1)));
+    frame.render_stateful_widget(list, list_area, &mut state);
+    frame.render_widget(
+        Paragraph::new(Line::from(
+            "type to filter · ↑/↓ pick · Enter set · Esc cancel".dim(),
+        )),
+        hint_area,
+    );
+    Some(RowList {
+        inner: list_area,
+        header: 0,
+        offset: state.offset(),
+        len: rows.len(),
+    })
+}
+
+/// Color used for the "ours" side everywhere in the resolver.
+const OURS_COLOR: Color = theme::SUCCESS;
+/// Color used for the "theirs" side everywhere in the resolver.
+const THEIRS_COLOR: Color = Color::Blue;
+/// Color used for a hand-edited (manual) resolution.
+const MANUAL_COLOR: Color = theme::WARNING;
+
+/// Short label and color for a hunk's chosen resolution action, shown on the
+/// hunk header so the decision reads at a glance.
 fn action_label(action: Option<&ResolutionAction>) -> (&'static str, Color) {
     match action {
-        None => ("… pick a side", BORDER),
-        Some(ResolutionAction::KeepOurs) => ("OURS", theme::SUCCESS),
-        Some(ResolutionAction::KeepTheirs) => ("THEIRS", Color::Blue),
-        Some(ResolutionAction::KeepBoth) => ("BOTH", Color::Cyan),
-        Some(ResolutionAction::KeepBothReversed) => ("BOTH (theirs first)", Color::Cyan),
-        Some(ResolutionAction::Manual(_)) => ("MANUAL", theme::WARNING),
+        None => ("undecided — press o / t / b", theme::WARNING),
+        Some(ResolutionAction::KeepOurs) => ("keeping OURS", OURS_COLOR),
+        Some(ResolutionAction::KeepTheirs) => ("keeping THEIRS", THEIRS_COLOR),
+        Some(ResolutionAction::KeepBoth) => ("keeping BOTH · ours first", Color::Cyan),
+        Some(ResolutionAction::KeepBothReversed) => ("keeping BOTH · theirs first", Color::Cyan),
+        Some(ResolutionAction::Manual(_)) => ("hand-edited", MANUAL_COLOR),
     }
 }
 
-/// One side of a hunk, each line prefixed with `marker` and colored, capped so
-/// a huge hunk can't blow out the pane. An empty side is called out explicitly.
-fn push_side(lines: &mut Vec<Line<'static>>, marker: &str, text: &str, color: Color) {
+/// How one side of a hunk is being treated by the chosen action: kept (with its
+/// position when both sides are kept), dropped, or not yet decided.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SideState {
+    /// Kept. `Some(n)` numbers it when both sides are kept in order.
+    Kept(Option<u8>),
+    Dropped,
+    Undecided,
+}
+
+impl SideState {
+    /// Glyph and fixed-width verdict word for the side's header row. The
+    /// verdict leads the row so it can never be the part that gets clipped on a
+    /// narrow pane.
+    fn marks(self) -> (&'static str, &'static str) {
+        match self {
+            SideState::Kept(None) => ("✓", "keep    "),
+            SideState::Kept(Some(1)) => ("✓", "keep 1st"),
+            SideState::Kept(Some(_)) => ("✓", "keep 2nd"),
+            SideState::Dropped => ("✗", "drop    "),
+            SideState::Undecided => ("○", "        "),
+        }
+    }
+}
+
+/// What `action` does to each side of the hunk, as (ours, theirs).
+fn side_states(action: Option<&ResolutionAction>) -> (SideState, SideState) {
+    match action {
+        None => (SideState::Undecided, SideState::Undecided),
+        Some(ResolutionAction::KeepOurs) => (SideState::Kept(None), SideState::Dropped),
+        Some(ResolutionAction::KeepTheirs) => (SideState::Dropped, SideState::Kept(None)),
+        Some(ResolutionAction::KeepBoth) => (SideState::Kept(Some(1)), SideState::Kept(Some(2))),
+        Some(ResolutionAction::KeepBothReversed) => {
+            (SideState::Kept(Some(2)), SideState::Kept(Some(1)))
+        }
+        // A hand-edited hunk replaces both sides, so neither is kept verbatim.
+        Some(ResolutionAction::Manual(_)) => (SideState::Dropped, SideState::Dropped),
+    }
+}
+
+/// How one side of a hunk is introduced: the box-drawing corner that opens its
+/// block, what the side is called, the branch it came from, the key that takes
+/// it, its color, and an optional trailing note. Where each side *comes from*
+/// lives in the pane's sticky legend instead, so these rows stay short enough
+/// not to clip on a narrow pane.
+struct SideView<'a> {
+    corner: &'a str,
+    side: &'a str,
+    label: &'a str,
+    key: char,
+    color: Color,
+    note: &'a str,
+}
+
+/// One labelled side of a hunk: a header row naming the side, its branch, and
+/// whether it is being kept, followed by its lines inside a colored gutter. A
+/// dropped side is dimmed so the kept one stands out; a huge side is capped so
+/// it can't blow out the pane.
+fn push_side(lines: &mut Vec<Line<'static>>, view: &SideView, text: &str, state: SideState) {
+    let SideView {
+        corner,
+        side,
+        label,
+        key,
+        color,
+        note,
+    } = *view;
+    let (glyph, verdict) = state.marks();
+    let dropped = state == SideState::Dropped;
+    let head = if dropped {
+        Style::new().fg(color).dim()
+    } else {
+        Style::new().fg(color).bold()
+    };
+    lines.push(Line::from(vec![
+        Span::styled(format!("  {corner} {glyph} {verdict}  "), head),
+        Span::styled(format!("{side} · {label}"), head),
+        Span::styled(format!("  [{key}]"), Style::new().fg(ACCENT).dim()),
+        Span::styled(format!("  {note}"), Style::new().fg(color).dim()),
+    ]));
+
+    let gutter = Span::styled("  │ ", Style::new().fg(color).dim());
+    let body_style = if dropped {
+        Style::new().fg(BORDER).dim()
+    } else {
+        Style::new().fg(color)
+    };
     let body: Vec<&str> = text.lines().collect();
     if body.is_empty() {
-        lines.push(Line::styled(
-            format!("  {marker} (nothing on this side)"),
-            Style::new().fg(color).dim(),
-        ));
+        lines.push(Line::from(vec![
+            gutter.clone(),
+            Span::styled("(this side is empty)", Style::new().fg(color).dim()),
+        ]));
         return;
     }
     const MAX: usize = 200;
     for l in body.iter().take(MAX) {
-        lines.push(Line::styled(
-            format!("  {marker} {l}"),
-            Style::new().fg(color),
-        ));
+        lines.push(Line::from(vec![
+            gutter.clone(),
+            Span::styled((*l).to_string(), body_style),
+        ]));
     }
     if body.len() > MAX {
-        lines.push(Line::styled(
-            format!("  {marker} … {} more line(s)", body.len() - MAX),
-            Style::new().fg(color).dim(),
-        ));
+        lines.push(Line::from(vec![
+            gutter,
+            Span::styled(
+                format!("… {} more line(s)", body.len() - MAX),
+                Style::new().fg(color).dim(),
+            ),
+        ]));
     }
 }
 
@@ -3967,7 +4345,14 @@ fn draw_conflict_resolver(
 
     let path = files.get(file).map(String::as_str).unwrap_or("");
 
-    // Right: a resolved note, or the file's hunks.
+    // Right: a resolved note, or the file's hunks. Both are drawn inside one
+    // panel whose top rows (the side legend) and bottom row (the key hints)
+    // stay put while the hunks scroll, so the reminder of which side is which
+    // is on screen at every hunk instead of scrolling away with the first one.
+    let block = panel(format!("resolve · {path}"));
+    let inner = block.inner(detail_area);
+    frame.render_widget(block, detail_area);
+
     let Some(rf) = current else {
         let para = Paragraph::new(vec![
             Line::from(""),
@@ -3984,49 +4369,62 @@ fn draw_conflict_resolver(
                 "  press c to complete once every file is done",
                 Style::new().dim(),
             ),
-        ])
-        .block(panel(format!("resolve · {path}")));
-        frame.render_widget(para, detail_area);
+        ]);
+        frame.render_widget(para, inner);
         return list_hit;
     };
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
     // Spell out which side is which. For a merge, OURS is what is already in
     // this worktree and THEIRS is what is being pulled in. A rebase reverses
     // that: it replays your commits on top of the other branch, so git's "ours"
     // is the branch being rebased onto and "theirs" is your own commit. Saying
     // "current" for a rebase would send the user the wrong way on every hunk.
-    let ours_role = if kind.sides_are_swapped() {
+    let swapped = kind.sides_are_swapped();
+    let ours_origin = if swapped {
         "the branch you're rebasing onto"
     } else {
-        "current"
+        "already in this worktree"
     };
-    lines.push(Line::from(vec![
-        Span::styled("‹ OURS ", Style::new().fg(theme::SUCCESS).bold()),
-        Span::styled(
-            format!("({ours_role} · {})", rf.file.ours_label),
-            Style::new().fg(theme::SUCCESS),
-        ),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("› THEIRS ", Style::new().fg(Color::Blue).bold()),
-        Span::styled(
-            format!(
-                "(incoming from {} · {})",
-                incoming_source(kind),
-                rf.file.theirs_label
+    let theirs_origin = format!("incoming from {}", incoming_source(kind));
+
+    // The legend is drawn outside the scrolling hunk list, so what each side
+    // means is on screen at the last hunk as much as at the first. It used to
+    // ride along at the top of the scrolled text and vanish after the first
+    // hunk, which left every later hunk as two anonymous blocks of code.
+    let mut legend: Vec<Line<'static>> = vec![
+        Line::from(vec![
+            Span::styled("OURS · ", Style::new().fg(OURS_COLOR).bold()),
+            Span::styled(
+                rf.file.ours_label.clone(),
+                Style::new().fg(OURS_COLOR).bold(),
             ),
-            Style::new().fg(Color::Blue),
-        ),
-    ]));
-    if kind.sides_are_swapped() {
-        lines.push(Line::styled(
-            "  note: a rebase swaps the sides — \"theirs\" is your own work",
-            Style::new().fg(theme::WARNING),
+            Span::styled("  [o]  ", Style::new().fg(ACCENT).dim()),
+            Span::styled(ours_origin, Style::new().fg(OURS_COLOR)),
+        ]),
+        Line::from(vec![
+            Span::styled("THEIRS · ", Style::new().fg(THEIRS_COLOR).bold()),
+            Span::styled(
+                rf.file.theirs_label.clone(),
+                Style::new().fg(THEIRS_COLOR).bold(),
+            ),
+            Span::styled("  [t]  ", Style::new().fg(ACCENT).dim()),
+            Span::styled(theirs_origin.clone(), Style::new().fg(THEIRS_COLOR)),
+        ]),
+    ];
+    if swapped {
+        legend.push(Line::styled(
+            "! a rebase swaps the sides — \"THEIRS\" is your own work",
+            Style::new().fg(theme::WARNING).bold(),
         ));
     }
-    lines.push(Line::from(""));
+    let legend_h = legend.len() as u16;
 
+    let total_hunks = rf.actions.len();
+    let decided = rf.actions.iter().filter(|a| a.is_some()).count();
+    // Text width inside the pane, leaving the scrollbar column free.
+    let body_w = inner.width.saturating_sub(1) as usize;
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
     let mut hunk_i = 0usize;
     // Line offset of the current hunk's header, used to keep it in view.
     let mut current_line = 0usize;
@@ -4034,7 +4432,7 @@ fn draw_conflict_resolver(
         match seg {
             ConflictSegment::Plain(text) => {
                 for l in context_lines(text) {
-                    lines.push(Line::styled(format!("  {l}"), Style::new().dim()));
+                    lines.push(Line::styled(format!("    {l}"), Style::new().dim()));
                 }
             }
             ConflictSegment::Hunk { ours, theirs, .. } => {
@@ -4042,42 +4440,121 @@ fn draw_conflict_resolver(
                 if is_cur {
                     current_line = lines.len();
                 }
-                let (label, color) = action_label(rf.actions.get(hunk_i).and_then(|a| a.as_ref()));
+                let action = rf.actions.get(hunk_i).and_then(|a| a.as_ref());
+                let (label, color) = action_label(action);
+                let (ours_state, theirs_state) = side_states(action);
                 let marker = if is_cur { "◆" } else { "◇" };
                 let hstyle = if is_cur {
                     Style::new().bg(SELECTION_BG).bold()
                 } else {
                     Style::new().bold()
                 };
+                let head = format!("{marker} hunk {} of {total_hunks} · ", hunk_i + 1);
+                // Pad the current hunk's header out to the pane width so its
+                // highlight reads as a full selected row, not a stray patch of
+                // background behind the text.
+                let pad = body_w.saturating_sub(head.chars().count() + label.chars().count());
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{marker} hunk {} ", hunk_i + 1), hstyle.fg(ACCENT)),
-                    Span::styled(format!("[{label}]"), Style::new().fg(color).bold()),
+                    Span::styled(head, hstyle.fg(ACCENT)),
+                    Span::styled(label, hstyle.fg(color)),
+                    Span::styled(" ".repeat(if is_cur { pad } else { 0 }), hstyle),
                 ]));
-                push_side(&mut lines, "‹", ours, theme::SUCCESS);
-                lines.push(Line::styled("  ─────", Style::new().dim()));
-                push_side(&mut lines, "›", theirs, Color::Blue);
+                push_side(
+                    &mut lines,
+                    &SideView {
+                        corner: "┌",
+                        side: "OURS",
+                        label: &rf.file.ours_label,
+                        key: 'o',
+                        color: OURS_COLOR,
+                        note: "",
+                    },
+                    ours,
+                    ours_state,
+                );
+                push_side(
+                    &mut lines,
+                    &SideView {
+                        corner: "├",
+                        side: "THEIRS",
+                        label: &rf.file.theirs_label,
+                        key: 't',
+                        color: THEIRS_COLOR,
+                        note: "",
+                    },
+                    theirs,
+                    theirs_state,
+                );
+                if let Some(ResolutionAction::Manual(text)) = action {
+                    push_side(
+                        &mut lines,
+                        &SideView {
+                            corner: "├",
+                            side: "YOUR EDIT",
+                            label: "hand-written",
+                            key: 'e',
+                            color: MANUAL_COLOR,
+                            note: "replaces both sides",
+                        },
+                        text,
+                        SideState::Kept(None),
+                    );
+                }
+                lines.push(Line::from(vec![
+                    Span::styled("  └ ", Style::new().fg(BORDER)),
+                    Span::styled("b", Style::new().fg(Color::Cyan).bold()),
+                    Span::styled(" both · ", Style::new().dim()),
+                    Span::styled("⇧B", Style::new().fg(Color::Cyan).bold()),
+                    Span::styled(" both, theirs 1st · ", Style::new().dim()),
+                    Span::styled("e", Style::new().fg(MANUAL_COLOR).bold()),
+                    Span::styled(" edit hunk", Style::new().dim()),
+                ]));
                 lines.push(Line::from(""));
                 hunk_i += 1;
             }
         }
     }
 
-    // Scroll so the current hunk's header sits near the top of the pane.
-    let scroll = current_line.saturating_sub(1) as u16;
+    let [legend_area, body_area, hint_area] = Layout::vertical([
+        Constraint::Length(legend_h),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    frame.render_widget(Paragraph::new(legend), legend_area);
+
+    // Scroll so the current hunk's header sits near the top of the pane, but
+    // never past the end of the content.
     let total = lines.len();
-    let para = Paragraph::new(lines)
-        .block(panel(format!("resolve · {path}")))
-        .scroll((scroll, 0));
-    frame.render_widget(para, detail_area);
-    let mut sb = ScrollbarState::new(total.saturating_sub(detail_area.height as usize))
-        .position(scroll as usize);
+    let max_scroll = total.saturating_sub(body_area.height as usize);
+    let scroll = current_line.saturating_sub(1).min(max_scroll) as u16;
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), body_area);
+    let mut sb = ScrollbarState::new(max_scroll).position(scroll as usize);
     frame.render_stateful_widget(
         Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .style(Style::new().fg(BORDER))
             .thumb_style(Style::new().fg(ACCENT)),
-        detail_area,
+        body_area,
         &mut sb,
     );
+
+    let hint = Line::from(vec![
+        Span::styled(
+            format!("{decided}/{total_hunks} decided · "),
+            Style::new().fg(if decided == total_hunks {
+                theme::SUCCESS
+            } else {
+                theme::WARNING
+            }),
+        ),
+        Span::styled("⇧E", Style::new().fg(ACCENT).bold()),
+        Span::styled(" edit file · ", Style::new().dim()),
+        Span::styled("⇧O/⇧T", Style::new().fg(ACCENT).bold()),
+        Span::styled(" take side · ", Style::new().dim()),
+        Span::styled("w", Style::new().fg(ACCENT).bold()),
+        Span::styled(" stage", Style::new().dim()),
+    ]);
+    frame.render_widget(Paragraph::new(hint), hint_area);
     // The manual hunk editor floats over the resolver as a modal (`draw_modal`).
     list_hit
 }
@@ -4121,6 +4598,92 @@ fn draw_hunk_editor(frame: &mut Frame, area: Rect, hunk: usize, editor: &super::
             lines.push(Line::from(spans));
         } else {
             lines.push(Line::raw(text.clone()));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Style for one raw line of a conflicted file in the whole-file editor: the
+/// conflict markers themselves stand out, and each side keeps the color it has
+/// in the resolver so the file reads the same way there and here.
+fn conflict_line_style(line: &str, side: &mut Color) -> Style {
+    if line.starts_with("<<<<<<<") {
+        *side = OURS_COLOR;
+        return Style::new().fg(theme::WARNING).bold();
+    }
+    if line.starts_with("|||||||") {
+        *side = BORDER;
+        return Style::new().fg(theme::WARNING).bold();
+    }
+    if line.trim_end() == "=======" {
+        *side = THEIRS_COLOR;
+        return Style::new().fg(theme::WARNING).bold();
+    }
+    if line.starts_with(">>>>>>>") {
+        let style = Style::new().fg(theme::WARNING).bold();
+        *side = Color::Reset;
+        return style;
+    }
+    Style::new().fg(*side)
+}
+
+/// The whole-file editor: the conflicted file exactly as it sits on disk, with
+/// line numbers, the conflict markers highlighted, and a visible block cursor.
+/// Saved with Ctrl+S, discarded with Esc.
+fn draw_file_editor(frame: &mut Frame, area: Rect, path: &str, editor: &super::app::TextArea) {
+    let popup = centered(
+        area,
+        area.width.saturating_sub(4).min(120),
+        area.height.saturating_sub(2).max(5),
+    );
+    frame.render_widget(Clear, popup);
+    let block = dialog_panel(format!("edit {path} · Ctrl+S save · Esc cancel"));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let height = inner.height as usize;
+    // No scroll offset is stored, so the view is derived from the cursor: keep
+    // it centered, clamped at both ends of the file.
+    let max_scroll = editor.lines.len().saturating_sub(height);
+    let scroll = editor.row.saturating_sub(height / 2).min(max_scroll);
+    let width = editor.lines.len().to_string().len();
+
+    // The side each line belongs to is carried down from the last marker seen,
+    // so it has to be tracked from the top of the file, not from the first
+    // visible row.
+    let mut side = Color::Reset;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (r, text) in editor.lines.iter().enumerate() {
+        let style = conflict_line_style(text, &mut side);
+        if r < scroll || r >= scroll + height {
+            continue;
+        }
+        let gutter = Span::styled(
+            format!("{:>width$} ", r + 1, width = width),
+            Style::new().fg(BORDER),
+        );
+        if r == editor.row {
+            // Split the cursor line so the character under the cursor is shown
+            // inverted, giving a visible caret (or a trailing block at line end).
+            let chars: Vec<char> = text.chars().collect();
+            let col = editor.col.min(chars.len());
+            let cursor_style = Style::new().bg(ACCENT).fg(Color::Black);
+            let mut spans = vec![
+                gutter,
+                Span::styled(chars[..col].iter().collect::<String>(), style),
+            ];
+            if col < chars.len() {
+                spans.push(Span::styled(chars[col].to_string(), cursor_style));
+                spans.push(Span::styled(
+                    chars[col + 1..].iter().collect::<String>(),
+                    style,
+                ));
+            } else {
+                spans.push(Span::styled(" ", cursor_style));
+            }
+            lines.push(Line::from(spans));
+        } else {
+            lines.push(Line::from(vec![gutter, Span::styled(text.clone(), style)]));
         }
     }
     frame.render_widget(Paragraph::new(lines), inner);
@@ -4212,6 +4775,10 @@ fn draw_modal(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
             draw_hunk_editor(frame, area, hunk, editor);
             None
         }
+        Modal::FileEditor { path, editor } => {
+            draw_file_editor(frame, area, path, editor);
+            None
+        }
     }
 }
 
@@ -4266,11 +4833,17 @@ fn modal_footer_hints(modal: &Modal) -> &'static [Binding] {
         hint("Ctrl+S", "save"),
         hint("Esc", "cancel"),
     ];
+    const FILE: &[Binding] = &[
+        hint("type", "edit the file"),
+        hint("Ctrl+S", "save to disk"),
+        hint("Esc", "cancel"),
+    ];
     match modal {
         Modal::Confirm { options, .. } if options.len() > 1 => CONFIRM_MULTI,
         Modal::Confirm { .. } => CONFIRM_SINGLE,
         Modal::Prompt { .. } => PROMPT,
         Modal::HunkEditor(_) => HUNK,
+        Modal::FileEditor { .. } => FILE,
     }
 }
 
@@ -4329,6 +4902,43 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    /// The gutter puts each line's own number beside it, sized to the widest,
+    /// and leaves headers and hunk markers blank.
+    #[test]
+    fn diff_gutter_numbers_each_line_from_the_hunk_header() {
+        let diff = "@@ -8,2 +98,3 @@\n ctx\n-gone\n+added\n";
+        let lines = diff_lines_with_gutter("x.rs", diff, true);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans[0].content.to_string())
+            .collect();
+        assert_eq!(
+            text,
+            ["   ", "98 ", " 9 ", "99 "],
+            "hunk header blank; context/added on the new side, removed on the old"
+        );
+    }
+
+    /// With the setting off the diff renders exactly as before: no gutter span
+    /// is prepended at all.
+    #[test]
+    fn diff_gutter_is_absent_when_line_numbers_are_off() {
+        let diff = "@@ -1,1 +1,1 @@\n+added\n";
+        let plain = diff_lines_with_gutter("x.rs", diff, false);
+        assert_eq!(plain, highlight::diff_lines("x.rs", diff));
+    }
+
+    /// A diff with no hunk headers (binary, or a status-only summary) has no
+    /// numbers to show, so it gets no empty gutter column either.
+    #[test]
+    fn diff_gutter_is_skipped_when_nothing_can_be_numbered() {
+        let diff = "Binary files a/x.png and b/x.png differ\n";
+        assert_eq!(
+            diff_lines_with_gutter("x.png", diff, true),
+            highlight::diff_lines("x.png", diff)
+        );
     }
 
     fn entry(hash: &str, subject: &str, refs: &[&str]) -> LogEntry {
@@ -4644,7 +5254,10 @@ mod tests {
     fn settings_tab_draws_the_open_command_list_editor() {
         let mut editor = settings_editor("");
         editor.selected = OPEN_COMMAND_ROW;
-        editor.fields.open_command = vec!["cursor {path}".to_string(), "open {path}".to_string()];
+        editor.fields.open_command = vec![
+            OpenCommand::new("cursor {path}"),
+            OpenCommand::new("open {path}"),
+        ];
         let mut list = OpenCommandEditor::new(editor.fields.open_command.clone());
         list.selected = 1;
         editor.open_list = Some(list);
@@ -4666,7 +5279,10 @@ mod tests {
     #[test]
     fn settings_tab_summarises_multiple_open_commands() {
         let mut editor = settings_editor("");
-        editor.fields.open_command = vec!["cursor {path}".to_string(), "open {path}".to_string()];
+        editor.fields.open_command = vec![
+            OpenCommand::new("cursor {path}"),
+            OpenCommand::new("open {path}"),
+        ];
         let out = render(90, 48, |frame, area| {
             draw_settings_tab(frame, area, &editor, None);
         });
@@ -4690,8 +5306,8 @@ mod tests {
                     status: "ahead",
                 },
                 &[
-                    "cursor {path}".to_string(),
-                    "open {path} # {branch}".to_string(),
+                    OpenCommand::new("cursor {path}"),
+                    OpenCommand::new("open {path} # {branch}").with_mode(CommandMode::Terminal),
                 ],
                 0,
             );
@@ -5076,5 +5692,223 @@ mod tests {
         assert!(out.iter().any(|r| r.contains("Commit message")), "{out:#?}");
         assert!(out.iter().any(|r| r.contains("subject here")), "{out:#?}");
         assert!(out.iter().any(|r| r.contains("^S commits")), "{out:#?}");
+    }
+
+    /// A two-hunk conflicted file, for the resolver rendering tests.
+    fn resolver_file(actions: Vec<Option<ResolutionAction>>, hunk: usize) -> ResolverFile {
+        ResolverFile {
+            file: crate::ops::ConflictFile {
+                path: "src/main.rs".into(),
+                segments: vec![
+                    ConflictSegment::Plain("fn main() {\n".into()),
+                    ConflictSegment::Hunk {
+                        ours: "    mine();\n".into(),
+                        theirs: "    yours();\n".into(),
+                        base: None,
+                    },
+                    ConflictSegment::Plain("}\n".into()),
+                    ConflictSegment::Hunk {
+                        ours: "    mine2();\n".into(),
+                        theirs: "    yours2();\n".into(),
+                        base: None,
+                    },
+                ],
+                ours_label: "main".into(),
+                theirs_label: "feature/login".into(),
+            },
+            actions,
+            hunk,
+        }
+    }
+
+    /// Renders the resolver over a two-hunk file.
+    fn render_resolver(kind: ResolveKind, rf: &ResolverFile) -> Vec<String> {
+        render(96, 30, |frame, area| {
+            draw_conflict_resolver(
+                frame,
+                area,
+                "wt",
+                "feature/login",
+                &kind,
+                &["src/main.rs".to_string()],
+                &[false],
+                0,
+                Some(rf),
+            );
+        })
+    }
+
+    /// The old pane put the OURS/THEIRS key in a header that scrolled away with
+    /// the first hunk, leaving later hunks as two anonymous blocks of text. Now
+    /// every hunk names both sides, the branch each came from, and the key that
+    /// takes it, so no hunk can be read out of context.
+    #[test]
+    fn resolver_names_both_sides_on_every_hunk() {
+        let rf = resolver_file(vec![None, None], 0);
+        let out = render_resolver(ResolveKind::Merge, &rf);
+        // Only the rows inside a hunk block (the ones opened by a box-drawing
+        // corner), not the pane's legend.
+        let ours = out
+            .iter()
+            .filter(|r| r.contains("┌") && r.contains("OURS · main") && r.contains("[o]"))
+            .count();
+        let theirs = out
+            .iter()
+            .filter(|r| {
+                r.contains("├") && r.contains("THEIRS · feature/login") && r.contains("[t]")
+            })
+            .count();
+        assert_eq!(ours, 2, "both hunks label ours: {out:#?}");
+        assert_eq!(theirs, 2, "both hunks label theirs: {out:#?}");
+        assert!(
+            out.iter()
+                .any(|r| r.contains("OURS · main") && r.contains("already in this worktree")),
+            "the legend says where ours came from: {out:#?}"
+        );
+        assert!(
+            out.iter()
+                .any(|r| r.contains("THEIRS · feature/login")
+                    && r.contains("incoming from the merge")),
+            "the legend says where theirs came from: {out:#?}"
+        );
+    }
+
+    /// An undecided hunk advertises every way out of it, including keeping both
+    /// sides and editing the whole file.
+    #[test]
+    fn resolver_offers_both_and_the_editors_on_screen() {
+        let rf = resolver_file(vec![None, None], 0);
+        let out = render_resolver(ResolveKind::Merge, &rf);
+        assert!(
+            out.iter()
+                .any(|r| r.contains("undecided — press o / t / b")),
+            "{out:#?}"
+        );
+        assert!(
+            out.iter()
+                .any(|r| r.contains("b both") && r.contains("⇧B both, theirs 1st")),
+            "keeping both is offered per hunk: {out:#?}"
+        );
+        assert!(
+            out.iter()
+                .any(|r| r.contains("0/2 decided") && r.contains("⇧E edit file")),
+            "the sticky footer counts the decisions and offers the file editor: {out:#?}"
+        );
+    }
+
+    /// The decision has to be readable off the hunk itself: the kept side is
+    /// marked "keep", the discarded one "drop".
+    #[test]
+    fn resolver_marks_the_kept_side_and_the_dropped_one() {
+        let rf = resolver_file(vec![Some(ResolutionAction::KeepTheirs), None], 0);
+        let out = render_resolver(ResolveKind::Merge, &rf);
+        assert!(
+            out.iter()
+                .any(|r| r.contains("✗ drop") && r.contains("OURS · main")),
+            "ours is dropped: {out:#?}"
+        );
+        assert!(
+            out.iter()
+                .any(|r| r.contains("✓ keep") && r.contains("THEIRS · feature/login")),
+            "theirs is kept: {out:#?}"
+        );
+        assert!(
+            out.iter().any(|r| r.contains("keeping THEIRS")),
+            "and the hunk header says so: {out:#?}"
+        );
+    }
+
+    /// Keeping both sides shows the order they will be written in, so "both"
+    /// isn't a guess about what lands in the file.
+    #[test]
+    fn resolver_numbers_both_sides_when_both_are_kept() {
+        let rf = resolver_file(vec![Some(ResolutionAction::KeepBoth), None], 0);
+        let out = render_resolver(ResolveKind::Merge, &rf);
+        assert!(
+            out.iter()
+                .any(|r| r.contains("✓ keep 1st") && r.contains("OURS")),
+            "{out:#?}"
+        );
+        assert!(
+            out.iter()
+                .any(|r| r.contains("✓ keep 2nd") && r.contains("THEIRS")),
+            "{out:#?}"
+        );
+
+        let rev = resolver_file(vec![Some(ResolutionAction::KeepBothReversed), None], 0);
+        let out = render_resolver(ResolveKind::Merge, &rev);
+        assert!(
+            out.iter()
+                .any(|r| r.contains("✓ keep 2nd") && r.contains("OURS")),
+            "reversed puts theirs first: {out:#?}"
+        );
+        assert!(
+            out.iter()
+                .any(|r| r.contains("✓ keep 1st") && r.contains("THEIRS")),
+            "reversed puts theirs first: {out:#?}"
+        );
+    }
+
+    /// A hand-edited hunk shows the text that will actually be written, not
+    /// just the label "MANUAL" over the two sides it replaced.
+    #[test]
+    fn resolver_shows_the_text_a_hand_edited_hunk_will_write() {
+        let rf = resolver_file(
+            vec![
+                Some(ResolutionAction::Manual("    merged();\n".into())),
+                None,
+            ],
+            0,
+        );
+        let out = render_resolver(ResolveKind::Merge, &rf);
+        assert!(
+            out.iter().any(|r| r.contains("YOUR EDIT")),
+            "the edit gets its own labelled block: {out:#?}"
+        );
+        assert!(
+            out.iter().any(|r| r.contains("merged();")),
+            "showing what it will write: {out:#?}"
+        );
+    }
+
+    /// A rebase swaps git's sides, which is the one thing a hunk can't say for
+    /// itself, so the warning gets a row that never scrolls away.
+    #[test]
+    fn resolver_warns_that_a_rebase_swaps_the_sides() {
+        let rf = resolver_file(vec![None, None], 1);
+        let out = render_resolver(ResolveKind::Rebase, &rf);
+        assert!(
+            out.iter().any(|r| r.contains("a rebase swaps the sides")),
+            "{out:#?}"
+        );
+        assert!(
+            out.iter()
+                .any(|r| r.contains("the branch you're rebasing onto")),
+            "ours is described as the rebase target: {out:#?}"
+        );
+    }
+
+    /// The whole-file editor numbers the lines and keeps git's markers visible,
+    /// since removing them is the job it exists for.
+    #[test]
+    fn file_editor_numbers_lines_and_keeps_the_markers() {
+        let editor = super::super::app::TextArea::new(
+            "fn main() {\n<<<<<<< main\n    mine();\n=======\n    yours();\n>>>>>>> feature\n}\n",
+        );
+        let out = render(80, 14, |frame, area| {
+            draw_file_editor(frame, area, "src/main.rs", &editor);
+        });
+        assert!(
+            out.iter().any(|r| r.contains("edit src/main.rs")),
+            "the panel names the file: {out:#?}"
+        );
+        assert!(
+            out.iter().any(|r| r.contains("2 <<<<<<< main")),
+            "numbered, markers intact: {out:#?}"
+        );
+        assert!(
+            out.iter().any(|r| r.contains("6 >>>>>>> feature")),
+            "numbered, markers intact: {out:#?}"
+        );
     }
 }

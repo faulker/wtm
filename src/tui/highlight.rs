@@ -287,9 +287,126 @@ fn diff_line(line: &str, highlighter: &mut Option<HighlightLines<'_>>) -> Line<'
     Line::from(spans)
 }
 
+/// Which file a gutter number refers to, so the renderer can dim numbers that
+/// point at the pre-image (a removed line's number is a line that no longer
+/// exists in the file on disk).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GutterSide {
+    /// A number in the file as it is now: a context or added line.
+    New,
+    /// A number in the file as it was: a removed line.
+    Old,
+}
+
+/// The line number to show beside each line of unified diff `content`, or
+/// `None` for lines that have no place in either file (headers, hunk markers,
+/// `\ No newline at end of file`).
+///
+/// Numbers are tracked from each `@@ -old,n +new,m @@` header: added and
+/// context lines carry their number in the new file, removed lines their
+/// number in the old one. A diff with no hunk headers (a status-only or
+/// binary summary) yields all `None`, so the gutter stays blank rather than
+/// inventing numbers.
+pub fn gutter_numbers(content: &str) -> Vec<Option<(u32, GutterSide)>> {
+    let mut old = 0u32;
+    let mut new = 0u32;
+    let mut in_hunk = false;
+    content
+        .lines()
+        .map(|line| {
+            if line.starts_with("@@") {
+                let (o, n) = parse_hunk_header(line);
+                old = o;
+                new = n;
+                in_hunk = true;
+                return None;
+            }
+            // Everything before the first hunk header is file-level chrome
+            // (`diff --git`, `index`, `---`/`+++`). Testing for those prefixes
+            // only outside a hunk keeps an added line whose own text starts
+            // with `++` from being mistaken for a header.
+            if !in_hunk {
+                return None;
+            }
+            // Each hunk header names the line the hunk *starts* at, so a line
+            // takes the current counter and the counter then advances past it.
+            match line.as_bytes().first() {
+                Some(b'+') => {
+                    let at = new;
+                    new += 1;
+                    Some((at, GutterSide::New))
+                }
+                Some(b'-') => {
+                    let at = old;
+                    old += 1;
+                    Some((at, GutterSide::Old))
+                }
+                Some(b' ') => {
+                    let at = new;
+                    old += 1;
+                    new += 1;
+                    Some((at, GutterSide::New))
+                }
+                // "\ No newline at end of file" and anything else in a hunk
+                // occupies no line in either file.
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Start line of each side of a hunk header, from `@@ -old[,n] +new[,m] @@`.
+/// A header that doesn't parse restarts both sides at 1, which keeps the
+/// gutter monotonic instead of leaving it stuck on the previous hunk.
+fn parse_hunk_header(line: &str) -> (u32, u32) {
+    let mut old = 1;
+    let mut new = 1;
+    for token in line.split_whitespace() {
+        let (target, digits) = match token.as_bytes().first() {
+            Some(b'-') => (&mut old, &token[1..]),
+            Some(b'+') => (&mut new, &token[1..]),
+            _ => continue,
+        };
+        let start = digits.split(',').next().unwrap_or("");
+        if let Ok(n) = start.parse::<u32>() {
+            *target = n;
+        }
+    }
+    (old, new)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gutter_numbers_track_both_sides_of_each_hunk() {
+        let diff = "diff --git a/x.rs b/x.rs\n--- a/x.rs\n+++ b/x.rs\n\
+                    @@ -10,3 +20,3 @@ fn main() {\n ctx\n-old\n+new\n\\ No newline\n";
+        let nums = gutter_numbers(diff);
+        assert_eq!(nums[0], None, "diff header");
+        assert_eq!(nums[1], None, "--- header");
+        assert_eq!(nums[2], None, "+++ header");
+        assert_eq!(nums[3], None, "hunk header");
+        assert_eq!(
+            nums[4],
+            Some((20, GutterSide::New)),
+            "context uses new side"
+        );
+        assert_eq!(
+            nums[5],
+            Some((11, GutterSide::Old)),
+            "removed uses old side"
+        );
+        assert_eq!(nums[6], Some((21, GutterSide::New)), "added uses new side");
+        assert_eq!(nums[7], None, "no-newline marker numbers nothing");
+    }
+
+    #[test]
+    fn gutter_numbers_are_blank_without_a_hunk_header() {
+        let nums = gutter_numbers("Binary files a/x.png and b/x.png differ\n");
+        assert_eq!(nums, vec![None]);
+    }
 
     #[test]
     fn added_and_removed_lines_get_background_tints() {

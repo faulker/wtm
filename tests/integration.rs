@@ -1616,6 +1616,11 @@ fn merge_conflict_lists_files_then_resolve_and_continue() {
     let read = stdout_json(&wtm(&repo, &["conflicts", "target", "README.md", "--json"]));
     assert_eq!(read["path"], "README.md");
     assert!(!read["segments"].as_array().unwrap().is_empty());
+    // Git writes "HEAD" on our side of a merge, which names no branch at all.
+    // The side labels are what tells the user (and an agent) which change is
+    // which, so ours reports the branch actually checked out there.
+    assert_eq!(read["ours_label"], "target");
+    assert_eq!(read["theirs_label"], "feature");
 
     // Resolve by keeping "ours" (the target's edit), then finish the merge.
     let resolved = stdout_json(&wtm(
@@ -1766,6 +1771,22 @@ fn rebase_conflict_lists_files_then_resolve_and_continue() {
     assert_eq!(feature["conflicted"], 1);
     assert_eq!(feature["in_progress"]["kind"], "rebase");
 
+    // Mid-rebase the worktree sits on a detached HEAD and git labels the
+    // markers "HEAD" and a bare hash, so neither side names a branch. Read from
+    // the rebase state instead, or there is no way to tell the sides apart.
+    let read = stdout_json(&wtm(
+        &repo,
+        &["conflicts", "feature", "README.md", "--json"],
+    ));
+    assert_eq!(
+        read["ours_label"], "main",
+        "ours is the branch rebased onto"
+    );
+    assert_eq!(
+        read["theirs_label"], "feature",
+        "theirs is the branch being replayed"
+    );
+
     // Mid-rebase git swaps the sides: "theirs" is the commit being replayed,
     // i.e. the feature edit.
     stdout_json(&wtm(
@@ -1879,4 +1900,144 @@ fn rebase_rejects_conflicting_flags_and_missing_onto() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// `branch upstream` points a branch at a remote-tracking ref, reports the
+/// previous one, and can clear tracking again with `--unset`.
+#[test]
+fn branch_upstream_sets_changes_and_clears_tracking() {
+    let (tmp, repo) = setup_repo();
+    let bare = bare_repo(tmp.path());
+    git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    git(&repo, &["push", "-u", "origin", "main"]);
+    // A second remote branch to switch the tracking over to.
+    git(&repo, &["push", "origin", "main:other"]);
+    git(&repo, &["fetch", "origin"]);
+    git(&repo, &["branch", "feat"]);
+
+    // A fresh branch tracks nothing until it is told to.
+    let set = stdout_json(&wtm(
+        &repo,
+        &["branch", "upstream", "feat", "origin/main", "--json"],
+    ));
+    assert_eq!(set["upstream"], "origin/main");
+    assert_eq!(set["previous"], serde_json::Value::Null);
+
+    // Changing it reports what it tracked before.
+    let changed = stdout_json(&wtm(
+        &repo,
+        &["branch", "upstream", "feat", "origin/other", "--json"],
+    ));
+    assert_eq!(changed["upstream"], "origin/other");
+    assert_eq!(changed["previous"], "origin/main");
+
+    let listed = stdout_json(&wtm(&repo, &["branch", "list", "--json"]));
+    let feat = listed["branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["name"] == "feat")
+        .expect("feat is listed");
+    assert_eq!(feat["upstream"], "origin/other");
+
+    // `--unset` removes tracking and names what was dropped.
+    let cleared = stdout_json(&wtm(
+        &repo,
+        &["branch", "upstream", "feat", "--unset", "--json"],
+    ));
+    assert_eq!(cleared["upstream"], serde_json::Value::Null);
+    assert_eq!(cleared["previous"], "origin/other");
+
+    // Clearing again has nothing to clear, and says so rather than failing
+    // with git's own message.
+    let out = wtm(&repo, &["branch", "upstream", "feat", "--unset"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no upstream to remove"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Passing both an upstream and `--unset` is contradictory, and a bare
+/// `branch upstream <name>` doesn't say what to do; both are refused rather
+/// than guessed at.
+#[test]
+fn branch_upstream_requires_exactly_one_intent() {
+    let (_tmp, repo) = setup_repo();
+    let out = wtm(
+        &repo,
+        &["branch", "upstream", "main", "origin/main", "--unset"],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not both"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = wtm(&repo, &["branch", "upstream", "main"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--unset to stop tracking"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `diff_line_numbers` is a real setting: on by default, settable per repo or
+/// globally, and reported with the layer it came from.
+#[test]
+fn diff_line_numbers_setting_round_trips() {
+    let (tmp, repo) = setup_repo();
+    let global = tmp.path().join("global.toml");
+
+    let shown = stdout_json(&wtm_global(&repo, &["config", "show", "--json"], &global));
+    assert_eq!(shown["diff_line_numbers"]["value"], true);
+    assert_eq!(shown["diff_line_numbers"]["source"], "default");
+
+    wtm_global(
+        &repo,
+        &["config", "set", "-g", "diff_line_numbers", "false"],
+        &global,
+    );
+    let shown = stdout_json(&wtm_global(&repo, &["config", "show", "--json"], &global));
+    assert_eq!(shown["diff_line_numbers"]["value"], false);
+    assert_eq!(shown["diff_line_numbers"]["source"], "global");
+
+    // A repo-level value wins over the global one.
+    wtm_global(
+        &repo,
+        &["config", "set", "diff_line_numbers", "true"],
+        &global,
+    );
+    let shown = stdout_json(&wtm_global(&repo, &["config", "show", "--json"], &global));
+    assert_eq!(shown["diff_line_numbers"]["value"], true);
+    assert_eq!(shown["diff_line_numbers"]["source"], "repo");
+}
+
+/// Open commands layer instead of overriding: a command in the global config
+/// is offered alongside the repo's own, and a `{ command, mode }` entry keeps
+/// its run mode through a load.
+#[test]
+fn open_commands_layer_across_global_and_repo_config() {
+    let (tmp, repo) = setup_repo();
+    let global = tmp.path().join("global.toml");
+    std::fs::write(&global, "open_command = \"cursor {path}\"\n").unwrap();
+    let mut repo_config = std::fs::read_to_string(repo.join(".wtm.toml")).unwrap();
+    repo_config.insert_str(
+        0,
+        "open_command = [{ command = \"nvim {path}\", mode = \"terminal\" }]\n",
+    );
+    std::fs::write(repo.join(".wtm.toml"), repo_config).unwrap();
+
+    let shown = stdout_json(&wtm_global(&repo, &["config", "show", "--json"], &global));
+    let commands = shown["open_command"]["value"].as_array().unwrap();
+    assert_eq!(commands.len(), 2, "{commands:?}");
+    assert_eq!(commands[0]["command"], "cursor {path}");
+    assert_eq!(commands[0]["mode"], "background");
+    assert_eq!(commands[0]["global"], true);
+    assert_eq!(commands[1]["command"], "nvim {path}");
+    assert_eq!(commands[1]["mode"], "terminal");
+    assert_eq!(commands[1]["global"], false);
 }
