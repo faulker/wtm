@@ -1061,6 +1061,9 @@ pub struct BranchListItem {
     pub changed_from_base: bool,
     /// True when the comparison tip has moved ahead of this branch.
     pub behind_base: bool,
+    /// True when the user archived this branch: it still exists in git, but
+    /// listings hide it unless archived branches are explicitly shown.
+    pub archived: bool,
 }
 
 impl BranchListItem {
@@ -1098,6 +1101,18 @@ pub struct BranchDeleteResult {
     pub name: String,
     /// True when `-D` (force) was used instead of `-d`.
     pub forced: bool,
+    /// True when the local branch was deleted. False when only the remote was.
+    pub local_deleted: bool,
+    /// `Some("origin")` when the branch was also deleted on that remote.
+    pub remote_deleted: Option<String>,
+}
+
+/// Result of `branch archive`.
+#[derive(Debug, Clone, Serialize)]
+pub struct BranchArchiveResult {
+    pub name: String,
+    /// True when the branch is now archived, false when it was un-archived.
+    pub archived: bool,
 }
 
 /// Result of `branch rename`.
@@ -1547,6 +1562,7 @@ pub fn branch_list(ctx: &Ctx) -> Result<BranchListResult> {
         None => HashSet::new(),
     };
     let created_from_map = crate::config::load_created_from(&ctx.repo_root).unwrap_or_default();
+    let archived = crate::config::load_archived_branches(&ctx.repo_root).unwrap_or_default();
     let local_names: HashSet<String> = local_details.iter().map(|d| d.name.clone()).collect();
     let mut branches = Vec::with_capacity(local_details.len());
     for d in local_details {
@@ -1566,6 +1582,7 @@ pub fn branch_list(ctx: &Ctx) -> Result<BranchListResult> {
             default.as_deref(),
         );
         branches.push(BranchListItem {
+            archived: archived.contains(&d.name),
             name: d.name,
             checked_out_path,
             upstream: d.upstream,
@@ -1599,6 +1616,7 @@ pub fn branch_list(ctx: &Ctx) -> Result<BranchListResult> {
             None => false,
         };
         branches.push(BranchListItem {
+            archived: archived.contains(short),
             name: short.to_string(),
             checked_out_path: None,
             upstream: d.upstream,
@@ -1631,20 +1649,94 @@ pub fn branch_create(ctx: &Ctx, name: &str, from: Option<&str>) -> Result<Branch
     })
 }
 
-/// Deletes a branch. Refuses when the branch is checked out in any worktree;
-/// `force` uses `-D` to delete even unmerged branches.
-pub fn branch_delete(ctx: &Ctx, name: &str, force: bool) -> Result<BranchDeleteResult> {
-    let worktrees = git::list_worktrees(&ctx.repo_root)?;
-    if let Some(wt) = worktrees.iter().find(|w| w.branch.as_deref() == Some(name)) {
-        bail!(
-            "branch '{name}' is checked out at {}; remove that worktree first",
-            wt.path.display()
-        );
+/// Where a branch delete should reach: the local ref, the remote one, or both.
+/// Local-only is the default everywhere; deleting on the remote is the one that
+/// affects other people, so it is never implied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteScope {
+    Local,
+    LocalAndRemote,
+    RemoteOnly,
+}
+
+/// Deletes a branch locally, on its remote, or both.
+///
+/// The remote and remote-side branch name come from the branch's upstream when
+/// it has one, and from the sole matching remote-tracking ref otherwise (the
+/// case of a remote-only branch that has no local ref at all). The local delete
+/// runs first, so a refused unmerged delete cannot leave the remote deleted
+/// while the local branch survives.
+pub fn branch_delete_where(
+    ctx: &Ctx,
+    name: &str,
+    force: bool,
+    scope: DeleteScope,
+) -> Result<BranchDeleteResult> {
+    let local = scope != DeleteScope::RemoteOnly;
+    if local {
+        let worktrees = git::list_worktrees(&ctx.repo_root)?;
+        if let Some(wt) = worktrees.iter().find(|w| w.branch.as_deref() == Some(name)) {
+            bail!(
+                "branch '{name}' is checked out at {}; remove that worktree first",
+                wt.path.display()
+            );
+        }
+        git::branch_delete_flag(&ctx.repo_root, name, force)?;
     }
-    git::branch_delete_flag(&ctx.repo_root, name, force)?;
+    let mut remote_deleted = None;
+    if scope != DeleteScope::Local {
+        let (remote, remote_branch) = branch_remote_ref(ctx, name)?;
+        git::push_delete(&ctx.repo_root, &remote, &remote_branch)?;
+        remote_deleted = Some(remote);
+    }
+    // Archiving a deleted branch would keep a dangling entry around forever.
+    let _ = crate::config::set_branch_archived(&ctx.repo_root, name, false);
     Ok(BranchDeleteResult {
         name: name.to_string(),
-        forced: force,
+        forced: force && local,
+        local_deleted: local,
+        remote_deleted,
+    })
+}
+
+/// The `(remote, branch-on-remote)` pair `name` lives at, from its upstream when
+/// it has one, else from a remote-tracking ref with the same short name.
+fn branch_remote_ref(ctx: &Ctx, name: &str) -> Result<(String, String)> {
+    if let Ok(Some((remote, branch))) = git::branch_upstream(&ctx.repo_root, name) {
+        return Ok((remote, branch));
+    }
+    let tracking = git::remote_tracking_refs(&ctx.repo_root)?;
+    let mut matches = tracking.iter().filter(|full| {
+        git::remote_short_name(full).is_some_and(|short| short == name) && !full.ends_with("/HEAD")
+    });
+    let Some(full) = matches.next() else {
+        bail!("branch '{name}' has no upstream and no remote branch to delete");
+    };
+    if matches.next().is_some() {
+        bail!("branch '{name}' exists on more than one remote; delete it with git directly");
+    }
+    let remote = full
+        .split_once('/')
+        .map(|(r, _)| r.to_string())
+        .unwrap_or_default();
+    Ok((remote, name.to_string()))
+}
+
+/// Archives or un-archives a branch. Archiving is presentation only: git is
+/// never touched, the name is just recorded in `.wtm.toml` so listings can hide
+/// it until archived branches are shown.
+pub fn branch_archive(ctx: &Ctx, name: &str, archived: bool) -> Result<BranchArchiveResult> {
+    if !git::branch_exists(&ctx.repo_root, name)
+        && !git::remote_tracking_refs(&ctx.repo_root)?
+            .iter()
+            .any(|full| git::remote_short_name(full) == Some(name))
+    {
+        bail!("no branch named '{name}'");
+    }
+    crate::config::set_branch_archived(&ctx.repo_root, name, archived)?;
+    Ok(BranchArchiveResult {
+        name: name.to_string(),
+        archived,
     })
 }
 
@@ -1700,6 +1792,8 @@ pub fn upstream_candidates(ctx: &Ctx) -> Result<Vec<String>> {
 /// Renames branch `old` to `new`.
 pub fn branch_rename(ctx: &Ctx, old: &str, new: &str) -> Result<BranchRenameResult> {
     git::branch_rename(&ctx.repo_root, old, new)?;
+    // Best-effort: a rename must not un-archive the branch behind the user's back.
+    let _ = crate::config::rename_archived_branch(&ctx.repo_root, old, new);
     Ok(BranchRenameResult {
         old: old.to_string(),
         new: new.to_string(),

@@ -428,6 +428,55 @@ pub enum Modal {
     FileEditor { path: String, editor: TextArea },
 }
 
+/// What the branch-delete modal is deleting and where the branch lives, so the
+/// option list and the chosen option's meaning are derived from one place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchDeleteTarget {
+    pub name: String,
+    /// `Some("origin")` when the branch also exists on a remote.
+    pub remote: Option<String>,
+    /// False for a remote-only row, which has no local branch to delete.
+    pub local_only_row: bool,
+}
+
+/// One option of the branch-delete modal. The order here is the order the
+/// options are drawn in, and local-only comes first so it is the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchDeleteChoice {
+    Local,
+    LocalAndRemote,
+    RemoteOnly,
+    ForceLocal,
+    Cancel,
+}
+
+impl BranchDeleteTarget {
+    /// The options this target offers, in display order.
+    pub fn choices(&self) -> Vec<BranchDeleteChoice> {
+        let mut choices = Vec::new();
+        if self.local_only_row {
+            choices.push(BranchDeleteChoice::Local);
+            if self.remote.is_some() {
+                choices.push(BranchDeleteChoice::LocalAndRemote);
+            }
+            choices.push(BranchDeleteChoice::ForceLocal);
+        } else {
+            // A remote-only row has nothing local to delete.
+            choices.push(BranchDeleteChoice::RemoteOnly);
+        }
+        choices.push(BranchDeleteChoice::Cancel);
+        choices
+    }
+}
+
+/// The remote a branch lives on (`origin`), from its upstream when it has one
+/// and from the remote-only row's own ref otherwise. `None` means the branch is
+/// local-only, so no remote delete can be offered.
+fn branch_remote_label(b: &BranchListItem) -> Option<String> {
+    let full = b.upstream.as_deref().or(b.remote.as_deref())?;
+    full.split_once('/').map(|(remote, _)| remote.to_string())
+}
+
 /// One selectable row of a `Modal::Confirm`.
 pub struct ConfirmOption {
     /// Optional single-key shortcut that confirms this option directly (in
@@ -562,8 +611,9 @@ pub enum ModalAction {
     BranchCreate,
     /// Rename `old` to the submitted text.
     BranchRename { old: String },
-    /// Delete a branch: option 0 = normal delete, 1 = force delete.
-    BranchDelete { name: String },
+    /// Delete a branch. The option index maps back through
+    /// `BranchDeleteTarget::choices`, which is what decided the option list.
+    BranchDelete(BranchDeleteTarget),
     /// Stash the worktree's changes with the submitted (optional) message.
     StashPush { name: String },
     /// Drop the stash entry `index` on `name` (option 0 confirms).
@@ -1434,6 +1484,12 @@ pub struct App {
     /// on screen (stale) while a background reload is in flight, so
     /// switching back into the tab is instant instead of flashing empty.
     pub branches: Vec<BranchListItem>,
+    /// Every branch the last load returned, archived ones included. `branches`
+    /// is this list run through `show_archived`; keeping both means toggling
+    /// the archived view is instant and never needs another git call.
+    branches_all: Vec<BranchListItem>,
+    /// Whether archived branches are shown on the Branches tab (`v` toggles).
+    pub show_archived: bool,
     /// Cursor into `branches` on the Branches tab.
     pub branch_selected: usize,
     /// A `load_branches` reload running on a background thread, so the
@@ -1597,6 +1653,8 @@ impl App {
             status_refresh_gen: 0,
             stash_pending: None,
             branches: Vec::new(),
+            branches_all: Vec::new(),
+            show_archived: false,
             branch_selected: 0,
             branches_pending: None,
             branches_want_selected: 0,
@@ -2542,8 +2600,11 @@ impl App {
                 branch,
             } => {
                 if let ModalResult::Confirmed(idx) = result {
-                    let delete_branch = idx == 1;
-                    self.begin_delete(name, dirty, branch, delete_branch);
+                    // The last option is always cancel (see `open_delete_modal`).
+                    let cancel = idx == if branch.is_some() { 2 } else { 1 };
+                    if !cancel {
+                        self.begin_delete(name, dirty, branch, idx == 1);
+                    }
                 }
             }
             ModalAction::DeleteWorktreeDirty {
@@ -2579,6 +2640,11 @@ impl App {
                 }
             }
             ModalAction::ForceBranch { branch } => match result {
+                // Option 1 is "keep the branch", which is what cancelling does.
+                ModalResult::Confirmed(1) => {
+                    self.message = Some(format!("kept branch '{branch}'"));
+                    self.refresh();
+                }
                 ModalResult::Confirmed(_) => {
                     match ops::force_delete_branch(&self.ctx, &branch) {
                         Ok(()) => {
@@ -2617,11 +2683,28 @@ impl App {
                     }
                 }
             }
-            ModalAction::BranchDelete { name } => match result {
-                ModalResult::Confirmed(0) => self.branch_delete(name, false),
-                ModalResult::Confirmed(_) => self.branch_delete(name, true),
-                ModalResult::Submitted(_) | ModalResult::Cancelled => {}
-            },
+            ModalAction::BranchDelete(target) => {
+                let ModalResult::Confirmed(idx) = result else {
+                    return;
+                };
+                match target.choices().get(idx) {
+                    Some(BranchDeleteChoice::Local) => {
+                        self.branch_delete(target, false, ops::DeleteScope::Local)
+                    }
+                    Some(BranchDeleteChoice::LocalAndRemote) => {
+                        self.branch_delete(target, false, ops::DeleteScope::LocalAndRemote)
+                    }
+                    Some(BranchDeleteChoice::RemoteOnly) => {
+                        self.branch_delete(target, false, ops::DeleteScope::RemoteOnly)
+                    }
+                    Some(BranchDeleteChoice::ForceLocal) => {
+                        self.branch_delete(target, true, ops::DeleteScope::Local)
+                    }
+                    Some(BranchDeleteChoice::Cancel) | None => {
+                        self.message = Some(format!("kept branch '{}'", target.name));
+                    }
+                }
+            }
             ModalAction::StashPush { name } => {
                 if let ModalResult::Submitted(msg) = result {
                     let msg = if msg.is_empty() { None } else { Some(msg) };
@@ -2784,12 +2867,18 @@ impl App {
                 Style::new().fg(theme::DANGER),
             ));
         }
+        // Cancel is always the last option, so stopping is a visible choice
+        // rather than something the user has to know Esc does.
         let options = match &branch {
             Some(b) => vec![
                 ConfirmOption::new(format!("remove folder only (keep branch '{b}')")),
                 ConfirmOption::new(format!("remove folder and delete branch '{b}'")).destructive(),
+                ConfirmOption::new("cancel"),
             ],
-            None => vec![ConfirmOption::new("remove the worktree folder")],
+            None => vec![
+                ConfirmOption::new("remove the worktree folder"),
+                ConfirmOption::new("cancel"),
+            ],
         };
         self.push_confirm(
             "delete",
@@ -2889,7 +2978,13 @@ impl App {
             Line::from("the worktree folder was removed, but the branch was kept".dim()),
             Line::styled(format!("⚠ {warn}"), Style::new().fg(theme::DANGER)),
         ];
-        let options = vec![ConfirmOption::new(action).key('f').destructive()];
+        // Keeping the branch is a listed option, not just an Esc away: this
+        // modal appears unprompted after a worktree removal, and an unmerged
+        // branch is exactly the case where stopping must be as easy as forcing.
+        let options = vec![
+            ConfirmOption::new(action).key('f').destructive(),
+            ConfirmOption::new(format!("keep branch '{branch}'")),
+        ];
         self.push_confirm(
             "delete branch?",
             body,
@@ -2918,18 +3013,53 @@ impl App {
         );
     }
 
-    /// Delete confirmation for the selected branch (`f` forces).
-    fn open_branch_delete_modal(&mut self, name: String) {
-        let body = vec![Line::from(format!("delete branch '{name}'?"))];
-        let options = vec![
-            ConfirmOption::new("delete branch"),
-            ConfirmOption::new("force delete").key('f').destructive(),
-        ];
+    /// Delete confirmation for the branch under the Branches-tab cursor.
+    fn open_branch_delete_modal_for_selection(&mut self) {
+        let Some(b) = self.branches.get(self.branch_selected) else {
+            return;
+        };
+        let target = BranchDeleteTarget {
+            name: b.name.clone(),
+            remote: branch_remote_label(b),
+            local_only_row: b.remote.is_none(),
+        };
+        self.open_branch_delete_modal(target);
+    }
+
+    /// Delete confirmation for a branch. When the branch also exists on a
+    /// remote the choices split local-only (first, so it is the default) from
+    /// local-and-remote; `f` still force-deletes locally, and cancel is always
+    /// a listed option rather than only an Esc away.
+    fn open_branch_delete_modal(&mut self, target: BranchDeleteTarget) {
+        let body = vec![Line::from(format!("delete branch '{}'?", target.name))];
+        let options = target
+            .choices()
+            .iter()
+            .map(|choice| match choice {
+                BranchDeleteChoice::Local => ConfirmOption::new("delete locally only"),
+                BranchDeleteChoice::LocalAndRemote => ConfirmOption::new(format!(
+                    "delete locally and on {}",
+                    target.remote.as_deref().unwrap_or("the remote")
+                ))
+                .destructive(),
+                BranchDeleteChoice::RemoteOnly => ConfirmOption::new(format!(
+                    "delete on {}",
+                    target.remote.as_deref().unwrap_or("the remote")
+                ))
+                .destructive(),
+                BranchDeleteChoice::ForceLocal => {
+                    ConfirmOption::new("force delete locally (unmerged work is lost)")
+                        .key('f')
+                        .destructive()
+                }
+                BranchDeleteChoice::Cancel => ConfirmOption::new("cancel"),
+            })
+            .collect();
         self.push_confirm(
             "delete branch",
             body,
             options,
-            ModalAction::BranchDelete { name },
+            ModalAction::BranchDelete(target),
         );
     }
 
@@ -2999,10 +3129,12 @@ impl App {
 
     /// Home-view key handling: cycle tabs, then dispatch to the active tab.
     fn on_list_key(&mut self, key: KeyEvent) {
-        // Tab / Shift+Tab cycle the top-level tabs. (A prompt/confirm on the
-        // Branches tab is a modal, handled by `on_modal_key` before reaching
-        // here, so Tab is never captured mid-input.)
-        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        // Tab / Shift+Tab cycle the top-level tabs, but never out from under an
+        // open dialog: switching tabs mid-dialog would leave the dialog's state
+        // stranded behind a screen it doesn't belong to. Modals and the error
+        // popup are already handled before this point; `dialog_open` covers the
+        // dialogs a tab owns itself (the Settings tab's editors).
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) && !self.dialog_open() {
             self.cycle_tab(key.code == KeyCode::Tab);
             return;
         }
@@ -3018,6 +3150,16 @@ impl App {
             Tab::Stash => self.on_stash_tab_key(key),
             Tab::Settings => self.on_settings_tab_key(key),
         }
+    }
+
+    /// Whether a dialog currently owns the keyboard, in which case Tab must not
+    /// switch tabs. Covers the modal overlay, the error popup, the help panel,
+    /// and the Settings tab's own in-tab editors.
+    pub fn dialog_open(&self) -> bool {
+        self.modal.is_some()
+            || self.error.is_some()
+            || self.show_help
+            || (self.tab == Tab::Settings && self.settings.dialog_open())
     }
 
     /// Cycles to the next (`forward`) or previous top-level tab, then runs
@@ -5862,10 +6004,8 @@ impl App {
         self.branches_pending = None;
         match result {
             Ok(r) => {
-                self.branch_selected = self
-                    .branches_want_selected
-                    .min(r.branches.len().saturating_sub(1));
-                self.branches = r.branches;
+                self.branches_all = r.branches;
+                self.apply_archived_filter(self.branches_want_selected);
                 self.branches_loaded_at = Some(Instant::now());
             }
             Err(e) => {
@@ -5873,6 +6013,88 @@ impl App {
                 self.tab = Tab::Worktrees;
             }
         }
+    }
+
+    /// Rebuilds the visible `branches` list from `branches_all` according to
+    /// `show_archived`, clamping the cursor to `selected`. Every index in the
+    /// Branches tab points into the visible list, so filtering here (rather
+    /// than at each read) keeps the rest of the tab unchanged.
+    fn apply_archived_filter(&mut self, selected: usize) {
+        self.branches = self
+            .branches_all
+            .iter()
+            .filter(|b| self.show_archived || !b.archived)
+            .cloned()
+            .collect();
+        self.branch_selected = selected.min(self.branches.len().saturating_sub(1));
+    }
+
+    /// Number of archived branches held back by the current filter, for the
+    /// hint that tells the user they exist at all.
+    pub fn archived_hidden_count(&self) -> usize {
+        if self.show_archived {
+            0
+        } else {
+            self.branches_all.iter().filter(|b| b.archived).count()
+        }
+    }
+
+    /// Shows or hides archived branches, keeping the cursor on the same branch
+    /// when it survives the switch.
+    fn toggle_show_archived(&mut self) {
+        let keep = self
+            .branches
+            .get(self.branch_selected)
+            .map(|b| b.name.clone());
+        self.show_archived = !self.show_archived;
+        self.apply_archived_filter(self.branch_selected);
+        if let Some(name) = keep
+            && let Some(i) = self.branches.iter().position(|b| b.name == name)
+        {
+            self.branch_selected = i;
+        }
+        self.message = Some(if self.show_archived {
+            "showing archived branches".to_string()
+        } else {
+            "hiding archived branches".to_string()
+        });
+    }
+
+    /// Archives (or un-archives) the selected branch and re-applies the filter
+    /// straight away, so the row disappears with the key press rather than
+    /// after the next background reload.
+    fn toggle_branch_archived(&mut self) {
+        let Some(b) = self.branches.get(self.branch_selected) else {
+            return;
+        };
+        let (name, archived) = (b.name.clone(), !b.archived);
+        match ops::branch_archive(&self.ctx, &name, archived) {
+            Ok(_) => {
+                if let Some(item) = self.branches_all.iter_mut().find(|b| b.name == name) {
+                    item.archived = archived;
+                }
+                self.apply_archived_filter(self.branch_selected);
+                self.message = Some(if archived {
+                    format!("archived '{name}' — press v to show archived branches")
+                } else {
+                    format!("un-archived '{name}'")
+                });
+            }
+            Err(e) => self.set_error(format!("{e:#}")),
+        }
+    }
+
+    /// Drops `name` from the cached branch lists the moment a delete succeeds,
+    /// so the row is gone immediately instead of lingering until the background
+    /// reload lands.
+    fn forget_branch(&mut self, name: &str) {
+        self.branches_all.retain(|b| b.name != name);
+        let selected = self
+            .branches
+            .iter()
+            .position(|b| b.name == name)
+            .map_or(self.branch_selected, |i| if i > 0 { i - 1 } else { 0 });
+        self.apply_archived_filter(selected);
     }
 
     /// Whether the Branches tab is showing its very first load: no cached
@@ -5941,15 +6163,11 @@ impl App {
                     );
                 }
             }
-            KeyCode::Char('d') => {
-                if let Some(name) = self
-                    .branches
-                    .get(self.branch_selected)
-                    .map(|b| b.name.clone())
-                {
-                    self.open_branch_delete_modal(name);
-                }
-            }
+            KeyCode::Char('d') => self.open_branch_delete_modal_for_selection(),
+            // `a` hides the branch from the list without touching git; `v`
+            // brings the hidden ones back into view.
+            KeyCode::Char('a') => self.toggle_branch_archived(),
+            KeyCode::Char('v') => self.toggle_show_archived(),
             // Enter drills into the branch's commit history, the entry point
             // for cherry-picking commits into a worktree.
             KeyCode::Enter => self.open_branch_commits(),
@@ -7272,19 +7490,27 @@ impl App {
     /// Deletes a branch. A refused non-force delete reopens the confirm (under
     /// the error popup) so the user can retry with `f` (force). Runs
     /// synchronously (a fast local op) so that retry flow stays intact.
-    fn branch_delete(&mut self, name: String, force: bool) {
-        match ops::branch_delete(&self.ctx, &name, force) {
+    fn branch_delete(&mut self, target: BranchDeleteTarget, force: bool, scope: ops::DeleteScope) {
+        match ops::branch_delete_where(&self.ctx, &target.name, force, scope) {
             Ok(r) => {
+                let where_ = match (&r.remote_deleted, r.local_deleted) {
+                    (Some(remote), true) => format!(" locally and on {remote}"),
+                    (Some(remote), false) => format!(" on {remote}"),
+                    (None, _) => String::new(),
+                };
                 self.message = Some(format!(
-                    "deleted branch '{}'{}",
+                    "deleted branch '{}'{}{where_}",
                     r.name,
                     if r.forced { " (forced)" } else { "" }
                 ));
+                // Drop the row now rather than letting it sit on screen until
+                // the background reload lands.
+                self.forget_branch(&target.name);
                 self.load_branches(self.branch_selected);
             }
             Err(e) => {
                 self.set_error(format!("{e:#} — press f to force"));
-                self.open_branch_delete_modal(name);
+                self.open_branch_delete_modal(target);
             }
         }
     }
@@ -10370,6 +10596,7 @@ mod tests {
             created_from: None,
             changed_from_base: false,
             behind_base: false,
+            archived: false,
         }
     }
 
@@ -12481,6 +12708,209 @@ mod tests {
         assert!(app.modal.is_none());
         assert!(matches!(app.view, View::List));
         assert!(!crate::git::branch_exists(&app.ctx.repo_root, "feature"));
+    }
+
+    /// The unmerged-branch prompt must offer stopping as a listed option, not
+    /// only as an Esc the user has to guess at.
+    #[test]
+    fn the_unmerged_branch_prompt_offers_keeping_the_branch() {
+        let (_tmp, mut app) = test_app();
+        add_and_select_worktree(&mut app, "feature");
+        let path = app.worktrees[app.selected].path.clone();
+        std::fs::write(Path::new(&path).join("f.txt"), "x\n").unwrap();
+        git(Path::new(&path), &["add", "."]);
+        git(Path::new(&path), &["commit", "-m", "unmerged work"]);
+
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Down); // "also delete branch"
+        press(&mut app, KeyCode::Char('y'));
+        settle(&mut app);
+        match &app.modal {
+            Some(Modal::Confirm {
+                action: ModalAction::ForceBranch { .. },
+                options,
+                ..
+            }) => {
+                assert_eq!(options.len(), 2, "force and keep");
+                assert!(
+                    options[1].label.contains("keep branch"),
+                    "{:?}",
+                    options[1].label
+                );
+            }
+            _ => panic!("expected the force-branch prompt"),
+        }
+        // Choosing "keep" leaves the branch alone.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        assert!(app.modal.is_none());
+        assert!(crate::git::branch_exists(&app.ctx.repo_root, "feature"));
+        assert_eq!(app.message.as_deref(), Some("kept branch 'feature'"));
+    }
+
+    /// Cancelling the worktree delete prompt is a listed option too, and it
+    /// leaves the worktree where it was.
+    #[test]
+    fn the_worktree_delete_prompt_can_be_cancelled_from_its_options() {
+        let (_tmp, mut app) = test_app();
+        add_and_select_worktree(&mut app, "feature");
+        press(&mut app, KeyCode::Char('d'));
+        let Some(Modal::Confirm { options, .. }) = &app.modal else {
+            panic!("expected the delete prompt");
+        };
+        assert_eq!(options.len(), 3, "folder / folder+branch / cancel");
+        assert_eq!(options[2].label, "cancel");
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down); // cancel
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        assert!(app.modal.is_none());
+        assert!(app.worktrees.iter().any(|w| w.name == "feature"));
+    }
+
+    /// Tab cycles the top-level tabs, but not while a dialog owns the keyboard:
+    /// switching out from under the Settings tab's field editor would strand it.
+    #[test]
+    fn tab_does_not_switch_tabs_while_a_dialog_is_open() {
+        let (_tmp, mut app) = test_app();
+        goto_settings(&mut app);
+        press(&mut app, KeyCode::Enter); // edit the first setting
+        assert!(app.dialog_open());
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.tab, Tab::Settings, "Tab must not leave an open dialog");
+        assert!(app.dialog_open(), "the dialog stays open");
+        // With the dialog closed, Tab cycles again.
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.dialog_open());
+        press(&mut app, KeyCode::Tab);
+        assert_ne!(app.tab, Tab::Settings);
+    }
+
+    /// `a` archives the selected branch: git keeps it, the row disappears, and
+    /// `v` brings it back into view.
+    #[test]
+    fn archiving_a_branch_hides_it_until_view_archived() {
+        let (_tmp, mut app) = test_app();
+        git(&app.ctx.repo_root.clone(), &["branch", "topic"]);
+        goto_tab(&mut app, Tab::Branches);
+        let topic = app
+            .branches
+            .iter()
+            .position(|b| b.name == "topic")
+            .expect("topic should be listed");
+        app.branch_selected = topic;
+
+        press(&mut app, KeyCode::Char('a'));
+        settle_branches(&mut app);
+        assert!(
+            !app.branches.iter().any(|b| b.name == "topic"),
+            "archived branch should drop out of the visible list"
+        );
+        assert!(
+            crate::git::branch_exists(&app.ctx.repo_root, "topic"),
+            "archiving must not delete the branch"
+        );
+        assert_eq!(app.archived_hidden_count(), 1);
+
+        press(&mut app, KeyCode::Char('v'));
+        assert!(app.show_archived);
+        assert!(app.branches.iter().any(|b| b.name == "topic" && b.archived));
+        assert_eq!(app.archived_hidden_count(), 0);
+
+        // Un-archiving from the archived view puts it back for good.
+        app.branch_selected = app.branches.iter().position(|b| b.name == "topic").unwrap();
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('v'));
+        assert!(!app.show_archived);
+        assert!(app.branches.iter().any(|b| b.name == "topic"));
+    }
+
+    /// A deleted branch leaves the list with the key press, rather than sitting
+    /// there until the background reload lands.
+    #[test]
+    fn deleting_a_branch_drops_its_row_immediately() {
+        let (_tmp, mut app) = test_app();
+        git(&app.ctx.repo_root.clone(), &["branch", "topic"]);
+        goto_tab(&mut app, Tab::Branches);
+        app.branch_selected = app
+            .branches
+            .iter()
+            .position(|b| b.name == "topic")
+            .expect("topic should be listed");
+
+        press(&mut app, KeyCode::Char('d'));
+        // Local-only is the first (default) option for a branch with no remote.
+        let Some(Modal::Confirm {
+            options, selected, ..
+        }) = &app.modal
+        else {
+            panic!("expected the branch delete prompt");
+        };
+        assert_eq!(*selected, 0);
+        assert_eq!(options[0].label, "delete locally only");
+        assert_eq!(options.last().unwrap().label, "cancel");
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        // No settle: the row must already be gone before the reload lands.
+        assert!(
+            !app.branches.iter().any(|b| b.name == "topic"),
+            "the deleted row should be gone right away"
+        );
+        assert!(app.branches_loading(), "a refresh should be in flight");
+        settle_branches(&mut app);
+        assert!(!app.branches.iter().any(|b| b.name == "topic"));
+    }
+
+    /// A branch that also lives on a remote offers both scopes, local-only
+    /// first so it is what Enter picks.
+    #[test]
+    fn branch_delete_offers_local_only_before_local_and_remote() {
+        let (tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        let bare = tmp.path().join("origin.git");
+        git(
+            tmp.path(),
+            &["init", "--bare", "-b", "main", bare.to_str().unwrap()],
+        );
+        git(&root, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git(&root, &["push", "-u", "origin", "main"]);
+        git(&root, &["branch", "shared"]);
+        git(&root, &["push", "-u", "origin", "shared"]);
+
+        goto_tab(&mut app, Tab::Branches);
+        app.branch_selected = app
+            .branches
+            .iter()
+            .position(|b| b.name == "shared")
+            .expect("shared should be listed");
+        press(&mut app, KeyCode::Char('d'));
+        let Some(Modal::Confirm {
+            options, selected, ..
+        }) = &app.modal
+        else {
+            panic!("expected the branch delete prompt");
+        };
+        assert_eq!(*selected, 0, "local-only is the default");
+        assert_eq!(options[0].label, "delete locally only");
+        assert_eq!(options[1].label, "delete locally and on origin");
+        assert!(options[2].label.starts_with("force delete locally"));
+        assert_eq!(options[3].label, "cancel");
+
+        // Taking the default leaves the remote branch alone.
+        press(&mut app, KeyCode::Enter);
+        settle_branches(&mut app);
+        assert!(!crate::git::branch_exists(&root, "shared"));
+        let remote_still_there = std::process::Command::new("git")
+            .args(["show-ref", "--verify", "--quiet", "refs/heads/shared"])
+            .current_dir(&bare)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(
+            remote_still_there,
+            "local-only delete must spare the remote"
+        );
     }
 
     /// A pull refused because the branch diverged opens the rebase prompt

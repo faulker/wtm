@@ -126,6 +126,22 @@ struct BranchDeleteRequest {
     name: String,
     #[schemars(description = "delete even if unmerged, using -D (default false)")]
     force: Option<bool>,
+    #[schemars(
+        description = "also delete the branch on its remote (default false; local-only is the safe default)"
+    )]
+    remote: Option<bool>,
+    #[schemars(
+        description = "delete only the remote branch, keeping the local one (default false)"
+    )]
+    remote_only: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BranchArchiveRequest {
+    #[schemars(description = "branch name")]
+    name: String,
+    #[schemars(description = "false un-archives the branch instead (default true)")]
+    archived: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -492,13 +508,34 @@ impl WtmServer {
     }
 
     #[tool(
-        description = "Delete a local branch. Refuses if it's checked out in a worktree (remove that worktree first) or unmerged, unless force is true"
+        description = "Delete a branch. Local-only by default; set remote to also delete it on its remote, or remote_only to delete just the remote branch. Refuses if it's checked out in a worktree (remove that worktree first) or unmerged, unless force is true"
     )]
     fn delete_branch(
         &self,
         Parameters(req): Parameters<BranchDeleteRequest>,
     ) -> Result<CallToolResult, ErrorData> {
-        let result = ops::branch_delete(&self.ctx()?, &req.name, req.force.unwrap_or(false))
+        let scope = match (
+            req.remote.unwrap_or(false),
+            req.remote_only.unwrap_or(false),
+        ) {
+            (_, true) => ops::DeleteScope::RemoteOnly,
+            (true, _) => ops::DeleteScope::LocalAndRemote,
+            _ => ops::DeleteScope::Local,
+        };
+        let result =
+            ops::branch_delete_where(&self.ctx()?, &req.name, req.force.unwrap_or(false), scope)
+                .map_err(internal)?;
+        json_result(&result)
+    }
+
+    #[tool(
+        description = "Archive a branch: it keeps existing in git but is hidden from wtm's branch listings until archived branches are shown. Set archived to false to un-archive"
+    )]
+    fn archive_branch(
+        &self,
+        Parameters(req): Parameters<BranchArchiveRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let result = ops::branch_archive(&self.ctx()?, &req.name, req.archived.unwrap_or(true))
             .map_err(internal)?;
         json_result(&result)
     }

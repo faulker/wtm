@@ -909,6 +909,12 @@ pub fn push_set_upstream(
     run(dir, &args)
 }
 
+/// Deletes `branch` on `remote` (`git push <remote> --delete <branch>`). The
+/// local branch is untouched; callers that want both delete the local one too.
+pub fn push_delete(dir: &Path, remote: &str, branch: &str) -> Result<String> {
+    run(dir, &["push", remote, "--delete", branch])
+}
+
 /// Names of the repository's configured remotes.
 pub fn remotes(dir: &Path) -> Result<Vec<String>> {
     let out = run(dir, &["remote"])?;

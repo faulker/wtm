@@ -315,6 +315,20 @@ pub enum BranchAction {
         /// Delete even if unmerged (uses -D).
         #[arg(long, short)]
         force: bool,
+        /// Also delete the branch on its remote.
+        #[arg(long, conflicts_with = "remote_only")]
+        remote: bool,
+        /// Delete only the remote branch, keeping the local one.
+        #[arg(long = "remote-only")]
+        remote_only: bool,
+    },
+    /// Hide a branch from listings without deleting it.
+    Archive {
+        /// Branch name.
+        name: String,
+        /// Un-archive instead, so the branch shows up again.
+        #[arg(long)]
+        undo: bool,
     },
     /// Rename a branch.
     Rename {

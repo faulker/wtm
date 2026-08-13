@@ -164,7 +164,9 @@ wtm switch <name> <branch> [--create]      # check a different branch out in the
 wtm fetch                                  # fetch all remotes, prune deleted branches
 wtm branch list                            # branches with checkout, tracking, last commit
 wtm branch create <name> [--from <ref>]    # branch without a worktree
-wtm branch delete <name> [--force]         # refuses if checked out in a worktree
+wtm branch delete <name> [--force]         # local only by default; refuses if checked out in a worktree
+                                           # --remote also deletes it on the remote, --remote-only just there
+wtm branch archive <name> [--undo]         # hide it from wtm's listings without deleting it
 wtm branch rename <old> <new>
 wtm branch upstream <name> <origin/ref>    # change which remote branch it tracks (--unset to stop tracking)
 wtm branch log <name> [-n <count>]         # a branch's commits without checking it out
@@ -221,7 +223,9 @@ Repo-wide commands (not tied to a single worktree):
 wtm fetch                                  # fetch all remotes and prune deleted branches
 wtm branch list                            # local branches: checkout, tracking, last commit
 wtm branch create <name> [--from <ref>]    # create a branch without a worktree
-wtm branch delete <name> [--force]         # delete; refuses if checked out in a worktree
+wtm branch delete <name> [--force]         # delete locally; refuses if checked out in a worktree.
+                                           # --remote deletes it on the remote too, --remote-only only there
+wtm branch archive <name> [--undo]         # keep the branch but hide it from wtm's branch listings
 wtm branch rename <old> <new>
 wtm branch upstream <name> <origin/ref>    # set the remote branch it tracks; --unset removes tracking
 wtm branch log <name> [-n <count>]         # a branch's commit history without checking it out
@@ -250,7 +254,7 @@ Run `wtm` inside a repo. If the repo isn't initialized yet, the setup wizard ope
 
 ![The Branches tab: every local branch with where it is checked out, its upstream, a ✓merged flag on release/1.4, and the last commit on each](docs/images/tui-branches.png)
 
-The Branches tab shows every branch, where each one is checked out, and the same **FLAGS** vocabulary as the worktree list (`unpushed` / `behind`, `same` / `changed` / `outdated`, `✓merged`). Remote-only branches are marked with `☁`. From here you can check a branch out in a new worktree, create or delete branches, merge one into a worktree, fast-forward onto upstream, or press `Enter` to browse and cherry-pick its commits.
+The Branches tab shows every branch, where each one is checked out, and the same **FLAGS** vocabulary as the worktree list (`unpushed` / `behind`, `same` / `changed` / `outdated`, `✓merged`). Remote-only branches are marked with `☁`. From here you can check a branch out in a new worktree, create or delete branches, merge one into a worktree, fast-forward onto upstream, or press `Enter` to browse and cherry-pick its commits. Deleting a branch that also lives on a remote asks whether to delete it locally only (the default) or locally and on the remote, and cancelling is always one of the listed options. Branches you're done with but don't want to delete can be **archived** with `a`: git keeps them, but they drop out of the list until you press `v` to view archived branches (the panel title says how many are hidden).
 
 ![The commit log drawn as a tree, with branch and tag names marked on the commits they point at and a fork and merge visible in the graph](docs/images/tui-log.png)
 
@@ -276,7 +280,7 @@ The Branches tab shows every branch, where each one is checked out, and the same
 | `⇧P` | push the selected worktree; publishes with `-u` when there's no upstream |
 | `f` | fetch all remotes and refresh |
 | `b` | switch the selected worktree to another branch: a picker of branches not checked out anywhere, local ones first, then remote-only branches (marked with their remote, checked out as a local tracking branch when picked). Type to filter the list, `↑`/`↓` select, `Enter` switches, `Esc` clears the filter then closes. With nothing matching what you typed, `Enter` tries it as a branch name anyway |
-| `Tab` / `⇧Tab` | cycle to the next/previous tab. On the **Settings tab**: edit this repo's settings (`worktree_dir`, `open_command`, `setup.copy`, `setup.run`) without touching the file. `↑`/`↓` pick a row, `Enter` edits or cycles it and writes immediately (`Esc` cancels an in-progress text edit). On the **Branches tab**: local branches under a `LOCAL BRANCHES` heading, then remote-only ones (marked `☁ origin/…`) under `REMOTE BRANCHES`, with where each is checked out. `u` changes which remote branch the selected local branch tracks, or removes its tracking, from a type-to-filter picker of the repo's remote refs. `Enter` opens the branch's **commit history**, where `Space` marks commits (`a` all/none), `Enter` (or `v`/`→`) **browses into** the highlighted commit, and `p` **cherry-picks** the marked commits (or the highlighted one) into a worktree you pick — choosing to commit them directly (keeping the original messages) or just load the changes for review; `t` switches that history between the commit tree and a flat list. `c` checks the branch out in a new worktree, `n` creates a **branch only** (no worktree, from HEAD), `d` deletes (`⇧F` forces). `m` **merges** the selected branch into a worktree you pick, and `b` **rebases** a worktree you pick onto the selected branch. `f` **fetches** all remotes, refreshing every branch's ahead/behind; `p` **fast-forwards** the selected branch onto its upstream — a branch checked out in a worktree is pulled there so its files move with it, and one checked out nowhere is fast-forwarded in place without a checkout. Either way a branch that has diverged from its upstream is reported rather than merged |
+| `Tab` / `⇧Tab` | cycle to the next/previous tab. On the **Settings tab**: edit this repo's settings (`worktree_dir`, `open_command`, `setup.copy`, `setup.run`) without touching the file. `↑`/`↓` pick a row, `Enter` edits or cycles it and writes immediately (`Esc` cancels an in-progress text edit). On the **Branches tab**: local branches under a `LOCAL BRANCHES` heading, then remote-only ones (marked `☁ origin/…`) under `REMOTE BRANCHES`, with where each is checked out. `u` changes which remote branch the selected local branch tracks, or removes its tracking, from a type-to-filter picker of the repo's remote refs. `Enter` opens the branch's **commit history**, where `Space` marks commits (`a` all/none), `Enter` (or `v`/`→`) **browses into** the highlighted commit, and `p` **cherry-picks** the marked commits (or the highlighted one) into a worktree you pick — choosing to commit them directly (keeping the original messages) or just load the changes for review; `t` switches that history between the commit tree and a flat list. `c` checks the branch out in a new worktree, `n` creates a **branch only** (no worktree, from HEAD), `d` deletes — locally only by default, or locally and on its remote when it has one, with `⇧F` for a force delete and `cancel` always listed. `a` **archives** the branch (git keeps it; it just stops showing up) and `v` toggles viewing archived branches. Tab never switches tabs while a dialog is open. `m` **merges** the selected branch into a worktree you pick, and `b` **rebases** a worktree you pick onto the selected branch. `f` **fetches** all remotes, refreshing every branch's ahead/behind; `p` **fast-forwards** the selected branch onto its upstream — a branch checked out in a worktree is pulled there so its files move with it, and one checked out nowhere is fast-forwarded in place without a checkout. Either way a branch that has diverged from its upstream is reported rather than merged |
 | `l` | log of recent commits for the selected worktree, drawn as a **commit tree** showing where branches fork and merge, with branch and tag names marked on the commits they point at. `↑`/`↓` move a cursor between commits and `Enter` **browses into the highlighted commit** — a read-only view of the files it changed with each file's syntax-highlighted diff (`t` there toggles tree/flat, `←`/`→` collapse/expand folders, `⇧↑`/`⇧↓` or the mouse wheel scroll the diff). `t` switches the log between the tree and a flat list; the choice carries over to the Branches tab's commit history (where `Enter`, `v`, or `→` browses a commit the same way) |
 | `x` | **resume the conflict resolver** for a worktree stopped mid-merge, mid-rebase, or mid-cherry-pick. Worktrees in that state are flagged in the list (`⚠ 3 conflicts` in the CHANGES column, `rebasing` in FLAGS), including operations started outside wtm in a terminal. This is the way back in after leaving the resolver with `q` |
 | `r` | refresh (the worktree and branch lists also refresh themselves every minute, keeping your place) |
@@ -337,7 +341,7 @@ Or set `WTM_NO_UPDATE_CHECK` in the environment, which skips the check without t
 | Merge/rebase/conflicts | `merge`, `rebase`, `update`, `list_conflicts`, `read_conflict`, `resolve_file`, `complete_merge`, `skip_rebase`, `abort_merge` |
 | Stashes | `stash_push`, `stash_list`, `stash_pop`, `stash_apply`, `stash_drop`, `move_changes` |
 | Remotes | `pull_worktree`, `push_worktree`, `fetch_remotes` |
-| Branches | `list_branches`, `create_branch`, `delete_branch`, `rename_branch`, `branch_log` |
+| Branches | `list_branches`, `create_branch`, `delete_branch`, `archive_branch`, `rename_branch`, `branch_log` |
 
 Register with [Claude Code](https://claude.com/claude-code) from inside your repo:
 

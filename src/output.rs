@@ -7,11 +7,11 @@ use serde_json::json;
 use crate::conflict::ConflictSegment;
 use crate::git::StatusEntry;
 use crate::ops::{
-    BranchCreateResult, BranchDeleteResult, BranchListResult, BranchRenameResult,
-    BranchUpstreamResult, CherryPickOutcome, CommitResult, CompleteResolutionResult, ConflictFile,
-    CreateResult, FetchResult, LogResult, MergeOutcome, MoveChangesResult, PullResult, PushResult,
-    StashListResult, StashPopOutcome, StashResult, SwitchResult, WorktreeInfo,
-    WorktreeRenameResult,
+    BranchArchiveResult, BranchCreateResult, BranchDeleteResult, BranchListResult,
+    BranchRenameResult, BranchUpstreamResult, CherryPickOutcome, CommitResult,
+    CompleteResolutionResult, ConflictFile, CreateResult, FetchResult, LogResult, MergeOutcome,
+    MoveChangesResult, PullResult, PushResult, StashListResult, StashPopOutcome, StashResult,
+    SwitchResult, WorktreeInfo, WorktreeRenameResult,
 };
 
 /// Serializes `value` as pretty JSON to stdout.
@@ -236,7 +236,16 @@ pub fn print_branch_list(result: &BranchListResult) {
         } else {
             "-".to_string()
         };
-        let flags = format_flags(&b.flag_labels());
+        // Archived is a wtm-side label, not a git state, so it is appended to
+        // the flags rather than folded into the shared `flag_labels` vocabulary.
+        let mut flags = format_flags(&b.flag_labels());
+        if b.archived {
+            flags = if flags == "-" {
+                "archived".to_string()
+            } else {
+                format!("{flags} archived")
+            };
+        }
         println!(
             "{:<name_w$}  {checkout:<10}  {upstream:<10}  {flags:<28}  {} ({})",
             b.name, b.subject, b.date
@@ -249,10 +258,30 @@ pub fn print_branch_create(result: &BranchCreateResult) {
     println!("created branch '{}' from {}", result.name, result.from);
 }
 
-/// Human-readable branch-delete confirmation.
+/// Human-readable branch-delete confirmation, naming the remote when the
+/// delete reached past the local repository.
 pub fn print_branch_delete(result: &BranchDeleteResult) {
     let how = if result.forced { " (forced)" } else { "" };
-    println!("deleted branch '{}'{how}", result.name);
+    match (&result.remote_deleted, result.local_deleted) {
+        (Some(remote), true) => {
+            println!(
+                "deleted branch '{}'{how} locally and on {remote}",
+                result.name
+            )
+        }
+        (Some(remote), false) => println!("deleted branch '{}' on {remote}", result.name),
+        (None, _) => println!("deleted branch '{}'{how}", result.name),
+    }
+}
+
+/// Human-readable branch-archive confirmation.
+pub fn print_branch_archive(result: &BranchArchiveResult) {
+    let what = if result.archived {
+        "archived"
+    } else {
+        "un-archived"
+    };
+    println!("{what} branch '{}'", result.name);
 }
 
 /// Human-readable branch-rename confirmation.

@@ -3129,11 +3129,21 @@ fn draw_tab_bar(frame: &mut Frame, area: Rect, app: &mut App) {
 /// (suppressed while a popup is up); its indices are display rows, so
 /// `App::select_branch_row` maps a click back to a branch.
 fn draw_branches(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
-    let title = if app.branches_loading() && !app.branches.is_empty() {
-        "branches · refreshing…".to_string()
+    // The title carries the two things the list alone can't say: that a
+    // background reload is running, and that archived branches are being held
+    // back (or are currently shown).
+    let mut title = "branches".to_string();
+    if app.show_archived {
+        title.push_str(" · archived shown");
     } else {
-        "branches".to_string()
-    };
+        let hidden = app.archived_hidden_count();
+        if hidden > 0 {
+            title.push_str(&format!(" · {hidden} archived hidden (v)"));
+        }
+    }
+    if app.branches_loading() && !app.branches.is_empty() {
+        title.push_str(" · refreshing…");
+    }
     let block = panel(title);
     let inner = block.inner(area);
     // The very first load has no cached list to fall back on, so show a
@@ -3171,7 +3181,16 @@ fn draw_branches(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
                 BranchRow::Branch(index) => *index,
             };
             let b = &app.branches[index];
-            let name = Span::styled(b.name.clone(), Style::new().bold());
+            // An archived branch is only visible with `v` on, so it is dimmed
+            // and marked to keep it distinct from the branches always listed.
+            let name = if b.archived {
+                Span::styled(
+                    format!("{} (archived)", b.name),
+                    Style::new().dim().italic(),
+                )
+            } else {
+                Span::styled(b.name.clone(), Style::new().bold())
+            };
             let checkout = match (&b.checked_out_path, &b.remote) {
                 (Some(p), _) => Span::styled(format!("● {p}"), Style::new().fg(theme::SUCCESS)),
                 (None, Some(remote)) => {

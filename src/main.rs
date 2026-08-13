@@ -250,12 +250,30 @@ fn run(cli: Cli) -> Result<()> {
                         output::print_branch_create(&result);
                     }
                 }
-                BranchAction::Delete { name, force } => {
-                    let result = ops::branch_delete(&ctx, &name, force)?;
+                BranchAction::Delete {
+                    name,
+                    force,
+                    remote,
+                    remote_only,
+                } => {
+                    let scope = match (remote, remote_only) {
+                        (_, true) => ops::DeleteScope::RemoteOnly,
+                        (true, _) => ops::DeleteScope::LocalAndRemote,
+                        _ => ops::DeleteScope::Local,
+                    };
+                    let result = ops::branch_delete_where(&ctx, &name, force, scope)?;
                     if cli.json {
                         output::print_json(&result)?;
                     } else {
                         output::print_branch_delete(&result);
+                    }
+                }
+                BranchAction::Archive { name, undo } => {
+                    let result = ops::branch_archive(&ctx, &name, !undo)?;
+                    if cli.json {
+                        output::print_json(&result)?;
+                    } else {
+                        output::print_branch_archive(&result);
                     }
                 }
                 BranchAction::Rename { old, new } => {

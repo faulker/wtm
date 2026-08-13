@@ -308,7 +308,17 @@ pub const BRANCHES: &[Binding] = &[
         "upstream",
         "change which remote branch this one tracks, or stop tracking",
     ),
-    both("d", "delete", "delete the selected branch (F to force)"),
+    both(
+        "d",
+        "delete",
+        "delete the selected branch — locally, or locally and on its remote",
+    ),
+    both(
+        "a",
+        "archive",
+        "hide the branch from this list without deleting it",
+    ),
+    both("v", "view archived", "show or hide archived branches"),
     both("⇧R", "rename", "rename the selected branch"),
     both("?", "help", "show this help"),
     both("q", "quit", "quit"),

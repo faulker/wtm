@@ -1334,6 +1334,135 @@ fn branch_create_list_delete_rename() {
     assert_eq!(renamed_wt["branch"], "renamed");
 }
 
+/// Archiving is presentation state: git keeps the branch, `.wtm.toml` records
+/// the name, and `branch list` reports it so every surface can hide it.
+#[test]
+fn branch_archive_marks_without_deleting() {
+    let (_tmp, repo) = setup_repo();
+    wtm(&repo, &["branch", "create", "topic"]);
+
+    let archived = stdout_json(&wtm(&repo, &["branch", "archive", "topic", "--json"]));
+    assert_eq!(archived["name"], "topic");
+    assert_eq!(archived["archived"], true);
+    let out = Command::new("git")
+        .args(["show-ref", "--verify", "--quiet", "refs/heads/topic"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "archiving must not delete the branch");
+    let config = std::fs::read_to_string(repo.join(".wtm.toml")).unwrap();
+    assert!(config.contains("archived_branches"), "{config}");
+
+    let list = stdout_json(&wtm(&repo, &["branch", "list", "--json"]));
+    let topic = list["branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["name"] == "topic")
+        .unwrap();
+    assert_eq!(topic["archived"], true);
+    assert!(
+        String::from_utf8_lossy(&wtm(&repo, &["branch", "list"]).stdout).contains("archived"),
+        "human output should label the archived branch"
+    );
+
+    // A rename carries the archived mark along with the branch.
+    wtm(&repo, &["branch", "rename", "topic", "subject"]);
+    let list = stdout_json(&wtm(&repo, &["branch", "list", "--json"]));
+    let renamed = list["branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["name"] == "subject")
+        .unwrap();
+    assert_eq!(renamed["archived"], true);
+
+    // Un-archiving clears it, and empties the list out of the config file.
+    let undone = stdout_json(&wtm(
+        &repo,
+        &["branch", "archive", "subject", "--undo", "--json"],
+    ));
+    assert_eq!(undone["archived"], false);
+    let config = std::fs::read_to_string(repo.join(".wtm.toml")).unwrap();
+    assert!(!config.contains("archived_branches"), "{config}");
+
+    // An unknown branch is refused rather than recorded.
+    let out = wtm(&repo, &["branch", "archive", "nope", "--json"]);
+    assert!(!out.status.success());
+}
+
+/// `branch delete` is local-only by default; `--remote` also removes it on the
+/// remote and `--remote-only` leaves the local branch alone.
+#[test]
+fn branch_delete_scopes_local_and_remote() {
+    let (tmp, repo) = setup_repo();
+    let bare = tmp.path().join("origin.git");
+    git(
+        tmp.path(),
+        &["init", "--bare", "-b", "main", bare.to_str().unwrap()],
+    );
+    git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    git(&repo, &["push", "-u", "origin", "main"]);
+
+    // Local-only delete leaves the remote branch in place.
+    wtm(&repo, &["branch", "create", "keep-remote"]);
+    git(&repo, &["push", "-u", "origin", "keep-remote"]);
+    let deleted = stdout_json(&wtm(&repo, &["branch", "delete", "keep-remote", "--json"]));
+    assert_eq!(deleted["local_deleted"], true);
+    assert!(deleted["remote_deleted"].is_null());
+    assert!(remote_has_branch(&bare, "keep-remote"));
+
+    // --remote-only is the mirror: the remote ref goes, the local one stays.
+    wtm(&repo, &["branch", "create", "remote-gone"]);
+    git(&repo, &["push", "-u", "origin", "remote-gone"]);
+    let deleted = stdout_json(&wtm(
+        &repo,
+        &["branch", "delete", "remote-gone", "--remote-only", "--json"],
+    ));
+    assert_eq!(deleted["local_deleted"], false);
+    assert_eq!(deleted["remote_deleted"], "origin");
+    assert!(!remote_has_branch(&bare, "remote-gone"));
+    let out = Command::new("git")
+        .args(["show-ref", "--verify", "--quiet", "refs/heads/remote-gone"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "local branch should survive");
+
+    // --remote takes both.
+    wtm(&repo, &["branch", "create", "both-gone"]);
+    git(&repo, &["push", "-u", "origin", "both-gone"]);
+    let deleted = stdout_json(&wtm(
+        &repo,
+        &["branch", "delete", "both-gone", "--remote", "--json"],
+    ));
+    assert_eq!(deleted["local_deleted"], true);
+    assert_eq!(deleted["remote_deleted"], "origin");
+    assert!(!remote_has_branch(&bare, "both-gone"));
+    let out = Command::new("git")
+        .args(["show-ref", "--verify", "--quiet", "refs/heads/both-gone"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "local branch should be gone");
+}
+
+/// Whether the bare repo at `bare` still has `branch`.
+fn remote_has_branch(bare: &Path, branch: &str) -> bool {
+    Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .current_dir(bare)
+        .output()
+        .unwrap()
+        .status
+        .success()
+}
+
 #[test]
 fn switch_changes_a_worktrees_branch() {
     let (_tmp, repo) = setup_repo();

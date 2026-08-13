@@ -389,6 +389,13 @@ impl ConfigEditor {
         self.editing.is_some() || self.open_list.as_ref().is_some_and(|l| l.input.is_some())
     }
 
+    /// Whether a dialog owns the keyboard here: a field being edited, or the
+    /// open_command list editor. The app asks so Tab can't switch tabs out from
+    /// under it.
+    pub fn dialog_open(&self) -> bool {
+        self.editing.is_some() || self.open_list.is_some()
+    }
+
     fn set_field(&mut self, row: usize, value: String) {
         match row {
             0 => self.fields.worktree_dir = value,

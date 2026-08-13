@@ -6,7 +6,7 @@
 //! `~/...`, or relative to the repo root) where `{repo}` expands to the repo
 //! directory name.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -268,6 +268,11 @@ pub struct FileConfig {
     /// `wtm create`. Not a user-facing setting; ignored by [`Config::merge`].
     #[serde(default)]
     pub created_from: Option<BTreeMap<String, String>>,
+    /// Runtime list of branches the user has archived: they still exist in git
+    /// but are hidden from the Branches tab unless "view archived" is on. Not a
+    /// user-facing setting; ignored by [`Config::merge`].
+    #[serde(default)]
+    pub archived_branches: Option<Vec<String>>,
 }
 
 /// The `[setup]` section of one config file.
@@ -606,6 +611,90 @@ pub fn rename_created_from(repo_root: &Path, old: &str, new: &str) -> Result<()>
     })
 }
 
+/// Reads the archived-branch list from the repo's `.wtm.toml`. Archiving only
+/// hides a branch from the Branches tab; git never sees it, so the list lives
+/// beside `[created_from]` as runtime state rather than as a setting.
+pub fn load_archived_branches(repo_root: &Path) -> Result<BTreeSet<String>> {
+    let file = FileConfig::load(&repo_root.join(CONFIG_FILE))?;
+    Ok(file
+        .archived_branches
+        .unwrap_or_default()
+        .into_iter()
+        .collect())
+}
+
+/// Adds or removes `branch` from the archived list, preserving other settings.
+pub fn set_branch_archived(repo_root: &Path, branch: &str, archived: bool) -> Result<()> {
+    edit_archived_branches(repo_root, |set| {
+        if archived {
+            set.insert(branch.to_string());
+        } else {
+            set.remove(branch);
+        }
+    })
+}
+
+/// Follows a rename so an archived branch stays archived under its new name.
+pub fn rename_archived_branch(repo_root: &Path, old: &str, new: &str) -> Result<()> {
+    if old == new {
+        return Ok(());
+    }
+    edit_archived_branches(repo_root, |set| {
+        if set.remove(old) {
+            set.insert(new.to_string());
+        }
+    })
+}
+
+/// Loads, mutates, and writes `archived_branches` via toml_edit so comments and
+/// unrelated settings survive.
+fn edit_archived_branches(
+    repo_root: &Path,
+    mutate: impl FnOnce(&mut BTreeSet<String>),
+) -> Result<()> {
+    let path = repo_root.join(CONFIG_FILE);
+    let mut doc = load_doc(&path)?;
+    let mut set: BTreeSet<String> = match doc.get("archived_branches").and_then(|i| i.as_array()) {
+        Some(array) => array
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        None => BTreeSet::new(),
+    };
+    mutate(&mut set);
+    if set.is_empty() {
+        doc.remove("archived_branches");
+    } else {
+        let mut array = toml_edit::Array::new();
+        for branch in &set {
+            array.push(branch.as_str());
+        }
+        doc["archived_branches"] = toml_edit::value(array);
+    }
+    save_doc(&path, doc)
+}
+
+/// Reads `path` as a TOML document, or starts an empty one when it is missing.
+fn load_doc(path: &Path) -> Result<DocumentMut> {
+    if !path.exists() {
+        return Ok(DocumentMut::new());
+    }
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    text.parse::<DocumentMut>()
+        .with_context(|| format!("invalid TOML in {}", path.display()))
+}
+
+/// Writes `doc` back to `path`, refusing anything `FileConfig` couldn't load
+/// again (same guard as `settings::save_doc`).
+fn save_doc(path: &Path, doc: DocumentMut) -> Result<()> {
+    let text = doc.to_string();
+    toml::from_str::<FileConfig>(&text)
+        .with_context(|| format!("refusing to write invalid config to {}", path.display()))?;
+    std::fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
 /// Loads, mutates, and writes the `[created_from]` table via toml_edit so
 /// comments and unrelated settings survive.
 fn edit_created_from(
@@ -613,14 +702,7 @@ fn edit_created_from(
     mutate: impl FnOnce(&mut BTreeMap<String, String>),
 ) -> Result<()> {
     let path = repo_root.join(CONFIG_FILE);
-    let mut doc = if path.exists() {
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        text.parse::<DocumentMut>()
-            .with_context(|| format!("invalid TOML in {}", path.display()))?
-    } else {
-        DocumentMut::new()
-    };
+    let mut doc = load_doc(&path)?;
     let mut map = match doc.get("created_from").and_then(|item| item.as_table()) {
         Some(table) => table
             .iter()
@@ -638,13 +720,7 @@ fn edit_created_from(
         }
         doc["created_from"] = toml_edit::Item::Table(table);
     }
-    let text = doc.to_string();
-    // Refuse to write anything FileConfig couldn't load again (same guard as
-    // settings::save_doc).
-    toml::from_str::<FileConfig>(&text)
-        .with_context(|| format!("refusing to write invalid config to {}", path.display()))?;
-    std::fs::write(&path, text).with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
+    save_doc(&path, doc)
 }
 
 #[cfg(test)]
@@ -900,6 +976,43 @@ mod tests {
         assert!(
             !text.contains("created_from"),
             "empty table removed: {text}"
+        );
+    }
+
+    /// Archiving round-trips through `.wtm.toml` and, crucially, keeps writing
+    /// valid TOML when `[created_from]` is already there: a top-level array
+    /// emitted after a table header would silently become part of that table.
+    #[test]
+    fn archived_branch_helpers_round_trip_alongside_created_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(CONFIG_FILE), "worktree_dir = \"home\"\n").unwrap();
+        set_created_from(root, "feature", "main").unwrap();
+        set_branch_archived(root, "feature", true).unwrap();
+        set_branch_archived(root, "old-thing", true).unwrap();
+
+        let archived = load_archived_branches(root).unwrap();
+        assert!(archived.contains("feature"));
+        assert!(archived.contains("old-thing"));
+        // Both kinds of runtime state survive together and stay readable.
+        assert_eq!(
+            load_created_from(root).unwrap().get("feature"),
+            Some(&"main".to_string())
+        );
+
+        rename_archived_branch(root, "feature", "renamed").unwrap();
+        let archived = load_archived_branches(root).unwrap();
+        assert!(!archived.contains("feature"));
+        assert!(archived.contains("renamed"));
+
+        set_branch_archived(root, "renamed", false).unwrap();
+        set_branch_archived(root, "old-thing", false).unwrap();
+        assert!(load_archived_branches(root).unwrap().is_empty());
+        let text = std::fs::read_to_string(root.join(CONFIG_FILE)).unwrap();
+        assert!(text.contains("worktree_dir"), "settings preserved: {text}");
+        assert!(
+            !text.contains("archived_branches"),
+            "empty list removed: {text}"
         );
     }
 
