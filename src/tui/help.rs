@@ -207,6 +207,10 @@ pub const WORKTREES: &[Binding] = &[
         "x",
         "resume the conflict resolver for a worktree stopped mid-merge/rebase",
     ),
+    help_only(
+        "⇧U",
+        "discard all local changes in the worktree (tracked files reset to HEAD, untracked files removed)",
+    ),
     help_only("r", "refresh the list"),
     both("?", "help", "show this help"),
     both("q", "quit", "quit"),

@@ -556,8 +556,11 @@ pub enum ModalAction {
     RevertFile,
     /// Delete the file under the Diff cursor from the worktree.
     DeleteFile,
-    /// Discard every uncommitted change in the Changes tab's worktree.
-    DiscardAllChanges,
+    /// Discard every uncommitted change in the named worktree. The name is
+    /// carried here rather than read back from `changes` because the command is
+    /// reachable from the Worktrees tab too, where the cursor's worktree and
+    /// the Changes tab's worktree can differ.
+    DiscardAllChanges { name: String },
     /// Add to `.gitignore`: option 0 ignores the exact `file`, option 1 the
     /// derived `pattern`.
     IgnorePath { file: String, pattern: String },
@@ -2537,9 +2540,9 @@ impl App {
                     self.delete_file(e);
                 }
             }
-            ModalAction::DiscardAllChanges => {
+            ModalAction::DiscardAllChanges { name } => {
                 if let ModalResult::Confirmed(_) = result {
-                    self.discard_all_changes();
+                    self.discard_all_changes(name);
                 }
             }
             ModalAction::IgnorePath { file, pattern } => {
@@ -2753,10 +2756,10 @@ impl App {
         self.push_confirm("delete file", body, options, ModalAction::DeleteFile);
     }
 
-    /// Confirmation for discarding every uncommitted change in the Changes
-    /// tab's worktree (tracked changes reset, untracked files removed).
-    fn open_discard_all_modal(&mut self) {
-        let name = self.changes.name.clone();
+    /// Confirmation for discarding every uncommitted change in `name` (tracked
+    /// changes reset, untracked files removed). Shared by the Changes tab and
+    /// the Worktrees tab, which pass their own worktree.
+    fn open_discard_all_modal(&mut self, name: String) {
         let body = vec![Line::from(format!(
             "discard ALL uncommitted changes in '{name}'? this resets tracked files to HEAD and removes untracked files."
         ))];
@@ -2765,7 +2768,7 @@ impl App {
             "discard all changes",
             body,
             options,
-            ModalAction::DiscardAllChanges,
+            ModalAction::DiscardAllChanges { name },
         );
     }
 
@@ -3271,6 +3274,20 @@ impl App {
             KeyCode::Char('u') => self.start_update(),
             KeyCode::Char('l') => self.open_log(),
             KeyCode::Char('R') => self.open_rename_worktree(),
+            // Discard every uncommitted change in the worktree under the
+            // cursor. Same key the Changes tab uses for the same command, so
+            // it works whichever panel the user is looking at.
+            KeyCode::Char('U') => {
+                if let Some((name, dirty)) =
+                    self.selected_worktree().map(|w| (w.name.clone(), w.dirty))
+                {
+                    if dirty == 0 {
+                        self.message = Some(format!("'{name}' has no uncommitted changes"));
+                    } else {
+                        self.open_discard_all_modal(name);
+                    }
+                }
+            }
             // Reopens the conflict resolver for a worktree left mid-merge,
             // mid-rebase, or mid-cherry-pick, including one started outside wtm.
             KeyCode::Char('x') => self.open_resolver_for_selected(),
@@ -4222,7 +4239,7 @@ impl App {
             }
             KeyCode::Char('U') => {
                 if !files.is_empty() {
-                    self.open_discard_all_modal();
+                    self.open_discard_all_modal(self.changes.name.clone());
                 }
             }
             KeyCode::Char('i') => {
@@ -4508,6 +4525,7 @@ impl App {
     /// resets like a fresh `load_changes`.
     fn apply_changes_files(&mut self, name: String, files: Vec<StatusEntry>, preserve_marks: bool) {
         let tree = self.file_tree;
+        self.sync_dirty_count(&name, &files);
         if preserve_marks {
             let old_path = {
                 let c = &self.changes;
@@ -4599,10 +4617,10 @@ impl App {
         self.refresh();
     }
 
-    /// Discards every uncommitted change in the Changes tab's worktree, then
-    /// reloads it.
-    fn discard_all_changes(&mut self) {
-        let name = self.changes.name.clone();
+    /// Discards every uncommitted change in the worktree named `name`, then
+    /// reloads the visible panels. `name` is whichever worktree the command was
+    /// issued for: the Changes tab's, or the Worktrees tab's cursor.
+    fn discard_all_changes(&mut self, name: String) {
         match ops::discard_all_changes(&self.ctx, &name) {
             Ok(_) => self.message = Some(format!("discarded all changes in '{name}'")),
             Err(e) => self.set_error(format!("{e:#}")),
@@ -5764,9 +5782,34 @@ impl App {
         if idx != self.selected {
             return;
         }
+        if let Some(name) = self.worktrees.get(idx).map(|w| w.name.clone()) {
+            self.sync_dirty_count(&name, &files);
+        }
         self.worktree_preview = files;
         self.preview_for = Some(idx);
         self.sync_three_panel_changes();
+    }
+
+    /// Folds a freshly loaded status listing for `name` back into that
+    /// worktree's row in the list, so the Changes column tracks the changed-file
+    /// panel instead of lagging it.
+    ///
+    /// The panel reloads status every `DIFF_REFRESH_INTERVAL` while a full
+    /// `ops::list` only runs every `AUTO_REFRESH_INTERVAL`; without this, files
+    /// added or removed outside the app would show up in the panel (and in the
+    /// commit list, which reloads with it) up to a minute before the column
+    /// beside them caught up. The counts are derived from the same
+    /// `git::status` listing `ops::list` derives them from, so this never
+    /// disagrees with what the next full reload computes.
+    fn sync_dirty_count(&mut self, name: &str, files: &[StatusEntry]) {
+        let Some(wt) = self.worktrees.iter_mut().find(|w| w.name == name) else {
+            return;
+        };
+        wt.dirty = files.len();
+        wt.conflicted = files
+            .iter()
+            .filter(|e| git::is_conflict_code(&e.code))
+            .count();
     }
 
     /// Hands a freshly loaded worktree status to the three-panel layout's
@@ -12673,6 +12716,102 @@ mod tests {
         settle(&mut app);
         assert!(matches!(app.view, View::List));
         assert!(!app.worktrees.iter().any(|w| w.name == "messy"));
+    }
+
+    /// `⇧U` on the Worktrees tab discards the cursor's worktree, not whatever
+    /// the Changes tab was last pointed at.
+    #[test]
+    fn discard_all_from_the_worktrees_tab_resets_the_selected_worktree() {
+        let (_tmp, mut app) = test_app();
+        app.three_panel = false;
+        add_and_select_worktree(&mut app, "messy");
+        let path = PathBuf::from(&app.worktrees[app.selected].path);
+        std::fs::write(path.join("tracked.txt"), "original\n").unwrap();
+        git(&path, &["add", "tracked.txt"]);
+        git(&path, &["commit", "-m", "add tracked"]);
+        std::fs::write(path.join("tracked.txt"), "modified\n").unwrap();
+        std::fs::write(path.join("untracked.txt"), "junk\n").unwrap();
+        app.refresh();
+        app.selected = app
+            .worktrees
+            .iter()
+            .position(|w| w.name == "messy")
+            .unwrap();
+        assert_eq!(app.worktrees[app.selected].dirty, 2);
+
+        press(&mut app, KeyCode::Char('U'));
+        match &app.modal {
+            Some(Modal::Confirm {
+                action: ModalAction::DiscardAllChanges { name },
+                ..
+            }) => assert_eq!(name, "messy"),
+            _ => panic!("expected the discard-all confirmation"),
+        }
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+
+        assert_eq!(
+            std::fs::read_to_string(path.join("tracked.txt")).unwrap(),
+            "original\n"
+        );
+        assert!(!path.join("untracked.txt").exists());
+        let row = app.worktrees.iter().find(|w| w.name == "messy").unwrap();
+        assert_eq!(row.dirty, 0);
+    }
+
+    /// Nothing to discard is a message, not a destructive prompt the user has
+    /// to back out of.
+    #[test]
+    fn discard_all_on_a_clean_worktree_reports_instead_of_prompting() {
+        let (_tmp, mut app) = test_app();
+        app.three_panel = false;
+        add_and_select_worktree(&mut app, "tidy");
+        press(&mut app, KeyCode::Char('U'));
+        assert!(app.modal.is_none());
+        assert_eq!(
+            app.message.as_deref(),
+            Some("'tidy' has no uncommitted changes")
+        );
+    }
+
+    /// The Changes column reads the worktree list, which only reloads on the
+    /// slow auto-refresh timer, while the changed-file panel beside it reloads
+    /// every second. A status reload has to fold its counts back into that row,
+    /// or files removed outside wtm stay in the column long after they leave
+    /// the panel.
+    #[test]
+    fn the_changes_column_follows_a_status_reload_without_a_full_list_refresh() {
+        let (_tmp, mut app) = test_app();
+        app.three_panel = false;
+        add_and_select_worktree(&mut app, "messy");
+        let path = PathBuf::from(&app.worktrees[app.selected].path);
+        std::fs::write(path.join("a.txt"), "x\n").unwrap();
+        std::fs::write(path.join("b.txt"), "y\n").unwrap();
+        app.refresh();
+        app.selected = app
+            .worktrees
+            .iter()
+            .position(|w| w.name == "messy")
+            .unwrap();
+        assert_eq!(app.worktrees[app.selected].dirty, 2);
+
+        press(&mut app, KeyCode::Enter);
+        settle_background(&mut app);
+        assert_eq!(app.tab, Tab::Changes);
+        assert_eq!(app.changes.files.len(), 2);
+
+        // An external actor removes the files; only the fast diff refresh is
+        // due, so nothing reloads the worktree list wholesale.
+        std::fs::remove_file(path.join("a.txt")).unwrap();
+        std::fs::remove_file(path.join("b.txt")).unwrap();
+        app.last_auto_refresh = Instant::now();
+        app.changes.last_refresh = Instant::now() - DIFF_REFRESH_INTERVAL;
+        app.tick();
+        settle_background(&mut app);
+
+        assert!(app.changes.files.is_empty(), "panel still shows the files");
+        let row = app.worktrees.iter().find(|w| w.name == "messy").unwrap();
+        assert_eq!(row.dirty, 0, "Changes column lagged the file panel");
     }
 
     #[test]
