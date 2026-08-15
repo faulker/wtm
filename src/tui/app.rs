@@ -626,6 +626,16 @@ pub enum ModalAction {
     /// A newer wtm is published: option 0 installs it and restarts, 1 postpones
     /// until the next launch.
     UpdateApp(Box<Release>),
+    /// The files being committed look like a folder rename with one side
+    /// missing: option 0 adds `extra` so git records the rename, option 1
+    /// commits `paths` as selected.
+    CommitFolderRename {
+        name: String,
+        message: String,
+        body: Option<String>,
+        paths: Vec<String>,
+        extra: Vec<String>,
+    },
 }
 
 /// Which screen/overlay is active.
@@ -707,9 +717,11 @@ pub enum View {
     },
     /// First-run setup wizard, shown until `.wtm.toml` exists.
     Setup(Box<SetupWizard>),
-    /// Commit flow: pick which changed files to include (all by default) and
+    /// Commit flow: pick which files to include (the ones that will be
+    /// committed; all dirty files by default, or the Changes-tab marks) and
     /// type a message. Focus cycles between the file list, the subject line,
-    /// and the optional body.
+    /// and the optional body. The file list scrolls when it is longer than
+    /// the dialog.
     Commit {
         name: String,
         files: Vec<StatusEntry>,
@@ -2732,6 +2744,21 @@ impl App {
                     self.start_update_install(*release);
                 }
             }
+            ModalAction::CommitFolderRename {
+                name,
+                message,
+                body,
+                mut paths,
+                extra,
+            } => {
+                let ModalResult::Confirmed(idx) = result else {
+                    return;
+                };
+                if idx == 0 {
+                    paths.extend(extra);
+                }
+                self.start_commit(name, message, body, paths);
+            }
         }
     }
 
@@ -3613,14 +3640,17 @@ impl App {
         // arrow keys. The help panel is modal, so a click on the view behind it
         // must not move that view's cursor.
         if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-            if !self.show_help {
-                let double = self.take_double_click(mouse.column, mouse.row);
-                self.on_click(mouse.column, mouse.row);
-                // The first click of the pair has already moved the cursor onto
-                // the row, so the second one acts on whatever is selected now.
-                if double {
-                    self.on_double_click();
-                }
+            // The error popup sits on top of everything, including help; a
+            // click must not land on the view behind it.
+            if self.error.is_some() || self.show_help {
+                return;
+            }
+            let double = self.take_double_click(mouse.column, mouse.row);
+            self.on_click(mouse.column, mouse.row);
+            // The first click of the pair has already moved the cursor onto
+            // the row, so the second one acts on whatever is selected now.
+            if double {
+                self.on_double_click();
             }
             return;
         }
@@ -3637,6 +3667,10 @@ impl App {
                 s.saturating_sub(3)
             }
         };
+        if self.error.is_some() {
+            self.scroll_error(if down { 3 } else { -3 });
+            return;
+        }
         if self.show_help {
             self.help_scroll = delta(self.help_scroll);
             return;
@@ -3753,6 +3787,21 @@ impl App {
             } => {
                 if let Some(next) = seek_commit_row(lines, *selected, down) {
                     *selected = next;
+                }
+            }
+            View::Commit {
+                files,
+                cursor,
+                focus,
+                ..
+            } if over_list => {
+                *focus = CommitFocus::Files;
+                if down {
+                    if *cursor + 1 < files.len() {
+                        *cursor += 1;
+                    }
+                } else {
+                    *cursor = cursor.saturating_sub(1);
                 }
             }
             _ => {}
@@ -4641,18 +4690,31 @@ impl App {
         self.refresh();
     }
 
-    /// Opens the commit dialog from the Changes tab, carrying the files marked
-    /// there as the initial selection.
+    /// Opens the commit dialog from the Changes tab with only the files marked
+    /// there. Unmarked files stay out of the list so it matches what will be
+    /// committed.
     fn commit_from_diff(&mut self) {
         let c = &self.changes;
         if c.files.is_empty() {
             self.message = Some("nothing to commit".to_string());
             return;
         }
+        let (files, marked): (Vec<_>, Vec<_>) = c
+            .files
+            .iter()
+            .cloned()
+            .zip(c.marked.iter().copied())
+            .filter(|(_, m)| *m)
+            .unzip();
+        if files.is_empty() {
+            self.message = Some("no files marked for commit".to_string());
+            return;
+        }
+        let name = c.name.clone();
         self.push_screen(View::Commit {
-            name: c.name.clone(),
-            files: c.files.clone(),
-            marked: c.marked.clone(),
+            name,
+            files,
+            marked,
             cursor: 0,
             input: TextInput::default(),
             body: TextArea::default(),
@@ -5167,7 +5229,8 @@ impl App {
     }
 
     /// Commits the files marked in the commit dialog. Errors and empty
-    /// selections keep the dialog open.
+    /// selections keep the dialog open. A selection that looks like one side
+    /// of a folder rename asks whether to include the other side first.
     fn do_commit(&mut self) {
         let View::Commit {
             name,
@@ -5198,6 +5261,69 @@ impl App {
             return;
         }
         let name = name.clone();
+        if let Some(dir) = self
+            .worktrees
+            .iter()
+            .find(|w| w.name == name)
+            .map(|w| PathBuf::from(&w.path))
+            && let Ok(Some(offer)) = git::folder_rename_offer(&dir, &paths)
+        {
+            self.open_folder_rename_modal(name, message, body, paths, offer);
+            return;
+        }
+        self.start_commit(name, message, body, paths);
+    }
+
+    /// Asks whether to add the other side of a detected folder rename before
+    /// committing. Esc leaves the commit dialog as it was.
+    fn open_folder_rename_modal(
+        &mut self,
+        name: String,
+        message: String,
+        body: Option<String>,
+        paths: Vec<String>,
+        offer: git::FolderRenameOffer,
+    ) {
+        let noun = if offer.pairs.len() == 1 {
+            "a renamed folder"
+        } else {
+            "renamed folders"
+        };
+        let mut lines = vec![
+            Line::from(format!("these changes look like {noun}:")),
+            Line::from(""),
+        ];
+        for (from, to) in &offer.pairs {
+            lines.push(Line::from(format!("  {from}/  →  {to}/")));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from("include both sides so git records the rename?"));
+        let options = vec![
+            ConfirmOption::new("include both sides (record as rename)").key('i'),
+            ConfirmOption::new("commit selected files only"),
+        ];
+        self.push_confirm(
+            "folder rename",
+            lines,
+            options,
+            ModalAction::CommitFolderRename {
+                name,
+                message,
+                body,
+                paths,
+                extra: offer.extra_paths,
+            },
+        );
+    }
+
+    /// Runs the commit on a background thread and returns to the worktree list.
+    fn start_commit(
+        &mut self,
+        name: String,
+        message: String,
+        body: Option<String>,
+        paths: Vec<String>,
+    ) {
         self.start_busy(
             format!("committing '{name}'…"),
             BusyThen::List,
@@ -8851,6 +8977,40 @@ mod tests {
     }
 
     #[test]
+    fn error_popup_wheel_scrolls_the_message_not_the_view_behind() {
+        let (_tmp, mut app) = test_app();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.tab, Tab::Changes);
+        app.changes.scroll = 0;
+        app.set_error("line1\nline2\nline3\nline4\nline5");
+        app.error_max_scroll = 10;
+        scroll_wheel(&mut app, MouseEventKind::ScrollDown);
+        assert_eq!(app.error_scroll, 3, "wheel scrolls the error three lines");
+        assert_eq!(
+            app.changes.scroll, 0,
+            "must not scroll the panel behind the error"
+        );
+        scroll_wheel(&mut app, MouseEventKind::ScrollUp);
+        assert_eq!(app.error_scroll, 0);
+    }
+
+    #[test]
+    fn error_popup_click_does_not_move_the_view_behind() {
+        let (_tmp, mut app) = test_app();
+        app.selected = 0;
+        app.set_error("boom");
+        app.row_list = Some(RowList {
+            inner: Rect::new(0, 2, 30, 10),
+            header: 0,
+            offset: 0,
+            len: 2,
+        });
+        click(&mut app, 1, 3);
+        assert_eq!(app.selected, 0, "click must not move the list behind");
+        assert!(app.error.is_some(), "click must not dismiss the error");
+    }
+
+    #[test]
     fn create_dialog_name_input_moves_cursor() {
         let (_tmp, mut app) = test_app();
         press(&mut app, KeyCode::Char('n'));
@@ -9487,7 +9647,7 @@ mod tests {
             inner: Rect::new(0, 2, 30, 10),
             header: 0,
             offset: 0,
-            len: len.min(10),
+            len,
         });
 
         click(&mut app, 1, 3); // second file row
@@ -9611,6 +9771,109 @@ mod tests {
             gitignore.lines().any(|l| l == "secret.log"),
             "exact file written: {gitignore}"
         );
+    }
+
+    #[test]
+    fn commit_from_diff_only_includes_marked_files() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("keep.txt"), "keep\n").unwrap();
+        std::fs::write(root.join("skip.txt"), "skip\n").unwrap();
+        app.refresh();
+        app.selected = 0;
+        press(&mut app, KeyCode::Enter);
+        select_diff_file(&mut app, "skip.txt");
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('c'));
+        match &app.view {
+            View::Commit { files, marked, .. } => {
+                assert!(
+                    files.iter().all(|f| f.path != "skip.txt"),
+                    "unmarked file must not appear: {files:?}"
+                );
+                assert!(
+                    files.iter().any(|f| f.path == "keep.txt"),
+                    "marked file must appear: {files:?}"
+                );
+                assert!(marked.iter().all(|m| *m), "dialog files start marked");
+            }
+            _ => panic!("expected the commit dialog"),
+        }
+    }
+
+    #[test]
+    fn commit_from_diff_refuses_when_nothing_is_marked() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("x.txt"), "x\n").unwrap();
+        app.refresh();
+        app.selected = 0;
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('c'));
+        assert!(matches!(app.view, View::List), "stays on Changes");
+        assert_eq!(app.tab, Tab::Changes);
+        assert!(
+            app.message.as_deref().unwrap().contains("no files marked"),
+            "message: {:?}",
+            app.message
+        );
+    }
+
+    #[test]
+    fn commit_dialog_cursor_reaches_files_past_the_visible_window() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        for i in 0..12 {
+            std::fs::write(root.join(format!("f{i:02}.txt")), "x\n").unwrap();
+        }
+        app.refresh();
+        app.selected = 0;
+        press(&mut app, KeyCode::Char('c'));
+        press(&mut app, KeyCode::BackTab);
+        match &app.view {
+            View::Commit { files, focus, .. } => {
+                assert!(files.len() >= 12, "need enough files: {}", files.len());
+                assert_eq!(*focus, CommitFocus::Files);
+            }
+            _ => panic!("expected the commit dialog"),
+        }
+        for _ in 0..11 {
+            press(&mut app, KeyCode::Down);
+        }
+        match &app.view {
+            View::Commit { cursor, .. } => assert_eq!(*cursor, 11),
+            _ => panic!("expected the commit dialog"),
+        }
+    }
+
+    #[test]
+    fn commit_dialog_wheel_over_the_file_list_moves_the_cursor() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        std::fs::write(root.join("b.txt"), "b\n").unwrap();
+        app.refresh();
+        app.selected = 0;
+        press(&mut app, KeyCode::Char('c'));
+        let len = match &app.view {
+            View::Commit { files, .. } => files.len(),
+            _ => panic!("expected the commit dialog"),
+        };
+        app.row_list = Some(RowList {
+            inner: Rect::new(0, 0, 30, 10),
+            header: 0,
+            offset: 0,
+            len,
+        });
+        scroll_wheel(&mut app, MouseEventKind::ScrollDown);
+        match &app.view {
+            View::Commit { cursor, focus, .. } => {
+                assert_eq!(*cursor, 1);
+                assert_eq!(*focus, CommitFocus::Files);
+            }
+            _ => panic!("expected the commit dialog"),
+        }
     }
 
     #[test]
@@ -10300,6 +10563,104 @@ mod tests {
         assert!(app.message.as_deref().unwrap().starts_with("committed"));
         app.refresh();
         assert_eq!(app.worktrees[0].dirty, 0, "worktree should be clean now");
+    }
+
+    /// Commits a folder of tracked files, then moves that folder, so status
+    /// shows deletions on the old path and untracked files on the new one.
+    fn rename_folder_on_main(app: &mut App) {
+        let root = app.ctx.repo_root.clone();
+        std::fs::create_dir(root.join("olddir")).unwrap();
+        std::fs::write(root.join("olddir/a.rs"), "a\n").unwrap();
+        std::fs::write(root.join("olddir/b.rs"), "b\n").unwrap();
+        git(&root, &["add", "olddir"]);
+        git(&root, &["commit", "-m", "add olddir"]);
+        std::fs::rename(root.join("olddir"), root.join("newdir")).unwrap();
+        app.refresh();
+        app.selected = 0;
+    }
+
+    /// Opens the commit dialog from Changes with only the new folder marked,
+    /// types a message, and submits so the folder-rename prompt appears.
+    fn submit_new_side_of_folder_rename(app: &mut App) {
+        press(app, KeyCode::Enter);
+        select_diff_file(app, "olddir/a.rs");
+        press(app, KeyCode::Char(' '));
+        select_diff_file(app, "olddir/b.rs");
+        press(app, KeyCode::Char(' '));
+        press(app, KeyCode::Char('c'));
+        assert!(matches!(app.view, View::Commit { .. }));
+        type_str(app, "move folder");
+        press(app, KeyCode::Enter);
+        match &app.modal {
+            Some(Modal::Confirm {
+                title,
+                action: ModalAction::CommitFolderRename { extra, .. },
+                ..
+            }) => {
+                assert_eq!(title, "folder rename");
+                assert!(
+                    extra.iter().any(|p| p == "olddir/a.rs"),
+                    "old paths should be offered: {extra:?}"
+                );
+            }
+            Some(Modal::Confirm { title, .. }) => {
+                panic!("expected folder-rename prompt, got {title}")
+            }
+            Some(_) => panic!("expected folder-rename prompt, got a different modal"),
+            None => panic!("expected folder-rename prompt, got no modal"),
+        }
+    }
+
+    #[test]
+    fn commit_of_both_sides_of_a_folder_rename_does_not_prompt() {
+        let (_tmp, mut app) = test_app();
+        rename_folder_on_main(&mut app);
+        press(&mut app, KeyCode::Char('c'));
+        type_str(&mut app, "move folder");
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            app.modal.is_none(),
+            "both sides selected, no prompt: {:?}",
+            app.modal.as_ref().map(|m| match m {
+                Modal::Confirm { title, .. } => title.as_str(),
+                _ => "other",
+            })
+        );
+        settle(&mut app);
+        assert!(matches!(app.view, View::List), "message: {:?}", app.message);
+        assert!(app.message.as_deref().unwrap().starts_with("committed"));
+    }
+
+    #[test]
+    fn commit_of_one_side_of_a_folder_rename_prompts_and_can_include_the_rest() {
+        let (_tmp, mut app) = test_app();
+        rename_folder_on_main(&mut app);
+        submit_new_side_of_folder_rename(&mut app);
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        assert!(matches!(app.view, View::List), "message: {:?}", app.message);
+        assert!(app.message.as_deref().unwrap().starts_with("committed"));
+        let status = crate::git::status(&app.ctx.repo_root).unwrap();
+        assert!(
+            !status.iter().any(|e| e.path.starts_with("olddir/")),
+            "old paths should have been included: {status:?}"
+        );
+    }
+
+    #[test]
+    fn commit_of_one_side_of_a_folder_rename_can_skip_the_rest() {
+        let (_tmp, mut app) = test_app();
+        rename_folder_on_main(&mut app);
+        submit_new_side_of_folder_rename(&mut app);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        assert!(matches!(app.view, View::List), "message: {:?}", app.message);
+        let status = crate::git::status(&app.ctx.repo_root).unwrap();
+        assert!(
+            status.iter().any(|e| e.path.starts_with("olddir/")),
+            "old deletions should remain: {status:?}"
+        );
     }
 
     /// Item 7: the commit message field supports mid-string editing with the

@@ -607,7 +607,10 @@ const CHANGES_SECTIONS: &[Section] = &[
     Section {
         heading: "commit dialog  (c)",
         bindings: COMMIT_FILES,
-        notes: &["while typing the message, F1 opens this help ('?' types a '?')"],
+        notes: &[
+            "while typing the message, F1 opens this help ('?' types a '?')",
+            "a folder rename with only one side marked asks whether to include the other side.",
+        ],
     },
     Section {
         heading: "stash tab  (s)",

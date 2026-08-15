@@ -3938,6 +3938,79 @@ mod tests {
         assert!(err.to_string().contains("main worktree"), "{err}");
     }
 
+    /// A failed `git add` during commit must surface git's own diagnostic, not
+    /// just the command that was run.
+    #[test]
+    fn commit_of_a_missing_path_reports_gits_error() {
+        let (_tmp, ctx) = temp_ctx();
+        let name = list(&ctx)
+            .unwrap()
+            .into_iter()
+            .find(|i| i.is_main)
+            .unwrap()
+            .name;
+        let err = commit(
+            &ctx,
+            &name,
+            "nope",
+            None,
+            Some(&["missing.txt".to_string()]),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("pathspec") || msg.contains("did not match"),
+            "git's diagnostic must be visible:\n{msg}"
+        );
+        let diag = msg.find("fatal:").or_else(|| msg.find("error:"));
+        let cmd = msg.find("(from");
+        assert!(
+            diag.is_some_and(|d| cmd.is_none_or(|c| d < c)),
+            "the diagnostic must appear before the command:\n{msg}"
+        );
+    }
+
+    /// A staged folder rename must commit from the new paths status reports,
+    /// not the `old -> new` porcelain string (that pathspec fails).
+    #[test]
+    fn commit_of_a_staged_folder_rename_uses_the_new_paths() {
+        let (_tmp, ctx) = temp_ctx();
+        let name = list(&ctx)
+            .unwrap()
+            .into_iter()
+            .find(|i| i.is_main)
+            .unwrap()
+            .name;
+        std::fs::create_dir(ctx.repo_root.join("olddir")).unwrap();
+        std::fs::write(ctx.repo_root.join("olddir/a.rs"), "a\n").unwrap();
+        git(&ctx.repo_root, &["add", "olddir"]);
+        git(&ctx.repo_root, &["commit", "-m", "add olddir"]);
+        std::fs::rename(ctx.repo_root.join("olddir"), ctx.repo_root.join("newdir")).unwrap();
+        git(&ctx.repo_root, &["add", "-A"]);
+        let paths: Vec<String> = git::status(&ctx.repo_root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        assert!(
+            paths.iter().any(|p| p == "newdir/a.rs"),
+            "status must list the new path: {paths:?}"
+        );
+        commit(&ctx, &name, "rename folder", None, Some(&paths)).unwrap();
+        let files = commit_files(
+            &ctx,
+            &name,
+            &git::run(&ctx.repo_root, &["rev-parse", "HEAD"]).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            files
+                .iter()
+                .any(|f| f.path == "newdir/a.rs" && f.code.starts_with('R')),
+            "commit should record a rename: {files:?}"
+        );
+    }
+
     /// Item 4: a commit's changed files and a single file's diff are readable.
     #[test]
     fn commit_files_and_diff_report_a_commits_changes() {

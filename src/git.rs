@@ -4,7 +4,7 @@
 //! than using libgit2 bindings, because git's worktree support is most
 //! complete and reliable in the CLI itself.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -14,10 +14,42 @@ use thiserror::Error;
 pub enum GitError {
     #[error("failed to run git: {0}")]
     Spawn(#[from] std::io::Error),
-    #[error("git {args} failed: {stderr}")]
+    /// `stderr` is git's diagnostic text (stderr, plus stdout when stderr was
+    /// empty). Display leads with that text so a long `git add --` of many
+    /// paths does not bury the actual failure under the command line.
+    #[error("{}", format_command_error(args, stderr))]
     Command { args: String, stderr: String },
     #[error("not inside a git repository")]
     NotARepo,
+}
+
+/// Shortens a git argv string for error messages so a `git add --` of many
+/// files does not push the real diagnostic off the first screen of the popup.
+fn summarize_git_args(args: &str) -> String {
+    const MAX: usize = 72;
+    if let Some((head, rest)) = args.split_once(" -- ") {
+        let n = rest.split_ascii_whitespace().count();
+        if n > 3 || args.len() > MAX {
+            return format!("{head} -- ({n} paths)");
+        }
+    }
+    if args.chars().count() > MAX {
+        let trimmed: String = args.chars().take(MAX.saturating_sub(1)).collect();
+        format!("{trimmed}…")
+    } else {
+        args.to_string()
+    }
+}
+
+/// Builds the user-facing `GitError::Command` text: git's own message first,
+/// then a short pointer at the command that produced it.
+fn format_command_error(args: &str, stderr: &str) -> String {
+    let cmd = summarize_git_args(args);
+    if stderr.is_empty() {
+        format!("git {cmd} failed")
+    } else {
+        format!("{stderr}\n\n(from `git {cmd}`)")
+    }
 }
 
 pub type Result<T> = std::result::Result<T, GitError>;
@@ -58,9 +90,19 @@ pub fn run(dir: &Path, args: &[&str]) -> Result<String> {
             .trim_end()
             .to_string())
     } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        // Some git subcommands put the useful diagnostic on stdout; keep both
+        // so the error popup is never just the command that was run.
+        let detail = match (stderr.is_empty(), stdout.is_empty()) {
+            (false, false) => format!("{stderr}\n{stdout}"),
+            (false, true) => stderr,
+            (true, false) => stdout,
+            (true, true) => String::new(),
+        };
         Err(GitError::Command {
             args: args.join(" "),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            stderr: detail,
         })
     }
 }
@@ -358,11 +400,203 @@ pub fn status(dir: &Path) -> Result<Vec<StatusEntry>> {
 pub fn parse_status_porcelain(out: &str) -> Vec<StatusEntry> {
     out.lines()
         .filter(|l| l.len() > 3)
-        .map(|l| StatusEntry {
-            code: l[..2].to_string(),
-            path: l[3..].to_string(),
+        .map(|l| {
+            let code = l[..2].to_string();
+            let path = porcelain_path(&code, &l[3..]);
+            StatusEntry { code, path }
         })
         .collect()
+}
+
+/// The path a porcelain line should be addressed by. Rename/copy lines are
+/// `old -> new` (or `"old" -> "new"` when git quotes unusual names); later
+/// `git add --` calls need the target path, not the whole arrow string.
+fn porcelain_path(code: &str, rest: &str) -> String {
+    let raw = match code.chars().next() {
+        Some('R' | 'C') => rest.split_once(" -> ").map(|(_, t)| t).unwrap_or(rest),
+        _ => rest,
+    };
+    unquote_porcelain_path(raw)
+}
+
+/// Strips git's C-style quotes from a porcelain path (`"a b.rs"` → `a b.rs`).
+fn unquote_porcelain_path(s: &str) -> String {
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        unescape_c_quoted(&s[1..s.len() - 1])
+    } else {
+        s.to_string()
+    }
+}
+
+/// Interprets the escapes git uses inside a quoted porcelain path.
+fn unescape_c_quoted(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            Some('"') => out.push('"'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// A working-tree folder that looks like it was renamed: every file under
+/// `from` is a deletion, matching files under `to` are additions, and `from`
+/// is gone from disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderRename {
+    pub from: String,
+    pub to: String,
+    /// Deleted paths under `from` plus added paths under `to`.
+    pub paths: Vec<String>,
+}
+
+/// Folder-rename counterparts that are not in `selected`, plus the folder
+/// pairs they belong to, so a caller can ask whether to include them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderRenameOffer {
+    pub pairs: Vec<(String, String)>,
+    pub extra_paths: Vec<String>,
+}
+
+/// Detects folder renames among `entries` whose other side is missing from
+/// `selected`. `None` when the selection already covers each matching pair
+/// (or nothing looks like a folder rename).
+pub fn folder_rename_offer(dir: &Path, selected: &[String]) -> Result<Option<FolderRenameOffer>> {
+    let entries = status(dir)?;
+    let renames = detect_folder_renames(dir, &entries);
+    let extra_paths = missing_rename_paths(&renames, selected);
+    if extra_paths.is_empty() {
+        return Ok(None);
+    }
+    let selected: HashSet<&str> = selected.iter().map(String::as_str).collect();
+    let extra: HashSet<&str> = extra_paths.iter().map(String::as_str).collect();
+    let pairs = renames
+        .into_iter()
+        .filter(|r| {
+            r.paths
+                .iter()
+                .any(|p| selected.contains(p.as_str()) || extra.contains(p.as_str()))
+        })
+        .map(|r| (r.from, r.to))
+        .collect();
+    Ok(Some(FolderRenameOffer { pairs, extra_paths }))
+}
+
+/// Groups deleted vs added files by parent folder and pairs folders that
+/// share most of their filenames, but only when the old folder is gone from
+/// disk (so a coincidental `docs/README.md` delete plus `src/README.md` add
+/// does not count).
+pub fn detect_folder_renames(dir: &Path, entries: &[StatusEntry]) -> Vec<FolderRename> {
+    let mut from_groups: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut to_groups: HashMap<&str, Vec<&str>> = HashMap::new();
+    for e in entries {
+        let parent = parent_dir(&e.path);
+        if parent.is_empty() {
+            continue;
+        }
+        if is_folder_rename_deletion(&e.code) {
+            from_groups.entry(parent).or_default().push(&e.path);
+        } else if is_folder_rename_addition(&e.code) {
+            to_groups.entry(parent).or_default().push(&e.path);
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for (&from, from_files) in &from_groups {
+        if dir.join(from).exists() {
+            continue;
+        }
+        let from_names: HashSet<&str> = from_files.iter().copied().map(basename).collect();
+        for (&to, to_files) in &to_groups {
+            if to == from {
+                continue;
+            }
+            let to_names: HashSet<&str> = to_files.iter().copied().map(basename).collect();
+            let overlap = from_names.intersection(&to_names).count();
+            if overlap == 0 {
+                continue;
+            }
+            let smaller = from_names.len().min(to_names.len());
+            if overlap * 2 < smaller {
+                continue;
+            }
+            candidates.push((overlap, from, to, from_files, to_files));
+        }
+    }
+    candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.len().cmp(&a.1.len())));
+
+    let mut used_from = HashSet::new();
+    let mut used_to = HashSet::new();
+    let mut out = Vec::new();
+    for (_, from, to, from_files, to_files) in candidates {
+        if used_from.contains(from) || used_to.contains(to) {
+            continue;
+        }
+        used_from.insert(from);
+        used_to.insert(to);
+        let mut paths: Vec<String> = from_files.iter().map(|p| (*p).to_string()).collect();
+        paths.extend(to_files.iter().map(|p| (*p).to_string()));
+        out.push(FolderRename {
+            from: from.to_string(),
+            to: to.to_string(),
+            paths,
+        });
+    }
+    out
+}
+
+/// Paths in `renames` that intersect `selected` but were left out of it.
+pub fn missing_rename_paths(renames: &[FolderRename], selected: &[String]) -> Vec<String> {
+    let selected: HashSet<&str> = selected.iter().map(String::as_str).collect();
+    let mut extra = Vec::new();
+    for r in renames {
+        if !r.paths.iter().any(|p| selected.contains(p.as_str())) {
+            continue;
+        }
+        for p in &r.paths {
+            if !selected.contains(p.as_str()) {
+                extra.push(p.clone());
+            }
+        }
+    }
+    extra.sort();
+    extra.dedup();
+    extra
+}
+
+/// Parent directory of a git path (`src/foo.rs` → `src`). Empty at the root.
+fn parent_dir(path: &str) -> &str {
+    path.rsplit_once('/').map(|(p, _)| p).unwrap_or("")
+}
+
+/// Final path component of a git path (`src/foo.rs` → `foo.rs`).
+fn basename(path: &str) -> &str {
+    path.rsplit_once('/').map(|(_, n)| n).unwrap_or(path)
+}
+
+/// Porcelain codes that are a deletion of a tracked file, not a rename or
+/// an unmerged conflict.
+fn is_folder_rename_deletion(code: &str) -> bool {
+    !is_conflict_code(code) && !matches!(code.chars().next(), Some('R' | 'C')) && code.contains('D')
+}
+
+/// Porcelain codes that are a new path (untracked or added to the index).
+fn is_folder_rename_addition(code: &str) -> bool {
+    code.starts_with('?') || code.starts_with('A') || code == " A"
 }
 
 /// Ahead/behind counts vs upstream; `None` when the branch has no upstream.
@@ -1779,6 +2013,42 @@ mod tests {
     }
 
     #[test]
+    fn command_error_leads_with_git_stderr_not_the_full_argv() {
+        let err = GitError::Command {
+            args: "add -- a.rs b.rs c.rs d.rs e.rs f.rs".to_string(),
+            stderr: "fatal: pathspec 'a.rs' did not match any files".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("fatal: pathspec"),
+            "stderr must be the first thing shown:\n{msg}"
+        );
+        assert!(
+            !msg.contains("b.rs"),
+            "must not dump every staged path:\n{msg}"
+        );
+        assert!(msg.contains("add -- (6 paths)"), "{msg}");
+    }
+
+    #[test]
+    fn run_failure_includes_gits_own_diagnostic() {
+        let (_tmp, repo) = temp_repo();
+        let err = run(&repo, &["add", "--", "missing.txt"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pathspec") || msg.contains("did not match"),
+            "git's diagnostic must be in the message:\n{msg}"
+        );
+        assert!(
+            msg.find("fatal:")
+                .or_else(|| msg.find("error:"))
+                .unwrap_or(usize::MAX)
+                < msg.find("(from").unwrap_or(0),
+            "the diagnostic must appear before the command:\n{msg}"
+        );
+    }
+
+    #[test]
     fn is_not_merged_error_matches_only_the_merge_refusal() {
         let merge = GitError::Command {
             args: "branch -d x".to_string(),
@@ -1839,6 +2109,107 @@ mod tests {
         assert_eq!(entries[0].path, "src/main.rs");
         assert_eq!(entries[1].code, "??");
         assert_eq!(entries[2].path, "staged.rs");
+    }
+
+    #[test]
+    fn parse_status_porcelain_uses_rename_target_not_the_arrow_string() {
+        let out = "R  olddir/a.rs -> newdir/a.rs\nRM olddir/b.rs -> newdir/b.rs\n";
+        let entries = parse_status_porcelain(out);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].code, "R ");
+        assert_eq!(entries[0].path, "newdir/a.rs");
+        assert_eq!(entries[1].code, "RM");
+        assert_eq!(entries[1].path, "newdir/b.rs");
+    }
+
+    #[test]
+    fn parse_status_porcelain_unquotes_rename_targets() {
+        let out = "R  \"old dir/a file.rs\" -> \"new dir/a file.rs\"\n";
+        let entries = parse_status_porcelain(out);
+        assert_eq!(entries[0].path, "new dir/a file.rs");
+    }
+
+    #[test]
+    fn detect_folder_renames_pairs_a_moved_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir(dir.join("newdir")).unwrap();
+        let entries = vec![
+            StatusEntry {
+                code: " D".into(),
+                path: "olddir/a.rs".into(),
+            },
+            StatusEntry {
+                code: " D".into(),
+                path: "olddir/b.rs".into(),
+            },
+            StatusEntry {
+                code: "??".into(),
+                path: "newdir/a.rs".into(),
+            },
+            StatusEntry {
+                code: "??".into(),
+                path: "newdir/b.rs".into(),
+            },
+        ];
+        let found = detect_folder_renames(dir, &entries);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].from, "olddir");
+        assert_eq!(found[0].to, "newdir");
+        let selected = vec!["newdir/a.rs".into(), "newdir/b.rs".into()];
+        assert_eq!(
+            missing_rename_paths(&found, &selected),
+            vec!["olddir/a.rs", "olddir/b.rs"]
+        );
+        let all = vec![
+            "olddir/a.rs".into(),
+            "olddir/b.rs".into(),
+            "newdir/a.rs".into(),
+            "newdir/b.rs".into(),
+        ];
+        assert!(missing_rename_paths(&found, &all).is_empty());
+    }
+
+    #[test]
+    fn detect_folder_renames_ignores_same_basename_when_old_folder_still_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir(dir.join("docs")).unwrap();
+        std::fs::create_dir(dir.join("src")).unwrap();
+        let entries = vec![
+            StatusEntry {
+                code: " D".into(),
+                path: "docs/README.md".into(),
+            },
+            StatusEntry {
+                code: "??".into(),
+                path: "src/README.md".into(),
+            },
+        ];
+        assert!(detect_folder_renames(dir, &entries).is_empty());
+    }
+
+    #[test]
+    fn status_after_staged_folder_rename_addresses_the_new_path() {
+        let (_tmp, repo) = temp_repo();
+        std::fs::create_dir(repo.join("olddir")).unwrap();
+        std::fs::write(repo.join("olddir/a.rs"), "a\n").unwrap();
+        run(&repo, &["add", "olddir"]).unwrap();
+        run(&repo, &["commit", "-m", "add olddir"]).unwrap();
+        std::fs::rename(repo.join("olddir"), repo.join("newdir")).unwrap();
+        run(&repo, &["add", "-A"]).unwrap();
+        let entries = status(&repo).unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.path == "newdir/a.rs" && e.code.starts_with('R')),
+            "staged rename must use the new path, got {entries:?}"
+        );
+        assert!(
+            entries.iter().all(|e| !e.path.contains(" -> ")),
+            "arrow string must not be used as a path: {entries:?}"
+        );
+        stage_paths(&repo, &["newdir/a.rs".into()]).unwrap();
     }
 
     #[test]

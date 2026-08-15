@@ -2044,7 +2044,7 @@ fn draw_error_popup(frame: &mut Frame, area: Rect, msg: &str, scroll: u16) -> u1
     frame.render_widget(
         Paragraph::new(Line::styled(
             if max_scroll > 0 {
-                "↑/↓ scroll · q / Esc to dismiss"
+                "↑/↓ or wheel scroll · q / Esc to dismiss"
             } else {
                 "q / Esc to dismiss"
             },
@@ -2847,9 +2847,9 @@ fn draw_open_command_list(frame: &mut Frame, area: Rect, list: &OpenCommandEdito
 /// Rows the commit dialog's body box occupies, borders included.
 const COMMIT_BODY_ROWS: u16 = 7;
 
-/// Commit dialog: a checklist of changed files (all ticked by default) above a
-/// clearly labelled subject input and an optional multi-line body. Focus
-/// cycles through the three panes.
+/// Commit dialog: a scrollable checklist of the files that will be committed
+/// (all ticked by default) above a clearly labelled subject input and an
+/// optional multi-line body. Focus cycles through the three panes.
 #[allow(clippy::too_many_arguments)]
 fn draw_commit(
     frame: &mut Frame,
@@ -2897,7 +2897,6 @@ fn draw_commit(
     let files_focused = *focus == CommitFocus::Files;
     let items: Vec<ListItem> = files
         .iter()
-        .take(10)
         .enumerate()
         .map(|(i, f)| {
             let checked = marked.get(i).copied().unwrap_or(false);
@@ -2923,12 +2922,13 @@ fn draw_commit(
     }
     let mut state = ListState::default().with_selected(Some(cursor));
     frame.render_stateful_widget(list, files_area, &mut state);
-    // Only the first 10 files are rendered, so clicks map onto that window.
+    // The popup shows at most 10 rows; ListState scrolls so the cursor file
+    // stays on screen and clicks map onto that window.
     let list_hit = RowList {
         inner: files_area,
         header: 0,
-        offset: 0,
-        len: files.len().min(10),
+        offset: state.offset(),
+        len: files.len(),
     };
 
     // Labels make it obvious which field is which, and which one is live.
@@ -5651,6 +5651,28 @@ mod tests {
         );
     }
 
+    /// A git-add failure must put the diagnostic on the first screen, not hide
+    /// it behind a wrapped `git add -- file1 file2 …` command line.
+    #[test]
+    fn error_popup_leads_with_gits_diagnostic() {
+        let msg = crate::git::GitError::Command {
+            args: "add -- a.rs b.rs c.rs d.rs e.rs f.rs".to_string(),
+            stderr: "fatal: pathspec 'a.rs' did not match any files".to_string(),
+        }
+        .to_string();
+        let out = render(80, 20, |frame, area| {
+            draw_error_popup(frame, area, &msg, 0);
+        });
+        let screen = out.join("\n");
+        let fatal_row = out.iter().position(|r| r.contains("fatal: pathspec"));
+        let cmd_row = out.iter().position(|r| r.contains("from `git"));
+        assert!(fatal_row.is_some(), "diagnostic missing:\n{screen}");
+        assert!(
+            fatal_row <= cmd_row,
+            "diagnostic must be above the command:\n{screen}"
+        );
+    }
+
     /// The commit dialog shows the body field, with its content.
     #[test]
     fn commit_dialog_draws_the_body_field() {
@@ -5682,6 +5704,45 @@ mod tests {
         );
         assert!(out.iter().any(|r| r.contains("second line")), "{out:#?}");
         assert!(out.iter().any(|r| r.contains("^S commits")), "{out:#?}");
+    }
+
+    /// More files than the popup's 10-row window still reach the screen: the
+    /// list scrolls so the cursor file is visible, and the hint counts them all.
+    #[test]
+    fn commit_dialog_scrolls_the_file_list_to_the_cursor() {
+        let files: Vec<StatusEntry> = (0..15)
+            .map(|i| StatusEntry {
+                code: "M ".to_string(),
+                path: format!("src/file{i:02}.rs"),
+            })
+            .collect();
+        let marked = vec![true; files.len()];
+        let out = render(100, 30, |frame, area| {
+            draw_commit(
+                frame,
+                area,
+                "feature",
+                &files,
+                &marked,
+                14,
+                &TextInput::with_value("subject"),
+                &super::super::app::TextArea::default(),
+                &CommitFocus::Files,
+            );
+        });
+        let screen = out.join("\n");
+        assert!(
+            out.iter().any(|r| r.contains("src/file14.rs")),
+            "cursor file must be on screen:\n{screen}"
+        );
+        assert!(
+            out.iter().all(|r| !r.contains("src/file00.rs")),
+            "list must have scrolled past the first file:\n{screen}"
+        );
+        assert!(
+            out.iter().any(|r| r.contains("15/15")),
+            "hint still counts every file:\n{screen}"
+        );
     }
 
     /// On a terminal too short for the whole dialog the body box gives way
