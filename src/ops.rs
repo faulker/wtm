@@ -438,6 +438,12 @@ fn base_status_vs(repo_root: &Path, base: &str, branch: &str, kind: BaseCompareK
 }
 
 /// Shared FLAGS vocabulary for worktrees and branches.
+///
+/// The push flags answer "is my work on the remote?", which is a different
+/// question from "does my branch differ from its base?" (`changed`). A branch
+/// that was never pushed has no upstream at all, so `ahead` is meaningless for
+/// it; without the `changed_from_base` fallback below it would read exactly
+/// like a branch whose commits are all safely on the remote.
 fn flag_labels(
     upstream: Option<(u32, u32)>,
     changed_from_base: bool,
@@ -447,13 +453,23 @@ fn flag_labels(
     locked: bool,
 ) -> Vec<&'static str> {
     let mut parts = Vec::new();
-    if let Some((ahead, behind)) = upstream {
-        if ahead > 0 {
-            parts.push("unpushed");
+    match upstream {
+        Some((ahead, behind)) => {
+            if ahead > 0 {
+                parts.push("unpushed");
+            } else if changed_from_base {
+                // Tracking a remote with nothing ahead of it: every commit that
+                // makes this branch different from its base is already pushed.
+                parts.push("pushed");
+            }
+            if behind > 0 {
+                parts.push("behind");
+            }
         }
-        if behind > 0 {
-            parts.push("behind");
-        }
+        // No upstream: the branch has never been pushed, so any commit of its
+        // own is unpushed by definition.
+        None if changed_from_base => parts.push("unpushed"),
+        None => {}
     }
     if changed_from_base {
         parts.push("changed");
@@ -1235,6 +1251,10 @@ pub enum ResolveKind {
     Merge,
     Rebase,
     CherryPick,
+    /// Undoing a commit with `git revert` hit later work that changed the same
+    /// lines. Finishing means continuing the revert, which records the inverse
+    /// commit.
+    Revert,
     StashPop {
         /// Stash entry to drop on completion (the one that was popped).
         index: Option<u32>,
@@ -1248,6 +1268,7 @@ impl ResolveKind {
             ResolveKind::Merge => "merge",
             ResolveKind::Rebase => "rebase",
             ResolveKind::CherryPick => "cherry-pick",
+            ResolveKind::Revert => "revert",
             ResolveKind::StashPop { .. } => "stash pop",
         }
     }
@@ -1965,6 +1986,102 @@ pub fn cherry_pick(
     }
 }
 
+/// What a commit-level undo did, for the caller's report.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum UndoOutcome {
+    /// A `git revert` recorded the inverse commit, or staged it under
+    /// `no_commit`.
+    Reverted {
+        target: String,
+        /// The commit that was undone (short hash).
+        commit: String,
+        /// False when the inverse was left staged instead of committed.
+        committed: bool,
+    },
+    /// Undoing the commit conflicted with later work; the worktree is left
+    /// mid-revert with these files unmerged, for the resolver to finish.
+    Conflicted { target: String, files: Vec<String> },
+    /// A `git reset` moved the branch back; `dropped` counts the commits that
+    /// are no longer on it.
+    Reset {
+        target: String,
+        commit: String,
+        dropped: usize,
+        mode: &'static str,
+    },
+}
+
+/// Records a new commit in the worktree named `target` that undoes `commit`,
+/// leaving history intact. With `no_commit` the inverse is staged in the
+/// working tree instead, so it can be reviewed, amended, or dropped before
+/// being committed.
+///
+/// This is the safe half of "undo a commit": the commit stays in history and
+/// nothing needs force-pushing. See [`reset_to_commit`] for the other half.
+pub fn revert_commit(
+    ctx: &Ctx,
+    target: &str,
+    commit: &str,
+    no_commit: bool,
+) -> Result<UndoOutcome> {
+    let info = find(ctx, target)?.ok_or_else(|| not_found(ctx, target))?;
+    let dir = Path::new(&info.path);
+    let short = git::run(dir, &["rev-parse", "--short", commit])
+        .unwrap_or_else(|_| commit.chars().take(9).collect());
+    match git::revert_commit(dir, commit, no_commit)? {
+        git::RevertStatus::Applied => Ok(UndoOutcome::Reverted {
+            target: info.name,
+            commit: short,
+            committed: !no_commit,
+        }),
+        git::RevertStatus::Conflicted(files) => Ok(UndoOutcome::Conflicted {
+            target: info.name,
+            files,
+        }),
+    }
+}
+
+/// Moves the branch checked out in the worktree named `target` back to
+/// `commit`, dropping every commit after it. `keep` decides what happens to the
+/// work those commits contained: `Soft`/`Mixed` leave it in the working tree,
+/// `Hard` throws it away with them.
+///
+/// This rewrites history, so a branch that has already been pushed will need a
+/// force-push afterwards; [`revert_commit`] is the non-rewriting alternative.
+/// Refuses when `commit` is not an ancestor of the current tip, which would
+/// move the branch sideways onto unrelated history rather than back along it.
+pub fn reset_to_commit(
+    ctx: &Ctx,
+    target: &str,
+    commit: &str,
+    keep: git::ResetMode,
+) -> Result<UndoOutcome> {
+    let info = find(ctx, target)?.ok_or_else(|| not_found(ctx, target))?;
+    let dir = Path::new(&info.path);
+    let short = git::run(dir, &["rev-parse", "--short", commit])
+        .unwrap_or_else(|_| commit.chars().take(9).collect());
+    if !git::is_ancestor(dir, commit, "HEAD")? {
+        bail!(
+            "commit {short} is not in this branch's history, so resetting to it would move \
+             '{}' onto unrelated commits rather than back along its own",
+            info.name
+        );
+    }
+    let dropped = git::commits_ahead_of(dir, commit, "HEAD").unwrap_or(0) as usize;
+    git::reset_to(dir, commit, keep)?;
+    Ok(UndoOutcome::Reset {
+        target: info.name,
+        commit: short,
+        dropped,
+        mode: match keep {
+            git::ResetMode::Soft => "soft",
+            git::ResetMode::Mixed => "mixed",
+            git::ResetMode::Hard => "hard",
+        },
+    })
+}
+
 /// Merges local branch `source_branch` into the branch checked out in the
 /// worktree named `target`, running the merge inside that worktree. `no_ff`
 /// forces a merge commit even when a fast-forward would do. On a conflict the
@@ -2250,6 +2367,7 @@ fn detect_resolve_kind_in(dir: &Path) -> Option<ResolveKind> {
         git::InProgress::Merge => Some(ResolveKind::Merge),
         git::InProgress::Rebase => Some(ResolveKind::Rebase),
         git::InProgress::CherryPick => Some(ResolveKind::CherryPick),
+        git::InProgress::Revert => Some(ResolveKind::Revert),
     }
 }
 
@@ -2301,6 +2419,13 @@ pub fn complete_resolution(
             git::cherry_pick_continue(dir)?;
             Some(git::short_hash(dir)?)
         }
+        ResolveKind::Revert => {
+            if !git::is_reverting(dir) {
+                bail!("worktree '{}' has no revert in progress", info.name);
+            }
+            git::revert_continue(dir)?;
+            Some(git::short_hash(dir)?)
+        }
         ResolveKind::StashPop { index } => {
             // A stash pop applies to the working tree with no commit; finishing
             // is simply dropping the stash the conflicting pop left behind.
@@ -2325,6 +2450,7 @@ pub fn abort_resolution(ctx: &Ctx, target: &str, kind: ResolveKind) -> Result<()
         ResolveKind::Merge => git::merge_abort(dir)?,
         ResolveKind::Rebase => git::rebase_abort(dir)?,
         ResolveKind::CherryPick => git::cherry_pick_abort(dir)?,
+        ResolveKind::Revert => git::revert_abort(dir)?,
         ResolveKind::StashPop { .. } => git::reset_hard(dir)?,
     }
     Ok(())
@@ -3490,13 +3616,6 @@ mod tests {
             conflict::render(&segments, &[conflict::ResolutionAction::KeepBothReversed]),
             "T\nO\n"
         );
-        assert_eq!(
-            conflict::render(
-                &segments,
-                &[conflict::ResolutionAction::Manual("X\n".to_string())]
-            ),
-            "X\n"
-        );
     }
 
     #[test]
@@ -3771,6 +3890,196 @@ mod tests {
         let flags = feature.flag_labels();
         assert!(flags.contains(&"unpushed"), "{flags:?}");
         assert!(flags.contains(&"behind"), "{flags:?}");
+    }
+
+    /// A branch that was never pushed has no upstream, so `ahead` says nothing
+    /// about it. Without the no-upstream fallback it read exactly like a branch
+    /// whose commits are all safely on the remote, which is the one distinction
+    /// the push flags exist to make.
+    #[test]
+    fn list_flag_labels_unpushed_without_an_upstream_and_pushed_with_one() {
+        let (tmp, ctx) = temp_ctx();
+        let bare = tmp.path().join("bare.git");
+        git(
+            tmp.path(),
+            &["init", "--bare", "-b", "main", bare.to_str().unwrap()],
+        );
+        git(
+            &ctx.repo_root,
+            &["remote", "add", "origin", bare.to_str().unwrap()],
+        );
+        git(&ctx.repo_root, &["push", "-u", "origin", "main"]);
+
+        // Never pushed: commits of its own, no upstream at all.
+        let never = make_worktree(&ctx, "never-pushed");
+        std::fs::write(never.join("a.txt"), "mine\n").unwrap();
+        git(&never, &["add", "a.txt"]);
+        git(&never, &["commit", "-m", "local only"]);
+
+        // Pushed: the same commits, but they are on the remote.
+        let pushed = make_worktree(&ctx, "all-pushed");
+        std::fs::write(pushed.join("b.txt"), "mine\n").unwrap();
+        git(&pushed, &["add", "b.txt"]);
+        git(&pushed, &["commit", "-m", "local then pushed"]);
+        git(&pushed, &["push", "-u", "origin", "all-pushed"]);
+
+        let infos = list(&ctx).unwrap();
+        let never = infos.iter().find(|i| i.name == "never-pushed").unwrap();
+        let pushed = infos.iter().find(|i| i.name == "all-pushed").unwrap();
+
+        let never_flags = never.flag_labels();
+        assert!(never.ahead_behind.is_none(), "no upstream to be ahead of");
+        assert!(never_flags.contains(&"unpushed"), "{never_flags:?}");
+        assert!(!never_flags.contains(&"pushed"), "{never_flags:?}");
+
+        let pushed_flags = pushed.flag_labels();
+        assert!(pushed_flags.contains(&"pushed"), "{pushed_flags:?}");
+        assert!(!pushed_flags.contains(&"unpushed"), "{pushed_flags:?}");
+
+        // Both have commits of their own, so `changed` cannot be what tells
+        // them apart; only the push flag does.
+        assert!(never_flags.contains(&"changed"), "{never_flags:?}");
+        assert!(pushed_flags.contains(&"changed"), "{pushed_flags:?}");
+    }
+
+    /// A worktree sitting on the default branch with nothing of its own gets no
+    /// push flag either way: there is no work to be pushed or unpushed.
+    #[test]
+    fn list_flag_labels_no_push_flag_without_commits_of_its_own() {
+        let (_tmp, ctx) = temp_ctx();
+        make_worktree(&ctx, "untouched");
+        let infos = list(&ctx).unwrap();
+        let wt = infos.iter().find(|i| i.name == "untouched").unwrap();
+        let flags = wt.flag_labels();
+        assert!(!flags.contains(&"pushed"), "{flags:?}");
+        assert!(!flags.contains(&"unpushed"), "{flags:?}");
+    }
+
+    /// `revert_commit` records the inverse as a new commit and leaves the
+    /// original in history, which is what makes it safe on a pushed branch.
+    #[test]
+    fn revert_commit_adds_an_inverse_commit() {
+        let (_tmp, ctx) = temp_ctx();
+        let path = make_worktree(&ctx, "feature");
+        std::fs::write(path.join("f.txt"), "one\n").unwrap();
+        git(&path, &["add", "f.txt"]);
+        git(&path, &["commit", "-m", "add f"]);
+        std::fs::write(path.join("f.txt"), "two\n").unwrap();
+        git(&path, &["commit", "-am", "change f"]);
+        let head = git::rev_parse(&path, "HEAD").unwrap();
+        let before = git::commits_ahead_of(&path, "main", "HEAD").unwrap();
+
+        let out = revert_commit(&ctx, "feature", &head, false).unwrap();
+        assert!(matches!(
+            out,
+            UndoOutcome::Reverted {
+                committed: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            std::fs::read_to_string(path.join("f.txt")).unwrap(),
+            "one\n",
+            "the change is undone in the working tree"
+        );
+        assert_eq!(
+            git::commits_ahead_of(&path, "main", "HEAD").unwrap(),
+            before + 1,
+            "history grew by the revert commit rather than shrinking"
+        );
+    }
+
+    /// `--no-commit` leaves the inverse staged so it can be reviewed first.
+    #[test]
+    fn revert_commit_no_commit_stages_without_committing() {
+        let (_tmp, ctx) = temp_ctx();
+        let path = make_worktree(&ctx, "feature");
+        std::fs::write(path.join("f.txt"), "one\n").unwrap();
+        git(&path, &["add", "f.txt"]);
+        git(&path, &["commit", "-m", "add f"]);
+        std::fs::write(path.join("f.txt"), "two\n").unwrap();
+        git(&path, &["commit", "-am", "change f"]);
+        let head = git::rev_parse(&path, "HEAD").unwrap();
+        let before = git::commits_ahead_of(&path, "main", "HEAD").unwrap();
+
+        let out = revert_commit(&ctx, "feature", &head, true).unwrap();
+        assert!(matches!(
+            out,
+            UndoOutcome::Reverted {
+                committed: false,
+                ..
+            }
+        ));
+        assert_eq!(
+            git::commits_ahead_of(&path, "main", "HEAD").unwrap(),
+            before,
+            "no commit was recorded"
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("f.txt")).unwrap(),
+            "one\n"
+        );
+        assert!(
+            !git::status(&path).unwrap().is_empty(),
+            "the undo is sitting in the working tree"
+        );
+    }
+
+    /// Reset drops the commits after the target. `--mixed` keeps their changes
+    /// in the working tree; `--hard` throws them away with the commits.
+    #[test]
+    fn reset_to_commit_keeps_or_discards_the_dropped_work() {
+        for (mode, expect_kept) in [(git::ResetMode::Mixed, true), (git::ResetMode::Hard, false)] {
+            let (_tmp, ctx) = temp_ctx();
+            let path = make_worktree(&ctx, "feature");
+            std::fs::write(path.join("f.txt"), "one\n").unwrap();
+            git(&path, &["add", "f.txt"]);
+            git(&path, &["commit", "-m", "first"]);
+            let first = git::rev_parse(&path, "HEAD").unwrap();
+            std::fs::write(path.join("f.txt"), "two\n").unwrap();
+            git(&path, &["commit", "-am", "second"]);
+            std::fs::write(path.join("f.txt"), "three\n").unwrap();
+            git(&path, &["commit", "-am", "third"]);
+
+            let out = reset_to_commit(&ctx, "feature", &first, mode).unwrap();
+            match out {
+                UndoOutcome::Reset { dropped, .. } => assert_eq!(dropped, 2, "{mode:?}"),
+                other => panic!("expected a reset, got {other:?}"),
+            }
+            assert_eq!(
+                git::rev_parse(&path, "HEAD").unwrap(),
+                first,
+                "the branch moved back ({mode:?})"
+            );
+            let on_disk = std::fs::read_to_string(path.join("f.txt")).unwrap();
+            if expect_kept {
+                assert_eq!(on_disk, "three\n", "the work survives the reset");
+                assert!(!git::status(&path).unwrap().is_empty());
+            } else {
+                assert_eq!(on_disk, "one\n", "the work went with the commits");
+                assert!(git::status(&path).unwrap().is_empty());
+            }
+        }
+    }
+
+    /// Resetting to a commit that is not in this branch's history would move it
+    /// sideways onto unrelated work, so it is refused rather than performed.
+    #[test]
+    fn reset_to_commit_refuses_a_commit_off_this_branch() {
+        let (_tmp, ctx) = temp_ctx();
+        let a = make_worktree(&ctx, "a");
+        let b = make_worktree(&ctx, "b");
+        std::fs::write(b.join("b.txt"), "b\n").unwrap();
+        git(&b, &["add", "b.txt"]);
+        git(&b, &["commit", "-m", "only on b"]);
+        let off_branch = git::rev_parse(&b, "HEAD").unwrap();
+
+        let err = reset_to_commit(&ctx, "a", &off_branch, git::ResetMode::Mixed).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not in this branch's history"),
+            "{err:#}"
+        );
+        assert_ne!(git::rev_parse(&a, "HEAD").unwrap(), off_branch);
     }
 
     /// Branch list carries the same base flags as worktree list.

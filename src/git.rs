@@ -337,6 +337,13 @@ pub fn commits_ahead_of(dir: &Path, base: &str, branch: &str) -> Result<u32> {
     Ok(out.trim().parse().unwrap_or(0))
 }
 
+/// True when `ancestor` is reachable from `descendant`, i.e. it sits back along
+/// the same history rather than on a divergent line. Used to refuse a reset
+/// that would move a branch sideways onto unrelated commits.
+pub fn is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    run_predicate(dir, &["merge-base", "--is-ancestor", ancestor, descendant])
+}
+
 /// Best common ancestor of `a` and `b` (`git merge-base`). Used when a named
 /// tip base is unavailable so we can still detect unique commits on a branch.
 pub fn merge_base(dir: &Path, a: &str, b: &str) -> Result<String> {
@@ -1363,6 +1370,94 @@ pub fn cherry_pick_abort(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// How a `git revert` finished.
+pub enum RevertStatus {
+    /// The inverse applied cleanly (committed, or staged under `no_commit`).
+    Applied,
+    /// Undoing the commit conflicted with later work; the revert is left in
+    /// progress with the listed files in conflict, for the resolver to finish.
+    Conflicted(Vec<String>),
+}
+
+/// Reverts `commit` on the branch checked out in `dir`: records a *new* commit
+/// that undoes it, leaving history intact. With `no_commit` (`-n`) the inverse
+/// lands staged in the working tree instead, so the caller can review, amend,
+/// or drop it before committing.
+///
+/// Mirrors [`cherry_pick`]: a genuine conflict is reported rather than raised
+/// and the sequence is left in progress for the resolver, while any other
+/// failure cleans up instead of leaving a half-applied revert behind.
+/// `core.editor=true` suppresses the message editor.
+pub fn revert_commit(dir: &Path, commit: &str, no_commit: bool) -> Result<RevertStatus> {
+    let mut args: Vec<&str> = vec!["-c", "core.editor=true", "revert"];
+    if no_commit {
+        args.push("-n");
+    } else {
+        args.push("--no-edit");
+    }
+    args.push(commit);
+    match run(dir, &args) {
+        Ok(_) => Ok(RevertStatus::Applied),
+        Err(e) => {
+            let files = conflicted_files(dir).unwrap_or_default();
+            if !files.is_empty() {
+                Ok(RevertStatus::Conflicted(files))
+            } else {
+                let _ = run(dir, &["revert", "--abort"]);
+                Err(e)
+            }
+        }
+    }
+}
+
+/// True while a revert is in progress in `dir` (REVERT_HEAD exists).
+pub fn is_reverting(dir: &Path) -> bool {
+    run_predicate(dir, &["rev-parse", "--verify", "--quiet", "REVERT_HEAD"]).unwrap_or(false)
+}
+
+/// Continues an in-progress revert once its conflicts are resolved and staged.
+pub fn revert_continue(dir: &Path) -> Result<()> {
+    run(dir, &["-c", "core.editor=true", "revert", "--continue"])?;
+    Ok(())
+}
+
+/// Aborts an in-progress revert, restoring the pre-revert state.
+pub fn revert_abort(dir: &Path) -> Result<()> {
+    run(dir, &["revert", "--abort"])?;
+    Ok(())
+}
+
+/// What `git reset` does with the work that the discarded commits contained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetMode {
+    /// `--soft`: the changes stay in the working tree *and* staged, ready to be
+    /// recommitted as one commit.
+    Soft,
+    /// `--mixed`: the changes stay in the working tree, unstaged.
+    Mixed,
+    /// `--hard`: the changes are thrown away with the commits.
+    Hard,
+}
+
+impl ResetMode {
+    fn flag(self) -> &'static str {
+        match self {
+            ResetMode::Soft => "--soft",
+            ResetMode::Mixed => "--mixed",
+            ResetMode::Hard => "--hard",
+        }
+    }
+}
+
+/// Moves the branch checked out in `dir` back to `commit`, dropping every
+/// commit after it. Unlike [`revert_commit`] this rewrites history, so a branch
+/// already pushed will need a force-push afterwards; `mode` decides whether the
+/// dropped commits' changes survive in the working tree.
+pub fn reset_to(dir: &Path, commit: &str, mode: ResetMode) -> Result<()> {
+    run(dir, &["reset", mode.flag(), commit])?;
+    Ok(())
+}
+
 /// Discards all tracked changes in the working tree and index, resetting to
 /// HEAD. Used to undo a conflicting stash pop's application while leaving the
 /// (still-present) stash entry intact.
@@ -1496,9 +1591,10 @@ pub enum InProgress {
     Merge,
     Rebase,
     CherryPick,
+    Revert,
 }
 
-/// Detects an interrupted merge, rebase, or cherry-pick from the marker files
+/// Detects an interrupted merge, rebase, cherry-pick, or revert from the marker files
 /// git leaves in the worktree's git dir, using a single git invocation to
 /// locate that directory and plain filesystem checks for the markers. `list`
 /// calls this per worktree on every refresh, so it is deliberately cheaper than
@@ -1518,6 +1614,8 @@ pub fn detect_in_progress(dir: &Path) -> Option<InProgress> {
         Some(InProgress::Merge)
     } else if git_dir.join("CHERRY_PICK_HEAD").exists() {
         Some(InProgress::CherryPick)
+    } else if git_dir.join("REVERT_HEAD").exists() {
+        Some(InProgress::Revert)
     } else {
         None
     }

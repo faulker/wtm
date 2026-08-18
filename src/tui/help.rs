@@ -203,9 +203,10 @@ pub const WORKTREES: &[Binding] = &[
         "⇧R",
         "rename the worktree (renames its branch and moves the folder)",
     ),
-    help_only(
+    both(
         "x",
-        "resume the conflict resolver for a worktree stopped mid-merge/rebase",
+        "resolve",
+        "open the conflict resolver for a worktree with unmerged files, or one stopped mid-merge/rebase/cherry-pick; this is the way back in after leaving the resolver with q",
     ),
     help_only(
         "⇧U",
@@ -247,11 +248,27 @@ pub const WORKTREE_FILES: &[Binding] = &[
     both("Enter", "open", "open the file in your default app"),
     both("Space", "mark", "mark a file (or folder) for commit"),
     both("c", "commit", "commit the marked files"),
+    both(
+        "u",
+        "revert file",
+        "discard the selected file's uncommitted changes",
+    ),
+    both(
+        "d",
+        "delete file",
+        "delete the selected file from the worktree",
+    ),
+    help_only(
+        "h/l or ←/→",
+        "collapse or expand the folder under the cursor (Enter toggles it)",
+    ),
     both("q/Esc", "worktrees", "focus the worktree list again"),
     help_only(
-        "f/b/l/m/d/n",
+        "f/b/m/n/x",
         "worktree commands the file keymap doesn't bind (fetch, switch \
-         branch, log, move changes, delete, new) still work from here",
+         branch, move changes, new, resolve conflicts) still work from here; \
+         deleting the worktree itself is only offered from the list above, so \
+         d here can never mean more than the one file",
     ),
 ];
 
@@ -271,7 +288,11 @@ pub const WORKTREE_COMMITS: &[Binding] = &[
     ),
     both("p/⇧P", "pull/push", "pull or push the worktree's branch"),
     both("f", "fetch", "fetch from the remote"),
-    both("u", "update", "update the worktree from the default branch"),
+    both(
+        "u",
+        "undo commit",
+        "undo the highlighted commit: revert it (a new commit that reverses it, safe on a pushed branch) or reset the branch back to it, keeping or discarding the changes",
+    ),
     both(
         "c",
         "commit",
@@ -344,7 +365,7 @@ pub const DIFF: &[Binding] = &[
     help_only("double-click", "same as Enter on the clicked row"),
     help_only(
         "click the path",
-        "copy the diff panel's file path to the clipboard",
+        "copy the diff panel's file path: choose relative or full (r/f)",
     ),
     both("Space", "mark", "mark a file (or folder) for commit"),
     help_only("a", "mark or unmark every file"),
@@ -427,6 +448,28 @@ pub const SETTINGS: &[Binding] = &[
     both("q", "quit", "quit"),
 ];
 
+/// The worktree's own commit log (`l` from the Worktrees tab).
+pub const WORKTREE_LOG: &[Binding] = &[
+    both("↑/↓ or j/k", "commit", "move the commit cursor"),
+    both(
+        "Enter",
+        "browse files",
+        "browse the commit's changed files and diffs",
+    ),
+    both(
+        "t",
+        "tree/flat",
+        "switch between the commit tree and a flat list",
+    ),
+    both(
+        "u",
+        "undo commit",
+        "undo the highlighted commit: revert it (a new commit that reverses it, leaving history and any push intact) or reset the branch back to it, choosing whether the dropped commits' changes stay in your working tree",
+    ),
+    both("g", "top", "jump to the newest commit"),
+    both("q", "back", "back to the worktree list"),
+];
+
 pub const BRANCH_COMMITS: &[Binding] = &[
     both("↑/↓", "select", "move the commit cursor"),
     both("Space", "mark commit", "mark a commit for cherry-pick"),
@@ -463,6 +506,11 @@ pub const COMMIT_DIFF: &[Binding] = &[
     help_only("⇧←/⇧→ or H/L", "scroll the diff horizontally"),
     help_only("←/→ or h/l", "collapse/expand the folder (Enter toggles)"),
     both("t", "tree/flat", "toggle folder tree vs. flat file list"),
+    both(
+        "u",
+        "undo commit",
+        "undo this commit: revert it (a new commit that reverses it, safe on a pushed branch) or reset the branch back to it, keeping or discarding the changes",
+    ),
     both("?", "help", "show this help"),
     both("q", "back", "back to the commit list"),
 ];
@@ -489,15 +537,17 @@ pub const RESOLVER: &[Binding] = &[
     ),
     both(
         "e",
-        "edit hunk",
-        "hand-edit the current hunk; Ctrl+S writes the file to disk (hunks you \
-         haven't decided keep their conflict markers), Esc discards",
+        "edit",
+        "edit the whole file, full screen, with the cursor on the hunk you are \
+         looking at; line numbers on the left, scrolls in every direction, \
+         Ctrl+S saves to disk and re-reads it, Esc discards",
     ),
     both(
         "⇧E",
         "edit file",
-        "edit the whole file with its conflict markers, for fixes the per-hunk \
-         choices can't express; Ctrl+S saves to disk and re-reads it, Esc discards",
+        "the same full-screen editor, opened at the top of the file, for fixes \
+         the per-hunk choices can't express (interleaving both sides, tidying \
+         an import list); Ctrl+S saves to disk and re-reads it, Esc discards",
     ),
     both(
         "w",
@@ -629,6 +679,14 @@ const COMMITS_SECTIONS: &[Section] = &[
         notes: &[
             "cherry-pick: pick a target worktree, then choose to commit",
             "directly (keeping the messages) or just load the changes.",
+        ],
+    },
+    Section {
+        heading: "worktree log  (Worktrees tab → l)",
+        bindings: WORKTREE_LOG,
+        notes: &[
+            "the same commit list the three-panel layout shows below a clean",
+            "worktree, and the same keys.",
         ],
     },
     Section {

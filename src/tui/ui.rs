@@ -321,7 +321,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     // A modal overlay (confirm/prompt/hunk editor) floats over the active view.
-    // Only Confirm reports its own rows; Prompt/HunkEditor have none.
+    // Only Confirm reports its own rows; Prompt/FileEditor have none.
     let modal_hit = app
         .modal
         .is_some()
@@ -357,7 +357,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         _ => None,
     };
     // A modal covers the list, so clicks go to it instead when it has its own
-    // rows (Confirm); other modal kinds (Prompt, HunkEditor) just suppress
+    // rows (Confirm); other modal kinds (Prompt, FileEditor) just suppress
     // clicks on whatever is behind them.
     if let Some(modal) = &app.modal {
         app.row_list = matches!(modal, Modal::Confirm { .. })
@@ -365,12 +365,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .flatten();
     }
 
-    // The tab bar and the worktree preview only take clicks when the home view
-    // is what the user is actually looking at: a dialog, overlay, or modal
-    // floats over both, and clicks belong to whatever is on top.
+    // The tab bar, the worktree preview, and the changed-file panel and its
+    // clickable diff path only take clicks when the home view is what the user
+    // is actually looking at: a dialog, overlay, or modal floats over them all,
+    // and clicks belong to whatever is on top.
     if !matches!(app.view, View::List) || app.modal.is_some() {
         app.tab_hits.clear();
         app.preview_list = None;
+        app.files_list = None;
+        app.diff_path_hit = None;
     }
 
     // The error popup sits on top of absolutely everything, including the
@@ -471,11 +474,11 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Shortens `text` to at most `max` characters by eliding its middle with `…`.
-/// Both ends of a branch name carry meaning (the namespace prefix and the
-/// distinguishing tail), so trimming from the middle keeps more signal than a
-/// trailing ellipsis would. Counts characters, not bytes, so a multi-byte name
+/// Both ends of a branch name (and of a file path) carry meaning (the namespace
+/// or directory prefix and the distinguishing tail), so trimming from the middle
+/// keeps more signal than a trailing ellipsis would. Counts characters, not bytes, so a multi-byte name
 /// can't be split mid-codepoint.
-fn truncate_middle(text: &str, max: usize) -> String {
+pub(super) fn truncate_middle(text: &str, max: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= max {
         return text.to_string();
@@ -578,6 +581,9 @@ fn status_flag_spans(labels: &[&str]) -> Vec<Span<'static>> {
         }
         let (text, style) = match *label {
             "unpushed" => ("unpushed", Style::new().fg(theme::WARNING)),
+            // The reassuring counterpart of `unpushed`: the work is on the
+            // remote, so it reads calm rather than as something to act on.
+            "pushed" => ("pushed", Style::new().fg(theme::SUCCESS)),
             "behind" => ("behind", Style::new().fg(theme::INFO)),
             "changed" => ("changed", Style::new().fg(theme::WARNING)),
             "same" => ("same", Style::new().dim()),
@@ -603,6 +609,7 @@ fn in_progress_label(kind: &ResolveKind) -> &'static str {
         ResolveKind::Merge => "merging",
         ResolveKind::Rebase => "rebasing",
         ResolveKind::CherryPick => "cherry-picking",
+        ResolveKind::Revert => "reverting",
         ResolveKind::StashPop { .. } => "unstashing",
     }
 }
@@ -1147,6 +1154,29 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         );
         return;
     }
+    // An unfinished merge/rebase/cherry-pick, or a worktree left with unmerged
+    // files, outranks the ordinary keymap: leaving the resolver with `q` used to
+    // strand the user with no visible way back in, since `x` is otherwise only
+    // documented in the help panel.
+    if matches!(app.view, View::List)
+        && app.tab == Tab::Worktrees
+        && app
+            .selected_worktree()
+            .is_some_and(|w| w.conflicted > 0 || w.in_progress.is_some())
+    {
+        frame.render_widget(
+            Paragraph::new(hint_line_fitting(
+                &[
+                    hint("x", "resolve conflicts"),
+                    hint("↑/↓", "worktree"),
+                    hint("?", "help"),
+                ],
+                Some(area.width),
+            )),
+            area,
+        );
+        return;
+    }
     let hints: &[Binding] = match &app.view {
         View::List => match app.tab {
             // Three-panel layout: the hints follow the focused panel, since the
@@ -1184,11 +1214,20 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         View::Log { .. } => &[
             hint("↑/↓", "commit"),
             hint("Enter", "browse files"),
+            hint("u", "undo commit"),
             hint("g", "top"),
             hint("t", "tree/flat"),
             hint("q", "back"),
         ],
-        View::CommitDiff { .. } | View::StashDiff { .. } => &[
+        View::CommitDiff { .. } => &[
+            hint("↑/↓", "file"),
+            hint("⇧↑/⇧↓", "scroll"),
+            hint("⇧←/⇧→", "h-scroll"),
+            hint("u", "undo commit"),
+            hint("t", "tree/flat"),
+            hint("q", "back"),
+        ],
+        View::StashDiff { .. } => &[
             hint("↑/↓", "file"),
             hint("⇧↑/⇧↓", "scroll"),
             hint("⇧←/⇧→", "h-scroll"),
@@ -4164,7 +4203,6 @@ fn action_label(action: Option<&ResolutionAction>) -> (&'static str, Color) {
         Some(ResolutionAction::KeepTheirs) => ("keeping THEIRS", THEIRS_COLOR),
         Some(ResolutionAction::KeepBoth) => ("keeping BOTH · ours first", Color::Cyan),
         Some(ResolutionAction::KeepBothReversed) => ("keeping BOTH · theirs first", Color::Cyan),
-        Some(ResolutionAction::Manual(_)) => ("hand-edited", MANUAL_COLOR),
     }
 }
 
@@ -4203,8 +4241,6 @@ fn side_states(action: Option<&ResolutionAction>) -> (SideState, SideState) {
         Some(ResolutionAction::KeepBothReversed) => {
             (SideState::Kept(Some(2)), SideState::Kept(Some(1)))
         }
-        // A hand-edited hunk replaces both sides, so neither is kept verbatim.
-        Some(ResolutionAction::Manual(_)) => (SideState::Dropped, SideState::Dropped),
     }
 }
 
@@ -4249,30 +4285,41 @@ fn push_side(lines: &mut Vec<Line<'static>>, view: &SideView, text: &str, state:
         Span::styled(format!("  {note}"), Style::new().fg(color).dim()),
     ]));
 
-    let gutter = Span::styled("  │ ", Style::new().fg(color).dim());
     let body_style = if dropped {
         Style::new().fg(BORDER).dim()
     } else {
         Style::new().fg(color)
     };
     let body: Vec<&str> = text.lines().collect();
+    // Each side is numbered from 1 rather than from its position in the file,
+    // so the two sides sit line-for-line against each other: "line 3 here says
+    // this, line 3 there says that" is the comparison being made, and file
+    // offsets would put the same logical line on two different numbers.
+    let number_width = body.len().max(1).to_string().len();
+    let blank_gutter = " ".repeat(number_width);
+    let gutter = |n: &str| {
+        Span::styled(
+            format!("  {n:>number_width$} │ "),
+            Style::new().fg(color).dim(),
+        )
+    };
     if body.is_empty() {
         lines.push(Line::from(vec![
-            gutter.clone(),
+            gutter(&blank_gutter),
             Span::styled("(this side is empty)", Style::new().fg(color).dim()),
         ]));
         return;
     }
     const MAX: usize = 200;
-    for l in body.iter().take(MAX) {
+    for (i, l) in body.iter().take(MAX).enumerate() {
         lines.push(Line::from(vec![
-            gutter.clone(),
+            gutter(&(i + 1).to_string()),
             Span::styled((*l).to_string(), body_style),
         ]));
     }
     if body.len() > MAX {
         lines.push(Line::from(vec![
-            gutter,
+            gutter(&blank_gutter),
             Span::styled(
                 format!("… {} more line(s)", body.len() - MAX),
                 Style::new().fg(color).dim(),
@@ -4308,6 +4355,8 @@ fn incoming_source(kind: &ResolveKind) -> &'static str {
         // not someone else's work; see `sides_are_swapped`.
         ResolveKind::Rebase => "the commit being replayed",
         ResolveKind::CherryPick => "the cherry-pick",
+        // A revert's incoming side is the inverse of the commit being undone.
+        ResolveKind::Revert => "the commit being undone",
         ResolveKind::StashPop { .. } => "the stash",
     }
 }
@@ -4436,10 +4485,27 @@ fn draw_conflict_resolver(
             Style::new().fg(theme::WARNING).bold(),
         ));
     }
-    let legend_h = legend.len() as u16;
 
     let total_hunks = rf.actions.len();
     let decided = rf.actions.iter().filter(|a| a.is_some()).count();
+    // Picking a side records the choice; it does not write anything. Nothing on
+    // screen used to say so, so a hunk marked "keeping BOTH" looked finished
+    // while git still saw the path as unmerged and refused to complete. The
+    // warning rides in the legend, which never scrolls away.
+    if decided > 0 {
+        legend.push(Line::from(vec![
+            Span::styled(
+                format!("! {decided} of {total_hunks} choice(s) not written yet — "),
+                Style::new().fg(theme::WARNING).bold(),
+            ),
+            Span::styled("w", Style::new().fg(ACCENT).bold()),
+            Span::styled(
+                " saves this file (and stages it once every hunk is decided)",
+                Style::new().fg(theme::WARNING),
+            ),
+        ]));
+    }
+    let legend_h = legend.len() as u16;
     // Text width inside the pane, leaving the scrollbar column free.
     let body_w = inner.width.saturating_sub(1) as usize;
 
@@ -4504,21 +4570,6 @@ fn draw_conflict_resolver(
                     theirs,
                     theirs_state,
                 );
-                if let Some(ResolutionAction::Manual(text)) = action {
-                    push_side(
-                        &mut lines,
-                        &SideView {
-                            corner: "├",
-                            side: "YOUR EDIT",
-                            label: "hand-written",
-                            key: 'e',
-                            color: MANUAL_COLOR,
-                            note: "replaces both sides",
-                        },
-                        text,
-                        SideState::Kept(None),
-                    );
-                }
                 lines.push(Line::from(vec![
                     Span::styled("  └ ", Style::new().fg(BORDER)),
                     Span::styled("b", Style::new().fg(Color::Cyan).bold()),
@@ -4578,51 +4629,7 @@ fn draw_conflict_resolver(
     list_hit
 }
 
-/// Floating multi-line editor for hand-editing one hunk's resolved text, with a
-/// visible block cursor. Saved with Ctrl+S, discarded with Esc.
-fn draw_hunk_editor(frame: &mut Frame, area: Rect, hunk: usize, editor: &super::app::TextArea) {
-    // Clamp bounds carefully: on a tiny terminal the available height can fall
-    // below the preferred minimum, and `clamp` panics when min > max.
-    let max_h = area.height.saturating_sub(2).max(3);
-    let min_h = 6.min(max_h);
-    let height = (editor.lines.len() as u16 + 4).clamp(min_h, max_h);
-    let popup = centered(area, area.width.saturating_sub(8).min(90), height);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        dialog_panel(format!("edit hunk {} · Ctrl+S save · Esc cancel", hunk + 1)),
-        popup,
-    );
-    let inner = popup.inner(ratatui::layout::Margin::new(2, 1));
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    for (r, text) in editor.lines.iter().enumerate() {
-        if r == editor.row {
-            // Split the cursor line so the character under the cursor is shown
-            // inverted, giving a visible caret (or a trailing block at line end).
-            let chars: Vec<char> = text.chars().collect();
-            let mut spans = Vec::new();
-            spans.push(Span::raw(
-                chars[..editor.col.min(chars.len())]
-                    .iter()
-                    .collect::<String>(),
-            ));
-            let cursor_style = Style::new().bg(ACCENT).fg(Color::Black);
-            if editor.col < chars.len() {
-                spans.push(Span::styled(chars[editor.col].to_string(), cursor_style));
-                spans.push(Span::raw(
-                    chars[editor.col + 1..].iter().collect::<String>(),
-                ));
-            } else {
-                spans.push(Span::styled(" ", cursor_style));
-            }
-            lines.push(Line::from(spans));
-        } else {
-            lines.push(Line::raw(text.clone()));
-        }
-    }
-    frame.render_widget(Paragraph::new(lines), inner);
-}
-
-/// Style for one raw line of a conflicted file in the whole-file editor: the
+/// Style for one raw line of a conflicted file in the conflict editor: the
 /// conflict markers themselves stand out, and each side keeps the color it has
 /// in the resolver so the file reads the same way there and here.
 fn conflict_line_style(line: &str, side: &mut Color) -> Style {
@@ -4646,26 +4653,35 @@ fn conflict_line_style(line: &str, side: &mut Color) -> Style {
     Style::new().fg(*side)
 }
 
-/// The whole-file editor: the conflicted file exactly as it sits on disk, with
+/// The conflict editor: the conflicted file exactly as it sits on disk, with
 /// line numbers, the conflict markers highlighted, and a visible block cursor.
 /// Saved with Ctrl+S, discarded with Esc.
 fn draw_file_editor(frame: &mut Frame, area: Rect, path: &str, editor: &super::app::TextArea) {
-    let popup = centered(
-        area,
-        area.width.saturating_sub(4).min(120),
-        area.height.saturating_sub(2).max(5),
-    );
-    frame.render_widget(Clear, popup);
-    let block = dialog_panel(format!("edit {path} · Ctrl+S save · Esc cancel"));
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
+    // The whole frame: this is a real source file, and a centred box with a
+    // margin buys nothing but fewer lines and columns of the thing being read.
+    frame.render_widget(Clear, area);
+    let block = dialog_panel(format!(
+        "edit {path} · Ctrl+S save · Esc cancel · ←/→/↑/↓ PgUp/PgDn move"
+    ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
 
     let height = inner.height as usize;
-    // No scroll offset is stored, so the view is derived from the cursor: keep
-    // it centered, clamped at both ends of the file.
+    // No scroll offsets are stored, so both are derived from the cursor: keep
+    // it centered vertically and just inside the edge horizontally, clamped at
+    // the ends of the file and of the line.
     let max_scroll = editor.lines.len().saturating_sub(height);
     let scroll = editor.row.saturating_sub(height / 2).min(max_scroll);
-    let width = editor.lines.len().to_string().len();
+    let gutter_width = editor.lines.len().to_string().len();
+    // What is left for the text itself once the line-number gutter is drawn.
+    let text_width = (inner.width as usize).saturating_sub(gutter_width + 1);
+    // Long lines used to be silently clipped at the right edge with no way to
+    // see past them; follow the cursor instead, keeping a few columns of lead-in
+    // so the character being typed is never flush against the border.
+    let h_scroll = editor.col.saturating_sub(text_width.saturating_sub(4));
 
     // The side each line belongs to is carried down from the last marker seen,
     // so it has to be tracked from the top of the file, not from the first
@@ -4678,14 +4694,16 @@ fn draw_file_editor(frame: &mut Frame, area: Rect, path: &str, editor: &super::a
             continue;
         }
         let gutter = Span::styled(
-            format!("{:>width$} ", r + 1, width = width),
+            format!("{:>width$} ", r + 1, width = gutter_width),
             Style::new().fg(BORDER),
         );
+        // Everything below indexes the horizontally scrolled slice of the line,
+        // so the cursor column is rebased into it too.
+        let chars: Vec<char> = text.chars().skip(h_scroll).collect();
         if r == editor.row {
             // Split the cursor line so the character under the cursor is shown
             // inverted, giving a visible caret (or a trailing block at line end).
-            let chars: Vec<char> = text.chars().collect();
-            let col = editor.col.min(chars.len());
+            let col = editor.col.saturating_sub(h_scroll).min(chars.len());
             let cursor_style = Style::new().bg(ACCENT).fg(Color::Black);
             let mut spans = vec![
                 gutter,
@@ -4702,7 +4720,10 @@ fn draw_file_editor(frame: &mut Frame, area: Rect, path: &str, editor: &super::a
             }
             lines.push(Line::from(spans));
         } else {
-            lines.push(Line::from(vec![gutter, Span::styled(text.clone(), style)]));
+            lines.push(Line::from(vec![
+                gutter,
+                Span::styled(chars.into_iter().collect::<String>(), style),
+            ]));
         }
     }
     frame.render_widget(Paragraph::new(lines), inner);
@@ -4782,18 +4803,6 @@ fn draw_modal(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
             );
             None
         }
-        Modal::HunkEditor(editor) => {
-            // The panel title numbers the hunk being edited, read from the
-            // resolver screen underneath.
-            let hunk = match &app.view {
-                View::ConflictResolver {
-                    current: Some(rf), ..
-                } => rf.hunk,
-                _ => 0,
-            };
-            draw_hunk_editor(frame, area, hunk, editor);
-            None
-        }
         Modal::FileEditor { path, editor } => {
             draw_file_editor(frame, area, path, editor);
             None
@@ -4847,13 +4856,9 @@ fn modal_footer_hints(modal: &Modal) -> &'static [Binding] {
         hint("Enter", "confirm"),
         hint("Esc", "cancel"),
     ];
-    const HUNK: &[Binding] = &[
-        hint("type", "edit result"),
-        hint("Ctrl+S", "save"),
-        hint("Esc", "cancel"),
-    ];
     const FILE: &[Binding] = &[
         hint("type", "edit the file"),
+        hint("↑↓←→", "move"),
         hint("Ctrl+S", "save to disk"),
         hint("Esc", "cancel"),
     ];
@@ -4861,7 +4866,6 @@ fn modal_footer_hints(modal: &Modal) -> &'static [Binding] {
         Modal::Confirm { options, .. } if options.len() > 1 => CONFIRM_MULTI,
         Modal::Confirm { .. } => CONFIRM_SINGLE,
         Modal::Prompt { .. } => PROMPT,
-        Modal::HunkEditor(_) => HUNK,
         Modal::FileEditor { .. } => FILE,
     }
 }
@@ -5010,7 +5014,7 @@ mod tests {
         assert_eq!(
             line,
             "⇥ tabs  Enter changes  n new  b switch branch  c commit  o open  \
-             s stash  p pull  ⇧P push  l log  d delete  ? help  q quit"
+             s stash  p pull  ⇧P push  l log  d delete  x resolve  ? help  q quit"
         );
         // `u`, `e`, `m`, `f`, `⇧R` and the cursor keys are documented in help
         // but have no footer label, so they are absent above.
@@ -5929,25 +5933,100 @@ mod tests {
         );
     }
 
-    /// A hand-edited hunk shows the text that will actually be written, not
-    /// just the label "MANUAL" over the two sides it replaced.
+    /// Each side is numbered from 1 so the two line up for comparison: "line 2
+    /// here" against "line 2 there" is the reading being made, which file
+    /// offsets would break by putting the same logical line on two numbers.
     #[test]
-    fn resolver_shows_the_text_a_hand_edited_hunk_will_write() {
-        let rf = resolver_file(
-            vec![
-                Some(ResolutionAction::Manual("    merged();\n".into())),
-                None,
-            ],
-            0,
-        );
+    fn resolver_numbers_each_side_from_one() {
+        let rf = ResolverFile {
+            file: crate::ops::ConflictFile {
+                path: "src/main.rs".into(),
+                segments: vec![ConflictSegment::Hunk {
+                    ours: "    a();\n    b();\n".into(),
+                    theirs: "    x();\n    y();\n".into(),
+                    base: None,
+                }],
+                ours_label: "main".into(),
+                theirs_label: "feature/login".into(),
+            },
+            actions: vec![None],
+            hunk: 0,
+        };
         let out = render_resolver(ResolveKind::Merge, &rf);
+        for (n, code) in [(1, "a();"), (2, "b();"), (1, "x();"), (2, "y();")] {
+            assert!(
+                out.iter()
+                    .any(|r| r.contains(&format!("{n} │ ")) && r.contains(code)),
+                "{code} is numbered {n} on its own side: {out:#?}"
+            );
+        }
+    }
+
+    /// Choosing a side records a choice and writes nothing. The pane says so in
+    /// the legend, which never scrolls away, so a hunk marked "keeping BOTH"
+    /// can't look finished while git still sees the path as unmerged.
+    #[test]
+    fn resolver_warns_that_choices_are_not_written_yet() {
+        let undecided = resolver_file(vec![None, None], 0);
+        let out = render_resolver(ResolveKind::Merge, &undecided);
         assert!(
-            out.iter().any(|r| r.contains("YOUR EDIT")),
-            "the edit gets its own labelled block: {out:#?}"
+            !out.iter().any(|r| r.contains("not written yet")),
+            "nothing chosen, nothing to warn about: {out:#?}"
+        );
+
+        let chosen = resolver_file(vec![Some(ResolutionAction::KeepBoth), None], 0);
+        let out = render_resolver(ResolveKind::Merge, &chosen);
+        assert!(
+            out.iter()
+                .any(|r| r.contains("1 of 2 choice(s) not written yet")),
+            "the pending write is spelled out: {out:#?}"
         );
         assert!(
-            out.iter().any(|r| r.contains("merged();")),
-            "showing what it will write: {out:#?}"
+            out.iter().any(|r| r.contains("saves this file")),
+            "and says which key does it: {out:#?}"
+        );
+    }
+
+    /// The conflict editor takes the whole frame and scrolls sideways with the
+    /// cursor, so a long line is readable instead of clipped at the border.
+    #[test]
+    fn file_editor_fills_the_frame_and_scrolls_horizontally() {
+        let long = format!("let x = {};", "z".repeat(200));
+        let mut editor = super::super::app::TextArea::new(&format!("short\n{long}\ntail\n"));
+
+        let out = render(60, 20, |frame, area| {
+            draw_file_editor(frame, area, "src/main.rs", &editor);
+        });
+        assert!(
+            out.iter().any(|r| r.contains("src/main.rs")),
+            "the editor is on screen: {out:#?}"
+        );
+        assert!(
+            out.iter().any(|r| r.contains("1 │") || r.contains("1 ")),
+            "line numbers are drawn: {out:#?}"
+        );
+        // Full frame: the panel border opens on the very first column of the
+        // very first row rather than being inset inside a centred popup.
+        assert!(
+            out[0].starts_with('┏') && out[0].ends_with('┓'),
+            "the editor spans the whole width: {:?}",
+            out[0]
+        );
+        assert_eq!(out.len(), 20);
+
+        // Park the cursor far along the long line; that column must be visible.
+        editor.row = 1;
+        editor.col = 190;
+        let out = render(60, 20, |frame, area| {
+            draw_file_editor(frame, area, "src/main.rs", &editor);
+        });
+        assert!(
+            out.iter().any(|r| r.contains("zzz")),
+            "the view followed the cursor into the line: {out:#?}"
+        );
+        assert!(
+            !out.iter().any(|r| r.contains("let x =")),
+            "and scrolled the start of the line off to the left: {out:#?}"
         );
     }
 

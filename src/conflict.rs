@@ -28,6 +28,11 @@ pub enum ConflictSegment {
 }
 
 /// How to resolve a single conflict hunk when rendering a resolved file.
+///
+/// Every variant keeps something, so the shared `Keep` prefix is the meaning
+/// rather than noise, and dropping it would leave `Ours`/`Theirs`/`Both` reading
+/// as sides instead of decisions.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolutionAction {
     /// Keep only "our" side.
@@ -38,8 +43,6 @@ pub enum ResolutionAction {
     KeepBoth,
     /// Keep both, theirs then ours.
     KeepBothReversed,
-    /// Replace the hunk with arbitrary text from the resolver's manual editor.
-    Manual(String),
 }
 
 /// Splits `text` into lines, keeping each line's trailing `\n` (and any `\r`
@@ -146,7 +149,6 @@ fn push_resolved(out: &mut String, ours: &str, theirs: &str, action: &Resolution
             out.push_str(theirs);
             out.push_str(ours);
         }
-        ResolutionAction::Manual(text) => out.push_str(text),
     }
 }
 

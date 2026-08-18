@@ -17,6 +17,7 @@ use super::help::HelpTab;
 use super::highlight;
 use super::setup::{self, SetupWizard, WizardOutcome};
 use super::theme;
+use super::ui;
 use crate::config::{CommandMode, OpenCommand, WorktreesLayout};
 use crate::conflict::{self, ConflictSegment, ResolutionAction};
 use crate::git::{self, GraphLine, LogEntry, StashEntry, StatusEntry};
@@ -186,6 +187,13 @@ const MESSAGE_TIMEOUT: Duration = Duration::from_secs(4);
 /// After q/Esc navigates "back", ignore a quit-bound q/Esc for this long so a
 /// key buffered during a slow frame cannot quit once the pop finally lands.
 const QUIT_IGNORE_AFTER_BACK: Duration = Duration::from_millis(400);
+
+/// Character budget for a path shown in the copy-path modal's option rows. The
+/// modal is at most 80 columns wide, which leaves 76 inside its border and
+/// padding; the radio marker, the `relative · ` prefix, and the ` (r)` shortcut
+/// hint take the rest. Longer paths are elided in the middle, so the file name
+/// stays readable.
+const COPY_PATH_WIDTH: usize = 56;
 
 /// How commit history is drawn in the log and branch-commit views. `Tree` runs
 /// the log through `git log --graph` so branch and merge topology is visible;
@@ -417,14 +425,13 @@ pub enum Modal {
         hint: String,
         action: ModalAction,
     },
-    /// The manual conflict-hunk editor. Unlike the others it edits in place and
-    /// saves back into the `ConflictResolver` screen underneath on Ctrl+S,
-    /// rather than producing a `ModalResult`.
-    HunkEditor(TextArea),
-    /// The whole-file editor: the conflicted file exactly as it sits on disk,
-    /// conflict markers included, for the cases the per-hunk choices can't
-    /// express (interleaving both sides, fixing up an import list, deleting a
-    /// stray line). Ctrl+S writes it straight back to disk and re-reads it.
+    /// The conflict editor: the file exactly as it sits on disk, conflict
+    /// markers included, for the cases the per-hunk choices can't express
+    /// (interleaving both sides, fixing up an import list, deleting a stray
+    /// line). Unlike the other modals it edits in place and, on Ctrl+S, writes
+    /// straight back to disk and re-reads it, rather than producing a
+    /// `ModalResult`. It takes the whole frame and scrolls both ways, since a
+    /// real source file is neither short nor narrow.
     FileEditor { path: String, editor: TextArea },
 }
 
@@ -564,6 +571,9 @@ pub enum ModalAction {
     /// Add to `.gitignore`: option 0 ignores the exact `file`, option 1 the
     /// derived `pattern`.
     IgnorePath { file: String, pattern: String },
+    /// Copy the diff panel's file path: option 0 copies `relative` (relative to
+    /// the worktree root), option 1 the absolute `full` path.
+    CopyPath { relative: String, full: String },
     /// The branch a create would start from (`base`, or `branch` itself when
     /// checking out an existing local branch) is behind its upstream: option 0
     /// pulls it first, 1 creates without pulling.
@@ -626,6 +636,28 @@ pub enum ModalAction {
     /// A newer wtm is published: option 0 installs it and restarts, 1 postpones
     /// until the next launch.
     UpdateApp(Box<Release>),
+    /// Step 1 of the undo-a-commit wizard: option 0 reverts (a new commit that
+    /// undoes this one), option 1 resets the branch back to it. `label` is the
+    /// short hash and subject, for the follow-up screens.
+    UndoCommitKind {
+        name: String,
+        hash: String,
+        label: String,
+    },
+    /// Step 2 after choosing revert: option 0 records the inverse as a commit,
+    /// option 1 leaves it staged in the working tree (`--no-commit`).
+    UndoCommitRevert {
+        name: String,
+        hash: String,
+        label: String,
+    },
+    /// Step 2 after choosing reset: the option index picks what happens to the
+    /// dropped commits' changes (0 = unstaged, 1 = staged, 2 = discarded).
+    UndoCommitReset {
+        name: String,
+        hash: String,
+        label: String,
+    },
     /// The files being committed look like a folder rename with one side
     /// missing: option 0 adds `extra` so git records the rename, option 1
     /// commits `paths` as selected.
@@ -1065,9 +1097,51 @@ impl TextArea {
             }
             KeyCode::Home => self.col = 0,
             KeyCode::End => self.col = self.cur_len(),
+            // A whole source file is long enough that line-at-a-time is not
+            // enough to get around it. The step is a fixed page rather than the
+            // viewport height, which the editor never sees.
+            KeyCode::PageUp => {
+                self.row = self.row.saturating_sub(PAGE);
+                self.col = self.col.min(self.cur_len());
+            }
+            KeyCode::PageDown => {
+                self.row = (self.row + PAGE).min(self.lines.len().saturating_sub(1));
+                self.col = self.col.min(self.cur_len());
+            }
             _ => {}
         }
     }
+
+    /// Puts the cursor at the start of `row` (clamped to the last line). Used
+    /// to open the conflict editor already sitting on the hunk in view.
+    pub fn go_to_line(&mut self, row: usize) {
+        self.row = row.min(self.lines.len().saturating_sub(1));
+        self.col = 0;
+    }
+}
+
+/// Short hash plus subject, the way a commit is named in dialogs and messages.
+fn commit_label(entry: &LogEntry) -> String {
+    format!(
+        "{} {}",
+        entry.hash.chars().take(9).collect::<String>(),
+        entry.subject
+    )
+}
+
+/// How many lines PageUp/PageDown move in a [`TextArea`].
+const PAGE: usize = 20;
+
+/// Row of the `hunk`-th `<<<<<<<` marker in `lines`, or 0 when there is no such
+/// marker (an already-resolved file, or an out-of-range index).
+fn nth_conflict_start(lines: &[String], hunk: usize) -> usize {
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.starts_with("<<<<<<<"))
+        .map(|(i, _)| i)
+        .nth(hunk)
+        .unwrap_or(0)
 }
 
 /// Which view to reopen once a `View::Busy` operation completes. Most ops land
@@ -1999,7 +2073,7 @@ impl App {
         self.error_scroll = 0;
     }
 
-    fn selected_worktree(&self) -> Option<&WorktreeInfo> {
+    pub fn selected_worktree(&self) -> Option<&WorktreeInfo> {
         self.worktrees.get(self.selected)
     }
 
@@ -2199,11 +2273,11 @@ impl App {
     /// `?` must reach it as a literal rather than opening help. F1 is the way in
     /// from these views.
     fn view_takes_text_input(&self) -> bool {
-        // A prompt or the hunk editor listens for characters, so `?` must reach
+        // A prompt or the file editor listens for characters, so `?` must reach
         // it as a literal rather than opening help.
         if matches!(
             self.modal,
-            Some(Modal::Prompt { .. } | Modal::HunkEditor(_) | Modal::FileEditor { .. })
+            Some(Modal::Prompt { .. } | Modal::FileEditor { .. })
         ) {
             return true;
         }
@@ -2475,12 +2549,7 @@ impl App {
     /// happen in place; a terminal key resolves the modal into a `ModalResult`,
     /// pops it, and routes the outcome to `dispatch_modal`.
     fn on_modal_key(&mut self, key: KeyEvent) {
-        // The hunk editor edits in place and saves back into the resolver.
-        if matches!(self.modal, Some(Modal::HunkEditor(_))) {
-            self.on_hunk_editor_key(key);
-            return;
-        }
-        // The whole-file editor writes straight to disk instead.
+        // The conflict editor edits in place and writes straight to disk.
         if matches!(self.modal, Some(Modal::FileEditor { .. })) {
             self.on_file_editor_key(key);
             return;
@@ -2557,10 +2626,40 @@ impl App {
                     self.discard_all_changes(name);
                 }
             }
+            ModalAction::UndoCommitKind { name, hash, label } => {
+                if let ModalResult::Confirmed(idx) = result {
+                    if idx == 0 {
+                        self.open_undo_revert_modal(name, hash, label);
+                    } else {
+                        self.open_undo_reset_modal(name, hash, label);
+                    }
+                }
+            }
+            ModalAction::UndoCommitRevert { name, hash, label } => {
+                if let ModalResult::Confirmed(idx) = result {
+                    self.run_revert_commit(name, hash, label, /* no_commit */ idx == 1);
+                }
+            }
+            ModalAction::UndoCommitReset { name, hash, label } => {
+                if let ModalResult::Confirmed(idx) = result {
+                    let mode = match idx {
+                        0 => git::ResetMode::Mixed,
+                        1 => git::ResetMode::Soft,
+                        _ => git::ResetMode::Hard,
+                    };
+                    self.run_reset_to_commit(name, hash, label, mode);
+                }
+            }
             ModalAction::IgnorePath { file, pattern } => {
                 if let ModalResult::Confirmed(idx) = result {
                     let p = if idx == 0 { file } else { pattern };
                     self.add_ignore(&p);
+                }
+            }
+            ModalAction::CopyPath { relative, full } => {
+                if let ModalResult::Confirmed(idx) = result {
+                    let p = if idx == 0 { relative } else { full };
+                    self.copy_path(&p);
                 }
             }
             ModalAction::ConfirmPullBase {
@@ -2797,6 +2896,177 @@ impl App {
             options,
             ModalAction::DiscardAllChanges { name },
         );
+    }
+
+    /// Step 1 of the undo-a-commit wizard, opened with `u` from a commit list.
+    ///
+    /// Git has two unrelated ways to "undo a commit" and picking the wrong one
+    /// is expensive, so the choice is spelled out rather than assumed: revert
+    /// adds a commit and is safe on a pushed branch, reset removes commits and
+    /// is not. `label` is the short hash and subject of the commit in question.
+    fn open_undo_commit_modal(&mut self, name: String, hash: String, label: String) {
+        let body = vec![
+            Line::from(format!("undo {label}")),
+            Line::from(""),
+            Line::styled(
+                "revert keeps history: it adds a new commit that reverses this one, so a \
+                 branch you have already pushed stays safe to push.",
+                Style::new().dim(),
+            ),
+            Line::styled(
+                "reset rewrites history: the branch moves back to this commit and everything \
+                 after it leaves the branch, which needs a force-push if it was shared.",
+                Style::new().dim(),
+            ),
+            Line::from(""),
+        ];
+        let options = vec![
+            ConfirmOption::new("revert it — add a commit that undoes this one"),
+            ConfirmOption::new("reset to it — drop the commits made after this one"),
+        ];
+        self.push_confirm(
+            format!("undo a commit · {name}"),
+            body,
+            options,
+            ModalAction::UndoCommitKind { name, hash, label },
+        );
+    }
+
+    /// Step 2 after choosing revert: whether to record the inverse as a commit
+    /// straight away, or leave it staged so it can be reviewed or trimmed first.
+    fn open_undo_revert_modal(&mut self, name: String, hash: String, label: String) {
+        let body = vec![
+            Line::from(format!("revert {label}")),
+            Line::from(""),
+            Line::styled(
+                "the reverse of this commit is applied on top of the branch; the commit \
+                 itself stays in history either way.",
+                Style::new().dim(),
+            ),
+            Line::from(""),
+        ];
+        let options = vec![
+            ConfirmOption::new("commit the revert now"),
+            ConfirmOption::new("keep the changes staged, don't commit yet"),
+        ];
+        self.push_confirm(
+            format!("revert · {name}"),
+            body,
+            options,
+            ModalAction::UndoCommitRevert { name, hash, label },
+        );
+    }
+
+    /// Step 2 after choosing reset: what happens to the work in the commits
+    /// being dropped. This is the "keep the changes?" question, and the only
+    /// one of the three answers that loses work is marked destructive.
+    fn open_undo_reset_modal(&mut self, name: String, hash: String, label: String) {
+        let body = vec![
+            Line::from(format!("reset '{name}' back to {label}")),
+            Line::from(""),
+            Line::styled(
+                "every commit made after it leaves the branch. what should happen to the \
+                 changes those commits contained?",
+                Style::new().dim(),
+            ),
+            Line::from(""),
+        ];
+        let options = vec![
+            ConfirmOption::new("keep them as uncommitted changes (--mixed)"),
+            ConfirmOption::new("keep them staged, ready to recommit (--soft)"),
+            ConfirmOption::new("discard them along with the commits (--hard)").destructive(),
+        ];
+        self.push_confirm(
+            format!("reset · {name}"),
+            body,
+            options,
+            ModalAction::UndoCommitReset { name, hash, label },
+        );
+    }
+
+    /// Runs the chosen revert. A revert that conflicts with later work opens the
+    /// conflict resolver, exactly like a conflicting merge or cherry-pick,
+    /// rather than leaving the worktree stopped with no way forward.
+    fn run_revert_commit(&mut self, name: String, hash: String, label: String, no_commit: bool) {
+        match ops::revert_commit(&self.ctx, &name, &hash, no_commit) {
+            Ok(ops::UndoOutcome::Reverted { commit, .. }) => {
+                self.refresh();
+                self.message = Some(if no_commit {
+                    format!("reverted {commit} into the working tree · staged, not committed")
+                } else {
+                    format!("reverted {commit} · {label}")
+                });
+            }
+            Ok(ops::UndoOutcome::Conflicted { files, .. }) => {
+                self.open_resolver(
+                    name,
+                    format!("reverting {label}"),
+                    ops::ResolveKind::Revert,
+                    files,
+                );
+            }
+            Ok(other) => self.message = Some(format!("{other:?}")),
+            Err(e) => self.set_error(format!("{e:#}")),
+        }
+    }
+
+    /// Runs the chosen reset and reports how many commits left the branch.
+    fn run_reset_to_commit(
+        &mut self,
+        name: String,
+        hash: String,
+        label: String,
+        mode: git::ResetMode,
+    ) {
+        match ops::reset_to_commit(&self.ctx, &name, &hash, mode) {
+            Ok(ops::UndoOutcome::Reset {
+                commit, dropped, ..
+            }) => {
+                self.refresh();
+                let kept = match mode {
+                    git::ResetMode::Soft => "their changes are staged",
+                    git::ResetMode::Mixed => "their changes are in the working tree, unstaged",
+                    git::ResetMode::Hard => "their changes were discarded",
+                };
+                self.message = Some(format!(
+                    "reset '{name}' to {commit} · {dropped} commit(s) dropped, {kept}"
+                ));
+            }
+            Ok(other) => self.message = Some(format!("{other:?}")),
+            Err(e) => self.set_error(format!("{e:#}")),
+        }
+        let _ = label;
+    }
+
+    /// Opens the undo wizard for the commit under the cursor in whichever
+    /// commit list is on screen (the worktree log, the three-panel commits
+    /// panel, or the commit browser). Commit lists reached from the Branches
+    /// tab are excluded: a branch there need not be checked out anywhere, and
+    /// undoing a commit has to happen in a worktree.
+    fn open_undo_commit_for_cursor(&mut self) {
+        let picked = match &self.view {
+            View::Log {
+                name,
+                lines,
+                selected,
+            } => lines
+                .get(*selected)
+                .and_then(|l| l.entry.as_ref())
+                .map(|e| (name.clone(), e.hash.clone(), commit_label(e))),
+            View::CommitDiff {
+                name, hash, label, ..
+            } => Some((name.clone(), hash.clone(), label.clone())),
+            View::List => self.worktree_commits.as_ref().and_then(|p| {
+                p.lines
+                    .get(p.selected)
+                    .and_then(|l| l.entry.as_ref())
+                    .map(|e| (p.name.clone(), e.hash.clone(), commit_label(e)))
+            }),
+            _ => None,
+        };
+        if let Some((name, hash, label)) = picked {
+            self.open_undo_commit_modal(name, hash, label);
+        }
     }
 
     /// Prompt for adding a file or folder to `.gitignore`.
@@ -3356,17 +3626,20 @@ impl App {
         }
         // Worktree-level commands the changed-file keymap leaves unbound, so
         // the file panel isn't a dead end for them either. Keys the file panel
-        // binds to something else (u = revert, s/S = stash, c = commit,
-        // t = layout, p/P = pull/push) are deliberately not in this list.
+        // binds to something else (u = revert, d = delete the selected file,
+        // s/S = stash, c = commit, t = layout, p/P = pull/push, h/l = collapse
+        // and expand a folder) are deliberately not in this list. `d` in particular: with the file list focused it
+        // deletes the file under the cursor, and deleting the whole worktree is
+        // only reachable from the worktree list above, so the same key can't
+        // mean "one file" or "everything" depending on where the eye happens to
+        // be.
         if matches!(
             key.code,
             KeyCode::Char('f')
                 | KeyCode::Char('b')
-                | KeyCode::Char('l')
                 | KeyCode::Char('m')
                 | KeyCode::Char('R')
                 | KeyCode::Char('x')
-                | KeyCode::Char('d')
                 | KeyCode::Char('n')
         ) {
             self.on_worktrees_tab_key(key);
@@ -3399,9 +3672,14 @@ impl App {
                 self.open_commit_diff_from_worktree_commits();
             }
             KeyCode::Char('t') => self.toggle_log_mode(),
-            // The panel belongs to the selected worktree, so anything it
+            // With commits focused, `u` undoes the one under the cursor rather
+            // than meaning the worktree list's "update"; the same rule as `d`
+            // in the file panel, so a key never acts on something other than
+            // what the cursor is on.
+            KeyCode::Char('u') => self.open_undo_commit_for_cursor(),
+            // The panel belongs to the selected worktree, so anything else it
             // doesn't bind itself falls through to the worktree list's keymap
-            // (pull, push, fetch, update, commit, …). q/Esc never reach here:
+            // (pull, push, fetch, commit, …). q/Esc never reach here:
             // `on_worktrees_files_key` intercepts them above.
             _ => self.on_worktrees_tab_key(key),
         }
@@ -3888,17 +4166,52 @@ impl App {
         }
     }
 
-    /// Copies the path shown in the diff panel's title to the system clipboard.
-    /// Relative to the worktree root, which is what a path is useful as here.
-    fn copy_diff_path(&mut self) {
+    /// Click on the diff panel's path title: asks which form of the path to
+    /// copy, because both get used for different things (the worktree-relative
+    /// one in a commit message or a code review, the absolute one to paste into
+    /// another terminal or an editor). When the worktree root can't be resolved
+    /// there is no second form to offer, so the relative path is copied
+    /// straight away.
+    fn open_copy_path_modal(&mut self) {
         let c = &self.changes;
-        let Some(path) = current_file_index(&c.rows, c.selected)
+        let Some(relative) = current_file_index(&c.rows, c.selected)
             .and_then(|i| c.files.get(i))
             .map(|f| f.path.clone())
         else {
             return;
         };
-        match platform::copy_to_clipboard(&path) {
+        let name = c.name.clone();
+        let full = match ops::path(&self.ctx, &name) {
+            Ok(root) => Path::new(&root).join(&relative).display().to_string(),
+            Err(_) => {
+                self.copy_path(&relative);
+                return;
+            }
+        };
+        let body = vec![Line::from("copy this file's path:"), Line::from("")];
+        let options = vec![
+            ConfirmOption::new(format!(
+                "relative · {}",
+                ui::truncate_middle(&relative, COPY_PATH_WIDTH)
+            ))
+            .key('r'),
+            ConfirmOption::new(format!(
+                "full · {}",
+                ui::truncate_middle(&full, COPY_PATH_WIDTH)
+            ))
+            .key('f'),
+        ];
+        self.push_confirm(
+            "copy path",
+            body,
+            options,
+            ModalAction::CopyPath { relative, full },
+        );
+    }
+
+    /// Copies one path to the system clipboard, reporting either outcome.
+    fn copy_path(&mut self, path: &str) {
+        match platform::copy_to_clipboard(path) {
             Ok(()) => self.message = Some(format!("copied '{path}' to the clipboard")),
             Err(e) => self.set_error(format!("cannot copy to the clipboard: {e:#}")),
         }
@@ -3925,7 +4238,7 @@ impl App {
             .diff_path_hit
             .is_some_and(|rect| rect_contains(rect, col, row))
         {
-            self.copy_diff_path();
+            self.open_copy_path_modal();
             // Don't let the same click also register as half of a double click on
             // the title, which would then try to open the file.
             self.last_click = None;
@@ -4357,8 +4670,17 @@ impl App {
                 selected,
                 ..
             } => (files, rows, selected),
-            // Otherwise this is the Changes tab (the only other caller).
-            View::List if self.tab == Tab::Changes => {
+            // The Changes tab, or the same changed-file list folded into the
+            // Worktrees tab as the three-panel layout's file panel. Both are
+            // backed by `self.changes`, so folder collapsing works the same in
+            // either place rather than only where the tab happens to be.
+            View::List
+                if self.tab == Tab::Changes
+                    || (self.tab == Tab::Worktrees
+                        && self.three_panel
+                        && self.worktrees_focus == WorktreesFocus::Files
+                        && self.worktree_commits.is_none()) =>
+            {
                 let c = &mut self.changes;
                 (&mut c.files, &mut c.rows, &mut c.selected)
             }
@@ -7020,12 +7342,8 @@ impl App {
             return;
         };
         let target = wt.name.clone();
-        let kind = match ops::detect_resolve_kind(&self.ctx, &target) {
-            Ok(Some(kind)) => kind,
-            Ok(None) => {
-                self.message = Some(format!("no merge, rebase, or cherry-pick in '{target}'"));
-                return;
-            }
+        let detected = match ops::detect_resolve_kind(&self.ctx, &target) {
+            Ok(kind) => kind,
             Err(e) => {
                 self.set_error(format!("{e:#}"));
                 return;
@@ -7035,6 +7353,22 @@ impl App {
             Ok(files) => files,
             Err(e) => {
                 self.set_error(format!("{e:#}"));
+                return;
+            }
+        };
+        let kind = match detected {
+            Some(kind) => kind,
+            // A conflicted stash pop leaves no marker on disk, so it can't be
+            // detected the way a merge or rebase can. Unmerged files with no
+            // in-progress operation are that case (or a conflict someone left
+            // behind), and the resolver is still the right place to fix them —
+            // refusing here would leave no way in at all.
+            None if !files.is_empty() => ops::ResolveKind::StashPop { index: None },
+            None => {
+                self.message = Some(format!(
+                    "nothing to resolve in '{target}': no conflicted files and no merge, \
+                     rebase, or cherry-pick in progress"
+                ));
                 return;
             }
         };
@@ -7101,8 +7435,11 @@ impl App {
             KeyCode::Char('B') => self.resolver_set_action(ResolutionAction::KeepBothReversed),
             KeyCode::Char('O') => self.resolver_whole_file(true),
             KeyCode::Char('T') => self.resolver_whole_file(false),
-            KeyCode::Char('e') => self.resolver_edit_hunk(),
-            KeyCode::Char('E') => self.resolver_edit_file(),
+            // One editor for both keys: the whole conflicted file, full screen.
+            // `e` parks the cursor on the hunk under the resolver's cursor,
+            // `E` opens at the top of the file.
+            KeyCode::Char('e') => self.resolver_edit_file(true),
+            KeyCode::Char('E') => self.resolver_edit_file(false),
             KeyCode::Char('w') | KeyCode::Enter => self.resolver_write_file(),
             KeyCode::Char('a') => self.resolver_stage_as_is(),
             KeyCode::Char('r') => self.resolver_reload(),
@@ -7151,56 +7488,63 @@ impl App {
         }
     }
 
-    /// Records `action` for the current hunk of the current file.
+    /// Records `action` for the current hunk of the current file. The choice is
+    /// only recorded, not written: the status line says so on every press, so
+    /// the pending `w` is never a surprise at completion time.
     fn resolver_set_action(&mut self, action: ResolutionAction) {
-        if let View::ConflictResolver {
-            current: Some(rf), ..
-        } = &mut self.view
-            && let Some(slot) = rf.actions.get_mut(rf.hunk)
-        {
-            *slot = Some(action);
-        }
-    }
-
-    /// Opens the manual editor for the current hunk. It is seeded from the
-    /// side already chosen (if any), else from both sides so nothing is lost;
-    /// the user then trims or rewrites it into the final result.
-    fn resolver_edit_hunk(&mut self) {
-        if let View::ConflictResolver {
+        let progress = if let View::ConflictResolver {
             current: Some(rf), ..
         } = &mut self.view
         {
-            let seed = rf
-                .file
-                .segments
-                .iter()
-                .filter_map(|s| match s {
-                    ConflictSegment::Hunk { ours, theirs, .. } => Some((ours, theirs)),
-                    _ => None,
-                })
-                .nth(rf.hunk)
-                .map(
-                    |(ours, theirs)| match rf.actions.get(rf.hunk).and_then(|a| a.clone()) {
-                        Some(ResolutionAction::KeepOurs) => ours.clone(),
-                        Some(ResolutionAction::KeepTheirs) => theirs.clone(),
-                        Some(ResolutionAction::KeepBothReversed) => format!("{theirs}{ours}"),
-                        Some(ResolutionAction::Manual(t)) => t,
-                        // No side picked, or "keep both": start with both, ours first.
-                        _ => format!("{ours}{theirs}"),
-                    },
-                );
-            if let Some(text) = seed {
-                self.modal = Some(Modal::HunkEditor(TextArea::new(&text)));
+            match rf.actions.get_mut(rf.hunk) {
+                Some(slot) => {
+                    *slot = Some(action);
+                    let undecided = rf.actions.iter().filter(|a| a.is_none()).count();
+                    Some((rf.hunk + 1, rf.actions.len(), undecided))
+                }
+                None => None,
             }
+        } else {
+            None
+        };
+        if let Some((hunk, total, undecided)) = progress {
+            self.message = Some(if undecided == 0 {
+                format!(
+                    "hunk {hunk} of {total} decided · nothing is on disk yet — press w to write \
+                     and stage '{}'",
+                    self.resolver_current_path().unwrap_or_default()
+                )
+            } else {
+                format!(
+                    "hunk {hunk} of {total} decided · {undecided} to go, then w writes them to \
+                     disk"
+                )
+            });
         }
     }
 
-    /// Opens the whole conflicted file in the editor, conflict markers and all,
-    /// for the fixes per-hunk choices can't express. Decisions already made in
-    /// the resolver are flushed to disk first, so the text on screen is the
-    /// file as it really stands rather than a stale copy that would silently
-    /// throw that work away on save.
-    fn resolver_edit_file(&mut self) {
+    /// Path of the conflicted file under the resolver's cursor.
+    fn resolver_current_path(&self) -> Option<String> {
+        match &self.view {
+            View::ConflictResolver { files, file, .. } => files.get(*file).cloned(),
+            _ => None,
+        }
+    }
+
+    /// Opens the whole conflicted file in the editor, conflict markers and all.
+    /// This is the one editor the resolver has: per-hunk choices (`o`/`t`/`b`)
+    /// cover the common cases, and anything they can't express (interleaving
+    /// both sides, fixing up an import list, deleting a stray line) is done
+    /// here on the real bytes rather than on a re-rendering of one hunk.
+    ///
+    /// With `at_hunk` the cursor lands on the `<<<<<<<` marker of the hunk the
+    /// resolver's cursor is on, so `e` goes straight to the conflict in view
+    /// while `E` opens at the top of the file.
+    ///
+    /// Decisions already made in the resolver are flushed to disk first, so the
+    /// text on screen is the file as it really stands rather than a stale copy
+    /// that would silently throw that work away on save.
+    fn resolver_edit_file(&mut self, at_hunk: bool) {
         // Only when there is something to flush: writing the file back
         // unprompted would relabel every conflict marker for no reason.
         let pending = matches!(
@@ -7210,6 +7554,8 @@ impl App {
         if pending {
             self.resolver_save_current_file(false);
         }
+        // Read after the flush: the hunk index below has to index the markers
+        // in the text actually on disk, which the flush may have renumbered.
         let target_path = match &self.view {
             View::ConflictResolver {
                 target,
@@ -7222,12 +7568,19 @@ impl App {
         let Some((target, path)) = target_path else {
             return;
         };
+        let hunk = match &self.view {
+            View::ConflictResolver {
+                current: Some(rf), ..
+            } if at_hunk => rf.hunk,
+            _ => 0,
+        };
         match ops::read_worktree_file(&self.ctx, &target, &path) {
             Ok(text) => {
-                self.modal = Some(Modal::FileEditor {
-                    path,
-                    editor: TextArea::new(&text),
-                });
+                let mut editor = TextArea::new(&text);
+                if at_hunk {
+                    editor.go_to_line(nth_conflict_start(&editor.lines, hunk));
+                }
+                self.modal = Some(Modal::FileEditor { path, editor });
                 self.message = Some(
                     "editing the whole file · Ctrl+S saves, Esc discards \
                      (delete the <<<<<<< / ======= / >>>>>>> markers as you go)"
@@ -7290,49 +7643,6 @@ impl App {
             }
             Err(e) => self.set_error(format!("{e:#}")),
         }
-    }
-
-    /// Key handling while the manual hunk editor modal is open: Ctrl+S saves the
-    /// edit as a `Manual` resolution, Esc discards it, everything else edits.
-    fn on_hunk_editor_key(&mut self, key: KeyEvent) {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
-            self.resolver_save_manual_edit();
-            return;
-        }
-        if key.code == KeyCode::Esc {
-            self.modal = None;
-            return;
-        }
-        // Any other Ctrl-chord is not an edit: without this guard Ctrl+A and
-        // friends insert their bare letter into the buffer.
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return;
-        }
-        if let Some(Modal::HunkEditor(ed)) = &mut self.modal {
-            ed.on_key(key);
-        }
-    }
-
-    /// Saves the open manual edit as the current hunk's resolution, closes the
-    /// editor, and writes the file straight out to disk. Persisting immediately
-    /// is the whole point: an edit kept only in memory is invisible to git and
-    /// to any other tool, and used to be silently discarded on moving to
-    /// another file. Undecided hunks keep their conflict markers, so this never
-    /// stages a half-resolved file.
-    fn resolver_save_manual_edit(&mut self) {
-        let text = match &self.modal {
-            Some(Modal::HunkEditor(ed)) => ed.text(),
-            _ => return,
-        };
-        self.modal = None;
-        if let View::ConflictResolver {
-            current: Some(rf), ..
-        } = &mut self.view
-            && let Some(slot) = rf.actions.get_mut(rf.hunk)
-        {
-            *slot = Some(ResolutionAction::Manual(text));
-        }
-        self.resolver_save_current_file(false);
     }
 
     /// Writes the current file and, when `stage` is set and every hunk has been
@@ -7545,6 +7855,38 @@ impl App {
             View::ConflictResolver { target, kind, .. } => (target.clone(), *kind),
             _ => return,
         };
+        // Choices made with o/t/b live in memory until `w` writes them. Say so
+        // in those words before git gets a chance to answer with its own
+        // "you have unmerged paths", which gives no hint that the work is right
+        // there on screen and one key away from being saved.
+        let pending = match &self.view {
+            View::ConflictResolver {
+                current: Some(rf),
+                files,
+                file,
+                ..
+            } => {
+                let decided = rf.actions.iter().filter(|a| a.is_some()).count();
+                (decided > 0).then(|| (decided, rf.actions.len(), files[*file].clone()))
+            }
+            _ => None,
+        };
+        if let Some((decided, total, path)) = pending {
+            let undecided = total - decided;
+            let next = if undecided == 0 {
+                "press w to write and stage it".to_string()
+            } else {
+                format!(
+                    "{undecided} hunk(s) still need a side (o / t / b), then w writes and \
+                     stages the file"
+                )
+            };
+            self.set_error(format!(
+                "'{path}' has {decided} of {total} hunk(s) decided, but nothing is written to \
+                 disk yet — a choice on screen is not a resolution until it is saved.\n\n{next}"
+            ));
+            return;
+        }
         match ops::complete_resolution(&self.ctx, &target, kind, None) {
             Ok(r) => {
                 self.go_root();
@@ -7753,6 +8095,8 @@ impl App {
             // Swap between the commit graph and the plain list, reloading in
             // place and returning to the top since the rows no longer line up.
             KeyCode::Char('t') => self.toggle_log_mode(),
+            // Undo the commit under the cursor: revert it, or reset back to it.
+            KeyCode::Char('u') => self.open_undo_commit_for_cursor(),
             _ => {}
         }
     }
@@ -7871,6 +8215,11 @@ impl App {
             | KeyCode::Char('l')
             | KeyCode::Enter => self.tree_nav(key.code),
             KeyCode::Char('t') => self.toggle_file_browser_layout(),
+            // Undo the commit being browsed. Only in the commit browser: a
+            // stash entry is not a commit and has nothing to revert or reset to.
+            KeyCode::Char('u') if matches!(self.view, View::CommitDiff { .. }) => {
+                self.open_undo_commit_for_cursor()
+            }
             _ => {}
         }
     }
@@ -11626,62 +11975,286 @@ mod tests {
         assert!(!crate::git::is_merging(&feat));
     }
 
+    /// The undo wizard spells out the two ways git undoes a commit before doing
+    /// either, then applies the branch chosen. Revert path: history grows.
     #[test]
-    fn resolver_manual_edit_writes_hand_edited_result() {
+    fn undo_wizard_reverts_a_commit_from_the_log() {
         let (_tmp, mut app) = test_app();
-        let feat = into_conflict_resolver(&mut app);
+        add_and_select_worktree(&mut app, "feature");
+        let path = std::path::PathBuf::from(app.worktrees[app.selected].path.clone());
+        std::fs::write(path.join("f.txt"), "one\n").unwrap();
+        git(&path, &["add", "f.txt"]);
+        git(&path, &["commit", "-m", "add f"]);
+        std::fs::write(path.join("f.txt"), "two\n").unwrap();
+        git(&path, &["commit", "-am", "change f"]);
+        app.refresh();
+        app.selected = app
+            .worktrees
+            .iter()
+            .position(|w| w.name == "feature")
+            .unwrap();
 
-        // `e` opens the manual editor seeded with both sides; inserting a
-        // character and Ctrl+S resolves the hunk and writes the file.
-        press(&mut app, KeyCode::Char('e'));
-        assert!(matches!(app.modal, Some(Modal::HunkEditor(_))));
-        press(&mut app, KeyCode::Char('Z'));
-        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
-        assert!(app.modal.is_none(), "editor closes on save");
+        press(&mut app, KeyCode::Char('l'));
+        assert!(matches!(app.view, View::Log { .. }), "the log is open");
 
-        // Ctrl+S must reach the disk, not just app state: an edit held only in
-        // memory is invisible to git and to the user's own editor. Ours is the
-        // feature side; the seed was ours-then-theirs with a 'Z' at the front.
-        assert_eq!(
-            std::fs::read_to_string(feat.join("shared.txt")).unwrap(),
-            "Zfeature version\nmain version\n",
-            "the edit is on disk before anything is staged"
-        );
-        // That was the only hunk, so re-reading the file finds nothing left to
-        // resolve.
-        match &app.view {
-            View::ConflictResolver { current, .. } => {
-                assert!(current.is_none(), "no conflict hunks remain");
+        press(&mut app, KeyCode::Char('u'));
+        match &app.modal {
+            Some(Modal::Confirm {
+                action: ModalAction::UndoCommitKind { .. },
+                body,
+                options,
+                ..
+            }) => {
+                let text: String = body.iter().map(|l| l.to_string()).collect();
+                assert!(text.contains("revert keeps history"), "{text}");
+                assert!(text.contains("reset rewrites history"), "{text}");
+                assert_eq!(options.len(), 2, "revert or reset, spelled out");
             }
-            _ => panic!("expected the conflict resolver"),
+            _ => panic!("expected the undo wizard"),
         }
 
-        // Saving does not stage: git still sees the path as unmerged until the
-        // user says so with `w`.
-        assert_eq!(
-            crate::git::conflicted_files(&feat).unwrap(),
-            vec!["shared.txt".to_string()]
-        );
+        // Option 0 is revert; its follow-up asks whether to commit now.
+        press(&mut app, KeyCode::Enter);
+        match &app.modal {
+            Some(Modal::Confirm {
+                action: ModalAction::UndoCommitRevert { .. },
+                options,
+                ..
+            }) => assert_eq!(options.len(), 2, "commit now, or keep it staged"),
+            _ => panic!("expected the revert step"),
+        }
+        press(&mut app, KeyCode::Enter);
 
-        press(&mut app, KeyCode::Char('w'));
-        press(&mut app, KeyCode::Char('c'));
-        assert!(matches!(app.view, View::List));
-        assert!(!crate::git::is_merging(&feat));
+        assert!(app.error.is_none(), "{:?}", app.error);
         assert_eq!(
-            std::fs::read_to_string(feat.join("shared.txt")).unwrap(),
-            "Zfeature version\nmain version\n"
+            std::fs::read_to_string(path.join("f.txt")).unwrap(),
+            "one\n",
+            "the commit was undone"
+        );
+        assert_eq!(
+            crate::git::log(&path, 10).unwrap().len(),
+            4,
+            "the revert is a new commit on top, not a rewrite"
         );
     }
 
-    /// The old editor kept manual edits in memory only, so moving to another
-    /// file silently threw them away. Saving writes through to disk, so the
-    /// edit has to survive the round trip.
+    /// Reset path: the branch moves back and the wizard's middle question is
+    /// what happens to the work in the commits being dropped.
+    #[test]
+    fn undo_wizard_resets_and_keeps_the_changes() {
+        let (_tmp, mut app) = test_app();
+        add_and_select_worktree(&mut app, "feature");
+        let path = std::path::PathBuf::from(app.worktrees[app.selected].path.clone());
+        std::fs::write(path.join("f.txt"), "one\n").unwrap();
+        git(&path, &["add", "f.txt"]);
+        git(&path, &["commit", "-m", "add f"]);
+        let first = crate::git::rev_parse(&path, "HEAD").unwrap();
+        std::fs::write(path.join("f.txt"), "two\n").unwrap();
+        git(&path, &["commit", "-am", "change f"]);
+        app.refresh();
+        app.selected = app
+            .worktrees
+            .iter()
+            .position(|w| w.name == "feature")
+            .unwrap();
+
+        press(&mut app, KeyCode::Char('l'));
+        // Move to the older commit, the one to reset back to.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('u'));
+
+        // Option 1 is reset.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        match &app.modal {
+            Some(Modal::Confirm {
+                action: ModalAction::UndoCommitReset { .. },
+                options,
+                body,
+                ..
+            }) => {
+                assert_eq!(options.len(), 3, "unstaged, staged, or discarded");
+                assert!(
+                    options[2].destructive,
+                    "only the discarding answer is marked destructive"
+                );
+                let text: String = body.iter().map(|l| l.to_string()).collect();
+                assert!(text.contains("what should happen to the"), "{text}");
+            }
+            _ => panic!("expected the reset step"),
+        }
+
+        // Option 0 keeps the changes as uncommitted work.
+        press(&mut app, KeyCode::Enter);
+        assert!(app.error.is_none(), "{:?}", app.error);
+        assert_eq!(
+            crate::git::rev_parse(&path, "HEAD").unwrap(),
+            first,
+            "the branch moved back"
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("f.txt")).unwrap(),
+            "two\n",
+            "the dropped commit's work is still in the working tree"
+        );
+        let msg = app.message.clone().unwrap_or_default();
+        assert!(msg.contains("1 commit(s) dropped"), "{msg}");
+    }
+
+    /// Leaving the resolver with `q` must not strand the worktree: `x` gets
+    /// back in, and the footer says so rather than hiding it in the help panel.
+    #[test]
+    fn conflicts_can_be_resumed_from_the_worktree_list() {
+        let (_tmp, mut app) = test_app();
+        into_conflict_resolver(&mut app);
+
+        press(&mut app, KeyCode::Char('q'));
+        assert!(matches!(app.view, View::List), "back on the root view");
+        // The resolver is reached from the Branches tab in this fixture; the
+        // worktree that is stuck is listed on the Worktrees tab.
+        goto_tab(&mut app, Tab::Worktrees);
+        app.selected = app
+            .worktrees
+            .iter()
+            .position(|w| w.conflicted > 0)
+            .expect("the conflicted worktree is flagged in the list");
+
+        let footer = render_app_rows(&mut app, 100, 30);
+        assert!(
+            footer.iter().any(|r| r.contains("x resolve conflicts")),
+            "the way back in is on screen: {:#?}",
+            footer.last()
+        );
+
+        press(&mut app, KeyCode::Char('x'));
+        assert!(
+            matches!(app.view, View::ConflictResolver { .. }),
+            "x reopens the resolver"
+        );
+    }
+
+    /// Picking a side records a choice; it does not write anything. Completing
+    /// with choices still in memory used to fail with git's bare "unmerged
+    /// paths", which gave no hint that the work was on screen one key away.
+    #[test]
+    fn complete_says_which_choices_are_not_written_yet() {
+        let (_tmp, mut app) = test_app();
+        let feat = into_conflict_resolver(&mut app);
+
+        press(&mut app, KeyCode::Char('b'));
+        let msg = app.message.clone().unwrap_or_default();
+        assert!(
+            msg.contains("press w"),
+            "choosing a side says what is still needed: {msg}"
+        );
+
+        press(&mut app, KeyCode::Char('c'));
+        let err = app.error.clone().expect("completing is refused");
+        assert!(err.contains("nothing is written to disk yet"), "{err}");
+        assert!(err.contains("press w"), "{err}");
+        assert!(
+            matches!(app.view, View::ConflictResolver { .. }),
+            "and it stays in the resolver"
+        );
+        assert!(
+            crate::git::is_merging(&feat),
+            "the merge is untouched by the refusal"
+        );
+
+        // Saving is all that was missing: keeping both then w completes.
+        app.error = None;
+        press(&mut app, KeyCode::Char('w'));
+        press(&mut app, KeyCode::Char('c'));
+        assert!(matches!(app.view, View::List), "{:?}", app.error);
+        assert!(!crate::git::is_merging(&feat));
+        assert_eq!(
+            std::fs::read_to_string(feat.join("shared.txt")).unwrap(),
+            "feature version\nmain version\n",
+            "keep-both wrote both sides"
+        );
+    }
+
+    /// `e` and `E` are the same editor: the whole conflicted file exactly as
+    /// it sits on disk. `e` only differs in where it parks the cursor, so the
+    /// hunk the resolver was pointing at is the one on screen.
+    #[test]
+    fn edit_keys_open_the_whole_file_at_the_right_line() {
+        let (_tmp, mut app) = test_app();
+        let feat = into_conflict_resolver(&mut app);
+        let on_disk = std::fs::read_to_string(feat.join("shared.txt")).unwrap();
+
+        press(&mut app, KeyCode::Char('e'));
+        let marker_row = match &app.modal {
+            Some(Modal::FileEditor { path, editor }) => {
+                assert_eq!(path, "shared.txt");
+                assert_eq!(
+                    editor.text(),
+                    on_disk,
+                    "`e` loads the whole file, not just the hunk"
+                );
+                assert!(
+                    editor.lines[editor.row].starts_with("<<<<<<<"),
+                    "`e` parks the cursor on the hunk's opening marker, not row {}",
+                    editor.row
+                );
+                assert_eq!(editor.col, 0);
+                editor.row
+            }
+            _ => panic!("expected the conflict editor"),
+        };
+        press(&mut app, KeyCode::Esc);
+
+        press(&mut app, KeyCode::Char('E'));
+        match &app.modal {
+            Some(Modal::FileEditor { editor, .. }) => {
+                assert_eq!(editor.text(), on_disk, "`E` loads the same whole file");
+                assert_eq!(editor.row, 0, "`E` opens at the top of the file");
+            }
+            _ => panic!("expected the conflict editor"),
+        }
+        assert_eq!(
+            marker_row,
+            on_disk
+                .lines()
+                .position(|l| l.starts_with("<<<<<<<"))
+                .expect("the fixture is conflicted"),
+        );
+    }
+
+    /// With several hunks, `e` follows the resolver's hunk cursor rather than
+    /// always landing on the first conflict in the file.
+    #[test]
+    fn edit_key_follows_the_hunk_cursor() {
+        let (_tmp, mut app) = test_app();
+        into_conflict_resolver_multi_hunk(&mut app);
+
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('e'));
+        match &app.modal {
+            Some(Modal::FileEditor { editor, .. }) => {
+                let markers: Vec<usize> = editor
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| l.starts_with("<<<<<<<"))
+                    .map(|(i, _)| i)
+                    .collect();
+                assert!(markers.len() >= 2, "fixture has two hunks: {markers:?}");
+                assert_eq!(
+                    editor.row, markers[1],
+                    "the cursor is on the second hunk's marker"
+                );
+            }
+            _ => panic!("expected the conflict editor"),
+        }
+    }
+
     #[test]
     fn resolver_manual_edit_survives_moving_between_files() {
         let (_tmp, mut app) = test_app();
         let feat = into_conflict_resolver_two_files(&mut app);
 
-        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Char('E'));
         press(&mut app, KeyCode::Char('Z'));
         app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
 
@@ -11885,24 +12458,24 @@ mod tests {
     /// Ctrl-chords other than Ctrl+S are not text: they must not leave stray
     /// letters in the buffer.
     #[test]
-    fn hunk_editor_ignores_other_control_chords() {
+    fn file_editor_ignores_other_control_chords() {
         let (_tmp, mut app) = test_app();
         into_conflict_resolver(&mut app);
         press(&mut app, KeyCode::Char('e'));
         let before = match &app.modal {
-            Some(Modal::HunkEditor(ed)) => ed.text(),
-            _ => panic!("expected the hunk editor"),
+            Some(Modal::FileEditor { editor, .. }) => editor.text(),
+            _ => panic!("expected the conflict editor"),
         };
         app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
         app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
         match &app.modal {
-            Some(Modal::HunkEditor(ed)) => assert_eq!(ed.text(), before),
+            Some(Modal::FileEditor { editor, .. }) => assert_eq!(editor.text(), before),
             _ => panic!("editor should still be open"),
         }
     }
 
     #[test]
-    fn resolver_manual_edit_esc_discards() {
+    fn resolver_file_edit_esc_leaves_the_hunk_undecided() {
         let (_tmp, mut app) = test_app();
         into_conflict_resolver(&mut app);
         press(&mut app, KeyCode::Char('e'));
@@ -14155,11 +14728,27 @@ mod tests {
     /// click geometry (`tab_hits`, `preview_list`, `row_list`) the mouse
     /// handlers read. Tests that click must render first.
     fn render_app(app: &mut App, width: u16, height: u16) {
+        render_app_rows(app, width, height);
+    }
+
+    /// `render_app`, plus the drawn rows as plain strings, for tests that
+    /// assert on what actually reached the screen (footer hints, banners).
+    fn render_app_rows(app: &mut App, width: u16, height: u16) -> Vec<String> {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| crate::tui::ui::draw(frame, app))
             .unwrap();
+        let buf = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
     }
 
     /// Writes `count` changed files into `dir`, named so their sorted order is
@@ -14601,10 +15190,11 @@ mod tests {
         assert!(platform::take_recorded().is_empty(), "different cell");
     }
 
-    /// Clicking the diff panel's path title copies the path, and doesn't count
+    /// Clicking the diff panel's path title asks which form of the path to copy;
+    /// the default (Enter) is the worktree-relative one. The click doesn't count
     /// towards a double click that would also open the file.
     #[test]
-    fn clicking_the_diff_path_copies_it() {
+    fn clicking_the_diff_path_copies_the_relative_path() {
         let (_tmp, mut app) = test_app();
         let path = changes_tab_with_one_file(&mut app);
         let hit = app
@@ -14613,6 +15203,12 @@ mod tests {
         platform::take_recorded();
 
         click(&mut app, hit.x + 1, hit.y);
+        assert!(
+            platform::take_recorded().is_empty(),
+            "the click only opens the chooser"
+        );
+        assert!(matches!(app.modal, Some(Modal::Confirm { .. })));
+        press(&mut app, KeyCode::Enter);
         assert_eq!(platform::take_recorded(), vec![format!("copy {path}")]);
         assert_eq!(
             app.message.as_deref(),
@@ -14621,7 +15217,72 @@ mod tests {
 
         // Twice in a row copies twice and never opens the file.
         click(&mut app, hit.x + 1, hit.y);
+        press(&mut app, KeyCode::Char('r'));
         assert_eq!(platform::take_recorded(), vec![format!("copy {path}")]);
+    }
+
+    /// The chooser's second option copies the file's absolute path in the
+    /// worktree, so it can be pasted into another terminal or an editor.
+    #[test]
+    fn the_diff_path_chooser_copies_the_full_path() {
+        let (_tmp, mut app) = test_app();
+        let path = changes_tab_with_one_file(&mut app);
+        let root = ops::path(&app.ctx, &app.changes.name).unwrap();
+        let full = Path::new(&root).join(&path).display().to_string();
+        let hit = app
+            .diff_path_hit
+            .expect("the diff panel records its path title");
+        platform::take_recorded();
+
+        click(&mut app, hit.x + 1, hit.y);
+        press(&mut app, KeyCode::Char('f'));
+        assert_eq!(platform::take_recorded(), vec![format!("copy {full}")]);
+        assert_eq!(
+            app.message.as_deref(),
+            Some(&*format!("copied '{full}' to the clipboard"))
+        );
+    }
+
+    /// Esc on the chooser copies nothing.
+    #[test]
+    fn cancelling_the_diff_path_chooser_copies_nothing() {
+        let (_tmp, mut app) = test_app();
+        changes_tab_with_one_file(&mut app);
+        let hit = app
+            .diff_path_hit
+            .expect("the diff panel records its path title");
+        platform::take_recorded();
+
+        click(&mut app, hit.x + 1, hit.y);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.modal.is_none());
+        assert!(platform::take_recorded().is_empty());
+    }
+
+    /// A modal floats over the diff panel, so a click on the path title behind
+    /// it must not replace that modal with the copy-path chooser.
+    #[test]
+    fn a_modal_suppresses_clicks_on_the_diff_path() {
+        let (_tmp, mut app) = test_app();
+        changes_tab_with_one_file(&mut app);
+        let hit = app
+            .diff_path_hit
+            .expect("the diff panel records its path title");
+        // `d` (delete the file) opens a confirmation over the diff.
+        press(&mut app, KeyCode::Char('d'));
+        assert!(matches!(app.modal, Some(Modal::Confirm { .. })));
+        render_app(&mut app, 100, 30);
+        assert!(app.diff_path_hit.is_none(), "the title stops taking clicks");
+        platform::take_recorded();
+
+        click(&mut app, hit.x + 1, hit.y);
+        assert!(platform::take_recorded().is_empty());
+        match &app.modal {
+            Some(Modal::Confirm { title, .. }) => {
+                assert_ne!(title, "copy path", "the revert modal is still up")
+            }
+            other => panic!("the modal was dismissed: {}", other.is_none()),
+        }
     }
 
     /// A folder row has no file path, so the title is not a copy target.
@@ -15130,6 +15791,105 @@ mod tests {
             !matches!(app.view, View::Busy { .. }),
             "u still means revert-file here, not update"
         );
+    }
+
+    /// With the file panel focused, `d` acts on the file under the cursor.
+    /// Deleting the whole worktree is only offered from the list above, so the
+    /// key can never mean "everything" while the eye is on one file.
+    #[test]
+    fn three_panel_files_panel_deletes_the_selected_file_not_the_worktree() {
+        let (_tmp, mut app) = three_panel_app();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.worktrees_focus, WorktreesFocus::Files);
+        let under_cursor = current_file_index(&app.changes.rows, app.changes.selected)
+            .map(|i| app.changes.files[i].path.clone())
+            .expect("the cursor starts on a file row");
+
+        press(&mut app, KeyCode::Char('d'));
+        match &app.modal {
+            Some(Modal::Confirm { action, body, .. }) => {
+                assert!(
+                    matches!(action, ModalAction::DeleteFile),
+                    "d deletes the file, not the worktree"
+                );
+                let text: String = body.iter().map(|l| l.to_string()).collect();
+                assert!(
+                    text.contains(&under_cursor),
+                    "names the file under the cursor: {text}"
+                );
+            }
+            other => panic!("expected the delete-file confirm, got {}", other.is_some()),
+        }
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        assert!(
+            !app.ctx.repo_root.join(&under_cursor).exists(),
+            "the file is gone; the worktree is not"
+        );
+        assert!(matches!(app.view, View::List));
+
+        // From the list above, `d` still means the worktree. (The main worktree
+        // is the repository and can't be removed, so use a spare one.)
+        press(&mut app, KeyCode::Char('q'));
+        app.ignore_quit_until = None;
+        add_and_select_worktree(&mut app, "spare");
+        assert_eq!(app.worktrees_focus, WorktreesFocus::List);
+        press(&mut app, KeyCode::Char('d'));
+        assert!(
+            matches!(
+                app.modal,
+                Some(Modal::Confirm {
+                    action: ModalAction::DeleteWorktree { .. },
+                    ..
+                })
+            ),
+            "the worktree list keeps delete-worktree"
+        );
+    }
+
+    /// Folders collapse in the file panel exactly as on the Changes tab: the
+    /// panel is the same list, so it should not be missing the same keys.
+    #[test]
+    fn three_panel_files_panel_collapses_folders() {
+        let (_tmp, mut app) = three_panel_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg/one.txt"), "1\n").unwrap();
+        std::fs::write(root.join("pkg/two.txt"), "2\n").unwrap();
+        app.refresh();
+        app.selected = app.worktrees.iter().position(|w| w.is_main).unwrap();
+        render_app(&mut app, 100, 30);
+        settle_preview(&mut app);
+        app.refresh_diff();
+        settle_diff(&mut app);
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.worktrees_focus, WorktreesFocus::Files);
+        let folder = app
+            .changes
+            .rows
+            .iter()
+            .position(|r| matches!(r, DiffRow::Folder { prefix, .. } if prefix == "pkg/"))
+            .expect("the tree has a pkg/ folder row");
+        app.changes.selected = folder;
+        let expanded = app.changes.rows.len();
+
+        press(&mut app, KeyCode::Char('h'));
+        assert!(app.collapsed_folders.contains("pkg/"), "h collapses it");
+        assert!(
+            app.changes.rows.len() < expanded,
+            "its files left the row list"
+        );
+
+        press(&mut app, KeyCode::Char('l'));
+        assert!(
+            !app.collapsed_folders.contains("pkg/"),
+            "l expands it again"
+        );
+        assert_eq!(app.changes.rows.len(), expanded);
+
+        press(&mut app, KeyCode::Enter);
+        assert!(app.collapsed_folders.contains("pkg/"), "Enter toggles it");
     }
 
     /// Dirty ↔ clean flips swap the three-panel bottom between changes and
