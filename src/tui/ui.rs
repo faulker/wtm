@@ -498,6 +498,25 @@ pub(super) fn truncate_middle(text: &str, max: usize) -> String {
     out
 }
 
+/// Shortens `text` to at most `max` characters by dropping characters off the
+/// front and marking the cut with a leading `…`. Filesystem paths are
+/// identified by their tail (the worktree directory), so the shared prefix is
+/// what gives way. Counts characters, not bytes.
+pub(super) fn truncate_start(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        return text.to_string();
+    }
+    // Below two characters there is no room for the ellipsis plus any tail.
+    if max <= 1 {
+        return if max == 0 { String::new() } else { "…".to_string() };
+    }
+    let keep = max - 1;
+    let mut out = String::from("…");
+    out.extend(&chars[chars.len() - keep..]);
+    out
+}
+
 /// Footer as key hints: the key in accent, its label dimmed. Bindings with no
 /// `short` label are help-panel-only and skipped here. Trailing hints that
 /// would overflow `width` are dropped and replaced with `…` so a narrow
@@ -614,10 +633,35 @@ fn in_progress_label(kind: &ResolveKind) -> &'static str {
     }
 }
 
+/// Fixed column widths of the worktree table, shared by the layout constraints
+/// and by the path-truncation budget derived from them.
+const CHANGES_W: u16 = 14;
+const UPSTREAM_W: u16 = 9;
+const FLAGS_W: u16 = 30;
+const MIN_PATH_W: u16 = 20;
+const COLUMN_SPACING: u16 = 1;
+/// Width of the row cursor drawn by `highlight_symbol` ("▌ ").
+const HIGHLIGHT_SYMBOL_W: u16 = 2;
+
 /// The worktree table. `focused` is false when another panel owns the keyboard
 /// (the three-panel layout's file list), which dims the row highlight so it is
 /// clear which cursor the arrow keys move.
 fn draw_list(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) -> Option<RowList> {
+    let name_w = app
+        .worktrees
+        .iter()
+        .map(|w| w.name.len() + 2)
+        .max()
+        .unwrap_or(10)
+        .max(10) as u16;
+    let block = focus_panel("worktrees", focused);
+    let inner = block.inner(area);
+    // Mirror the table's own horizontal layout so the path can be trimmed from
+    // the front before ratatui would clip it from the back: the highlight
+    // symbol column, the four fixed columns, and one space between all five.
+    let path_w = inner.width.saturating_sub(
+        HIGHLIGHT_SYMBOL_W + name_w + CHANGES_W + UPSTREAM_W + FLAGS_W + COLUMN_SPACING * 4,
+    ) as usize;
     let rows: Vec<Row> = app
         .worktrees
         .iter()
@@ -670,30 +714,25 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) -> Opt
                 Cell::from(changes),
                 Cell::from(upstream),
                 Cell::from(Line::from(flag_spans)),
-                Cell::from(Span::styled(wt.path.clone(), Style::new().dim())),
+                Cell::from(Span::styled(
+                    truncate_start(&wt.path, path_w),
+                    Style::new().dim(),
+                )),
             ])
         })
         .collect();
 
-    let name_w = app
-        .worktrees
-        .iter()
-        .map(|w| w.name.len() + 2)
-        .max()
-        .unwrap_or(10)
-        .max(10) as u16;
-    let block = focus_panel("worktrees", focused);
-    let inner = block.inner(area);
     let table = Table::new(
         rows,
         [
             Constraint::Length(name_w),
-            Constraint::Length(14),
-            Constraint::Length(9),
-            Constraint::Length(30),
-            Constraint::Min(20),
+            Constraint::Length(CHANGES_W),
+            Constraint::Length(UPSTREAM_W),
+            Constraint::Length(FLAGS_W),
+            Constraint::Min(MIN_PATH_W),
         ],
     )
+    .column_spacing(COLUMN_SPACING)
     .header(
         Row::new(["NAME", "CHANGES", "UPSTREAM", "FLAGS", "PATH"]).style(Style::new().dim().bold()),
     )
@@ -5503,6 +5542,73 @@ mod tests {
         let out = truncate_middle("fix/café-señor-branch", 10);
         assert_eq!(out.chars().count(), 10, "{out}");
         assert_eq!(truncate_middle("anything", 1), "…");
+    }
+
+    /// The path budget `draw_list` computes must match the width ratatui
+    /// actually hands the PATH column, or the front-truncated path gets clipped
+    /// at the back again. Rebuilds the same table and counts the cell.
+    #[test]
+    fn path_column_budget_matches_the_rendered_width() {
+        let width = 100u16;
+        let name_w = 12u16;
+        let block = focus_panel("worktrees", true);
+        let inner = block.inner(Rect::new(0, 0, width, 4));
+        let budget = inner.width.saturating_sub(
+            HIGHLIGHT_SYMBOL_W + name_w + CHANGES_W + UPSTREAM_W + FLAGS_W + COLUMN_SPACING * 4,
+        ) as usize;
+        let filler = "x".repeat(200);
+        let out = render(width, 4, |frame, area| {
+            let table = Table::new(
+                vec![Row::new(vec![
+                    Cell::from("wt"),
+                    Cell::from("clean"),
+                    Cell::from("-"),
+                    Cell::from(""),
+                    Cell::from(filler.clone()),
+                ])],
+                [
+                    Constraint::Length(name_w),
+                    Constraint::Length(CHANGES_W),
+                    Constraint::Length(UPSTREAM_W),
+                    Constraint::Length(FLAGS_W),
+                    Constraint::Min(MIN_PATH_W),
+                ],
+            )
+            .column_spacing(COLUMN_SPACING)
+            .header(Row::new(["NAME", "CHANGES", "UPSTREAM", "FLAGS", "PATH"]))
+            .block(block)
+            .highlight_symbol(Span::raw("▌ "));
+            let mut state = TableState::default().with_selected(Some(0));
+            frame.render_stateful_widget(table, area, &mut state);
+        });
+        let drawn = out[2].chars().filter(|c| *c == 'x').count();
+        assert_eq!(drawn, budget, "{out:#?}");
+    }
+
+    /// The PATH column drops the shared prefix, never the worktree directory
+    /// at the end, which is the part that identifies the row.
+    #[test]
+    fn truncate_start_keeps_the_tail() {
+        assert_eq!(truncate_start("/Users/w/Dev/wtm", 20), "/Users/w/Dev/wtm");
+        assert_eq!(
+            truncate_start("/Users/w/Dev/wtm", 16),
+            "/Users/w/Dev/wtm",
+            "exact fit is untouched"
+        );
+        let out = truncate_start("/Users/w/Dev/wtm-worktrees/feat-login", 20);
+        assert_eq!(out.chars().count(), 20, "{out}");
+        assert!(out.starts_with('…'), "{out}");
+        assert!(out.ends_with("feat-login"), "{out}");
+    }
+
+    #[test]
+    fn truncate_start_handles_multibyte_and_tiny_budgets() {
+        // Splitting by chars, not bytes, so an accented path can't panic.
+        let out = truncate_start("/Users/w/Dev/café-señor", 10);
+        assert_eq!(out.chars().count(), 10, "{out}");
+        assert!(out.ends_with("afé-señor"), "{out}");
+        assert_eq!(truncate_start("anything", 1), "…");
+        assert_eq!(truncate_start("anything", 0), "");
     }
 
     /// The base branch gets its own row under the name input, so a long branch
