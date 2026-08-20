@@ -3389,9 +3389,27 @@ impl App {
     }
 
     /// Reloads the merged config after a settings change and refreshes the
-    /// cached worktree base shown in the create dialog.
+    /// cached worktree base shown in the create dialog. Reads the global
+    /// layer from the same file Settings writes (`settings.global_config`)
+    /// so a save cannot pick up a different global file than the one just
+    /// edited.
     fn reload_config(&mut self) {
-        match crate::config::Config::load(&self.ctx.repo_root) {
+        let global_path = self
+            .settings
+            .global_config
+            .clone()
+            .or_else(crate::config::global_config_path);
+        let loaded = (|| -> anyhow::Result<crate::config::Config> {
+            let global = match &global_path {
+                Some(path) => crate::config::FileConfig::load(path)?,
+                None => crate::config::FileConfig::default(),
+            };
+            let repo = crate::config::FileConfig::load(
+                &self.ctx.repo_root.join(crate::config::CONFIG_FILE),
+            )?;
+            Ok(crate::config::Config::merge(global, repo))
+        })();
+        match loaded {
             Ok(config) => {
                 self.ctx.config = config;
                 self.worktree_base = self
@@ -4319,9 +4337,7 @@ impl App {
                 // Non-uniform layout: section headers, spaced setting blocks
                 // (value + description + blank), theme sample, and footer
                 // lines, so `row_at_line` owns the decoding.
-                Tab::Settings
-                    if self.settings.editing.is_none() && self.settings.open_list.is_none() =>
-                {
+                Tab::Settings if self.settings.editing.is_none() && !self.settings.list_open() => {
                     if let Some(row) = config_editor::row_at_line(idx) {
                         self.settings.selected = row;
                     }
@@ -14061,9 +14077,18 @@ mod tests {
         // Move past open_command (row 1) to setup.copy (row 2) and set it.
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter); // open the copy list editor
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, ".env");
         press(&mut app, KeyCode::Enter);
-        type_str(&mut app, ".env, config/.env.local");
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "config/.env.local");
         press(&mut app, KeyCode::Enter);
+        let list = app.settings.string_list.as_ref().unwrap();
+        for _ in list.selected..list.done_row() {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Enter); // [ done ]
 
         assert_eq!(app.tab, Tab::Settings, "saving stays on the tab");
         let text = std::fs::read_to_string(app.ctx.repo_root.join(".wtm.toml")).unwrap();
@@ -14106,6 +14131,45 @@ mod tests {
         assert_eq!(
             command_texts(&app.settings.fields.open_command),
             ["cursor {path}", "sh -c 'cd {path}, npm start'"]
+        );
+    }
+
+    /// The setup.run row is edited as a list; finishing with `[ done ]`
+    /// writes a TOML array with each command kept whole, commas and all.
+    #[test]
+    fn config_editor_saves_the_setup_run_list() {
+        let (_tmp, mut app) = test_app();
+        goto_settings(&mut app);
+        press(&mut app, KeyCode::Down); // open_command
+        press(&mut app, KeyCode::Down); // setup.copy
+        press(&mut app, KeyCode::Down); // setup.run
+        press(&mut app, KeyCode::Enter); // open the list editor
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "npm install");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('a'));
+        type_str(&mut app, "sh -c 'echo hi, there'");
+        press(&mut app, KeyCode::Enter);
+        let list = app.settings.string_list.as_ref().unwrap();
+        for _ in list.selected..list.done_row() {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(app.settings.string_list.is_none());
+        assert!(
+            app.message.as_deref().unwrap().contains("saved"),
+            "{:?}",
+            app.message
+        );
+        assert_eq!(
+            app.ctx.config.setup.run,
+            ["npm install", "sh -c 'echo hi, there'"]
+        );
+        app.select_tab(Tab::Worktrees);
+        goto_settings(&mut app);
+        assert_eq!(
+            app.settings.fields.run,
+            ["npm install", "sh -c 'echo hi, there'"]
         );
     }
 

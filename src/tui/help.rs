@@ -445,6 +445,14 @@ pub const SETTINGS: &[Binding] = &[
         "open_command",
         "Enter opens a list editor: ↑/↓ move, Enter edits the selected command, a adds one, d removes one, g saves that command globally (offered in every repo) instead of in this repo's .wtm.toml, t switches it between running in the background and taking over this terminal (wtm closes), Enter on [ done ] writes the list, Esc discards the edits",
     ),
+    help_only(
+        "setup.copy",
+        "Enter opens a list editor: ↑/↓ move, Enter edits the selected file, a adds one, d removes one, Enter on [ done ] writes the list, Esc discards the edits",
+    ),
+    help_only(
+        "setup.run",
+        "Enter opens a list editor: ↑/↓ move, Enter edits the selected command, a adds one, d removes one, Enter on [ done ] writes the list, Esc discards the edits",
+    ),
     both("q", "quit", "quit"),
 ];
 
@@ -595,7 +603,7 @@ const BASICS_SECTIONS: &[Section] = &[
         notes: &[
             "edits write to .wtm.toml (and the global config for UI prefs) as soon as you change a row; Esc cancels an in-progress text edit.",
             "auto_update_check, diff_theme, worktrees_layout, and branches_refresh_mins are saved in the global config, so they apply to every repo.",
-            "open_command holds one command or several, edited as a list; o shows them expanded ({path}, {name}, {branch}, {status}) in a picker.",
+            "open_command, setup.copy, and setup.run are each a list; Enter opens the editor and [ done ] writes it. o shows open_command expanded ({path}, {name}, {branch}, {status}) in a picker.",
         ],
     },
     Section {

@@ -18,9 +18,10 @@ use super::app::{
     WorktreesFocus, branch_display_rows, branch_row_of, filtered_candidates, upstream_rows,
 };
 use super::config_editor::{
-    BRANCHES_REFRESH_ROW, CHECK_ROW, ConfigEditor, DIFF_LINE_NUMBERS_ROW, FIELD_ROWS, LAYOUT_ROW,
-    OPEN_COMMAND_ROW, OpenCommandEditor, THEME_PREVIEW_SAMPLE_LINES, THEME_ROW, UPDATE_ROW,
-    check_line, form_lines, line_of_row, preview_line,
+    BRANCHES_REFRESH_ROW, CHECK_ROW, COPY_ROW, ConfigEditor, DIFF_LINE_NUMBERS_ROW, FIELD_ROWS,
+    LAYOUT_ROW, OPEN_COMMAND_ROW, OpenCommandEditor, RUN_ROW, StringListEditor,
+    THEME_PREVIEW_SAMPLE_LINES, THEME_ROW, UPDATE_ROW, check_line, form_lines, line_of_row,
+    preview_line,
 };
 use super::help::{self, Binding, HelpTab};
 use super::highlight;
@@ -509,7 +510,11 @@ pub(super) fn truncate_start(text: &str, max: usize) -> String {
     }
     // Below two characters there is no room for the ellipsis plus any tail.
     if max <= 1 {
-        return if max == 0 { String::new() } else { "…".to_string() };
+        return if max == 0 {
+            String::new()
+        } else {
+            "…".to_string()
+        };
     }
     let keep = max - 1;
     let mut out = String::from("…");
@@ -1245,6 +1250,14 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 hint("d", "remove"),
                 hint("g", "save globally"),
                 hint("t", "run in terminal"),
+                hint("[ done ]", "save"),
+                hint("Esc", "discard"),
+            ],
+            Tab::Settings if app.settings.string_list.is_some() => &[
+                hint("↑/↓", "row"),
+                hint("Enter", "edit"),
+                hint("a", "add"),
+                hint("d", "remove"),
                 hint("[ done ]", "save"),
                 hint("Esc", "discard"),
             ],
@@ -2590,8 +2603,8 @@ fn draw_settings_tab(
     let descriptions = [
         "Where new worktrees go: sibling, inside, home, or a path ({repo} = name).",
         "Commands the o key runs. Enter edits the list ({path} {name} {branch}).",
-        "Files copied into each new worktree, comma-separated (e.g. .env).",
-        "Commands run in each new worktree after create, comma-separated.",
+        "Files copied into each new worktree. Enter edits the list (e.g. .env).",
+        "Commands run in each new worktree after create. Enter edits the list.",
         "Check GitHub for a newer wtm when the TUI starts. Enter cycles.",
         "Syntax colours in the diff pane. Enter cycles themes.",
         "Worktrees tab layout. Three panels add files + diff. Enter cycles.",
@@ -2690,10 +2703,16 @@ fn draw_settings_tab(
                 },
                 highlight,
             )),
-            // The list row shows a one-line summary of its entries; Enter
+            // List rows show a one-line summary of their entries; Enter
             // opens the list editor drawn over the form below.
             _ if row == OPEN_COMMAND_ROW && !editor.fields.open_command.is_empty() => {
                 spans.push(Span::styled(editor.open_command_summary(), highlight))
+            }
+            _ if row == COPY_ROW && !editor.fields.copy.is_empty() => {
+                spans.push(Span::styled(editor.copy_summary(), highlight))
+            }
+            _ if row == RUN_ROW && !editor.fields.run.is_empty() => {
+                spans.push(Span::styled(editor.run_summary(), highlight))
             }
             _ if editor.field(row).is_empty() => {
                 spans.push(Span::styled("(default)".to_string(), highlight.dim()))
@@ -2818,6 +2837,10 @@ fn draw_settings_tab(
         draw_open_command_list(frame, area, list);
         return None;
     }
+    if let Some(list) = &editor.string_list {
+        draw_string_list(frame, area, list);
+        return None;
+    }
     // The line layout is shared with `config_editor::row_at_line`, which
     // `on_click` uses to turn a clicked line back into a row. `offset` is the
     // scroll so a click on the visible viewport maps to the right form line.
@@ -2918,6 +2941,76 @@ fn draw_open_command_list(frame: &mut Frame, area: Rect, list: &OpenCommandEdito
         "Enter save · Esc cancel entry"
     } else {
         "Enter edit · a add · d remove · g global · t terminal · [ done ] saves"
+    };
+    frame.render_widget(Paragraph::new(Line::from(hint.dim())), hint_area);
+}
+
+/// The `setup.copy` / `setup.run` list editor, floating over the Settings
+/// form: one row per entry, then an add row and a done row. Same shape as
+/// [`draw_open_command_list`] without the per-command global/terminal toggles.
+fn draw_string_list(frame: &mut Frame, area: Rect, list: &StringListEditor) {
+    let rows = list.rows().clamp(3, 14) as u16;
+    let popup = centered(area, 84, rows + 5);
+    frame.render_widget(Clear, popup);
+    let block = dialog_panel(list.kind.title());
+    frame.render_widget(&block, popup);
+    let inner = block.inner(popup);
+    let [head_area, list_area, hint_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(list.kind.heading().dim())),
+        head_area,
+    );
+
+    let row_style = |row: usize| {
+        if list.selected == row {
+            Style::new().bg(SELECTION_BG)
+        } else {
+            Style::new()
+        }
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    for (index, item) in list.items.iter().enumerate() {
+        let style = row_style(index);
+        let mut spans = vec![Span::styled(" ● ", style.fg(Color::Green))];
+        match &list.input {
+            Some(input) if list.editing_index == Some(index) => {
+                push_cursor_spans(&mut spans, input.as_str(), input.cursor, style)
+            }
+            _ => spans.push(Span::styled(item.clone(), style)),
+        }
+        lines.push(Line::from(spans));
+    }
+    let add_style = row_style(list.add_row());
+    match &list.input {
+        Some(input) if list.editing_index.is_none() => {
+            let mut spans = vec![Span::styled(" + ", add_style.fg(ACCENT))];
+            push_cursor_spans(&mut spans, input.as_str(), input.cursor, add_style);
+            lines.push(Line::from(spans));
+        }
+        _ => lines.push(Line::from(vec![
+            Span::styled(" + ", add_style.fg(ACCENT)),
+            Span::styled(list.kind.add_label(), add_style.dim()),
+        ])),
+    }
+    lines.push(Line::from(Span::styled(
+        " [ done ] ",
+        if list.selected == list.done_row() {
+            Style::new().bg(SELECTION_BG).bold().fg(ACCENT)
+        } else {
+            Style::new().bold()
+        },
+    )));
+    frame.render_widget(Paragraph::new(lines), list_area);
+
+    let hint = if list.input.is_some() {
+        "Enter save · Esc cancel entry"
+    } else {
+        "Enter edit · a add · d remove · [ done ] saves"
     };
     frame.render_widget(Paragraph::new(Line::from(hint.dim())), hint_area);
 }
@@ -4941,8 +5034,9 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::super::config_editor::{
-        BRANCHES_REFRESH_ROW, LAYOUT_ROW, THEME_ROW, UPDATE_ROW, check_line, line_of_row,
-        preview_line, theme_preview_label_line, theme_preview_line, version_line,
+        BRANCHES_REFRESH_ROW, COPY_ROW, LAYOUT_ROW, OPEN_COMMAND_ROW, RUN_ROW, StringListEditor,
+        StringListKind, THEME_ROW, UPDATE_ROW, check_line, line_of_row, preview_line,
+        theme_preview_label_line, theme_preview_line, version_line,
     };
     use super::*;
     use crate::git::LogEntry;
@@ -5160,6 +5254,7 @@ mod tests {
             selected: 0,
             editing: None,
             open_list: None,
+            string_list: None,
         }
     }
 
@@ -5350,6 +5445,60 @@ mod tests {
         });
         let row = &out[2 + line_of_row(OPEN_COMMAND_ROW)];
         assert!(row.contains("2 commands"), "{row}");
+    }
+
+    #[test]
+    fn settings_tab_draws_the_setup_run_list_editor() {
+        let mut editor = settings_editor("");
+        editor.selected = RUN_ROW;
+        editor.fields.run = vec!["npm install".to_string(), "npm run build".to_string()];
+        let mut list = StringListEditor::new(StringListKind::Run, editor.fields.run.clone());
+        list.selected = 1;
+        editor.string_list = Some(list);
+        let hit = std::cell::Cell::new(true);
+        let out = render(90, 48, |frame, area| {
+            hit.set(draw_settings_tab(frame, area, &editor, None).is_some());
+        });
+        let text = out.join("\n");
+        assert!(text.contains("setup commands"), "{text}");
+        assert!(text.contains("npm install"), "{text}");
+        assert!(text.contains("add a command"), "{text}");
+        assert!(text.contains("[ done ]"), "{text}");
+        assert!(text.contains("Enter edit"), "{text}");
+        assert!(!text.contains("g global"), "{text}");
+        assert!(!hit.get(), "the modal list must swallow clicks");
+    }
+
+    #[test]
+    fn settings_tab_draws_the_setup_copy_list_editor() {
+        let mut editor = settings_editor("");
+        editor.selected = COPY_ROW;
+        editor.fields.copy = vec![".env".to_string()];
+        editor.string_list = Some(StringListEditor::new(
+            StringListKind::Copy,
+            editor.fields.copy.clone(),
+        ));
+        let out = render(90, 48, |frame, area| {
+            draw_settings_tab(frame, area, &editor, None);
+        });
+        let text = out.join("\n");
+        assert!(text.contains("copy files"), "{text}");
+        assert!(text.contains(".env"), "{text}");
+        assert!(text.contains("add a file"), "{text}");
+    }
+
+    #[test]
+    fn settings_tab_summarises_multiple_setup_items() {
+        let mut editor = settings_editor("");
+        editor.fields.copy = vec![".env".to_string(), ".env.local".to_string()];
+        editor.fields.run = vec!["npm ci".to_string(), "npm run build".to_string()];
+        let out = render(90, 48, |frame, area| {
+            draw_settings_tab(frame, area, &editor, None);
+        });
+        let copy = &out[2 + line_of_row(COPY_ROW)];
+        assert!(copy.contains("2 files"), "{copy}");
+        let run = &out[2 + line_of_row(RUN_ROW)];
+        assert!(run.contains("2 commands"), "{run}");
     }
 
     /// The picker previews what will actually run, so the rows carry the

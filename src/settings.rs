@@ -205,8 +205,7 @@ pub fn write_draft(repo_root: &Path, draft: &ConfigDraft) -> Result<PathBuf> {
 }
 
 /// The values the repo's own `.wtm.toml` sets (ignoring the global layer), as
-/// strings for the TUI config editor. Unset keys come back empty; `copy` and
-/// `run` are comma-joined.
+/// strings (or lists) for the TUI config editor. Unset keys come back empty.
 ///
 /// `auto_update_check`, `diff_theme`, `worktrees_layout`, and
 /// `branches_refresh_mins` are the exceptions: they govern wtm itself rather
@@ -229,9 +228,8 @@ pub fn repo_config_fields(
         .unwrap_or_default()
         .iter()
         .map(|p| p.to_string_lossy().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let run = setup.run.unwrap_or_default().join(", ");
+        .collect();
+    let run = setup.run.unwrap_or_default();
     // Both layers are shown in one list, each entry flagged with the file it
     // came from, so the editor can move a command between global and repo by
     // flipping that flag.
@@ -344,8 +342,12 @@ pub struct RepoConfigFields {
     pub branches_refresh_mins: String,
     /// `""`, `"true"`, or `"false"`; lives in the global config.
     pub diff_line_numbers: String,
-    pub copy: String,
-    pub run: String,
+    /// Files copied into each new worktree. Kept as a list so a path
+    /// containing a comma survives a round trip through the TUI's list editor.
+    pub copy: Vec<String>,
+    /// Commands run in each new worktree after create. Same list shape as
+    /// [`RepoConfigFields::copy`].
+    pub run: Vec<String>,
 }
 
 /// Applies edits from the TUI config editor, preserving comments and the
@@ -371,8 +373,8 @@ pub fn save_config_edits(
     let (global_cmds, repo_cmds): (Vec<_>, Vec<_>) =
         fields.open_command.iter().partition(|c| c.global);
     set_or_unset_commands(&mut doc, &repo_cmds)?;
-    set_or_unset(&mut doc, "setup.copy", &fields.copy)?;
-    set_or_unset(&mut doc, "setup.run", &fields.run)?;
+    set_or_unset_setup_list(&mut doc, "copy", &fields.copy)?;
+    set_or_unset_setup_list(&mut doc, "run", &fields.run)?;
     // Drop repo overrides of UI prefs; Settings owns them at the global layer.
     apply_unset(&mut doc, "auto_update_check")?;
     apply_unset(&mut doc, "diff_theme")?;
@@ -416,6 +418,29 @@ fn save_global_setting(path: &Path, key: &str, raw: &str) -> Result<()> {
     };
     if changed {
         save_doc(path, &doc)?;
+    }
+    Ok(())
+}
+
+/// Writes `setup.<sub>` as a TOML array of `items`, or unsets it when there
+/// are none. Items are taken verbatim so a path or command containing a comma
+/// stays a single entry.
+fn set_or_unset_setup_list(doc: &mut DocumentMut, sub: &str, items: &[String]) -> Result<()> {
+    let items: Vec<String> = items
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    if items.is_empty() {
+        apply_unset(doc, &format!("setup.{sub}"))?;
+    } else {
+        let setup = doc
+            .entry("setup")
+            .or_insert(toml_edit::table())
+            .as_table_mut()
+            .context("'setup' in the config file is not a table")?;
+        setup[sub] = toml_value(to_array(&items));
     }
     Ok(())
 }
@@ -1347,8 +1372,8 @@ mod tests {
     fn fields(
         worktree_dir: &str,
         open_command: &[&str],
-        copy: &str,
-        run: &str,
+        copy: &[&str],
+        run: &[&str],
     ) -> RepoConfigFields {
         RepoConfigFields {
             worktree_dir: worktree_dir.to_string(),
@@ -1358,8 +1383,8 @@ mod tests {
             worktrees_layout: String::new(),
             branches_refresh_mins: String::new(),
             diff_line_numbers: String::new(),
-            copy: copy.to_string(),
-            run: run.to_string(),
+            copy: copy.iter().map(|s| (*s).to_string()).collect(),
+            run: run.iter().map(|s| (*s).to_string()).collect(),
         }
     }
 
@@ -1374,8 +1399,8 @@ mod tests {
         let fields = repo_config_fields(dir.path(), None).unwrap();
         assert_eq!(fields.worktree_dir, "home");
         assert!(fields.open_command.is_empty());
-        assert_eq!(fields.copy, ".env, config/.env");
-        assert_eq!(fields.run, "");
+        assert_eq!(fields.copy, [".env", "config/.env"]);
+        assert!(fields.run.is_empty());
         // With no global config to read, the toggle shows as unset (default).
         assert_eq!(fields.auto_update_check, "");
     }
@@ -1384,14 +1409,14 @@ mod tests {
     fn save_and_read_open_command() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join(CONFIG_FILE);
-        save_config_edits(dir.path(), None, &fields("", &["cursor ."], "", "")).unwrap();
+        save_config_edits(dir.path(), None, &fields("", &["cursor ."], &[], &[])).unwrap();
         let cfg = FileConfig::load(&file).unwrap();
         assert_eq!(
             cfg.open_command,
             Some(OpenCommandList(vec!["cursor .".into()]))
         );
         // Clearing it unsets the key again.
-        save_config_edits(dir.path(), None, &fields("", &[], "", "")).unwrap();
+        save_config_edits(dir.path(), None, &fields("", &[], &[], &[])).unwrap();
         let cfg = FileConfig::load(&file).unwrap();
         assert_eq!(cfg.open_command, None);
     }
@@ -1403,7 +1428,7 @@ mod tests {
         save_config_edits(
             dir.path(),
             None,
-            &fields("", &["open {path}", "cursor {path}"], "", ""),
+            &fields("", &["open {path}", "cursor {path}"], &[], &[]),
         )
         .unwrap();
         let cfg = FileConfig::load(&file).unwrap();
@@ -1424,7 +1449,7 @@ mod tests {
     fn save_writes_global_commands_to_the_global_file() {
         let dir = tempfile::tempdir().unwrap();
         let global = dir.path().join("global.toml");
-        let mut fields = fields("", &["npm run dev"], "", "");
+        let mut fields = fields("", &["npm run dev"], &[], &[]);
         fields
             .open_command
             .push(OpenCommand::new("cursor {path}").global(true));
@@ -1459,7 +1484,7 @@ mod tests {
     #[test]
     fn save_writes_a_mode_table_only_for_terminal_commands() {
         let dir = tempfile::tempdir().unwrap();
-        let mut fields = fields("", &["cursor {path}"], "", "");
+        let mut fields = fields("", &["cursor {path}"], &[], &[]);
         fields
             .open_command
             .push(OpenCommand::new("nvim {path}").with_mode(CommandMode::Terminal));
@@ -1489,9 +1514,30 @@ mod tests {
     fn save_open_command_keeps_commands_containing_commas_whole() {
         let dir = tempfile::tempdir().unwrap();
         let commands = ["sh -c 'cd {path}, npm start'", "code --goto {path}:1,1"];
-        save_config_edits(dir.path(), None, &fields("", &commands, "", "")).unwrap();
+        save_config_edits(dir.path(), None, &fields("", &commands, &[], &[])).unwrap();
         let fields = repo_config_fields(dir.path(), None).unwrap();
         assert_eq!(command_texts(&fields), commands);
+    }
+
+    /// The editor path takes copy/run as lists, so a path or command with a
+    /// comma in it stays one entry instead of being split.
+    #[test]
+    fn save_setup_lists_keep_items_containing_commas_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        save_config_edits(
+            dir.path(),
+            None,
+            &fields(
+                "",
+                &[],
+                &["file,with,commas.env"],
+                &["sh -c 'echo hi, there'"],
+            ),
+        )
+        .unwrap();
+        let fields = repo_config_fields(dir.path(), None).unwrap();
+        assert_eq!(fields.copy, ["file,with,commas.env"]);
+        assert_eq!(fields.run, ["sh -c 'echo hi, there'"]);
     }
 
     #[test]
@@ -1505,7 +1551,12 @@ mod tests {
         .unwrap();
 
         // Change worktree_dir, add a run command, and clear copy (unset it).
-        save_config_edits(dir.path(), None, &fields("inside", &[], "", "npm install")).unwrap();
+        save_config_edits(
+            dir.path(),
+            None,
+            &fields("inside", &[], &[], &["npm install"]),
+        )
+        .unwrap();
         let text = std::fs::read_to_string(&file).unwrap();
         assert!(text.contains("# keep me"), "comment lost: {text}");
         let cfg = FileConfig::load(&file).unwrap();
@@ -1521,7 +1572,7 @@ mod tests {
         let global = dir.path().join("global.toml");
         std::fs::write(&global, "# global notes\nworktree_dir = \"home\"\n").unwrap();
 
-        let mut edits = fields("", &[], "", "");
+        let mut edits = fields("", &[], &[], &[]);
         edits.auto_update_check = "false".to_string();
         save_config_edits(dir.path(), Some(&global), &edits).unwrap();
 
@@ -1556,7 +1607,7 @@ mod tests {
         let global = dir.path().join("global.toml");
         std::fs::write(&global, "# global notes\nworktree_dir = \"home\"\n").unwrap();
 
-        let mut edits = fields("", &[], "", "");
+        let mut edits = fields("", &[], &[], &[]);
         edits.worktrees_layout = "three_panel".to_string();
         save_config_edits(dir.path(), Some(&global), &edits).unwrap();
 
@@ -1602,7 +1653,7 @@ mod tests {
         let read = repo_config_fields(dir.path(), Some(&global)).unwrap();
         assert_eq!(read.worktrees_layout, "two_panel");
 
-        let mut edits = fields("sibling", &[], "", "");
+        let mut edits = fields("sibling", &[], &[], &[]);
         edits.worktrees_layout = "three_panel".to_string();
         save_config_edits(dir.path(), Some(&global), &edits).unwrap();
 
@@ -1670,7 +1721,7 @@ mod tests {
         std::fs::write(dir.path().join(CONFIG_FILE), "worktree_dir = \"sibling\"\n").unwrap();
         let global = dir.path().join("global.toml");
 
-        let mut edits = fields("", &[], "", "");
+        let mut edits = fields("", &[], &[], &[]);
         edits.branches_refresh_mins = "30".to_string();
         save_config_edits(dir.path(), Some(&global), &edits).unwrap();
 

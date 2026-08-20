@@ -5,9 +5,9 @@
 //! the diff-theme cycle (with a live colour sample), the Worktrees-tab layout
 //! cycle, and a "check for updates now" row. Every change is written
 //! immediately (text fields on Enter, cycle rows on Enter/Space, the
-//! open_command list on `[ done ]`), preserving comments and only writing the
-//! keys that are set; a cleared field unsets that key so the default (or
-//! global value) applies again.
+//! open_command / setup.copy / setup.run lists on `[ done ]`), preserving
+//! comments and only writing the keys that are set; a cleared field unsets
+//! that key so the default (or global value) applies again.
 
 use std::path::PathBuf;
 
@@ -19,12 +19,17 @@ use crate::config::{self, OpenCommand};
 use crate::settings::{self, RepoConfigFields};
 
 /// Rows holding an editable value (worktree_dir, open_command, setup.copy,
-/// setup.run). Enter on one of these opens the text input, except
-/// [`OPEN_COMMAND_ROW`], which opens the list editor.
+/// setup.run). Enter on one of these opens the text input, except the list
+/// rows ([`OPEN_COMMAND_ROW`], [`COPY_ROW`], [`RUN_ROW`]), which open a
+/// list editor.
 pub const TEXT_ROWS: usize = 4;
 /// Index of the `open_command` row, whose value is a list of commands the
 /// Worktrees-tab `o` key can run rather than one string.
 pub const OPEN_COMMAND_ROW: usize = 1;
+/// Index of the `setup.copy` row, edited as a list of files.
+pub const COPY_ROW: usize = 2;
+/// Index of the `setup.run` row, edited as a list of commands.
+pub const RUN_ROW: usize = 3;
 /// Index of the update-check toggle, which Enter cycles rather than edits.
 pub const UPDATE_ROW: usize = TEXT_ROWS;
 /// Index of the diff-theme cycle row.
@@ -157,6 +162,8 @@ pub struct ConfigEditor {
     /// The `open_command` list editor while it is open, working on a copy of
     /// the list so cancelling discards its edits.
     pub open_list: Option<OpenCommandEditor>,
+    /// The `setup.copy` / `setup.run` list editor while it is open.
+    pub string_list: Option<StringListEditor>,
 }
 
 /// The `open_command` list editor: a modal over the Settings tab for adding,
@@ -299,6 +306,142 @@ impl OpenCommandEditor {
     }
 }
 
+/// Which string-list setting the modal is editing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StringListKind {
+    Copy,
+    Run,
+}
+
+impl StringListKind {
+    /// Dialog title.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Copy => "copy files",
+            Self::Run => "setup commands",
+        }
+    }
+
+    /// One-line heading under the title.
+    pub fn heading(self) -> &'static str {
+        match self {
+            Self::Copy => "copied into each new worktree from the repo root",
+            Self::Run => "run in each new worktree after create",
+        }
+    }
+
+    /// Label on the add row while nothing is being typed.
+    pub fn add_label(self) -> &'static str {
+        match self {
+            Self::Copy => "add a file",
+            Self::Run => "add a command",
+        }
+    }
+}
+
+/// List editor for `setup.copy` and `setup.run`: a modal over the Settings
+/// tab for adding, editing, and removing individual entries. Same shape as
+/// [`OpenCommandEditor`] without the per-command global/terminal toggles.
+pub struct StringListEditor {
+    pub kind: StringListKind,
+    /// Working copy of the list, one entry per configured file or command.
+    pub items: Vec<String>,
+    /// Cursor over the rows: `0..items.len()`, then add, then done.
+    pub selected: usize,
+    /// Buffer while typing an entry; `None` while navigating.
+    pub input: Option<TextInput>,
+    /// Which entry `input` is rewriting, or `None` when it is a new one.
+    pub editing_index: Option<usize>,
+}
+
+impl StringListEditor {
+    /// Opens the editor on a copy of `items`, with the first row selected.
+    pub fn new(kind: StringListKind, items: Vec<String>) -> StringListEditor {
+        StringListEditor {
+            kind,
+            items,
+            selected: 0,
+            input: None,
+            editing_index: None,
+        }
+    }
+
+    /// Index of the "add" row, just past the items.
+    pub fn add_row(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Index of the "done" row, the last one.
+    pub fn done_row(&self) -> usize {
+        self.items.len() + 1
+    }
+
+    /// Total selectable rows: the items plus add and done.
+    pub fn rows(&self) -> usize {
+        self.items.len() + 2
+    }
+
+    /// Starts typing a new entry, appended when committed.
+    fn start_add(&mut self) {
+        self.selected = self.add_row();
+        self.editing_index = None;
+        self.input = Some(TextInput::default());
+    }
+
+    /// Starts rewriting the entry at `index`.
+    fn start_edit(&mut self, index: usize) {
+        self.editing_index = Some(index);
+        self.input = Some(TextInput::with_value(&self.items[index]));
+    }
+
+    /// Drops the entry at `index`, keeping the cursor on a valid row.
+    fn remove(&mut self, index: usize) {
+        self.items.remove(index);
+        self.selected = self.selected.min(self.rows() - 1);
+    }
+
+    /// Handles one key press, whether typing an entry or navigating rows.
+    fn on_key(&mut self, key: KeyEvent) -> ListOutcome {
+        if let Some(mut input) = self.input.take() {
+            match key.code {
+                KeyCode::Esc => self.editing_index = None,
+                KeyCode::Enter => {
+                    let value = input.trimmed();
+                    match (self.editing_index.take(), value.is_empty()) {
+                        (Some(index), false) => self.items[index] = value,
+                        (None, false) => {
+                            self.items.push(value);
+                            self.selected = self.items.len() - 1;
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {
+                    input.on_key(key);
+                    self.input = Some(input);
+                }
+            }
+            return ListOutcome::Continue;
+        }
+        match key.code {
+            KeyCode::Esc => return ListOutcome::Cancel,
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.selected = (self.selected + 1).min(self.rows() - 1)
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
+            KeyCode::Enter if self.selected == self.done_row() => return ListOutcome::Done,
+            KeyCode::Enter if self.selected == self.add_row() => self.start_add(),
+            KeyCode::Enter => self.start_edit(self.selected),
+            KeyCode::Char('a') => self.start_add(),
+            KeyCode::Char('d') | KeyCode::Delete if self.selected < self.items.len() => {
+                self.remove(self.selected)
+            }
+            _ => {}
+        }
+        ListOutcome::Continue
+    }
+}
+
 /// What a key press did, for the app to act on.
 pub enum EditorOutcome {
     Continue,
@@ -321,6 +464,7 @@ impl ConfigEditor {
             selected: 0,
             editing: None,
             open_list: None,
+            string_list: None,
         })
     }
 
@@ -332,6 +476,7 @@ impl ConfigEditor {
         self.selected = 0;
         self.editing = None;
         self.open_list = None;
+        self.string_list = None;
         Ok(())
     }
 
@@ -345,18 +490,17 @@ impl ConfigEditor {
             selected: 0,
             editing: None,
             open_list: None,
+            string_list: None,
         }
     }
 
-    /// Current text of a single-value setting row. [`OPEN_COMMAND_ROW`] holds
-    /// a list rather than one value, so it reads as empty here; the renderer
-    /// uses [`ConfigEditor::open_command_summary`] for it instead.
+    /// Current text of a single-value setting row. List rows
+    /// ([`OPEN_COMMAND_ROW`], [`COPY_ROW`], [`RUN_ROW`]) read as empty here;
+    /// the renderer uses the matching summary method instead.
     pub fn field(&self, row: usize) -> &str {
         match row {
             0 => &self.fields.worktree_dir,
-            OPEN_COMMAND_ROW => "",
-            2 => &self.fields.copy,
-            3 => &self.fields.run,
+            OPEN_COMMAND_ROW | COPY_ROW | RUN_ROW => "",
             UPDATE_ROW => &self.fields.auto_update_check,
             THEME_ROW => &self.fields.diff_theme,
             LAYOUT_ROW => &self.fields.worktrees_layout,
@@ -366,47 +510,67 @@ impl ConfigEditor {
         }
     }
 
-    /// The `open_command` row's value as one line: the command itself when
-    /// there is one, otherwise a count followed by the commands. Empty when
-    /// nothing is configured, so the row falls back to "(default)".
+    /// One-line summary of a string list: the item itself when there is one,
+    /// otherwise a count followed by the items. Empty when nothing is
+    /// configured, so the row falls back to "(default)".
+    fn items_summary(items: &[String], plural: &str) -> String {
+        match items {
+            [] => String::new(),
+            [one] => one.clone(),
+            many => format!("{} {}: {}", many.len(), plural, many.join(" · ")),
+        }
+    }
+
+    /// The `open_command` row's value as one line.
     pub fn open_command_summary(&self) -> String {
-        let commands: Vec<&str> = self
+        let commands: Vec<String> = self
             .fields
             .open_command
             .iter()
-            .map(|c| c.command.as_str())
+            .map(|c| c.command.clone())
             .collect();
-        match commands.len() {
-            0 => String::new(),
-            1 => commands[0].to_string(),
-            n => format!("{n} commands: {}", commands.join(" · ")),
-        }
+        Self::items_summary(&commands, "commands")
+    }
+
+    /// The `setup.copy` row's value as one line.
+    pub fn copy_summary(&self) -> String {
+        Self::items_summary(&self.fields.copy, "files")
+    }
+
+    /// The `setup.run` row's value as one line.
+    pub fn run_summary(&self) -> String {
+        Self::items_summary(&self.fields.run, "commands")
     }
 
     /// Whether a text buffer is open, so the app knows to route printable keys
     /// here instead of treating them as shortcuts.
     pub fn is_typing(&self) -> bool {
-        self.editing.is_some() || self.open_list.as_ref().is_some_and(|l| l.input.is_some())
+        self.editing.is_some()
+            || self.open_list.as_ref().is_some_and(|l| l.input.is_some())
+            || self.string_list.as_ref().is_some_and(|l| l.input.is_some())
     }
 
-    /// Whether a dialog owns the keyboard here: a field being edited, or the
-    /// open_command list editor. The app asks so Tab can't switch tabs out from
-    /// under it.
+    /// Whether a dialog owns the keyboard here: a field being edited, or a
+    /// list editor. The app asks so Tab can't switch tabs out from under it.
     pub fn dialog_open(&self) -> bool {
-        self.editing.is_some() || self.open_list.is_some()
+        self.editing.is_some() || self.list_open()
+    }
+
+    /// Whether a list-editor modal is covering the form (so clicks and footer
+    /// hints should follow the list, not the settings rows).
+    pub fn list_open(&self) -> bool {
+        self.open_list.is_some() || self.string_list.is_some()
     }
 
     fn set_field(&mut self, row: usize, value: String) {
         match row {
             0 => self.fields.worktree_dir = value,
-            2 => self.fields.copy = value,
-            3 => self.fields.run = value,
             UPDATE_ROW => self.fields.auto_update_check = value,
             THEME_ROW => self.fields.diff_theme = value,
             LAYOUT_ROW => self.fields.worktrees_layout = value,
             BRANCHES_REFRESH_ROW => self.fields.branches_refresh_mins = value,
             DIFF_LINE_NUMBERS_ROW => self.fields.diff_line_numbers = value,
-            // `open_command` is edited as a list, never as one text value.
+            // List rows are edited as lists, never as one text value.
             _ => {}
         }
     }
@@ -517,6 +681,22 @@ impl ConfigEditor {
                 ListOutcome::Cancel => return EditorOutcome::Continue,
             }
         }
+        if let Some(mut list) = self.string_list.take() {
+            match list.on_key(key) {
+                ListOutcome::Continue => {
+                    self.string_list = Some(list);
+                    return EditorOutcome::Continue;
+                }
+                ListOutcome::Done => {
+                    match list.kind {
+                        StringListKind::Copy => self.fields.copy = list.items,
+                        StringListKind::Run => self.fields.run = list.items,
+                    }
+                    return self.save_fields(message);
+                }
+                ListOutcome::Cancel => return EditorOutcome::Continue,
+            }
+        }
         // While editing, work on the buffer taken out of `self`; Esc and Enter
         // leave it out (cancel / commit+save), other keys drive the text input
         // and put the edited buffer back.
@@ -563,10 +743,22 @@ impl ConfigEditor {
                 self.cycle_worktrees_layout();
                 return self.save_fields(message);
             }
-            // The list row opens its own editor rather than a text input, so
-            // a command containing a comma stays one entry.
+            // List rows open their own editor rather than a text input, so an
+            // entry containing a comma stays one item.
             KeyCode::Enter if self.selected == OPEN_COMMAND_ROW => {
                 self.open_list = Some(OpenCommandEditor::new(self.fields.open_command.clone()))
+            }
+            KeyCode::Enter if self.selected == COPY_ROW => {
+                self.string_list = Some(StringListEditor::new(
+                    StringListKind::Copy,
+                    self.fields.copy.clone(),
+                ))
+            }
+            KeyCode::Enter if self.selected == RUN_ROW => {
+                self.string_list = Some(StringListEditor::new(
+                    StringListKind::Run,
+                    self.fields.run.clone(),
+                ))
             }
             KeyCode::Enter
                 if self.selected < TEXT_ROWS || self.selected == BRANCHES_REFRESH_ROW =>
@@ -604,6 +796,7 @@ mod tests {
             selected: 0,
             editing: None,
             open_list: None,
+            string_list: None,
         }
     }
 
@@ -715,6 +908,7 @@ mod tests {
             selected: OPEN_COMMAND_ROW,
             editing: None,
             open_list: None,
+            string_list: None,
         };
         (dir, ed)
     }
@@ -847,6 +1041,143 @@ mod tests {
             "2 commands: cursor {path} · open {path}"
         );
         assert_eq!(list_editor(&[]).open_command_summary(), "");
+    }
+
+    /// The editor sitting on a setup.copy or setup.run row with `items`.
+    fn string_list_editor(kind: StringListKind, items: &[&str]) -> ConfigEditor {
+        let mut ed = editor();
+        let owned: Vec<String> = items.iter().map(|s| (*s).to_string()).collect();
+        match kind {
+            StringListKind::Copy => {
+                ed.fields.copy = owned;
+                ed.selected = COPY_ROW;
+            }
+            StringListKind::Run => {
+                ed.fields.run = owned;
+                ed.selected = RUN_ROW;
+            }
+        }
+        ed
+    }
+
+    /// String-list editor backed by a real config file, so `[ done ]` can persist.
+    fn string_list_editor_on_disk(
+        kind: StringListKind,
+        items: &[&str],
+    ) -> (tempfile::TempDir, ConfigEditor) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(config::CONFIG_FILE), "").unwrap();
+        let owned: Vec<String> = items.iter().map(|s| (*s).to_string()).collect();
+        let mut fields = RepoConfigFields::default();
+        match kind {
+            StringListKind::Copy => fields.copy = owned.clone(),
+            StringListKind::Run => fields.run = owned.clone(),
+        }
+        settings::save_config_edits(dir.path(), None, &fields).unwrap();
+        let selected = match kind {
+            StringListKind::Copy => COPY_ROW,
+            StringListKind::Run => RUN_ROW,
+        };
+        let ed = ConfigEditor {
+            repo_root: dir.path().to_path_buf(),
+            global_config: None,
+            fields,
+            selected,
+            editing: None,
+            open_list: None,
+            string_list: None,
+        };
+        (dir, ed)
+    }
+
+    /// Moves to `[ done ]` in the string-list editor and confirms.
+    fn finish_string_list(ed: &mut ConfigEditor) -> EditorOutcome {
+        let list = ed.string_list.as_ref().expect("string list editor open");
+        for _ in list.selected..list.done_row() {
+            press(ed, KeyCode::Down);
+        }
+        press(ed, KeyCode::Enter)
+    }
+
+    #[test]
+    fn setup_run_row_opens_the_list_editor_not_a_text_input() {
+        let mut ed = string_list_editor(StringListKind::Run, &["npm install"]);
+        press(&mut ed, KeyCode::Enter);
+        assert!(ed.editing.is_none(), "the list row has no single value");
+        let list = ed.string_list.as_ref().expect("list editor open");
+        assert_eq!(list.kind, StringListKind::Run);
+        assert_eq!(list.items, ["npm install"]);
+        assert_eq!(list.add_row(), 1);
+        assert_eq!(list.done_row(), 2);
+    }
+
+    #[test]
+    fn setup_copy_row_opens_the_list_editor_not_a_text_input() {
+        let mut ed = string_list_editor(StringListKind::Copy, &[".env"]);
+        press(&mut ed, KeyCode::Enter);
+        assert!(ed.editing.is_none());
+        let list = ed.string_list.as_ref().expect("list editor open");
+        assert_eq!(list.kind, StringListKind::Copy);
+        assert_eq!(list.items, [".env"]);
+    }
+
+    #[test]
+    fn setup_run_list_adds_edits_and_keeps_commas_whole() {
+        let (_dir, mut ed) = string_list_editor_on_disk(StringListKind::Run, &["npm install"]);
+        press(&mut ed, KeyCode::Enter); // open
+        press(&mut ed, KeyCode::Enter); // edit "npm install"
+        press(&mut ed, KeyCode::End);
+        type_str(&mut ed, " --legacy-peer-deps");
+        press(&mut ed, KeyCode::Enter);
+        press(&mut ed, KeyCode::Char('a'));
+        type_str(&mut ed, "sh -c 'echo hi, there'");
+        press(&mut ed, KeyCode::Enter);
+        let outcome = finish_string_list(&mut ed);
+        assert!(matches!(outcome, EditorOutcome::Saved(_)));
+        assert!(ed.string_list.is_none());
+        assert_eq!(
+            ed.fields.run,
+            [
+                "npm install --legacy-peer-deps".to_string(),
+                "sh -c 'echo hi, there'".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn setup_copy_list_adds_a_file() {
+        let (_dir, mut ed) = string_list_editor_on_disk(StringListKind::Copy, &[".env"]);
+        press(&mut ed, KeyCode::Enter);
+        press(&mut ed, KeyCode::Char('a'));
+        type_str(&mut ed, ".env.local");
+        press(&mut ed, KeyCode::Enter);
+        let outcome = finish_string_list(&mut ed);
+        assert!(matches!(outcome, EditorOutcome::Saved(_)));
+        assert_eq!(ed.fields.copy, [".env", ".env.local"]);
+    }
+
+    #[test]
+    fn escaping_the_setup_list_editor_discards_its_edits() {
+        let mut ed = string_list_editor(StringListKind::Run, &["npm install"]);
+        press(&mut ed, KeyCode::Enter);
+        press(&mut ed, KeyCode::Char('d'));
+        press(&mut ed, KeyCode::Esc);
+        assert!(ed.string_list.is_none());
+        assert_eq!(ed.fields.run, ["npm install"]);
+    }
+
+    #[test]
+    fn setup_summaries_count_multiple_items() {
+        let ed = string_list_editor(StringListKind::Copy, &[".env"]);
+        assert_eq!(ed.copy_summary(), ".env");
+        let ed = string_list_editor(StringListKind::Copy, &[".env", ".env.local"]);
+        assert_eq!(ed.copy_summary(), "2 files: .env · .env.local");
+        assert_eq!(
+            string_list_editor(StringListKind::Copy, &[]).copy_summary(),
+            ""
+        );
+        let ed = string_list_editor(StringListKind::Run, &["npm ci", "npm run build"]);
+        assert_eq!(ed.run_summary(), "2 commands: npm ci · npm run build");
     }
 
     #[test]
