@@ -913,7 +913,8 @@ pub enum View {
         selected: usize,
     },
     /// Picker for the remote branch a local branch tracks, opened by `u` on the
-    /// Branches tab. Row 0 removes tracking (only offered when there is some);
+    /// Branches tab and `t` on the Worktrees tab (for the selected worktree's
+    /// branch). Row 0 removes tracking (only offered when there is some);
     /// the rows below are the repo's remote-tracking refs, narrowed live by
     /// `filter` since a busy repo can have dozens.
     UpstreamPick {
@@ -3587,6 +3588,10 @@ impl App {
             KeyCode::Char('f') => self.start_fetch(),
             KeyCode::Char('b') => self.open_switch(),
             KeyCode::Char('u') => self.start_update(),
+            // `t` changes (or clears) the remote branch this worktree's branch
+            // tracks — the same picker the Branches tab opens with `u`, which
+            // is taken here by update.
+            KeyCode::Char('t') => self.open_upstream_pick_for_worktree(),
             KeyCode::Char('l') => self.open_log(),
             KeyCode::Char('R') => self.open_rename_worktree(),
             // Discard every uncommitted change in the worktree under the
@@ -5868,6 +5873,35 @@ impl App {
             return;
         }
         let (name, current) = (branch.name.clone(), branch.upstream.clone());
+        self.open_upstream_pick_for(name, current);
+    }
+
+    /// Opens the same upstream picker for the worktree under the cursor on the
+    /// Worktrees tab, so the branch a worktree tracks can be set without
+    /// leaving the list. Refuses on a detached HEAD, which has no branch to
+    /// track anything. The current upstream is read from git rather than the
+    /// row, which only carries ahead/behind counts.
+    fn open_upstream_pick_for_worktree(&mut self) {
+        let Some(wt) = self.selected_worktree() else {
+            return;
+        };
+        let Some(branch) = wt.branch.clone() else {
+            self.message = Some(format!(
+                "'{}' is on a detached HEAD; check out a branch to give it an upstream",
+                wt.name
+            ));
+            return;
+        };
+        let current = match git::branch_upstream(&self.ctx.repo_root, &branch) {
+            Ok(up) => up.map(|(remote, b)| format!("{remote}/{b}")),
+            Err(e) => return self.set_error(format!("{e:#}")),
+        };
+        self.open_upstream_pick_for(branch, current);
+    }
+
+    /// Shared body of the upstream picker: loads the remote-tracking refs and
+    /// pushes the screen for `branch`, whose current upstream is `current`.
+    fn open_upstream_pick_for(&mut self, branch: String, current: Option<String>) {
         let candidates = match ops::upstream_candidates(&self.ctx) {
             Ok(c) => c,
             Err(e) => return self.set_error(format!("{e:#}")),
@@ -5877,7 +5911,7 @@ impl App {
             return;
         }
         self.push_screen(View::UpstreamPick {
-            branch: name,
+            branch,
             current,
             candidates,
             filter: TextInput::default(),
@@ -5949,9 +5983,13 @@ impl App {
                     Some(now) => format!("'{branch}' now tracks {now}"),
                     None => format!("'{branch}' no longer tracks a remote branch"),
                 });
-                // The row's tracking column and ahead/behind counts both change,
-                // so the cached list is stale until it reloads.
-                self.load_branches(self.branch_selected);
+                // The row's tracking column and ahead/behind counts both
+                // change, so whichever list the picker was opened from is
+                // stale until it reloads.
+                match self.tab {
+                    Tab::Branches => self.load_branches(self.branch_selected),
+                    _ => self.refresh(),
+                }
             }
             Err(e) => self.set_error(format!("{e:#}")),
         }
@@ -11463,6 +11501,94 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("only exists on a remote"),
+            "{:?}",
+            app.message
+        );
+    }
+
+    /// Records a remote-tracking ref without a real remote, so the upstream
+    /// picker has something to offer in a temp repo.
+    fn fake_remote_ref(app: &App, name: &str) {
+        let root = app.ctx.repo_root.display().to_string();
+        // git refuses `--set-upstream-to` for a remote it has no config for,
+        // so the remote is declared (pointing at this same repo) as well as
+        // the ref being written.
+        for args in [
+            vec!["remote", "add", "origin", root.as_str()],
+            vec!["update-ref", &format!("refs/remotes/{name}"), "HEAD"],
+        ] {
+            let out = Command::new("git")
+                .args(&args)
+                .current_dir(&app.ctx.repo_root)
+                .output()
+                .unwrap();
+            // Re-adding an existing remote fails harmlessly; the ref write must
+            // succeed.
+            assert!(out.status.success() || args[0] == "remote");
+        }
+    }
+
+    /// `t` on the Worktrees tab opens the same picker the Branches tab reaches
+    /// with `u`, targeting the selected worktree's branch.
+    #[test]
+    fn worktrees_tab_t_opens_upstream_picker() {
+        let (_tmp, mut app) = test_app();
+        fake_remote_ref(&app, "origin/main");
+        app.refresh();
+        assert_eq!(app.tab, Tab::Worktrees);
+
+        press(&mut app, KeyCode::Char('t'));
+        match &app.view {
+            View::UpstreamPick {
+                branch,
+                current,
+                candidates,
+                ..
+            } => {
+                assert_eq!(branch, "main");
+                assert_eq!(*current, None, "the branch tracks nothing yet");
+                assert_eq!(candidates, &["origin/main".to_string()]);
+            }
+            _ => panic!("expected the upstream picker"),
+        }
+    }
+
+    /// Picking a row applies it to the worktree's branch and reloads the
+    /// worktree list (not the branch list) since that is what is on screen.
+    #[test]
+    fn worktrees_tab_upstream_pick_sets_the_branchs_upstream() {
+        let (_tmp, mut app) = test_app();
+        fake_remote_ref(&app, "origin/main");
+        app.refresh();
+
+        press(&mut app, KeyCode::Char('t'));
+        press(&mut app, KeyCode::Enter);
+
+        assert!(matches!(app.view, View::List), "the picker closed");
+        assert_eq!(
+            git::branch_upstream(&app.ctx.repo_root, "main").unwrap(),
+            Some(("origin".to_string(), "main".to_string()))
+        );
+        assert!(
+            app.message.as_deref().unwrap().contains("origin/main"),
+            "{:?}",
+            app.message
+        );
+    }
+
+    /// A detached worktree has no branch to track anything, so `t` says so
+    /// instead of opening a picker that could not apply.
+    #[test]
+    fn worktrees_tab_t_refuses_a_detached_worktree() {
+        let (_tmp, mut app) = test_app();
+        fake_remote_ref(&app, "origin/main");
+        app.refresh();
+        app.worktrees[0].branch = None;
+
+        press(&mut app, KeyCode::Char('t'));
+        assert!(matches!(app.view, View::List), "no picker opens");
+        assert!(
+            app.message.as_deref().unwrap().contains("detached HEAD"),
             "{:?}",
             app.message
         );

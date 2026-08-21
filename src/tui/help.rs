@@ -192,6 +192,10 @@ pub const WORKTREES: &[Binding] = &[
     ),
     both("p", "pull", "pull (fast-forward) the worktree"),
     both("⇧P", "push", "push the worktree"),
+    help_only(
+        "t",
+        "change which remote branch the worktree's branch tracks, or stop tracking",
+    ),
     help_only("f", "fetch all remotes"),
     both("l", "log", "commit log"),
     both(
