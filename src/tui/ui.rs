@@ -36,7 +36,7 @@ use crate::config::{
 };
 use crate::conflict::{ConflictSegment, ResolutionAction};
 use crate::git::{GraphLine, StatusEntry};
-use crate::ops::ResolveKind;
+use crate::ops::{BranchListItem, ResolveKind};
 use crate::update::{CURRENT_VERSION, Release};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -3294,6 +3294,10 @@ fn draw_tab_bar(frame: &mut Frame, area: Rect, app: &mut App) {
     app.tab_hits = hits;
 }
 
+/// Width of the branches table's CHECKED OUT column, shared by the layout
+/// constraint and by the path-truncation budget derived from it.
+const BRANCH_CHECKOUT_W: u16 = 24;
+
 /// The Branches tab: a full-width table of branches in two labelled groups,
 /// local first and remote-only second, with the inline new-branch and
 /// confirm-delete popups floating on top. Returns the clickable row list
@@ -3362,11 +3366,22 @@ fn draw_branches(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
             } else {
                 Span::styled(b.name.clone(), Style::new().bold())
             };
+            // The column is fixed-width, so the path is trimmed from the
+            // front here rather than clipped from the back by the table: a
+            // worktree is identified by the tail of its path. The full value
+            // is on the detail line under the table.
             let checkout = match (&b.checked_out_path, &b.remote) {
-                (Some(p), _) => Span::styled(format!("● {p}"), Style::new().fg(theme::SUCCESS)),
-                (None, Some(remote)) => {
-                    Span::styled(format!("☁ {remote}"), Style::new().fg(theme::INFO).dim())
-                }
+                (Some(p), _) => Span::styled(
+                    format!("● {}", truncate_start(p, BRANCH_CHECKOUT_W as usize - 2)),
+                    Style::new().fg(theme::SUCCESS),
+                ),
+                (None, Some(remote)) => Span::styled(
+                    format!(
+                        "☁ {}",
+                        truncate_middle(remote, BRANCH_CHECKOUT_W as usize - 2)
+                    ),
+                    Style::new().fg(theme::INFO).dim(),
+                ),
                 (None, None) => Span::styled("–".to_string(), Style::new().dim()),
             };
             let track = if b.upstream.is_some() {
@@ -3392,7 +3407,7 @@ fn draw_branches(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
         rows,
         [
             Constraint::Length(22),
-            Constraint::Length(24),
+            Constraint::Length(BRANCH_CHECKOUT_W),
             Constraint::Length(14),
             Constraint::Length(28),
             Constraint::Min(20),
@@ -3402,20 +3417,72 @@ fn draw_branches(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
         Row::new(["BRANCH", "CHECKED OUT", "UPSTREAM", "FLAGS", "LAST COMMIT"])
             .style(Style::new().dim().bold()),
     )
-    .block(block)
     .row_highlight_style(Style::new().bg(SELECTION_BG).bold())
     .highlight_symbol(Span::styled("▌ ", Style::new().fg(ACCENT)));
+    // The last inner row belongs to the detail line, so the block is drawn on
+    // its own and the table gets the rows above it.
+    frame.render_widget(block, area);
+    let [table_area, detail_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
     let mut state = TableState::default()
         .with_selected(Some(branch_row_of(&display_rows, app.branch_selected)));
-    frame.render_stateful_widget(table, area, &mut state);
+    frame.render_stateful_widget(table, table_area, &mut state);
+    if let Some(b) = app.branches.get(app.branch_selected) {
+        frame.render_widget(
+            Paragraph::new(branch_detail_line(b, detail_area.width as usize)),
+            detail_area,
+        );
+    }
 
     // The create/rename/delete prompts are modals now, drawn over this list.
     Some(RowList {
-        inner,
+        inner: table_area,
         header: 1,
         offset: state.offset(),
         len: display_rows.len(),
     })
+}
+
+/// The line under the branches table: the selected branch's full name beside
+/// the full path of the worktree that has it checked out. The table's columns
+/// are fixed-width and elide both, so this is where the untruncated values
+/// live. When even this line is too narrow the path gives way first (from the
+/// front, down to an eight-character floor), and only past that is the name
+/// itself elided from the middle.
+fn branch_detail_line(b: &BranchListItem, width: usize) -> Line<'static> {
+    const PREFIX: &str = "⎇ ";
+    const GAP: &str = "   ";
+    let (marker, value, style) = match (&b.checked_out_path, &b.remote) {
+        (Some(p), _) => ("● ", p.clone(), Style::new().fg(theme::SUCCESS)),
+        (None, Some(remote)) => (
+            "☁ ",
+            format!("on {remote} only"),
+            Style::new().fg(theme::INFO),
+        ),
+        (None, None) => ("", "not checked out".to_string(), Style::new().dim()),
+    };
+    let fixed = PREFIX.chars().count() + GAP.chars().count() + marker.chars().count();
+    let avail = width.saturating_sub(fixed);
+    let name_w = b.name.chars().count();
+    let value_w = value.chars().count();
+    let (name, value) = if name_w + value_w <= avail {
+        (b.name.clone(), value)
+    } else {
+        let floor = 8.min(avail);
+        let value_budget = value_w.min(avail.saturating_sub(name_w)).max(floor);
+        let name_budget = avail.saturating_sub(value_budget);
+        (
+            truncate_middle(&b.name, name_budget),
+            truncate_start(&value, value_budget),
+        )
+    };
+    Line::from(vec![
+        Span::styled(PREFIX, Style::new().fg(ACCENT)),
+        Span::styled(name, Style::new().bold()),
+        Span::raw(GAP),
+        Span::styled(marker, style),
+        Span::styled(value, style),
+    ])
 }
 
 /// The switch-branch picker: a type-to-filter prompt over a centered list of
@@ -5758,6 +5825,96 @@ mod tests {
         assert!(out.ends_with("afé-señor"), "{out}");
         assert_eq!(truncate_start("anything", 1), "…");
         assert_eq!(truncate_start("anything", 0), "");
+    }
+
+    fn detail_branch(name: &str, path: Option<&str>, remote: Option<&str>) -> BranchListItem {
+        BranchListItem {
+            name: name.to_string(),
+            checked_out_path: path.map(str::to_string),
+            upstream: None,
+            ahead: 0,
+            behind: 0,
+            subject: String::new(),
+            date: String::new(),
+            merged: false,
+            remote: remote.map(str::to_string),
+            created_from: None,
+            changed_from_base: false,
+            behind_base: false,
+            archived: false,
+        }
+    }
+
+    /// Rendering of a `Line` as plain text, for asserting on the detail line.
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// The detail line carries the two values the fixed-width columns elide:
+    /// the branch's full name and the full path it is checked out at.
+    #[test]
+    fn branch_detail_line_shows_full_name_and_path() {
+        let b = detail_branch(
+            "feature/some-quite-long-branch-name",
+            Some("/Users/w/Dev/proj-worktrees/feature-some-quite-long-branch-name"),
+            None,
+        );
+        let text = line_text(&branch_detail_line(&b, 160));
+        assert!(
+            text.contains("feature/some-quite-long-branch-name"),
+            "{text}"
+        );
+        assert!(
+            text.contains("/Users/w/Dev/proj-worktrees/feature-some-quite-long-branch-name"),
+            "{text}"
+        );
+        assert!(
+            !text.contains('…'),
+            "nothing is elided when it fits: {text}"
+        );
+    }
+
+    /// Too narrow to hold both: the path gives way from the front (its tail is
+    /// the identifying half) while the name is kept whole.
+    #[test]
+    fn branch_detail_line_trims_the_path_before_the_name() {
+        let b = detail_branch(
+            "feature/login",
+            Some("/Users/w/Dev/proj-worktrees/feature-login"),
+            None,
+        );
+        let line = branch_detail_line(&b, 40);
+        let text = line_text(&line);
+        assert!(text.chars().count() <= 40, "{text}");
+        assert!(text.contains("feature/login"), "name is whole: {text}");
+        assert!(text.contains('…'), "path is elided: {text}");
+        assert!(text.ends_with("feature-login"), "tail survives: {text}");
+    }
+
+    /// Past the path's floor the name itself is elided rather than the line
+    /// overflowing, and a branch with no checkout says so instead of showing a
+    /// blank half.
+    #[test]
+    fn branch_detail_line_handles_tiny_widths_and_no_checkout() {
+        let long = detail_branch(
+            "feature/a-really-very-extremely-long-branch-name",
+            Some("/Users/w/Dev/proj-worktrees/x"),
+            None,
+        );
+        let text = line_text(&branch_detail_line(&long, 30));
+        assert!(text.chars().count() <= 30, "{text}");
+        assert!(text.contains('…'), "{text}");
+
+        let local = detail_branch("main", None, None);
+        assert!(
+            line_text(&branch_detail_line(&local, 80)).contains("not checked out"),
+            "a local branch with no worktree says so"
+        );
+        let remote = detail_branch("wip", None, Some("origin/wip"));
+        assert!(
+            line_text(&branch_detail_line(&remote, 80)).contains("on origin/wip only"),
+            "a remote-only branch names its remote"
+        );
     }
 
     /// The base branch gets its own row under the name input, so a long branch

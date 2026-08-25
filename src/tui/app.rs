@@ -11407,6 +11407,60 @@ mod tests {
         }
     }
 
+    /// The CHECKED OUT column is fixed-width, so a long worktree path is
+    /// trimmed from the front (keeping the folder that identifies it), and the
+    /// detail line under the table carries the untrimmed branch name and path.
+    #[test]
+    fn branches_tab_trims_the_path_column_and_shows_the_full_value_below() {
+        let (_tmp, mut app) = test_app();
+        goto_tab(&mut app, Tab::Branches);
+        let path = "/Users/w/Dev/proj-worktrees/feature-checkout-column";
+        let name = "feature/checkout-column-is-narrow";
+        let mut item = branch_item(name, None);
+        item.checked_out_path = Some(path.to_string());
+        app.branches = vec![item];
+        app.branch_selected = 0;
+
+        let (w, h) = (120u16, 24u16);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        terminal
+            .draw(|frame| crate::tui::ui::draw(frame, &mut app))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+
+        let column = rows
+            .iter()
+            .find(|r| r.contains("● …"))
+            .unwrap_or_else(|| panic!("no elided path cell: {rows:#?}"));
+        assert!(
+            column.contains("ture-checkout-column"),
+            "the tail of the path survives: {column}"
+        );
+        assert!(
+            !column.contains(path),
+            "the full path does not fit the column: {column}"
+        );
+
+        let detail = rows
+            .iter()
+            .find(|r| r.contains(name))
+            .unwrap_or_else(|| panic!("no detail line: {rows:#?}"));
+        assert!(
+            detail.contains(path),
+            "the detail line shows the full path: {detail}"
+        );
+    }
+
     /// The Branches tab draws two labelled groups, local first. Both groups
     /// only appear when they have branches, so a repo with no remotes looks
     /// exactly as it did before grouping existed.
