@@ -1,24 +1,20 @@
 # wtm — worktree manager
 
-A friendly top-level interface for git, built for working with AI agents on multiple branches at once. Create, list, inspect, and remove worktrees without knowing git commands, with automated per-repo setup (copying `.env` files, running `npm install`, and so on). Beyond worktrees it covers the everyday git workflow too: commit, stash, pull, push, fetch, branches, and log, all addressed by worktree name instead of paths and flags.
+A friendly top-level interface for git, built for working with AI agents on multiple branches at once.
+
+Git only lets you have one branch checked out in a folder. A **worktree** is a second folder for the same repo, sitting on a different branch, so you (or an agent) can work on several things without stashing or switching. wtm creates those folders, copies in the files git ignores (your `.env`, and so on), runs setup like `npm install`, and then lets you commit, pull, push, stash, merge, and resolve conflicts by **worktree name** instead of paths and flags.
 
 [Project page on sleepymagpie.com](https://sleepymagpie.com/tools/wtm.html)
 
 Three ways to use it:
 
-- **TUI**: run `wtm` with no arguments inside a repo. It has five tabs (press `Tab`/`⇧Tab` to cycle): **Worktrees** (the worktree list with a live changed-files preview below it — `b` switches the selected worktree to another branch, `n` opens the new-worktree dialog, `⇧R` renames a worktree), **Changes** (browse and act on the selected worktree's diff), **Branches** (create, delete, rename (`⇧R`), and check out branches), **Stash** (stash/pop/apply/drop for the selected worktree), and **Settings** (edit this repo's `.wtm.toml` fields). Worktrees and Branches flag branches whose work has landed in the repo's default branch as `✓merged`. Press `?` for help, which opens on the page for whatever you're looking at; `Tab` moves between its pages and `↑/↓` scrolls. While typing in a field, `?` is a literal character, so use `F1` there instead.
-- **CLI**: scriptable subcommands, all with `--json` output for agents
-- **MCP**: `wtm mcp` serves worktree operations as MCP tools over stdio
+- **TUI**: `wtm` with no arguments, inside a repo
+- **CLI**: scriptable subcommands, all with `--json` for agents
+- **MCP**: `wtm mcp` serves the same operations as tools over stdio
 
 ![The Worktrees tab: a table of worktrees with change counts, ahead/behind, and paths, over a preview of the selected worktree's changed files](docs/images/tui-worktrees.png)
 
-The Worktrees tab is the home screen: every worktree with how many files it has changed, how far it is ahead of or behind its upstream, and any flags (`unpushed`/`pushed`/`behind` vs the remote, `same`/`changed`/`outdated` vs its creation base or the default branch, `✓merged`, `locked`). The panel underneath lists the changed files of whichever worktree you have selected, so you can see what an agent has been up to without leaving the list. Every changed file is listed: when there are more than fit, `⇧↑`/`⇧↓` or the mouse wheel over the panel scroll it, and the border shows your position (`10-18/27`). Lists that scroll (worktrees, branches, stashes) mark the overflow with `▲`/`▼` in the left border, so it's clear when there are rows off screen. Clicking a file there opens it on the Changes tab.
-
-If you'd rather read the diff without leaving the tab, `wtm config set --global worktrees_layout three_panel` (or the `worktrees_layout` row on the Settings tab) swaps that in for a **three-panel** Worktrees tab: a compact scrollable worktree list on top, and the Changes tab's file list and syntax-highlighted diff filling the space below it. When the highlighted worktree is clean, that bottom area shows the branch's commit list instead (navigate and open a commit the same way as Branches → Enter). The commits the branch added since it forked are drawn bold on a tinted band, and the panel title counts them (`3 on this branch`), so its own work reads apart from the history it inherited. The same marking is on the full-screen log (`l`) and the Branches tab's commit history. `Enter` hands the keyboard to the panel below and `q`/`Esc` gives it back, so the app still only quits from the worktree list. The bottom panel is the selected worktree's, so the worktree keys (`p` pull, `P` push, `f` fetch, `c` commit, and the rest) keep working while it holds the keyboard. Two keys mean what the focused panel is showing rather than what the list above it is: over the files, `d` deletes the file under the cursor (delete-worktree stays on the list above); over the commits, `u` opens the undo wizard for the commit under the cursor. The Changes tab is folded away while this layout is on (it's already on screen), and a terminal too short for three panels falls back to two so the diff stays reachable. The default is `two_panel`.
-
-The mouse works throughout: clicking a tab switches to it, and clicking a row selects it.
-
-## Setup
+## Quick start
 
 Requires `git` on your PATH.
 
@@ -28,7 +24,7 @@ Install the latest release (macOS Apple Silicon/Intel, Linux x86_64/ARM64):
 curl -fsSL https://raw.githubusercontent.com/faulker/wtm/main/install.sh | bash
 ```
 
-That downloads the matching binary from [GitHub Releases](https://github.com/faulker/wtm/releases), verifies its SHA-256 checksum, and installs it to `~/.local/bin/wtm` (override with `WTM_INSTALL_DIR`).
+That downloads the matching binary from [GitHub Releases](https://github.com/faulker/wtm/releases), verifies its SHA-256 checksum, and installs it to `~/.local/bin/wtm` (override with `WTM_INSTALL_DIR`). If `wtm` is not found after install, add `~/.local/bin` to your PATH.
 
 Or unpack a release tarball by hand:
 
@@ -37,22 +33,45 @@ tar -xzf wtm-vX.Y.Z-aarch64-apple-darwin.tar.gz
 mv wtm ~/.local/bin/
 ```
 
-To build from source instead you also need Rust (edition 2024 toolchain):
+To build from source you also need Rust (edition 2024 toolchain):
 
 ```sh
 cargo build --release
-# then put it on your PATH, e.g.:
 cp target/release/wtm ~/.local/bin/
 ```
 
+Then, in any git repo:
+
+```sh
+cd your-repo
+wtm
+```
+
+The first time, a setup wizard asks where worktree folders should live, which ignored files to copy into them, and what to run once they exist. After that you get the worktree list.
+
+From there:
+
+| Key | What it does |
+| --- | --- |
+| `n` | new worktree (type a branch name, or pick an existing one) |
+| `o` | open the selected worktree in your editor |
+| `c` | commit |
+| `Enter` | see that worktree's changed files and diff |
+| `?` | help for the screen you're on (`F1` while typing, since `?` is a character then) |
+| `q` | quit |
+
+Press `Tab` / `⇧Tab` to move between **Worktrees**, **Changes**, **Branches**, **Stash**, and **Settings**. The mouse works too: click a tab or a row to select it.
+
+That's enough to start. The rest of this page is a reference.
+
 ## Settings
 
-Every repo must be initialized before worktree commands work: until a `.wtm.toml` exists in the repo root, `create`, `list`, and friends refuse with a pointer to `wtm init` (MCP tool calls report the same error). There are two ways to initialize:
+Every repo needs a `.wtm.toml` in its root before worktree commands work. Until that file exists, `create`, `list`, and friends refuse with a pointer to `wtm init` (MCP tool calls report the same error). Two ways to create it:
 
-- **`wtm init`**: a guided wizard in the terminal. It first offers to clone settings from another repo (give a path to the repo or its `.wtm.toml`), otherwise it asks where worktrees should go and what setup each new one needs, then writes `.wtm.toml`.
-- **run `wtm` with no arguments**: in an uninitialized repo the TUI opens straight into a setup wizard. It opens on a welcome screen explaining what worktrees are for and what the one file it writes contains, then offers two routes: answer three questions, or copy the settings from a repo that already uses wtm (press `Tab` on the path prompt to pick the source with a file browser instead of typing).
+- **`wtm init`**: a guided wizard in the terminal. It first offers to clone settings from another repo (give a path to the repo or its `.wtm.toml`), otherwise it asks the three questions below.
+- **run `wtm` with no arguments**: in an uninitialized repo the TUI opens the same wizard. It starts on a welcome screen, then offers two routes: answer three questions, or copy settings from a repo that already uses wtm (`Tab` on the path prompt opens a file browser).
 
-  The three questions are where worktree folders should live (each choice shows the path it resolves to), which files to copy into them, and what to run once they exist. The last two arrive **pre-filled from your repo**: a `.env` sitting in the root is suggested for copying, and a lockfile (`pnpm-lock.yaml`, `package-lock.json`, `uv.lock`, `Gemfile.lock`, `go.mod`, and friends) suggests the matching install command. Every screen says why it's asking, `Esc` steps back exactly one screen keeping your answers, and both routes end on a review screen where you can still edit everything before the file is written.
+The three questions are where worktree folders should live (each choice shows the path it resolves to), which files to copy into them, and what to run once they exist. The last two arrive **pre-filled from your repo**: a `.env` in the root is suggested for copying, and a lockfile (`pnpm-lock.yaml`, `package-lock.json`, `uv.lock`, `Gemfile.lock`, `go.mod`, and friends) suggests the matching install command. Every screen says why it's asking, `Esc` steps back one screen keeping your answers, and both routes end on a review screen where you can still edit everything before the file is written.
 
 ```sh
 wtm init
@@ -60,7 +79,7 @@ wtm init
 
 ![The Settings tab: worktree_dir, open_command, setup.copy, and setup.run, each with a hint line, plus a live preview of where worktrees will land](docs/images/tui-settings.png)
 
-The Settings tab (`o` in the TUI) edits the same fields, with a hint under each one and a live preview of where new worktrees will land. `Enter` edits the selected row (and writes immediately; `Esc` cancels an in-progress edit). Below the location preview it shows a sample of the selected `diff_theme` (cycling the row updates the palette right away), then the running version and whether an update is waiting, with a `[ check for updates now ]` row. The `diff_theme` row cycles the syntax-highlight palette used in the diff pane (Eighties, Mocha, Ocean, Solarized, GitHub) and the `worktrees_layout` row cycles the Worktrees tab between two and three panels; both are saved globally like `auto_update_check`. `branches_refresh_mins` (default 10) controls how long the Branches tab keeps its cached list before refreshing on its own; `r` on that tab always reloads immediately. `diff_line_numbers` (on by default) toggles the line-number gutter in the diff pane.
+The Settings tab (`Tab` until you land there, or click **Settings**) edits the same fields, with a hint under each one and a live preview of where new worktrees will land. `Enter` edits the selected row and writes immediately (`Esc` cancels an in-progress edit). Below the location preview it shows a sample of the selected `diff_theme` (cycling the row updates the palette right away), then the running version and whether an update is waiting, with a `[ check for updates now ]` row.
 
 To view or change settings later, no TOML editing required:
 
@@ -78,6 +97,8 @@ wtm config set --global diff_line_numbers false        # hide the diff pane's li
 wtm config unset setup.copy      # back to the default (or the global value)
 wtm config path                  # where the config files live
 ```
+
+`diff_theme` and `worktrees_layout` can also be cycled on the Settings tab. Both are saved globally, like `auto_update_check`. `branches_refresh_mins` (default 10) is how long the Branches tab keeps its cached list; `r` on that tab always reloads immediately. `diff_line_numbers` (on by default) toggles the line-number gutter in the diff pane.
 
 ### Where worktrees go: `worktree_dir`
 
@@ -137,6 +158,8 @@ Setup commands are interactive: with `wtm create` in a terminal they attach to y
 
 ## CLI
 
+Worktrees are addressed by branch name (or directory name when detached). Every command accepts `--json` for machine-readable output. Errors go to stderr as `{"error": "..."}` with a non-zero exit code.
+
 ```sh
 wtm init [--force]                    # guided setup, writes .wtm.toml
 wtm create <branch> [--from <base>]   # new worktree; creates the branch if needed, runs setup
@@ -151,6 +174,8 @@ wtm upgrade [--check]                 # update wtm itself to the latest release
 wtm mcp                               # MCP server over stdio
 ```
 
+`wtm create` also pulls down remote branches: when the branch only exists on a remote, it creates a local tracking branch from it instead of branching off HEAD.
+
 Everyday git, addressed by worktree name:
 
 ```sh
@@ -163,7 +188,13 @@ wtm push <name> [--force-with-lease]       # publishes with -u origin when no up
 wtm switch <name> <branch> [--create]      # check a different branch out in the worktree; a remote-only
                                            # branch becomes a local branch tracking the remote.
                                            # --create makes a new branch off HEAD when it doesn't exist
+wtm log <name> [-n <count>]                # recent commits (default 20)
 wtm fetch                                  # fetch all remotes, prune deleted branches
+```
+
+Branches (repo-wide, not tied to one worktree):
+
+```sh
 wtm branch list                            # branches with checkout, tracking, last commit
 wtm branch create <name> [--from <ref>]    # branch without a worktree
 wtm branch delete <name> [--force]         # local only by default; refuses if checked out in a worktree
@@ -172,18 +203,14 @@ wtm branch archive <name> [--undo]         # hide it from wtm's listings without
 wtm branch rename <old> <new>
 wtm branch upstream <name> <origin/ref>    # change which remote branch it tracks (--unset to stop tracking)
 wtm branch log <name> [-n <count>]         # a branch's commits without checking it out
-wtm log <name> [-n <count>]                # recent commits (default 20)
 wtm cherry-pick --into <name> <commit>...  # apply commits into a worktree (--no-commit to load only)
-wtm merge <source> --into <name> [--no-ff] # merge a branch into a worktree's branch
-wtm rebase <name> --onto <branch>          # replay a worktree's commits on top of a branch
-wtm update <name>                          # refresh default from upstream, then merge into a worktree
 ```
 
 Merging, rebasing, updating, and resolving conflicts:
 
 ```sh
-wtm merge <source> --into <name>           # merge; on conflict, leaves the tree mid-merge to resolve
-wtm rebase <name> --onto <branch>          # rebase; on conflict, leaves the tree mid-rebase
+wtm merge <source> --into <name> [--no-ff] # merge a branch into a worktree's branch
+wtm rebase <name> --onto <branch>          # replay a worktree's commits on top of a branch
 wtm rebase <name> --continue               # finish the rebase once conflicts are resolved
 wtm rebase <name> --skip                   # drop the commit it stopped on and carry on
 wtm rebase <name> --abort                  # abandon the rebase, restore the worktree
@@ -204,96 +231,112 @@ The same conflict flow covers five sources: `merge`, `rebase`, `update`, `cherry
 
 > **Mid-rebase, git swaps the two sides.** Rebasing replays *your* commits on top of another branch, so during a rebase `--ours` is the branch you are rebasing onto and `--theirs` is your own commit being replayed. This is the opposite of a merge, and it catches people out. The TUI's resolver labels both sides explicitly and flags the swap.
 
-`wtm create` also pulls down remote branches: when the branch only exists on a remote, it creates a local tracking branch from it instead of branching off HEAD.
-
-Everyday git operations, each scoped to one worktree addressed by name:
-
-```sh
-wtm commit <name> -m <msg> [-b <body>] [--paths a,b]   # stage (all, or just these paths) and commit
-wtm log <name> [-n <count>]                # recent commits (default 20)
-wtm pull <name> [--rebase]                 # fast-forward pull, or rebase; errors if no upstream
-wtm push <name> [--force-with-lease]       # push; publishes to origin with -u if no upstream
-wtm stash push <name> [-m <msg>]           # stash changes, including untracked files
-wtm stash list <name>                      # list stash entries
-wtm stash pop|apply|drop <name> [--index N]
-wtm move-changes <from> <to>               # move uncommitted changes from one worktree into another
-```
-
-Repo-wide commands (not tied to a single worktree):
-
-```sh
-wtm fetch                                  # fetch all remotes and prune deleted branches
-wtm branch list                            # local branches: checkout, tracking, last commit
-wtm branch create <name> [--from <ref>]    # create a branch without a worktree
-wtm branch delete <name> [--force]         # delete locally; refuses if checked out in a worktree.
-                                           # --remote deletes it on the remote too, --remote-only only there
-wtm branch archive <name> [--undo]         # keep the branch but hide it from wtm's branch listings
-wtm branch rename <old> <new>
-wtm branch upstream <name> <origin/ref>    # set the remote branch it tracks; --unset removes tracking
-wtm branch log <name> [-n <count>]         # a branch's commit history without checking it out
-wtm cherry-pick --into <name> <commit>...  # cherry-pick commits into a worktree; --no-commit stages only
-```
-
-When `wtm create <branch>` is given a branch that only exists on a remote (e.g. `origin/<branch>`), it fetches if needed and checks out a local tracking branch from the remote instead of branching from HEAD.
-
-Worktrees are addressed by branch name (or directory name when detached). Every command accepts `--json` for machine-readable output, so agents can simply run e.g. `wtm list --json`. Errors go to stderr as `{"error": "..."}` with a non-zero exit code.
-
 ## TUI
 
-Run `wtm` inside a repo. If the repo isn't initialized yet, the setup wizard opens first (see [Settings](#settings)); once `.wtm.toml` exists you get the worktree list. Each worktree shows its change count, ahead/behind, and a **FLAGS** column: `unpushed` / `pushed` / `behind` for where the branch's commits stand against the remote, `same` / `changed` / `outdated` vs the comparison base (recorded `[created_from]` in `.wtm.toml` when present, otherwise the repo default branch, with a merge-base fallback when that tip is missing), `✓merged` when fully merged into the default branch (safe to clean up), and `locked` for a locked worktree.
+Run `wtm` inside a repo. If the repo isn't initialized yet, the setup wizard opens first (see [Settings](#settings)); once `.wtm.toml` exists you get the worktree list.
+
+Each worktree shows its change count, ahead/behind, and a **FLAGS** column: `unpushed` / `pushed` / `behind` for where the branch's commits stand against the remote, `same` / `changed` / `outdated` vs the comparison base (recorded `[created_from]` in `.wtm.toml` when present, otherwise the repo default branch, with a merge-base fallback when that tip is missing), `✓merged` when fully merged into the default branch (safe to clean up), and `locked` for a locked worktree. Worktrees and Branches both flag `✓merged`.
+
+The panel underneath the list shows the changed files of whichever worktree you have selected, so you can see what an agent has been up to without leaving the list. When there are more files than fit, `⇧↑`/`⇧↓` or the mouse wheel over the panel scroll it, and the border shows your position (`10-18/27`). Lists that scroll (worktrees, branches, stashes) mark the overflow with `▲`/`▼` in the left border. Clicking a file there opens it on the Changes tab.
+
+`b` switches the selected worktree to another branch. `⇧R` renames a worktree.
+
+### Three-panel layout
+
+The default Worktrees tab is `two_panel` (list plus the changed-file preview). `wtm config set --global worktrees_layout three_panel` (or the `worktrees_layout` row on the Settings tab) swaps that for a **three-panel** layout: a compact scrollable worktree list on top, and the Changes tab's file list and syntax-highlighted diff filling the space below it.
+
+When the highlighted worktree is clean, that bottom area shows the branch's commit list instead (navigate and open a commit the same way as Branches → Enter). The commits the branch added since it forked are drawn bold on a tinted band, and the panel title counts them (`3 on this branch`), so its own work reads apart from the history it inherited. The same marking is on the full-screen log (`l`) and the Branches tab's commit history.
+
+`Enter` hands the keyboard to the panel below and `q`/`Esc` gives it back, so the app still only quits from the worktree list. The bottom panel is the selected worktree's, so the worktree keys (`p` pull, `P` push, `f` fetch, `c` commit, and the rest) keep working while it holds the keyboard. Two keys mean what the focused panel is showing rather than what the list above it is: over the files, `d` deletes the file under the cursor (delete-worktree stays on the list above); over the commits, `u` opens the undo wizard for the commit under the cursor.
+
+The Changes tab is folded away while this layout is on (it's already on screen). A terminal too short for three panels falls back to two so the diff stays reachable.
+
+### Changes
 
 ![The Changes tab: changed files grouped into a folder tree on the left, the selected file's syntax-highlighted diff on the right with added lines tinted green and removed lines red](docs/images/tui-changes.png)
 
-`Enter` on a worktree opens the Changes tab. Files are grouped under their folders on the left (`[x]`/`[ ]`/`[~]` shows how much of a folder is marked), and the selected file's diff is syntax-highlighted on the right (`⇧←`/`⇧→` or `H`/`L` scroll it horizontally; `⇧↑`/`⇧↓` or `J`/`K` scroll vertically). From here you can mark files with `Space`, commit them with `c`, pull/push with `p`/`⇧P`, stash one or all of them, undo a file's changes with `u`, delete it with `d`, or add it to `.gitignore`. `←`/`→` (or `h`/`l`) collapse and expand the folder under the cursor, and `Enter` toggles it. The same keys work in the three-panel layout's file panel, where `d` always means the file under the cursor: deleting the worktree itself is only offered from the list above it. `Enter` (or a double click) on a file opens it in whatever app your OS opens that file type with, and clicking the path in the diff panel's title copies it to the clipboard, asking first whether you want it relative to the worktree (`r`) or the full path (`f`).
+`Enter` on a worktree opens the Changes tab. Files are grouped under their folders on the left (`[x]`/`[ ]`/`[~]` shows how much of a folder is marked), and the selected file's diff is syntax-highlighted on the right (`⇧←`/`⇧→` or `H`/`L` scroll it horizontally; `⇧↑`/`⇧↓` or `J`/`K` scroll vertically). Diffs load in the background, so switching files never freezes the UI. New files inside brand-new folders are listed too. Updates live as files change; `r` refreshes now. `t` switches the file list between the folder tree and a flat path list.
+
+From here you can mark files with `Space`, commit them with `c`, pull/push with `p`/`⇧P`, stash one (`s`) or all marked (`⇧S`) files, undo a file's changes with `u` (a brand-new file has no committed version, so it points you at delete instead), delete it with `d`, or add it to `.gitignore` with `i` (exact path or a glob). `←`/`→` (or `h`/`l`) collapse and expand the folder under the cursor (`←` on a file jumps to its parent); `Enter` toggles a folder, and on a file row opens it in whatever app your OS opens that file type with. Double-clicking a row does the same. The mouse wheel scrolls whichever panel it's over.
+
+Clicking the path in the diff panel's title copies it to the clipboard, asking first whether you want it relative to the worktree (`r`) or the full path (`f`).
+
+### Commit
 
 ![The commit dialog over the worktree list: a checklist of the five changed files, all ticked, with a typed commit message underneath](docs/images/tui-commit.png)
 
-`c` commits without leaving the list. Tick the files you want (everything is selected by default, `Space` toggles), type a message, and `Enter` commits. The dialog opens right away and reads the changed files in the background, so a big changeset never makes you wait to start typing; the list shows `reading changes…` until it lands, and a commit submitted before then fires as soon as it does. If the commit fails (a pre-commit hook rejects it, signing goes wrong), the dialog comes back with your message and body intact rather than making you retype them. If the selection looks like one side of a renamed folder, you're asked whether to include the other side so git records the rename.
+`c` commits without leaving the list. Tick the files you want (everything is selected by default, `Space` toggles, `Tab` switches between the file list and the message), type a message, and `Enter` commits. The dialog opens right away and reads the changed files in the background, so a big changeset never makes you wait to start typing; the list shows `reading changes…` until it lands, and a commit submitted before then fires as soon as it does. If the commit fails (a pre-commit hook rejects it, signing goes wrong), the dialog comes back with your message and body intact rather than making you retype them. If the selection looks like one side of a renamed folder, you're asked whether to include the other side so git records the rename.
+
+### New worktree
 
 ![The new worktree dialog: an empty name field, a row for creating a new branch off a chosen base, and rows for checking out existing local and remote-only branches](docs/images/tui-new-worktree.png)
 
-`n` creates a worktree. The top row makes a new branch off a base you pick with `Tab`; the rows below check out an existing branch, including remote-only ones like a teammate's `origin/feature/webhooks`, which become local tracking branches. Typing filters that list and names the new branch at the same time.
+`n` creates a worktree. The top row makes a new branch off a base you pick with `Tab`; the rows below check out an existing branch, including remote-only ones like a teammate's `origin/feature/webhooks`, which become local tracking branches. Typing filters that list and names the new branch at the same time. A long branch name is elided in the middle so it never crowds the field you are typing into. To make a branch *without* a worktree, use the Branches tab (`n` there) instead. If the target folder already exists you're asked to open it (when it's already a worktree), replace it, or cancel.
+
+### Branches
 
 ![The Branches tab: every local branch with where it is checked out, its upstream, a ✓merged flag on release/1.4, and the last commit on each](docs/images/tui-branches.png)
 
-The Branches tab shows every branch, where each one is checked out, and the same **FLAGS** vocabulary as the worktree list (`unpushed` / `pushed` / `behind`, `same` / `changed` / `outdated`, `✓merged`). Remote-only branches are marked with `☁`. From here you can check a branch out in a new worktree, create or delete branches, merge one into a worktree, fast-forward onto upstream, or press `Enter` to browse and cherry-pick its commits. Deleting a branch that also lives on a remote asks whether to delete it locally only (the default) or locally and on the remote, and cancelling is always one of the listed options. Branches you're done with but don't want to delete can be **archived** with `a`: git keeps them, but they drop out of the list until you press `v` to view archived branches (the panel title says how many are hidden).
+The Branches tab shows every branch, where each one is checked out, and the same **FLAGS** vocabulary as the worktree list. Remote-only branches are marked with `☁` under a `REMOTE BRANCHES` heading. Local branches sit under `LOCAL BRANCHES`.
+
+From here:
+
+- `c` checks the branch out in a new worktree
+- `n` creates a branch only (no worktree, from HEAD)
+- `d` deletes, locally only by default, or locally and on its remote when it has one (`⇧F` for a force delete; cancel is always listed)
+- `a` archives the branch (git keeps it; it just stops showing up) and `v` toggles viewing archived branches (the panel title says how many are hidden)
+- `u` changes which remote branch it tracks, or stops tracking, from a type-to-filter picker
+- `m` merges it into a worktree you pick
+- `b` rebases a worktree you pick onto it
+- `p` fast-forwards it onto its upstream (a branch checked out in a worktree is pulled there so its files move with it; one checked out nowhere is fast-forwarded in place). A branch that has diverged is reported rather than merged
+- `f` fetches all remotes, refreshing every branch's ahead/behind
+- `Enter` opens the branch's commit history: `Space` marks commits (`a` all/none), `Enter` / `v` / `→` browses into the highlighted commit, `p` cherry-picks the marked commits (or the highlighted one) into a worktree you pick, and `t` switches between the commit tree and a flat list
+
+### Log
 
 ![The commit log drawn as a tree, with branch and tag names marked on the commits they point at and a fork and merge visible in the graph](docs/images/tui-log.png)
 
-`l` draws the log as a commit tree, with branch and tag names on the commits they point at, so forks and merges are visible at a glance. `Enter` browses into a commit to read the files it changed.
+`l` draws the log as a commit tree, with branch and tag names on the commits they point at, so forks and merges are visible at a glance. `↑`/`↓` move between commits and `Enter` browses into one (a read-only view of the files it changed, same tree + diff layout as Changes). `t` switches between the tree and a flat list; the choice carries over to the Branches tab's commit history. `u` opens the [undo wizard](#undoing-a-commit) for the highlighted commit.
+
+### Stash
 
 ![The Stash tab listing two stash entries for a worktree, each with its message and branch](docs/images/tui-stash.png)
 
-`s` opens the Stash tab: stash the selected worktree's current changes, then pop, apply, or drop any entry. `Enter` on an entry browses the files it changed (same tree + diff layout as a commit). Stashes are shared across the whole repo, so popping or applying one asks which worktree to put it into.
+`s` opens the Stash tab. Stashes are shared across the whole repo, so popping or applying one asks which worktree to put it into (defaulting to the worktree the tab was opened from). `s` stashes the selected worktree's current changes (optional message); `p`/`a` pop/apply the selected entry; `x` drops it. `Enter` on an entry browses the files it changed. A pop that conflicts opens the conflict resolver.
+
+### Keys
+
+On the worktree list:
 
 | Key | Action |
 | --- | --- |
-| `↑`/`↓` or `j`/`k` | select worktree (the mouse wheel over the table does the same) |
-| `⇧↑`/`⇧↓` | scroll the changed-file panel below the table, which lists every changed file of the selected worktree. The wheel scrolls it too when the pointer is over it, and clicking a file opens it on the Changes tab |
-| `Enter` | jump to the **Changes tab** for the selected worktree: the left panel groups changed files under their folders (a folder shows `[x]`/`[ ]`/`[~]` for all/none/some of its files marked); pick a file to see its **syntax-highlighted diff** on the right, with added/removed lines tinted green/red. Diffs load in the background, so switching files never freezes the UI. `←`/`→` (or `h`/`l`) **collapse/expand** the folder under the cursor (`←` on a file jumps to its parent folder). `Enter` toggles a folder row, and on a file row **opens the file** in the OS default application for its type; **double-clicking** a row does the same. `t` switches the file list between the folder tree and a flat path list. The **mouse wheel** scrolls whichever panel it's over — the file list moves the cursor, the diff panel scrolls the text — and clicking a row selects it. Clicking the **file path in the diff panel's title** copies that path to the clipboard, offering both forms: relative to the worktree root (`r`, the default) or the full absolute path (`f`). `Space` marks/unmarks the file, or the whole folder when the cursor is on a folder row; `s` stashes just the highlighted file, `⇧S` stashes every marked (`[x]`) file, `u` undoes (reverts) the highlighted file to its last committed state (a brand-new file has no committed version to revert to, so it says so and points you at delete instead), `d` deletes the highlighted file from the worktree, `c` commits the marked files, `i` adds the file or folder to `.gitignore` (choose the exact path or a glob that ignores everything like it), `?` shows help. New files inside brand-new folders are listed too, so you can view their contents. Updates live as files change; `r` refreshes now |
-| `n` | new **worktree**. The top row creates a **new branch** (named as you type) branched off a base branch, shown on its own row directly under the name field as `↳ off [ main ⌄ ]` — press `Tab` to focus that button and `Enter` to choose a different base (defaults to the main branch). A long branch name is elided in the middle so it never crowds the field you are typing into. The rows below **check out an existing branch**: local branches plus **remote-only branches** (a teammate's work, shown with their `origin/…` ref) which check out into a local tracking branch. Typing **filters** that list while also naming the new branch, so you can search a long branch list. To make a branch *without* a worktree, use the branch browser (`b`) instead. If the target folder already exists you're asked to open it (when it's already a worktree), replace it, or cancel |
-| `d` | delete the selected worktree: choose folder-only (keeps the branch) or folder + branch. If the worktree has uncommitted changes you're asked to stash them (keeping the work) or discard them. If the branch can't be safely deleted (not fully merged, or checked out in another worktree) you're offered a force delete; forcing a branch that's checked out elsewhere first switches that worktree to the repo's default branch |
-| `c` | commit the selected worktree: tick which changed files to include (all selected by default; `Tab` switches between the file list and the message, `Space` toggles a file), type a message, `Enter` commits. A selection that looks like one side of a renamed folder asks whether to include the other side so git records the rename |
-| `o` | **open**: run a configured `open_command` for the selected worktree. Any configured commands open a picker (even a single one), listing each command already expanded for that worktree so you see exactly what will run; with none configured it prompts for a one-off. Templates expand `{path}` (worktree folder), `{name}`, `{branch}`, and `{status}` (`behind` / `ahead` / `merged`). A command saved with `mode = "terminal"` (marked `▶` in the picker) closes wtm and runs in this terminal, so interactive programs get it to themselves; the default `background` mode spawns detached and leaves wtm up. `e` does the same |
-| `u` | update the selected worktree: refresh the default branch from its upstream, then merge it in (or fast-forward in place when already on the default). If the worktree has uncommitted changes you're offered to stash them first and reapply them after the merge (so the update doesn't refuse on the dirty tree). On conflict, opens the conflict resolver |
-| `s` | **Stash tab**: stashes are shared across the whole repo, not tied to one worktree. `s` stashes the selected worktree's current changes (with an optional message); `p`/`a` pick a destination worktree to pop/apply the selected entry into (defaulting to the worktree the tab was opened from), and `x` drops it. A pop that conflicts opens the conflict resolver |
-| `m` | **move changes**: move the selected worktree's uncommitted changes into another worktree you pick (stash, then apply); refuses if the destination isn't clean |
-| `p` | pull the selected worktree (fast-forward only). When the pull is refused because the branch has diverged from its upstream, offers to retry the pull with a rebase |
-| `⇧P` | push the selected worktree; publishes with `-u` when there's no upstream |
+| `↑`/`↓` or `j`/`k` | select a worktree (mouse wheel over the table does the same) |
+| `⇧↑`/`⇧↓` | scroll the changed-file panel below the table |
+| `Enter` | Changes tab for the selected worktree (or focus the bottom panel in three-panel layout) |
+| `n` | new worktree |
+| `d` | delete the selected worktree: folder-only (keeps the branch) or folder + branch. Uncommitted changes: stash them or discard. If the branch can't be safely deleted you're offered a force delete; forcing a branch that's checked out elsewhere first switches that worktree to the repo's default branch |
+| `c` | commit |
+| `o` / `e` | open: run a configured `open_command`. Any configured commands open a picker listing each one already expanded (`{path}`, `{name}`, `{branch}`, `{status}`). `mode = "terminal"` (marked `▶`) closes wtm and runs in this terminal; the default `background` mode spawns detached. With none configured it prompts for a one-off |
+| `u` | update: refresh the default branch from its upstream, then merge it in (or fast-forward in place). Offers to stash local changes first. On conflict, opens the conflict resolver |
+| `s` | Stash tab |
+| `m` | move uncommitted changes into another worktree you pick; refuses if the destination isn't clean |
+| `p` | pull (fast-forward only). If the branch has diverged, offers to retry with a rebase |
+| `⇧P` | push; publishes with `-u` when there's no upstream |
 | `f` | fetch all remotes and refresh |
-| `t` | change which remote branch the selected worktree's branch **tracks** (its upstream), or stop tracking, from a type-to-filter picker of the repo's remote refs — the same picker the Branches tab opens with `u`. A worktree on a detached HEAD has no branch to track anything, so it says so instead |
-| `b` | switch the selected worktree to another branch: a picker of branches not checked out anywhere, local ones first, then remote-only branches (marked with their remote, checked out as a local tracking branch when picked). Type to filter the list, `↑`/`↓` select, `Enter` switches, `Esc` clears the filter then closes. With nothing matching what you typed, `Enter` tries it as a branch name anyway |
-| `Tab` / `⇧Tab` | cycle to the next/previous tab. On the **Settings tab**: edit this repo's settings (`worktree_dir`, `open_command`, `setup.copy`, `setup.run`) without touching the file. `↑`/`↓` pick a row, `Enter` edits or cycles it and writes immediately (`open_command`, `setup.copy`, and `setup.run` each open a list editor; `Esc` cancels an in-progress text edit or discards a list). On the **Branches tab**: local branches under a `LOCAL BRANCHES` heading, then remote-only ones (marked `☁ origin/…`) under `REMOTE BRANCHES`, with where each is checked out. `u` changes which remote branch the selected local branch tracks, or removes its tracking, from a type-to-filter picker of the repo's remote refs. `Enter` opens the branch's **commit history**, where `Space` marks commits (`a` all/none), `Enter` (or `v`/`→`) **browses into** the highlighted commit, and `p` **cherry-picks** the marked commits (or the highlighted one) into a worktree you pick — choosing to commit them directly (keeping the original messages) or just load the changes for review; `t` switches that history between the commit tree and a flat list. `c` checks the branch out in a new worktree, `n` creates a **branch only** (no worktree, from HEAD), `d` deletes — locally only by default, or locally and on its remote when it has one, with `⇧F` for a force delete and `cancel` always listed. `a` **archives** the branch (git keeps it; it just stops showing up) and `v` toggles viewing archived branches. Tab never switches tabs while a dialog is open. `m` **merges** the selected branch into a worktree you pick, and `b` **rebases** a worktree you pick onto the selected branch. `f` **fetches** all remotes, refreshing every branch's ahead/behind; `p` **fast-forwards** the selected branch onto its upstream — a branch checked out in a worktree is pulled there so its files move with it, and one checked out nowhere is fast-forwarded in place without a checkout. Either way a branch that has diverged from its upstream is reported rather than merged |
-| `l` | log of recent commits for the selected worktree, drawn as a **commit tree** showing where branches fork and merge, with branch and tag names marked on the commits they point at. `↑`/`↓` move a cursor between commits and `Enter` **browses into the highlighted commit** — a read-only view of the files it changed with each file's syntax-highlighted diff (`t` there toggles tree/flat, `←`/`→` collapse/expand folders, `⇧↑`/`⇧↓` or the mouse wheel scroll the diff). `t` switches the log between the tree and a flat list; the choice carries over to the Branches tab's commit history (where `Enter`, `v`, or `→` browses a commit the same way). `u` opens the **undo wizard** for the highlighted commit (see below) |
-| `x` | **jump to the conflict resolver** for a worktree stopped mid-merge, mid-rebase, mid-cherry-pick, or mid-revert, and for one simply left with unmerged files (a conflicted stash pop leaves no marker on disk, so it can't be detected any other way). Worktrees in that state are flagged in the list (`⚠ 3 conflicts` in the CHANGES column, `rebasing` in FLAGS), including operations started outside wtm in a terminal. `Enter` gets there too — the resolver is that worktree's changes pane — so `x` is a shortcut rather than the only door, and it's the one that says why there is nothing to resolve when there isn't |
-| `⇧U` | **discard all local changes** in the selected worktree: tracked files reset to `HEAD`, untracked files removed. Asks first, and says so instead of prompting when the worktree is already clean. The same key does the same thing on the Changes tab |
+| `t` | change which remote branch this worktree's branch tracks, or stop tracking (a detached HEAD has no branch, so it says so) |
+| `b` | switch this worktree to another branch (type to filter; local first, then remote-only). With nothing matching, `Enter` tries the typed name anyway |
+| `l` | commit log for this worktree |
+| `x` | jump to the conflict resolver for a worktree stopped mid-operation or left with unmerged files. Flagged in the list as `⚠ 3 conflicts` / `rebasing`. `Enter` gets there too; `x` is the shortcut that says why there is nothing to resolve when there isn't |
+| `⇧U` | discard all local changes (asks first; same key on the Changes tab) |
+| `⇧R` | rename this worktree |
 | `r` | refresh (the worktree and branch lists also refresh themselves every minute, keeping your place) |
-| `?` | help (works here and in the changes view; any key closes it) |
+| `Tab` / `⇧Tab` | cycle tabs. Tab never switches tabs while a dialog is open |
+| `?` | help (works here and in the changes view; `Tab` moves between help pages, `↑`/`↓` scrolls). Any key closes it |
 | `q` / `Ctrl+C` | quit |
 
 ### Undoing a commit
 
-Git has two unrelated ways to undo a commit, and picking the wrong one is expensive, so wtm asks rather than guessing. Press `u` on a commit — in a worktree's log (`l`), in the commits panel of the three-panel layout, or while browsing a commit's files — and a short wizard walks you through it.
+Git has two unrelated ways to undo a commit, and picking the wrong one is expensive, so wtm asks rather than guessing. Press `u` on a commit in a worktree's log (`l`), in the commits panel of the three-panel layout, or while browsing a commit's files, and a short wizard walks you through it.
 
 The first question is which kind of undo:
 
@@ -302,23 +345,29 @@ The first question is which kind of undo:
 
 Each screen spells out what it will do before you confirm it. A reset to a commit that isn't in that branch's history is refused rather than performed, since it would move the branch sideways onto unrelated work. If undoing the commit conflicts with later work, the conflict resolver opens on it just like a conflicting merge or cherry-pick.
 
+### Conflicts
+
 ![The conflict resolver: two conflicted files on the left, and on the right one hunk showing the OURS side in green and the THEIRS side in blue, waiting for a side to be picked](docs/images/tui-conflicts.png)
 
-When a merge, rebase, update, cherry-pick, or stash pop hits a conflict, the **conflict resolver** opens automatically — and it isn't a window you can lose. While a worktree has unmerged files (or is stopped mid-merge, mid-rebase, or mid-cherry-pick) the resolver **is** that worktree's changes pane: it takes the place of the file list and diff on the Changes tab, and of the bottom region under the three-panel layout, so there is no ordinary changes view to switch to until the conflicts are settled. The Changes tab is flagged `⚠` while that's true. Finish the conflicts and the same pane turns back into the normal changes view, commit and all.
+When a merge, rebase, update, cherry-pick, or stash pop hits a conflict, the **conflict resolver** opens automatically, and it isn't a window you can lose. While a worktree has unmerged files (or is stopped mid-merge, mid-rebase, or mid-cherry-pick) the resolver **is** that worktree's changes pane: it takes the place of the file list and diff on the Changes tab, and of the bottom region under the three-panel layout, so there is no ordinary changes view until the conflicts are settled. The Changes tab is flagged `⚠` while that's true. Finish the conflicts and the same pane turns back into the normal changes view, commit and all.
 
-It lists the conflicted files (each with a resolved/unresolved marker) and shows the selected file's hunks as **OURS** (green) vs **THEIRS** (blue). Every hunk names both of its sides in place: the branch each came from, the key that takes it, and a `✓ keep` / `✗ drop` verdict once you've decided, so nothing has to be read out of context. A pinned two-line legend at the top of the pane says where each side comes from and stays put as you scroll, and the footer counts how many hunks are decided. Each side is numbered from 1 down its own gutter, so line 2 of OURS reads against line 2 of THEIRS. During a **rebase** git swaps the two, so OURS is the branch you are rebasing onto and THEIRS is your own commit being replayed; the resolver flags that in the legend rather than leaving you to work it out.
+It lists the conflicted files (each with a resolved/unresolved marker) and shows the selected file's hunks as **OURS** (green) vs **THEIRS** (blue). Every hunk names both of its sides in place: the branch each came from, the key that takes it, and a `✓ keep` / `✗ drop` verdict once you've decided. A pinned two-line legend at the top of the pane says where each side comes from and stays put as you scroll, and the footer counts how many hunks are decided. Each side is numbered from 1 down its own gutter, so line 2 of OURS reads against line 2 of THEIRS. During a **rebase** git swaps the two, so OURS is the branch you are rebasing onto and THEIRS is your own commit being replayed; the resolver flags that in the legend.
 
-`←`/`→` move between files, `↑`/`↓` between hunks; `o`/`t` keep ours/theirs for the current hunk, `b`/`⇧B` **keep both** (ours-then-theirs or reversed, on separate lines — the hunk then shows which side lands first), `⇧O`/`⇧T` take the whole file's side.
+`←`/`→` move between files, `↑`/`↓` between hunks; `o`/`t` keep ours/theirs for the current hunk, `b`/`⇧B` **keep both** (ours-then-theirs or reversed, on separate lines), `⇧O`/`⇧T` take the whole file's side.
 
-`e` and `⇧E` open the same thing: the **whole file**, full screen, conflict markers and all, for the fixes per-hunk choices can't express (interleaving both sides, fixing an import list, deleting a stray line). `e` puts the cursor on the hunk you were looking at; `⇧E` opens at the top. Choices you have already made are written to disk first, so you edit the file as it really stands. The editor takes the entire frame, numbers every line down the left, highlights the conflict markers with each side in its resolver colour, and scrolls in **both** directions — arrows and `PgUp`/`PgDn` move the cursor, and the view follows it into a long line instead of clipping at the border. `Ctrl+S` saves and re-reads the file, so any hunks the edit settled drop out of the list; `Esc` discards.
+`e` and `⇧E` open the **whole file**, full screen, conflict markers and all, for the fixes per-hunk choices can't express (interleaving both sides, fixing an import list, deleting a stray line). `e` puts the cursor on the hunk you were looking at; `⇧E` opens at the top. Choices you have already made are written to disk first, so you edit the file as it really stands. The editor takes the entire frame, numbers every line down the left, highlights the conflict markers with each side in its resolver colour, and scrolls in both directions. `Ctrl+S` saves and re-reads the file, so any hunks the edit settled drop out of the list; `Esc` discards.
 
-Choosing a side with `o`/`t`/`b` **records the choice, it does not write it**. The pinned legend counts how many choices are still unwritten, the status line says the same on every press, and `c` refuses in those words rather than passing along git's bare "unmerged paths". `w` (or `Enter`) is what saves the file and, once every hunk is decided, stages it as resolved. If you fixed a conflict **in your own editor** instead, `a` marks the file resolved using exactly what is on disk (it refuses while conflict markers remain, rather than committing them), and `r` re-reads the conflicts from disk to pick up changes made outside wtm.
+Choosing a side with `o`/`t`/`b` **records the choice, it does not write it**. The pinned legend counts how many choices are still unwritten, the status line says the same on every press, and `c` refuses in those words rather than passing along git's bare "unmerged paths". `w` (or `Enter`) is what saves the file and, once every hunk is decided, stages it as resolved. If you fixed a conflict **in your own editor** instead, `a` marks the file resolved using exactly what is on disk (it refuses while conflict markers remain), and `r` re-reads the conflicts from disk to pick up changes made outside wtm.
 
-`c` completes the operation (commit the merge, continue the rebase or cherry-pick, or drop the popped stash), `s` **skips** the commit a rebase stopped on, and `x` then `y` aborts and restores the worktree. `Esc`/`q` backs out to the worktree list and leaves the operation in progress; since the resolver is that worktree's changes pane, `Enter` on it (or the `⚠ Changes` tab) walks straight back in where you left off.
+`c` completes the operation (commit the merge, continue the rebase or cherry-pick, or drop the popped stash), `s` **skips** the commit a rebase stopped on, and `x` then `y` aborts and restores the worktree. `Esc`/`q` backs out to the worktree list and leaves the operation in progress; `Enter` on that worktree (or the `⚠ Changes` tab) walks straight back in where you left off.
+
+### Settings tab
+
+Pressing `Tab` to the **Settings** tab opens an editor for the repo's `.wtm.toml`: pick a row with `↑`/`↓`, press `Enter` to edit or cycle it, and the change is written immediately (comments preserved). It shows a live preview of where worktrees will land and a colour sample for the selected `diff_theme`, and clearing a field unsets it so the default (or global value) applies again. The `auto_update_check`, `diff_theme`, and `worktrees_layout` rows cycle rather than edit free text (`Enter` or `Space`), and all three are saved in the global config since they apply to wtm rather than to one repo. Switching `worktrees_layout` redraws the Worktrees tab on the next frame, no restart needed.
+
+`open_command` holds a list of commands, so `Enter` on that row opens a small list editor: `↑`/`↓` move, `Enter` edits the selected command, `a` adds one, `d` removes one, `Enter` on `[ done ]` saves the list, and `Esc` discards the edits. Each command row carries two toggles: `g` saves that command **globally** so every repo offers it, and `t` switches it between running in the **background** and taking over the **terminal**. Both are shown in fixed columns on the row. Because entries are edited one at a time, a command containing a comma stays a single command.
 
 Every text field (the new-branch name, the commit message, stash and branch names, and the settings and setup-wizard inputs) supports cursor editing: `←`/`→` move, `Home`/`End` jump, and `Backspace`/`Delete` remove characters mid-string.
-
-Pressing `Tab` to the **Settings** tab opens an editor for the repo's `.wtm.toml`: pick a row with `↑`/`↓`, press `Enter` to edit or cycle it, and the change is written immediately (comments preserved). It shows a live preview of where worktrees will land and a colour sample for the selected `diff_theme`, and clearing a field unsets it so the default (or global value) applies again. The `auto_update_check`, `diff_theme`, and `worktrees_layout` rows cycle rather than edit free text (`Enter` or `Space`), and all three are saved in the global config since they apply to wtm rather than to one repo. Switching `worktrees_layout` redraws the Worktrees tab on the next frame, no restart needed. `open_command` holds a list of commands, so `Enter` on that row opens a small list editor: `↑`/`↓` move, `Enter` edits the selected command, `a` adds one, `d` removes one, `Enter` on `[ done ]` saves the list, and `Esc` discards the edits. Each command row carries two toggles: `g` saves that command **globally** so every repo offers it (it goes to the global config instead of this repo's `.wtm.toml`), and `t` switches it between running in the **background** and taking over the **terminal** (wtm closes and hands the terminal to the command). Both are shown in fixed columns on the row, so a newly added command can be set up right where it was typed. Because entries are edited one at a time, a command containing a comma stays a single command. `{path}`, `{name}`, `{branch}`, and `{status}` are expanded in the picker that `o` opens on the Worktrees tab, so each row is the command that will actually run.
 
 While setup runs, its output streams into the progress window. Type a line and press `Enter` to answer a prompting command; press `Ctrl+C` twice to kill a stuck setup.
 
@@ -326,7 +375,7 @@ While setup runs, its output streams into the progress window. Type a line and p
 
 When the TUI starts it looks up the latest [release](https://github.com/faulker/wtm/releases) on a background thread. This never delays startup: the first frame draws immediately, and if the network is slow or unreachable the check simply fails silently. If a newer version exists you get a prompt with the version, a link to the release notes, and two choices, update and restart, or not now. Postponing keeps the version visible on the Settings tab and doesn't ask again until the next launch.
 
-The check uses the public release URLs, not `api.github.com`. `/releases/latest` redirects to the newest tag, so one lookup gives both the version and (via the release workflow's asset naming) every download URL. That matters because the GitHub API rate-limits anonymous callers per IP, which any shared or office network exhausts quickly, and a start-up check that fails for everyone behind one NAT would be worse than no check at all. No token is needed or used.
+The check uses the public release URLs, not `api.github.com`. `/releases/latest` redirects to the newest tag, so one lookup gives both the version and (via the release workflow's asset naming) every download URL. That avoids GitHub's anonymous API rate limit, which any shared or office network exhausts quickly. No token is needed or used.
 
 Installing downloads the build for your platform, verifies it against the release's SHA-256 checksums, checks that the new binary runs and reports the expected version, and only then moves it over the old one. If wtm lives somewhere your user can't write (a `/usr/local` or Homebrew install owned by root) it says so up front instead of failing halfway through.
 
