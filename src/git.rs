@@ -337,6 +337,20 @@ pub fn commits_ahead_of(dir: &Path, base: &str, branch: &str) -> Result<u32> {
     Ok(out.trim().parse().unwrap_or(0))
 }
 
+/// Full hashes of the commits reachable from `branch` but not from `base`
+/// (`git rev-list base..branch`), i.e. the branch's own work. The set form
+/// (like [`first_parent_commits`]) is what lets a log row be tested one at a
+/// time, where [`commits_ahead_of`] only answers how many there are.
+pub fn commits_ahead_hashes(dir: &Path, base: &str, branch: &str) -> Result<HashSet<String>> {
+    let range = format!("{base}..{branch}");
+    let out = run(dir, &["rev-list", &range])?;
+    Ok(out
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
 /// True when `ancestor` is reachable from `descendant`, i.e. it sits back along
 /// the same history rather than on a divergent line. Used to refuse a reset
 /// that would move a branch sideways onto unrelated commits.
@@ -2432,6 +2446,52 @@ mod tests {
 
     /// The real `git log --graph` on a merge: the art must come back drawn, and
     /// every commit must still be readable off it.
+    #[test]
+    fn commits_ahead_hashes_lists_only_the_branchs_own_work() {
+        let (_tmp, repo) = temp_repo();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&["checkout", "-b", "feature"]);
+        git(&["commit", "--allow-empty", "-m", "mine one"]);
+        git(&["commit", "--allow-empty", "-m", "mine two"]);
+
+        let own = commits_ahead_hashes(&repo, "main", "feature").unwrap();
+        assert_eq!(own.len(), 2, "only the two commits made on feature");
+        // Every hash is full length and none of them is main's tip.
+        let main_tip = rev_parse(&repo, "main").unwrap();
+        assert!(own.iter().all(|h| h.len() == 40));
+        assert!(!own.contains(&main_tip), "the base tip is not the branch's");
+        // The subjects confirm which commits landed in the set.
+        let subjects: Vec<String> = log_ref(&repo, "feature", 2)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.subject)
+            .collect();
+        assert_eq!(subjects, ["mine two", "mine one"]);
+        for e in log_ref(&repo, "feature", 2).unwrap() {
+            assert!(own.contains(&e.hash), "{} is the branch's own", e.subject);
+        }
+
+        // A branch that has nothing of its own yields an empty set, which is
+        // what leaves a log unhighlighted rather than fully highlighted.
+        assert!(
+            commits_ahead_hashes(&repo, "feature", "main")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            commits_ahead_hashes(&repo, "main", "main")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn log_graph_draws_a_merge() {
         let (_tmp, repo) = temp_repo();

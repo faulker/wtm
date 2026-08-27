@@ -246,6 +246,33 @@ fn commit_log_lines(
     }
 }
 
+/// Which of `lines`' commits are the branch's own work: reachable from `branch`
+/// but not from the base it was created off. All false when `branch` is `None`
+/// (a detached HEAD has no base to compare against) or when no base resolves,
+/// so an unhighlighted log is always the safe degradation.
+///
+/// Hashes are matched by prefix because the two log paths abbreviate
+/// differently: `ops::log_graph` asks git for `%h`, `ops::branch_log_graph` for
+/// `%H` (full, so its rows can be cherry-picked). `rev-list` always returns
+/// full hashes, so a short row hash is a prefix of its set entry.
+fn own_commit_flags(ctx: &Ctx, branch: Option<&str>, lines: &[GraphLine]) -> Vec<bool> {
+    let Some(branch) = branch else {
+        return vec![false; lines.len()];
+    };
+    let own = ops::branch_own_commits(ctx, branch).unwrap_or_default();
+    if own.is_empty() {
+        return vec![false; lines.len()];
+    }
+    lines
+        .iter()
+        .map(|l| {
+            l.entry.as_ref().is_some_and(|e| {
+                own.contains(&e.hash) || own.iter().any(|h| h.starts_with(&e.hash))
+            })
+        })
+        .collect()
+}
+
 /// Identity of a three-panel commits-panel load, used to drop stale background
 /// results when the selection, branch, or log mode has since changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,9 +283,13 @@ struct CommitsLoadKey {
     log_mode: LogMode,
 }
 
-type CommitsPending = Option<(CommitsLoadKey, Task<Result<Vec<GraphLine>, String>>)>;
+type CommitsPending = Option<(
+    CommitsLoadKey,
+    Task<Result<(Vec<GraphLine>, Vec<bool>), String>>,
+)>;
 type StatusRefreshPending = Option<(u64, String, bool, Task<Result<Vec<StatusEntry>, String>>)>;
 type StashPending = Option<(String, Task<Result<Vec<StashEntry>, String>>)>;
+type CommitFilesPending = Option<(String, Task<Result<Vec<StatusEntry>, String>>)>;
 
 /// Index of the first row holding a commit, skipping any leading art-only rows.
 /// 0 when there are none (an empty list has nothing to select anyway).
@@ -765,6 +796,14 @@ pub enum View {
         /// Optional commit body, below the subject line.
         body: TextArea,
         focus: CommitFocus,
+        /// True until the background `ops::status` load lands. `files` is empty
+        /// meanwhile, so the list draws a placeholder instead of reading as an
+        /// empty changeset. Always false when the dialog was opened from the
+        /// Changes tab, which already has the files in hand.
+        loading: bool,
+        /// A submit pressed while `loading`, replayed by
+        /// `poll_commit_files_load` once the files arrive.
+        submit_pending: bool,
     },
     /// Picker for switching the selected worktree onto a different branch: any
     /// local branch not checked out elsewhere, plus remote-only branches.
@@ -788,6 +827,10 @@ pub enum View {
     Log {
         name: String,
         lines: Vec<GraphLine>,
+        /// Parallel with `lines`: the branch's own commits (see
+        /// `own_commit_flags`), drawn banded so they stand out from the
+        /// history the branch inherited.
+        own: Vec<bool>,
         /// Cursor into `lines`; the cursor skips art-only rows.
         selected: usize,
     },
@@ -843,6 +886,9 @@ pub enum View {
         branch: String,
         lines: Vec<GraphLine>,
         marked: Vec<bool>,
+        /// Parallel with `lines`: the branch's own commits (see
+        /// `own_commit_flags`), which are usually the ones worth picking.
+        own: Vec<bool>,
         selected: usize,
     },
     /// Cherry-pick flow: choose which worktree to apply the picked commits into,
@@ -930,28 +976,6 @@ pub enum View {
         /// `candidates` directly.
         selected: usize,
     },
-    /// Friendly conflict resolver for a worktree left mid-merge. Lists the
-    /// conflicted files, and for the selected file shows each hunk's OURS vs
-    /// THEIRS sides so a resolution can be picked per hunk (or the whole file
-    /// taken from one side), then staged. Reached when a merge/update conflicts.
-    ConflictResolver {
-        /// Worktree being resolved (addressed by name in ops).
-        target: String,
-        /// What is being merged in, for the header (e.g. the source branch).
-        source_label: String,
-        /// The in-progress operation this resolver finishes (merge, cherry-pick,
-        /// or stash pop), so complete/abort dispatch correctly.
-        kind: ops::ResolveKind,
-        /// Conflicted file paths, parallel with `resolved`.
-        files: Vec<String>,
-        /// Whether each file has been staged as resolved.
-        resolved: Vec<bool>,
-        /// Cursor into `files`.
-        file: usize,
-        /// Parsed state of the file under the cursor, when it loaded and still
-        /// has conflicts. `None` on an already-resolved file or a load error.
-        current: Option<ResolverFile>,
-    },
     /// A git operation (pull/push/fetch/delete/…) running on a background
     /// thread. Its result message is shown and the list refreshed when it
     /// finishes; `then` decides which view to reopen afterwards.
@@ -960,6 +984,35 @@ pub enum View {
         rx: Task<Result<String, String>>,
         then: BusyThen,
     },
+}
+
+/// Friendly conflict resolver for a worktree left mid-merge. Lists the
+/// conflicted files, and for the selected file shows each hunk's OURS vs THEIRS
+/// sides so a resolution can be picked per hunk (or the whole file taken from
+/// one side), then staged.
+///
+/// This is not a view of its own: while it is set it *is* the changes pane, in
+/// place of the file list and diff, on the Changes tab and in the three-panel
+/// Worktrees layout alike. `sync_resolver_panel` decides when that happens, so
+/// a worktree with conflicts cannot be looked at any other way and there is no
+/// separate window to get lost outside of.
+pub struct ResolverState {
+    /// Worktree being resolved (addressed by name in ops).
+    pub target: String,
+    /// What is being merged in, for the header (e.g. the source branch).
+    pub source_label: String,
+    /// The in-progress operation this resolver finishes (merge, cherry-pick,
+    /// or stash pop), so complete/abort dispatch correctly.
+    pub kind: ops::ResolveKind,
+    /// Conflicted file paths, parallel with `resolved`.
+    pub files: Vec<String>,
+    /// Whether each file has been staged as resolved.
+    pub resolved: Vec<bool>,
+    /// Cursor into `files`.
+    pub file: usize,
+    /// Parsed state of the file under the cursor, when it loaded and still has
+    /// conflicts. `None` on an already-resolved file or a load error.
+    pub current: Option<ResolverFile>,
 }
 
 /// A conflicted file loaded into the resolver: its parsed contents plus the
@@ -1179,6 +1232,14 @@ pub enum BusyThen {
     Restart {
         exe: PathBuf,
     },
+    /// A commit is running. `draft` is the `View::Commit` the submit came from,
+    /// carried through the op so a failure (a rejecting pre-commit hook, a
+    /// signing error, nothing staged) can put the dialog back with the typed
+    /// subject and body intact instead of making the user retype them. Dropped
+    /// on success.
+    Commit {
+        draft: Box<View>,
+    },
 }
 
 /// A worktree the picked commits can be cherry-picked into. Cherry-pick needs a
@@ -1348,6 +1409,9 @@ pub struct WorktreeCommitsPanel {
     /// True when `branch` is a real branch ref; false for detached HEAD.
     pub from_branch: bool,
     pub lines: Vec<GraphLine>,
+    /// Parallel with `lines`: true where the row's commit is the branch's own
+    /// work rather than history inherited from its base. See `own_commit_flags`.
+    pub own: Vec<bool>,
     pub selected: usize,
 }
 
@@ -1553,8 +1617,15 @@ pub struct App {
     /// Content of the Changes tab, populated by `open_changes_tab`. Also feeds
     /// the bottom two panels of the three-panel Worktrees layout.
     pub changes: ChangesTab,
+    /// When `Some`, the changes pane shows the conflict resolver instead of the
+    /// file list and diff, because the worktree it is pointed at is mid-merge.
+    /// Reconciled by `sync_resolver_panel`; outranks `worktree_commits`.
+    pub resolver: Option<ResolverState>,
     /// When `Some`, the three-panel bottom area shows this commit list instead
     /// of the changes/diff panels (selected worktree is clean).
+    /// In-flight file-list load for an open commit dialog, keyed by worktree
+    /// name so a result for a dialog the user has since closed is dropped.
+    commit_files_pending: CommitFilesPending,
     pub worktree_commits: Option<WorktreeCommitsPanel>,
     /// Background load for `worktree_commits`. The key identifies which
     /// worktree/branch/mode the result belongs to; `poll_commits_load` drops
@@ -1737,6 +1808,8 @@ impl App {
             worktrees_focus: WorktreesFocus::default(),
             files_list: None,
             changes: ChangesTab::default(),
+            resolver: None,
+            commit_files_pending: None,
             worktree_commits: None,
             commits_pending: None,
             status_refresh_pending: None,
@@ -1991,6 +2064,7 @@ impl App {
         }
         let on_changes = self.tab == Tab::Changes;
         self.changes = ChangesTab::default();
+        self.resolver = None;
         if on_changes {
             match self.worktrees.get(self.selected).map(|w| w.name.clone()) {
                 Some(name) => {
@@ -2101,6 +2175,9 @@ impl App {
         self.poll_commits_load();
         self.poll_status_refresh();
         self.poll_stash_load();
+        // The commit dialog opens before its file list exists, so drain that
+        // load here too; it is view-dependent but cheap to check.
+        self.poll_commit_files_load();
         if let View::Busy { rx, .. } = &self.view {
             if let Some(result) = rx.poll_latest() {
                 // Pull the follow-up out of the view so we can mutate self, then
@@ -2140,6 +2217,18 @@ impl App {
                         self.refresh();
                         self.finish_merge_op(target, source_label, kind, m);
                     }
+                    // A commit failed: put the dialog back exactly as it was
+                    // (subject, body, files, marks, focus) under the error box,
+                    // so dismissing the error leaves the message ready to fix
+                    // and resubmit.
+                    (Err(e), BusyThen::Commit { draft }) => {
+                        self.set_error(e);
+                        self.refresh();
+                        self.view = *draft;
+                        if let View::Commit { submit_pending, .. } = &mut self.view {
+                            *submit_pending = false;
+                        }
+                    }
                     (Ok(m), then) => {
                         self.message = Some(m);
                         self.refresh();
@@ -2147,7 +2236,9 @@ impl App {
                             // A pull or push started from the Changes tab moves
                             // the working tree under it, so re-read the file
                             // list and diff rather than showing a stale one.
-                            BusyThen::List | BusyThen::Pull { .. } => {
+                            // A commit moves the working tree under the
+                            // Changes tab exactly like a pull or push does.
+                            BusyThen::List | BusyThen::Pull { .. } | BusyThen::Commit { .. } => {
                                 if self.tab == Tab::Changes {
                                     self.refresh_diff();
                                 }
@@ -2315,7 +2406,7 @@ impl App {
 
     /// Opens the help panel on the page documenting the active view.
     fn open_help(&mut self) {
-        self.help_tab = HelpTab::for_view(&self.view, self.tab);
+        self.help_tab = HelpTab::for_view(&self.view, self.tab, self.resolver.is_some());
         self.help_scroll = 0;
         self.show_help = true;
     }
@@ -2506,7 +2597,6 @@ impl App {
             View::OpenCommand { .. } => self.on_open_command_key(key),
             View::UpstreamPick { .. } => self.on_upstream_pick_key(key),
             View::StashTarget { .. } => self.on_stash_target_key(key),
-            View::ConflictResolver { .. } => self.on_resolver_key(key),
             // A background op owns the screen until tick() drains its result.
             View::Busy { .. } => {}
         }
@@ -3050,6 +3140,7 @@ impl App {
                 name,
                 lines,
                 selected,
+                ..
             } => lines
                 .get(*selected)
                 .and_then(|l| l.entry.as_ref())
@@ -3458,12 +3549,23 @@ impl App {
             return;
         }
         match self.tab {
+            // The resolver stands in for the changes pane wherever that pane is
+            // drawn, so it owns that pane's keys too — in the three-panel
+            // layout's bottom region as much as on the Changes tab.
+            Tab::Worktrees
+                if self.three_panel
+                    && self.worktrees_focus == WorktreesFocus::Files
+                    && self.resolver.is_some() =>
+            {
+                self.on_resolver_key(key)
+            }
             // In the three-panel layout the changed-file panel can hold the
             // keyboard instead of the worktree list above it.
             Tab::Worktrees if self.three_panel && self.worktrees_focus == WorktreesFocus::Files => {
                 self.on_worktrees_files_key(key)
             }
             Tab::Worktrees => self.on_worktrees_tab_key(key),
+            Tab::Changes if self.resolver.is_some() => self.on_resolver_key(key),
             Tab::Changes => self.on_changes_tab_key(key),
             Tab::Branches => self.on_branches_tab_key(key),
             Tab::Stash => self.on_stash_tab_key(key),
@@ -4326,6 +4428,18 @@ impl App {
                 // The branch table's rows include group headings, so a click
                 // index is a display row, not a branch index.
                 Tab::Branches => self.select_branch_row(idx),
+                // The resolver stands in for the file list while this
+                // worktree is conflicted, so a click there picks a conflicted
+                // file rather than a changed one.
+                Tab::Changes if self.resolver.is_some() => {
+                    if let Some(r) = &mut self.resolver {
+                        if idx >= r.files.len() || r.file == idx {
+                            return;
+                        }
+                        r.file = idx;
+                    }
+                    self.load_resolver_file();
+                }
                 Tab::Changes => {
                     let c = &mut self.changes;
                     if idx >= c.rows.len() || c.selected == idx {
@@ -4444,15 +4558,6 @@ impl App {
                 {
                     *selected = idx;
                 }
-            }
-            View::ConflictResolver { .. } => {
-                if let View::ConflictResolver { files, file, .. } = &mut self.view {
-                    if idx >= files.len() || *file == idx {
-                        return;
-                    }
-                    *file = idx;
-                }
-                self.load_resolver_file();
             }
             // The wizard's rows are drawn per-step, so the click target
             // depends on which step (and, for Review, whether it's mid-edit)
@@ -4867,6 +4972,10 @@ impl App {
         } else if self.changes.name != name {
             self.changes.name = name.clone();
         }
+        // The pane just moved; the resolver belongs to whichever worktree it is
+        // pointed at, and waiting for the status to land would leave the old
+        // worktree's conflicts on screen under the new one's name.
+        self.sync_resolver_panel();
         let (tx, rx) = channel();
         let ctx = self.ctx.clone();
         let name_for_thread = name.clone();
@@ -4959,6 +5068,7 @@ impl App {
             };
             self.load_diff_content(true);
         }
+        self.sync_resolver_panel();
         self.sync_worktree_commits_panel();
     }
 
@@ -5062,6 +5172,10 @@ impl App {
             input: TextInput::default(),
             body: TextArea::default(),
             focus: CommitFocus::Message,
+            // The Changes tab already holds the file list, so there is nothing
+            // to wait for here.
+            loading: false,
+            submit_pending: false,
         });
     }
 
@@ -5477,21 +5591,97 @@ impl App {
             return;
         }
         let name = wt.name.clone();
-        match ops::status(&self.ctx, &name) {
-            Ok((_, files)) => {
-                let marked = vec![true; files.len()];
-                self.push_screen(View::Commit {
-                    name,
+        // The dialog opens on the spot and the file list fills in behind it:
+        // `ops::status` is a full `git status` (plus a worktree listing), which
+        // on a large changeset is far too slow to hold the UI thread for.
+        // Focus starts on the message, so the subject can be typed meanwhile.
+        self.push_screen(View::Commit {
+            name: name.clone(),
+            files: Vec::new(),
+            marked: Vec::new(),
+            cursor: 0,
+            input: TextInput::default(),
+            body: TextArea::default(),
+            focus: CommitFocus::Message,
+            loading: true,
+            submit_pending: false,
+        });
+        self.load_commit_files(name);
+    }
+
+    /// Fetches the commit dialog's changed-file list on a background thread,
+    /// the same shape as `load_worktree_preview`. `poll_commit_files_load`
+    /// applies it once it lands.
+    fn load_commit_files(&mut self, name: String) {
+        let (tx, rx) = channel();
+        let ctx = self.ctx.clone();
+        let key = name.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(
+                ops::status(&ctx, &name)
+                    .map(|(_, files)| files)
+                    .map_err(|e| format!("{e:#}")),
+            );
+        });
+        self.commit_files_pending = Some((key, Task::new(rx)));
+    }
+
+    /// Applies a finished commit-dialog file load, then replays a submit the
+    /// user pressed while it was still running. A result for a dialog that has
+    /// since closed (or moved to another worktree) is dropped.
+    fn poll_commit_files_load(&mut self) {
+        let Some((name, task)) = &self.commit_files_pending else {
+            return;
+        };
+        let name = name.clone();
+        let Some(result) = task.poll_latest() else {
+            return;
+        };
+        self.commit_files_pending = None;
+        let View::Commit {
+            name: open_name, ..
+        } = &self.view
+        else {
+            return;
+        };
+        if *open_name != name {
+            return;
+        }
+        match result {
+            Ok(loaded) => {
+                let View::Commit {
                     files,
                     marked,
-                    cursor: 0,
-                    input: TextInput::default(),
-                    body: TextArea::default(),
-                    focus: CommitFocus::Message,
-                });
+                    cursor,
+                    loading,
+                    submit_pending,
+                    ..
+                } = &mut self.view
+                else {
+                    return;
+                };
+                *marked = vec![true; loaded.len()];
+                *files = loaded;
+                *cursor = (*cursor).min(files.len().saturating_sub(1));
+                *loading = false;
+                let replay = std::mem::take(submit_pending);
+                if replay {
+                    self.do_commit();
+                }
             }
-            Err(e) => self.set_error(format!("{e:#}")),
+            Err(e) => {
+                // Nothing to show the dialog for; close it the way the old
+                // synchronous load did on error.
+                self.navigate_back();
+                self.set_error(e);
+            }
         }
+    }
+
+    /// Whether an open commit dialog is still waiting on its file list.
+    #[cfg(test)]
+    fn commit_files_loading(&self) -> bool {
+        self.commit_files_pending.is_some()
     }
 
     /// Drives the commit dialog. The file list and message input each own a
@@ -5504,11 +5694,13 @@ impl App {
             input,
             body,
             focus,
+            loading,
             ..
         } = &mut self.view
         else {
             return;
         };
+        let loading = *loading;
         match key.code {
             KeyCode::Esc => {
                 self.navigate_back();
@@ -5535,12 +5727,12 @@ impl App {
             KeyCode::Char('s') | KeyCode::Char('d')
                 if key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
-                self.do_commit();
+                self.submit_commit(loading);
                 return;
             }
             // Enter still commits from the file list and the subject line.
             KeyCode::Enter if *focus != CommitFocus::Body => {
-                self.do_commit();
+                self.submit_commit(loading);
                 return;
             }
             _ => {}
@@ -5569,6 +5761,32 @@ impl App {
             }
             CommitFocus::Body => body.on_key(key),
         }
+    }
+
+    /// Handles a submit from the commit dialog. While the file list is still
+    /// loading there is nothing to commit yet, so the submit is remembered and
+    /// `poll_commit_files_load` replays it the moment the files land. The
+    /// empty-message guard still runs first, so a blank subject is rejected
+    /// straight away rather than after the wait.
+    fn submit_commit(&mut self, loading: bool) {
+        if !loading {
+            self.do_commit();
+            return;
+        }
+        let View::Commit {
+            input,
+            submit_pending,
+            ..
+        } = &mut self.view
+        else {
+            return;
+        };
+        if input.trimmed().is_empty() {
+            self.message = Some("commit message must not be empty".to_string());
+            return;
+        }
+        *submit_pending = true;
+        self.message = Some("committing once changes finish loading…".to_string());
     }
 
     /// Commits the files marked in the commit dialog. Errors and empty
@@ -5667,9 +5885,15 @@ impl App {
         body: Option<String>,
         paths: Vec<String>,
     ) {
+        // Move the dialog out of the view so it can ride along with the op:
+        // `start_busy` is about to overwrite `self.view`, and on failure this
+        // is the only copy of what the user typed.
+        let draft = std::mem::replace(&mut self.view, View::List);
         self.start_busy(
             format!("committing '{name}'…"),
-            BusyThen::List,
+            BusyThen::Commit {
+                draft: Box::new(draft),
+            },
             move |ctx| {
                 ops::commit(ctx, &name, &message, body.as_deref(), Some(&paths))
                     .map(|r| {
@@ -6344,6 +6568,7 @@ impl App {
             };
             self.load_diff_content(true);
         }
+        self.sync_resolver_panel();
         self.sync_worktree_commits_panel();
     }
 
@@ -6351,6 +6576,11 @@ impl App {
     /// current changes pane is empty, or clears it when there are uncommitted
     /// files again. Reuses `commit_log_lines` (same path as `View::BranchCommits`).
     fn sync_worktree_commits_panel(&mut self) {
+        if self.resolver.is_some() {
+            self.worktree_commits = None;
+            self.commits_pending = None;
+            return;
+        }
         if !self.three_panel || self.changes.name.is_empty() {
             self.worktree_commits = None;
             self.commits_pending = None;
@@ -6411,7 +6641,13 @@ impl App {
         let from_branch = key.from_branch;
         let mode = key.log_mode;
         std::thread::spawn(move || {
-            let _ = tx.send(commit_log_lines(&ctx, &name, &branch, from_branch, mode));
+            // The own-commit set costs an extra `rev-list`, so it is computed
+            // here on the worker rather than when the rows are applied.
+            let result = commit_log_lines(&ctx, &name, &branch, from_branch, mode).map(|lines| {
+                let own = own_commit_flags(&ctx, from_branch.then_some(branch.as_str()), &lines);
+                (lines, own)
+            });
+            let _ = tx.send(result);
         });
         self.commits_pending = Some((key, Task::new(rx)));
     }
@@ -6447,13 +6683,14 @@ impl App {
             return;
         }
         match result {
-            Ok(lines) => {
+            Ok((lines, own)) => {
                 let selected = first_commit_row(&lines);
                 self.worktree_commits = Some(WorktreeCommitsPanel {
                     name: key.name,
                     branch: key.branch,
                     from_branch: key.from_branch,
                     lines,
+                    own,
                     selected,
                 });
             }
@@ -6753,10 +6990,12 @@ impl App {
         match self.branch_log_lines(&branch) {
             Ok(lines) => {
                 let selected = first_commit_row(&lines);
+                let own = own_commit_flags(&self.ctx, Some(&branch), &lines);
                 self.push_screen(View::BranchCommits {
                     branch,
                     marked: vec![false; lines.len()],
                     lines,
+                    own,
                     selected,
                 });
             }
@@ -6861,6 +7100,7 @@ impl App {
             lines,
             marked,
             selected,
+            ..
         } = &self.view
         else {
             return;
@@ -7375,41 +7615,39 @@ impl App {
         files: Vec<String>,
     ) {
         let resolved = vec![false; files.len()];
-        self.view = View::ConflictResolver {
-            target,
+        self.resolver = Some(ResolverState {
+            target: target.clone(),
             source_label,
             kind,
             files,
             resolved,
             file: 0,
             current: None,
-        };
+        });
         self.load_resolver_file();
+        // The resolver *is* the changes pane, so opening one means putting that
+        // pane on this worktree: the Changes tab in the two-panel layout, the
+        // focused bottom region in three-panel. `open_changes_tab` knows which.
+        //
+        // Refresh first: `sync_resolver_panel` decides whether the pane keeps
+        // the resolver from the list's per-worktree conflict counts, which are
+        // still pre-merge until the list reloads.
+        self.go_root();
+        self.refresh();
+        self.select_worktree(&target);
+        self.open_changes_tab(target);
     }
 
-    /// Reopens the resolver for the selected worktree when it is stopped in the
-    /// middle of a merge, rebase, or cherry-pick. This is the way back in after
-    /// leaving with `q`, and the only way to reach a conflict that started
-    /// outside wtm (a `git rebase` in a terminal, say).
-    fn open_resolver_for_selected(&mut self) {
-        let Some(wt) = self.selected_worktree() else {
-            return;
-        };
-        let target = wt.name.clone();
-        let detected = match ops::detect_resolve_kind(&self.ctx, &target) {
-            Ok(kind) => kind,
-            Err(e) => {
-                self.set_error(format!("{e:#}"));
-                return;
-            }
-        };
-        let files = match ops::list_conflicts(&self.ctx, &target) {
-            Ok(files) => files,
-            Err(e) => {
-                self.set_error(format!("{e:#}"));
-                return;
-            }
-        };
+    /// Reads the worktree named `name` and builds a resolver for whatever it is
+    /// stopped in the middle of. `Err` is a git failure worth reporting; `Ok(None)`
+    /// means there is genuinely nothing to resolve there.
+    ///
+    /// Shared by the explicit `x` key and by `sync_resolver_panel`, so a
+    /// conflict started outside wtm (a `git rebase` in a terminal, say) is
+    /// picked up the same way as one wtm started itself.
+    fn build_resolver_for(&self, name: &str) -> Result<Option<ResolverState>, String> {
+        let detected = ops::detect_resolve_kind(&self.ctx, name).map_err(|e| format!("{e:#}"))?;
+        let files = ops::list_conflicts(&self.ctx, name).map_err(|e| format!("{e:#}"))?;
         let kind = match detected {
             Some(kind) => kind,
             // A conflicted stash pop leaves no marker on disk, so it can't be
@@ -7418,19 +7656,111 @@ impl App {
             // behind), and the resolver is still the right place to fix them —
             // refusing here would leave no way in at all.
             None if !files.is_empty() => ops::ResolveKind::StashPop { index: None },
-            None => {
+            None => return Ok(None),
+        };
+        Ok(Some(ResolverState {
+            target: name.to_string(),
+            source_label: format!("{} in progress", kind.label()),
+            kind,
+            resolved: vec![false; files.len()],
+            files,
+            file: 0,
+            current: None,
+        }))
+    }
+
+    /// Jumps straight to the resolver for the selected worktree. The resolver
+    /// takes over that worktree's changes pane on its own (`sync_resolver_panel`),
+    /// so this is a shortcut rather than the only way in — but it is the one
+    /// that reports why there is nothing to resolve when there isn't.
+    fn open_resolver_for_selected(&mut self) {
+        let Some(target) = self.selected_worktree().map(|w| w.name.clone()) else {
+            return;
+        };
+        match self.build_resolver_for(&target) {
+            Ok(Some(state)) => {
+                // An operation with nothing left unmerged still belongs in the
+                // resolver: it needs the "complete" step, and there is nowhere
+                // else to do that from.
+                self.resolver = Some(state);
+                self.load_resolver_file();
+                self.go_root();
+                self.refresh();
+                self.open_changes_tab(target);
+            }
+            Ok(None) => {
                 self.message = Some(format!(
                     "nothing to resolve in '{target}': no conflicted files and no merge, \
                      rebase, or cherry-pick in progress"
                 ));
-                return;
             }
-        };
-        // An operation with nothing left unmerged still belongs in the
-        // resolver: it needs the "complete" step, and there is nowhere else to
-        // do that from. `q` leaves via `go_root`, so nothing needs pushing.
-        let label = format!("{} in progress", kind.label());
-        self.open_resolver(target, label, kind, files);
+            Err(e) => self.set_error(e),
+        }
+    }
+
+    /// Decides whether the changes pane shows the resolver or the ordinary file
+    /// list and diff, for whichever worktree the pane is pointed at. Called
+    /// wherever that pane is (re)loaded, never from the renderer: creating a
+    /// resolver shells out to git.
+    ///
+    /// A worktree with unmerged files, or one stopped mid-merge/rebase/
+    /// cherry-pick, has no ordinary changes view at all — the resolver is it,
+    /// and finishing the conflicts is what hands the pane back.
+    fn sync_resolver_panel(&mut self) {
+        let name = self.changes.name.clone();
+        if name.is_empty() {
+            self.resolver = None;
+            return;
+        }
+        // The pane moved to a different worktree; that worktree's resolver (if
+        // any) is rebuilt from disk below rather than carried over.
+        if self.resolver.as_ref().is_some_and(|r| r.target != name) {
+            self.resolver = None;
+        }
+        let unresolved = self
+            .worktrees
+            .iter()
+            .find(|w| w.name == name)
+            .is_some_and(|w| w.conflicted > 0 || w.in_progress.is_some());
+        if unresolved {
+            if self.resolver.is_none()
+                && let Ok(Some(state)) = self.build_resolver_for(&name)
+            {
+                self.resolver = Some(state);
+                self.load_resolver_file();
+            }
+            return;
+        }
+        // Nothing unmerged and no operation in flight. Normally that means the
+        // pane goes back to being an ordinary changes view — but a conflicted
+        // stash pop leaves no marker on disk, so a resolver the user has
+        // already staged files in would be yanked away before `c` could drop
+        // the stash. Keep those until they are finished explicitly.
+        if !self
+            .resolver
+            .as_ref()
+            .is_some_and(|r| r.resolved.iter().any(|&done| done))
+        {
+            self.resolver = None;
+        }
+    }
+
+    /// Hands the changes pane back after the resolver finishes (complete, abort,
+    /// or a rebase skipped to the end): the worktree list and that pane both
+    /// reload, so the same screen is now the ordinary file list and diff.
+    fn close_resolver(&mut self) {
+        self.resolver = None;
+        self.refresh();
+        self.refresh_diff();
+    }
+
+    /// Moves the worktree cursor onto `name` when it is in the list. Used when
+    /// an operation's result belongs to a worktree other than the selected one.
+    fn select_worktree(&mut self, name: &str) {
+        if let Some(idx) = self.worktrees.iter().position(|w| w.name == name) {
+            self.selected = idx;
+            self.preview_scroll = 0;
+        }
     }
 
     /// Loads (or reloads) the currently selected conflicted file into the
@@ -7438,15 +7768,10 @@ impl App {
     /// with no remaining conflict markers (already resolved) or a read error
     /// leaves `current` empty, which the renderer shows as "resolved".
     fn load_resolver_file(&mut self) {
-        let target_path = match &self.view {
-            View::ConflictResolver {
-                target,
-                files,
-                file,
-                ..
-            } => files.get(*file).map(|p| (target.clone(), p.clone())),
-            _ => None,
-        };
+        let target_path = self
+            .resolver
+            .as_ref()
+            .and_then(|r| r.files.get(r.file).map(|p| (r.target.clone(), p.clone())));
         let Some((target, path)) = target_path else {
             return;
         };
@@ -7465,17 +7790,21 @@ impl App {
                     hunk: 0,
                 })
             });
-        if let View::ConflictResolver { current, .. } = &mut self.view {
-            *current = loaded;
+        if let Some(r) = &mut self.resolver {
+            r.current = loaded;
         }
     }
 
     /// Key handling for the conflict resolver.
     fn on_resolver_key(&mut self, key: KeyEvent) {
         match key.code {
-            // Leaving keeps the merge in progress so it can be resumed later.
+            // Backing out goes where the Changes tab's own `q` goes, and the
+            // resolver state stays put: coming back to this worktree's changes
+            // lands on the same file and hunk. There is nothing to get lost
+            // from, which is the whole point of the resolver living in the pane.
             KeyCode::Esc | KeyCode::Char('q') => {
-                self.go_root();
+                self.tab = Tab::Worktrees;
+                self.worktrees_focus = WorktreesFocus::List;
                 self.arm_ignore_quit();
                 self.refresh();
             }
@@ -7500,8 +7829,7 @@ impl App {
             KeyCode::Char('s') => self.resolver_skip_commit(),
             KeyCode::Char('c') => self.resolver_complete(),
             KeyCode::Char('x') => {
-                if let View::ConflictResolver { target, .. } = &self.view {
-                    let target = target.clone();
+                if let Some(target) = self.resolver.as_ref().map(|r| r.target.clone()) {
                     self.open_resolver_abort_modal(target);
                 }
             }
@@ -7511,14 +7839,14 @@ impl App {
 
     /// Moves the file cursor by `delta`, clamped, and reloads the new file.
     fn resolver_move_file(&mut self, delta: isize) {
-        let moved = if let View::ConflictResolver { files, file, .. } = &mut self.view {
-            let n = files.len();
+        let moved = if let Some(r) = &mut self.resolver {
+            let n = r.files.len();
             if n == 0 {
                 false
             } else {
-                let new = (*file as isize + delta).clamp(0, n as isize - 1) as usize;
-                let moved = new != *file;
-                *file = new;
+                let new = (r.file as isize + delta).clamp(0, n as isize - 1) as usize;
+                let moved = new != r.file;
+                r.file = new;
                 moved
             }
         } else {
@@ -7531,10 +7859,7 @@ impl App {
 
     /// Moves the hunk cursor within the current file by `delta`, clamped.
     fn resolver_move_hunk(&mut self, delta: isize) {
-        if let View::ConflictResolver {
-            current: Some(rf), ..
-        } = &mut self.view
-        {
+        if let Some(rf) = self.resolver.as_mut().and_then(|r| r.current.as_mut()) {
             let n = rf.actions.len();
             if n > 0 {
                 rf.hunk = (rf.hunk as isize + delta).clamp(0, n as isize - 1) as usize;
@@ -7546,10 +7871,7 @@ impl App {
     /// only recorded, not written: the status line says so on every press, so
     /// the pending `w` is never a surprise at completion time.
     fn resolver_set_action(&mut self, action: ResolutionAction) {
-        let progress = if let View::ConflictResolver {
-            current: Some(rf), ..
-        } = &mut self.view
-        {
+        let progress = if let Some(rf) = self.resolver.as_mut().and_then(|r| r.current.as_mut()) {
             match rf.actions.get_mut(rf.hunk) {
                 Some(slot) => {
                     *slot = Some(action);
@@ -7579,10 +7901,9 @@ impl App {
 
     /// Path of the conflicted file under the resolver's cursor.
     fn resolver_current_path(&self) -> Option<String> {
-        match &self.view {
-            View::ConflictResolver { files, file, .. } => files.get(*file).cloned(),
-            _ => None,
-        }
+        self.resolver
+            .as_ref()
+            .and_then(|r| r.files.get(r.file).cloned())
     }
 
     /// Opens the whole conflicted file in the editor, conflict markers and all.
@@ -7601,31 +7922,25 @@ impl App {
     fn resolver_edit_file(&mut self, at_hunk: bool) {
         // Only when there is something to flush: writing the file back
         // unprompted would relabel every conflict marker for no reason.
-        let pending = matches!(
-            &self.view,
-            View::ConflictResolver { current: Some(rf), .. } if rf.actions.iter().any(Option::is_some)
-        );
+        let pending = self
+            .resolver
+            .as_ref()
+            .and_then(|r| r.current.as_ref())
+            .is_some_and(|rf| rf.actions.iter().any(Option::is_some));
         if pending {
             self.resolver_save_current_file(false);
         }
         // Read after the flush: the hunk index below has to index the markers
         // in the text actually on disk, which the flush may have renumbered.
-        let target_path = match &self.view {
-            View::ConflictResolver {
-                target,
-                files,
-                file,
-                ..
-            } => files.get(*file).map(|p| (target.clone(), p.clone())),
-            _ => None,
-        };
+        let target_path = self
+            .resolver
+            .as_ref()
+            .and_then(|r| r.files.get(r.file).map(|p| (r.target.clone(), p.clone())));
         let Some((target, path)) = target_path else {
             return;
         };
-        let hunk = match &self.view {
-            View::ConflictResolver {
-                current: Some(rf), ..
-            } if at_hunk => rf.hunk,
+        let hunk = match self.resolver.as_ref().and_then(|r| r.current.as_ref()) {
+            Some(rf) if at_hunk => rf.hunk,
             _ => 0,
         };
         match ops::read_worktree_file(&self.ctx, &target, &path) {
@@ -7675,20 +7990,18 @@ impl App {
         let Some((path, text)) = edit else {
             return;
         };
-        let target = match &self.view {
-            View::ConflictResolver { target, .. } => target.clone(),
-            _ => return,
+        let Some(target) = self.resolver.as_ref().map(|r| r.target.clone()) else {
+            return;
         };
         match ops::write_partial_resolution(&self.ctx, &target, &path, &text) {
             Ok(()) => {
                 self.modal = None;
                 self.load_resolver_file();
-                let remaining = match &self.view {
-                    View::ConflictResolver {
-                        current: Some(rf), ..
-                    } => rf.actions.len(),
-                    _ => 0,
-                };
+                let remaining = self
+                    .resolver
+                    .as_ref()
+                    .and_then(|r| r.current.as_ref())
+                    .map_or(0, |rf| rf.actions.len());
                 self.message = Some(if remaining == 0 {
                     format!("saved '{path}' · no conflict markers left, press w to stage it")
                 } else {
@@ -7707,16 +8020,9 @@ impl App {
     /// survives on disk while git rightly still sees the path as unmerged. The
     /// file is then re-read, which drops the settled hunks from the hunk list.
     fn resolver_save_current_file(&mut self, stage: bool) {
-        let prepared = if let View::ConflictResolver {
-            target,
-            files,
-            file,
-            current,
-            ..
-        } = &self.view
-        {
-            current.as_ref().and_then(|rf| {
-                let path = files.get(*file)?.clone();
+        let prepared = if let Some(r) = &self.resolver {
+            r.current.as_ref().and_then(|rf| {
+                let path = r.files.get(r.file)?.clone();
                 let text = conflict::render_partial(
                     &rf.file.segments,
                     &rf.actions,
@@ -7724,7 +8030,7 @@ impl App {
                     &rf.file.theirs_label,
                 );
                 let undecided = rf.actions.iter().filter(|a| a.is_none()).count();
-                Some((target.clone(), path, text, undecided))
+                Some((r.target.clone(), path, text, undecided))
             })
         } else {
             None
@@ -7777,15 +8083,10 @@ impl App {
     /// a conflict fixed outside wtm (in an editor, or another terminal). Fails
     /// loudly while conflict markers remain rather than staging them.
     fn resolver_stage_as_is(&mut self) {
-        let target_path = match &self.view {
-            View::ConflictResolver {
-                target,
-                files,
-                file,
-                ..
-            } => files.get(*file).map(|p| (target.clone(), p.clone())),
-            _ => None,
-        };
+        let target_path = self
+            .resolver
+            .as_ref()
+            .and_then(|r| r.files.get(r.file).map(|p| (r.target.clone(), p.clone())));
         let Some((target, path)) = target_path else {
             return;
         };
@@ -7803,14 +8104,10 @@ impl App {
     /// longer conflicted drop off the list; the cursor stays on the same path
     /// when it survives.
     fn resolver_reload(&mut self) {
-        let target = match &self.view {
-            View::ConflictResolver { target, .. } => target.clone(),
-            _ => return,
+        let Some(target) = self.resolver.as_ref().map(|r| r.target.clone()) else {
+            return;
         };
-        let current_path = match &self.view {
-            View::ConflictResolver { files, file, .. } => files.get(*file).cloned(),
-            _ => None,
-        };
+        let current_path = self.resolver_current_path();
         let files = match ops::list_conflicts(&self.ctx, &target) {
             Ok(files) => files,
             Err(e) => {
@@ -7819,18 +8116,11 @@ impl App {
             }
         };
         if files.is_empty() {
-            if let View::ConflictResolver {
-                files: f,
-                resolved,
-                file,
-                current,
-                ..
-            } = &mut self.view
-            {
-                f.clear();
-                resolved.clear();
-                *file = 0;
-                *current = None;
+            if let Some(r) = &mut self.resolver {
+                r.files.clear();
+                r.resolved.clear();
+                r.file = 0;
+                r.current = None;
             }
             self.message = Some("every conflict is resolved · press c to finish".to_string());
             return;
@@ -7838,16 +8128,10 @@ impl App {
         let keep = current_path
             .and_then(|p| files.iter().position(|f| *f == p))
             .unwrap_or(0);
-        if let View::ConflictResolver {
-            files: f,
-            resolved,
-            file,
-            ..
-        } = &mut self.view
-        {
-            *resolved = vec![false; files.len()];
-            *f = files;
-            *file = keep;
+        if let Some(r) = &mut self.resolver {
+            r.resolved = vec![false; files.len()];
+            r.files = files;
+            r.file = keep;
         }
         self.load_resolver_file();
         self.message = Some("reloaded conflicts from disk".to_string());
@@ -7856,15 +8140,10 @@ impl App {
     /// Takes the whole current file from one side (ours or theirs) and stages
     /// it, then advances to the next unresolved file.
     fn resolver_whole_file(&mut self, ours: bool) {
-        let target_path = match &self.view {
-            View::ConflictResolver {
-                target,
-                files,
-                file,
-                ..
-            } => files.get(*file).map(|p| (target.clone(), p.clone())),
-            _ => None,
-        };
+        let target_path = self
+            .resolver
+            .as_ref()
+            .and_then(|r| r.files.get(r.file).map(|p| (r.target.clone(), p.clone())));
         let Some((target, path)) = target_path else {
             return;
         };
@@ -7886,17 +8165,19 @@ impl App {
     /// Marks the current file resolved, then jumps to the next still-unresolved
     /// file (wrapping around), reloading its contents.
     fn resolver_mark_resolved_and_advance(&mut self) {
-        let next = if let View::ConflictResolver { resolved, file, .. } = &mut self.view {
-            if let Some(r) = resolved.get_mut(*file) {
-                *r = true;
+        let next = if let Some(r) = &mut self.resolver {
+            if let Some(done) = r.resolved.get_mut(r.file) {
+                *done = true;
             }
-            let n = resolved.len();
-            (1..=n).map(|off| (*file + off) % n).find(|&i| !resolved[i])
+            let n = r.resolved.len();
+            (1..=n)
+                .map(|off| (r.file + off) % n)
+                .find(|&i| !r.resolved[i])
         } else {
             None
         };
-        if let (Some(i), View::ConflictResolver { file, .. }) = (next, &mut self.view) {
-            *file = i;
+        if let (Some(i), Some(r)) = (next, &mut self.resolver) {
+            r.file = i;
         }
         self.load_resolver_file();
     }
@@ -7905,26 +8186,18 @@ impl App {
     /// cherry-pick, or drop the popped stash) and returns to the worktree list.
     /// Errors (e.g. conflicts still unresolved) surface in the modal error popup.
     fn resolver_complete(&mut self) {
-        let (target, kind) = match &self.view {
-            View::ConflictResolver { target, kind, .. } => (target.clone(), *kind),
-            _ => return,
+        let Some((target, kind)) = self.resolver.as_ref().map(|r| (r.target.clone(), r.kind)) else {
+            return;
         };
         // Choices made with o/t/b live in memory until `w` writes them. Say so
         // in those words before git gets a chance to answer with its own
         // "you have unmerged paths", which gives no hint that the work is right
         // there on screen and one key away from being saved.
-        let pending = match &self.view {
-            View::ConflictResolver {
-                current: Some(rf),
-                files,
-                file,
-                ..
-            } => {
-                let decided = rf.actions.iter().filter(|a| a.is_some()).count();
-                (decided > 0).then(|| (decided, rf.actions.len(), files[*file].clone()))
-            }
-            _ => None,
-        };
+        let pending = self.resolver.as_ref().and_then(|r| {
+            let rf = r.current.as_ref()?;
+            let decided = rf.actions.iter().filter(|a| a.is_some()).count();
+            (decided > 0).then(|| (decided, rf.actions.len(), r.files[r.file].clone()))
+        });
         if let Some((decided, total, path)) = pending {
             let undecided = total - decided;
             let next = if undecided == 0 {
@@ -7943,8 +8216,9 @@ impl App {
         }
         match ops::complete_resolution(&self.ctx, &target, kind, None) {
             Ok(r) => {
-                self.go_root();
-                self.refresh();
+                // The pane turns straight back into the ordinary file list and
+                // diff for this worktree, with the merge staged and committed.
+                self.close_resolver();
                 self.message = Some(match r.commit {
                     Some(commit) => format!("resolved '{}' ({commit})", r.target),
                     None => format!("resolved '{}'", r.target),
@@ -7975,9 +8249,8 @@ impl App {
     /// Drops the commit a rebase stopped on and carries on with the rest.
     /// Only a rebase has anything to skip; other kinds report why not.
     fn resolver_skip_commit(&mut self) {
-        let (target, kind) = match &self.view {
-            View::ConflictResolver { target, kind, .. } => (target.clone(), *kind),
-            _ => return,
+        let Some((target, kind)) = self.resolver.as_ref().map(|r| (r.target.clone(), r.kind)) else {
+            return;
         };
         if kind != ops::ResolveKind::Rebase {
             self.message = Some(format!(
@@ -7998,8 +8271,7 @@ impl App {
                     self.message = Some("skipped the commit".to_string());
                     self.resolver_reload();
                 } else {
-                    self.go_root();
-                    self.refresh();
+                    self.close_resolver();
                     self.message = Some(format!("rebase of '{target}' finished"));
                 }
             }
@@ -8009,14 +8281,12 @@ impl App {
 
     /// Aborts the in-progress operation and returns to the worktree list.
     fn abort_resolver(&mut self) {
-        let (target, kind) = match &self.view {
-            View::ConflictResolver { target, kind, .. } => (target.clone(), *kind),
-            _ => return,
+        let Some((target, kind)) = self.resolver.as_ref().map(|r| (r.target.clone(), r.kind)) else {
+            return;
         };
         match ops::abort_resolution(&self.ctx, &target, kind) {
             Ok(()) => {
-                self.go_root();
-                self.refresh();
+                self.close_resolver();
                 self.message = Some(format!("aborted resolution in '{target}'"));
                 // An aborted stash pop leaves the stash in place; re-read it so
                 // the Stash tab behind the resolver matches.
@@ -8104,12 +8374,17 @@ impl App {
             return;
         };
         let name = wt.name.clone();
+        // `worktree_log_lines` logs HEAD in the worktree dir, so the branch to
+        // measure "my commits" against comes from the worktree row, not the log.
+        let branch = wt.branch.clone();
         match self.worktree_log_lines(&name) {
             Ok(lines) => {
                 let selected = first_commit_row(&lines);
+                let own = own_commit_flags(&self.ctx, branch.as_deref(), &lines);
                 self.push_screen(View::Log {
                     name,
                     lines,
+                    own,
                     selected,
                 })
             }
@@ -8161,6 +8436,7 @@ impl App {
             name,
             lines,
             selected,
+            ..
         } = &self.view
         else {
             return;
@@ -8554,12 +8830,19 @@ impl App {
         match &self.view {
             View::Log { name, .. } => {
                 let name = name.clone();
+                let branch = self
+                    .worktrees
+                    .iter()
+                    .find(|w| w.name == name)
+                    .and_then(|w| w.branch.clone());
                 match self.worktree_log_lines(&name) {
                     Ok(lines) => {
                         let selected = first_commit_row(&lines);
+                        let own = own_commit_flags(&self.ctx, branch.as_deref(), &lines);
                         self.view = View::Log {
                             name,
                             lines,
+                            own,
                             selected,
                         }
                     }
@@ -8573,10 +8856,12 @@ impl App {
                 match self.branch_log_lines(&branch) {
                     Ok(lines) => {
                         let selected = first_commit_row(&lines);
+                        let own = own_commit_flags(&self.ctx, Some(&branch), &lines);
                         self.view = View::BranchCommits {
                             branch,
                             marked: vec![false; lines.len()],
                             lines,
+                            own,
                             selected,
                         };
                     }
@@ -9029,6 +9314,21 @@ mod tests {
     }
 
     /// Waits out an in-flight Stash tab list load.
+    /// Drives `poll_commit_files_load` until an open commit dialog has its file
+    /// list. A no-op when nothing is in flight, so it is safe to call after any
+    /// path that opens the dialog.
+    fn settle_commit_files(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.commit_files_loading() {
+            app.poll_commit_files_load();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "commit file list load timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
     fn settle_stash(app: &mut App) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while app.stash_loading() {
@@ -10040,6 +10340,7 @@ mod tests {
         app.refresh();
         app.selected = 0;
         press(&mut app, KeyCode::Char('c')); // opens the commit view
+        settle_commit_files(&mut app);
         assert!(matches!(app.view, View::Commit { .. }));
 
         let len = match &app.view {
@@ -10233,6 +10534,7 @@ mod tests {
         app.refresh();
         app.selected = 0;
         press(&mut app, KeyCode::Char('c'));
+        settle_commit_files(&mut app);
         press(&mut app, KeyCode::BackTab);
         match &app.view {
             View::Commit { files, focus, .. } => {
@@ -10259,6 +10561,7 @@ mod tests {
         app.refresh();
         app.selected = 0;
         press(&mut app, KeyCode::Char('c'));
+        settle_commit_files(&mut app);
         let len = match &app.view {
             View::Commit { files, .. } => files.len(),
             _ => panic!("expected the commit dialog"),
@@ -10958,6 +11261,7 @@ mod tests {
         dirty_main(&mut app);
         assert!(app.worktrees[0].dirty > 0);
         press(&mut app, KeyCode::Char('c'));
+        settle_commit_files(&mut app);
         assert!(matches!(app.view, View::Commit { .. }));
         type_str(&mut app, "add scratch");
         press(&mut app, KeyCode::Enter);
@@ -11019,6 +11323,7 @@ mod tests {
         let (_tmp, mut app) = test_app();
         rename_folder_on_main(&mut app);
         press(&mut app, KeyCode::Char('c'));
+        settle_commit_files(&mut app);
         type_str(&mut app, "move folder");
         press(&mut app, KeyCode::Enter);
         assert!(
@@ -11105,6 +11410,7 @@ mod tests {
         dirty_main(&mut app);
         let dir = app.worktrees[0].path.clone();
         press(&mut app, KeyCode::Char('c'));
+        settle_commit_files(&mut app);
         type_str(&mut app, "add scratch");
 
         press(&mut app, KeyCode::Tab); // message -> body
@@ -11152,6 +11458,7 @@ mod tests {
         dirty_main(&mut app);
         let dir = app.worktrees[0].path.clone();
         press(&mut app, KeyCode::Char('c'));
+        settle_commit_files(&mut app);
         type_str(&mut app, "just a subject");
         press(&mut app, KeyCode::Enter);
         settle(&mut app);
@@ -11313,7 +11620,7 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         settle(&mut app);
         assert!(
-            matches!(app.view, View::ConflictResolver { .. }),
+            app.resolver.is_some(),
             "conflicting pop opens the resolver"
         );
 
@@ -11322,7 +11629,12 @@ mod tests {
         press(&mut app, KeyCode::Char('c')); // complete
 
         assert!(matches!(app.view, View::List));
-        assert_eq!(app.tab, Tab::Stash, "back on the tab the pop started from");
+        assert!(app.resolver.is_none(), "the pane hands itself back");
+        assert_eq!(
+            app.tab,
+            Tab::Changes,
+            "the resolver lives in the changes pane, so that is where it ends"
+        );
         assert!(
             app.stash_entries.is_empty(),
             "a completed pop drops the stash"
@@ -11741,6 +12053,14 @@ mod tests {
     ///
     /// Each entry of `files` is `(path, base, main version, feature version)`;
     /// the two sides diverge from the base so git has to stop.
+    /// The resolver standing in for the changes pane, which is where every
+    /// conflict test looks now that it is not a view of its own.
+    fn resolver(app: &App) -> &ResolverState {
+        app.resolver
+            .as_ref()
+            .expect("the changes pane is showing the conflict resolver")
+    }
+
     fn conflict_resolver_with(
         app: &mut App,
         files: &[(&str, &str, &str, &str)],
@@ -12141,26 +12461,21 @@ mod tests {
         let (_tmp, mut app) = test_app();
         let feat = into_conflict_resolver(&mut app);
 
-        // The resolver opened on the conflicted file with one undecided hunk.
-        match &app.view {
-            View::ConflictResolver {
-                target,
-                files,
-                current,
-                ..
-            } => {
-                assert_eq!(target, "feature");
-                assert_eq!(files, &vec!["shared.txt".to_string()]);
-                let rf = current.as_ref().expect("file loaded with a hunk");
-                assert_eq!(rf.actions.len(), 1);
-                assert!(rf.actions[0].is_none());
-            }
-            _ => panic!("expected the conflict resolver"),
+        // The resolver opened on the conflicted file with one undecided hunk,
+        // in the changes pane rather than a window of its own.
+        assert_eq!(app.tab, Tab::Changes);
+        {
+            let r = resolver(&app);
+            assert_eq!(r.target, "feature");
+            assert_eq!(r.files, vec!["shared.txt".to_string()]);
+            let rf = r.current.as_ref().expect("file loaded with a hunk");
+            assert_eq!(rf.actions.len(), 1);
+            assert!(rf.actions[0].is_none());
         }
 
         // Staging before choosing a side is refused (still unresolved).
         press(&mut app, KeyCode::Char('w'));
-        assert!(matches!(app.view, View::ConflictResolver { .. }));
+        assert!(app.resolver.is_some());
 
         // Pick a side, stage the file, then complete the merge.
         press(&mut app, KeyCode::Char('o'));
@@ -12168,6 +12483,10 @@ mod tests {
         press(&mut app, KeyCode::Char('c'));
 
         assert!(matches!(app.view, View::List));
+        assert!(
+            app.resolver.is_none(),
+            "the pane is an ordinary changes view again"
+        );
         assert!(!crate::git::is_merging(&feat));
     }
 
@@ -12297,8 +12616,9 @@ mod tests {
         assert!(msg.contains("1 commit(s) dropped"), "{msg}");
     }
 
-    /// Leaving the resolver with `q` must not strand the worktree: `x` gets
-    /// back in, and the footer says so rather than hiding it in the help panel.
+    /// Backing out of the resolver must not strand the worktree. The resolver
+    /// is the changes pane, so it is still right there: Enter on the worktree
+    /// walks straight back into it, and the footer says so.
     #[test]
     fn conflicts_can_be_resumed_from_the_worktree_list() {
         let (_tmp, mut app) = test_app();
@@ -12306,9 +12626,11 @@ mod tests {
 
         press(&mut app, KeyCode::Char('q'));
         assert!(matches!(app.view, View::List), "back on the root view");
-        // The resolver is reached from the Branches tab in this fixture; the
-        // worktree that is stuck is listed on the Worktrees tab.
-        goto_tab(&mut app, Tab::Worktrees);
+        assert_eq!(app.tab, Tab::Worktrees, "q backs out to the worktree list");
+        assert!(
+            app.resolver.is_some(),
+            "the resolver is kept, not thrown away"
+        );
         app.selected = app
             .worktrees
             .iter()
@@ -12317,16 +12639,24 @@ mod tests {
 
         let footer = render_app_rows(&mut app, 100, 30);
         assert!(
-            footer.iter().any(|r| r.contains("x resolve conflicts")),
+            footer.iter().any(|r| r.contains("resolve conflicts")),
             "the way back in is on screen: {:#?}",
             footer.last()
         );
 
-        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.tab, Tab::Changes, "Enter opens the changes pane");
         assert!(
-            matches!(app.view, View::ConflictResolver { .. }),
-            "x reopens the resolver"
+            app.resolver.is_some(),
+            "which is the resolver while the worktree is conflicted"
         );
+
+        // `x` from the worktree list is the same door, for a conflict wtm did
+        // not start itself.
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.resolver.is_some(), "x reopens the resolver");
+        assert_eq!(app.tab, Tab::Changes);
     }
 
     /// Picking a side records a choice; it does not write anything. Completing
@@ -12348,10 +12678,7 @@ mod tests {
         let err = app.error.clone().expect("completing is refused");
         assert!(err.contains("nothing is written to disk yet"), "{err}");
         assert!(err.contains("press w"), "{err}");
-        assert!(
-            matches!(app.view, View::ConflictResolver { .. }),
-            "and it stays in the resolver"
-        );
+        assert!(app.resolver.is_some(), "and it stays in the resolver");
         assert!(
             crate::git::is_merging(&feat),
             "the merge is untouched by the refusal"
@@ -12454,9 +12781,9 @@ mod tests {
         press(&mut app, KeyCode::Char('Z'));
         app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
 
-        let first = match &app.view {
-            View::ConflictResolver { files, file, .. } => files[*file].clone(),
-            _ => panic!("expected the conflict resolver"),
+        let first = {
+            let r = resolver(&app);
+            r.files[r.file].clone()
         };
         let saved = std::fs::read_to_string(feat.join(&first)).unwrap();
         assert!(saved.starts_with('Z'), "edit landed on disk: {saved}");
@@ -12494,7 +12821,7 @@ mod tests {
             vec!["multi.txt".to_string()],
             "a partly-resolved file is saved but not staged"
         );
-        assert!(matches!(app.view, View::ConflictResolver { .. }));
+        assert!(app.resolver.is_some());
 
         // Decide the one that is left; now `w` stages it.
         press(&mut app, KeyCode::Char('o'));
@@ -12551,12 +12878,8 @@ mod tests {
         crate::git::stage_paths(&feat, &["shared.txt".to_string()]).unwrap();
 
         press(&mut app, KeyCode::Char('r'));
-        match &app.view {
-            View::ConflictResolver { files, .. } => {
-                assert!(files.is_empty(), "resolved file dropped off: {files:?}");
-            }
-            _ => panic!("expected the conflict resolver"),
-        }
+        let files = &resolver(&app).files;
+        assert!(files.is_empty(), "resolved file dropped off: {files:?}");
         press(&mut app, KeyCode::Char('c'));
         assert!(matches!(app.view, View::List));
         assert!(!crate::git::is_merging(&feat));
@@ -12595,12 +12918,10 @@ mod tests {
             "feature version\nmain version\n",
             "the edit is on disk"
         );
-        match &app.view {
-            View::ConflictResolver { current, .. } => {
-                assert!(current.is_none(), "no conflict hunks remain");
-            }
-            _ => panic!("expected the conflict resolver"),
-        }
+        assert!(
+            resolver(&app).current.is_none(),
+            "no conflict hunks remain"
+        );
         // Saving is not staging: git still sees the path as unmerged until `w`.
         assert_eq!(
             crate::git::conflicted_files(&feat).unwrap(),
@@ -12679,17 +13000,14 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         // Esc drops the editor without recording an action.
         assert!(app.modal.is_none());
-        match &app.view {
-            View::ConflictResolver {
-                current: Some(rf), ..
-            } => {
-                assert!(
-                    rf.actions[0].is_none(),
-                    "discarded edit leaves hunk undecided"
-                );
-            }
-            _ => panic!("expected the conflict resolver"),
-        }
+        let rf = resolver(&app)
+            .current
+            .as_ref()
+            .expect("the file is still loaded");
+        assert!(
+            rf.actions[0].is_none(),
+            "discarded edit leaves hunk undecided"
+        );
     }
 
     #[test]
@@ -12808,16 +13126,17 @@ mod tests {
                 ..
             })
         ));
-        assert!(matches!(app.view, View::ConflictResolver { .. }));
+        assert!(app.resolver.is_some());
         press(&mut app, KeyCode::Esc);
         assert!(app.modal.is_none());
-        assert!(matches!(app.view, View::ConflictResolver { .. }));
+        assert!(app.resolver.is_some());
         assert!(crate::git::is_merging(&feat));
 
         // Confirming the abort restores the pre-merge state.
         press(&mut app, KeyCode::Char('x'));
         press(&mut app, KeyCode::Char('y'));
         assert!(matches!(app.view, View::List));
+        assert!(app.resolver.is_none(), "the pane hands itself back");
         assert!(!crate::git::is_merging(&feat));
         assert_eq!(
             std::fs::read_to_string(feat.join("shared.txt")).unwrap(),
@@ -12831,24 +13150,156 @@ mod tests {
         into_conflict_resolver(&mut app);
         // `t` records "keep theirs" for the current hunk.
         press(&mut app, KeyCode::Char('t'));
-        match &app.view {
-            View::ConflictResolver {
-                current: Some(rf), ..
-            } => {
-                assert_eq!(rf.actions[0], Some(ResolutionAction::KeepTheirs));
-            }
-            _ => panic!("expected the resolver with a loaded file"),
-        }
+        let action = |app: &App| {
+            resolver(app)
+                .current
+                .as_ref()
+                .expect("the resolver has a loaded file")
+                .actions[0]
+                .clone()
+        };
+        assert_eq!(action(&app), Some(ResolutionAction::KeepTheirs));
         // `b` overrides it with "keep both".
         press(&mut app, KeyCode::Char('b'));
-        match &app.view {
-            View::ConflictResolver {
-                current: Some(rf), ..
-            } => {
-                assert_eq!(rf.actions[0], Some(ResolutionAction::KeepBoth));
-            }
-            _ => panic!("expected the resolver with a loaded file"),
-        }
+        assert_eq!(action(&app), Some(ResolutionAction::KeepBoth));
+    }
+
+    /// The resolver is not a window that can be quit out of: it stands in for
+    /// the changes pane itself, so a conflicted worktree has no ordinary
+    /// file-list-and-diff view to reach at all.
+    #[test]
+    fn a_conflicted_worktree_has_no_ordinary_changes_view() {
+        let (_tmp, mut app) = test_app();
+        into_conflict_resolver(&mut app);
+        assert_eq!(app.tab, Tab::Changes);
+
+        let rows = render_app_rows(&mut app, 120, 40);
+        assert!(
+            rows.iter().any(|r| r.contains("conflicts · feature")),
+            "the changes pane is the resolver: {rows:#?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("files · feature")),
+            "and the ordinary file list is not reachable: {rows:#?}"
+        );
+        // The tab bar carries the warning, so the half-finished merge is
+        // visible from whichever tab the user wandered off to.
+        assert!(
+            rows.iter().any(|r| r.contains("⚠ Changes")),
+            "the Changes tab is flagged: {rows:#?}"
+        );
+        // Footer hints follow the pane too.
+        assert!(
+            rows.iter().any(|r| r.contains("stage") && r.contains("keep")),
+            "resolver hints, not diff hints: {:#?}",
+            rows.last()
+        );
+    }
+
+    /// Finishing the conflicts turns the same pane back into the normal changes
+    /// view, commit dialog and all. That is the other half of the takeover: the
+    /// user never has to find their way anywhere.
+    #[test]
+    fn resolving_hands_the_changes_pane_back() {
+        let (_tmp, mut app) = test_app();
+        let feat = into_conflict_resolver(&mut app);
+
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Char('w'));
+        press(&mut app, KeyCode::Char('c'));
+
+        assert!(!crate::git::is_merging(&feat));
+        assert!(app.resolver.is_none());
+        assert_eq!(app.tab, Tab::Changes, "the pane stays where it was");
+        let rows = render_app_rows(&mut app, 120, 40);
+        // The merge is committed, so the ordinary changes view for `feature` is
+        // an empty one — which is exactly the point: it is a changes view again.
+        assert!(
+            rows.iter().any(|r| r.contains("changes · feature")),
+            "back to the ordinary changes view: {rows:#?}"
+        );
+        assert!(!rows.iter().any(|r| r.contains("conflicts · feature")));
+        assert!(
+            !rows.iter().any(|r| r.contains("⚠ Changes")),
+            "and the tab bar warning is gone: {rows:#?}"
+        );
+
+        // And the keys are the Changes tab's again: `c` commits rather than
+        // trying to complete a merge that is already done.
+        std::fs::write(feat.join("shared.txt"), "more work\n").unwrap();
+        app.refresh_diff();
+        settle_background(&mut app);
+        press(&mut app, KeyCode::Char('c'));
+        assert!(
+            matches!(app.view, View::Commit { .. }),
+            "c opens the commit dialog again"
+        );
+    }
+
+    /// The resolver belongs to the worktree the pane is pointed at, not to the
+    /// app: pointing the pane somewhere clean shows that worktree's changes.
+    #[test]
+    fn the_resolver_follows_the_worktree_the_pane_is_pointed_at() {
+        let (_tmp, mut app) = test_app();
+        into_conflict_resolver(&mut app);
+        assert!(app.resolver.is_some());
+
+        let main = app
+            .worktrees
+            .iter()
+            .find(|w| w.is_main)
+            .map(|w| w.name.clone())
+            .expect("the main worktree is listed");
+        app.load_changes(main);
+        settle_background(&mut app);
+        assert!(
+            app.resolver.is_none(),
+            "a clean worktree gets its ordinary changes view"
+        );
+
+        app.load_changes("feature".to_string());
+        settle_background(&mut app);
+        assert!(
+            app.resolver.is_some(),
+            "and coming back rebuilds the resolver from disk"
+        );
+    }
+
+    /// Under the three-panel layout the changes pane is the bottom region of
+    /// the Worktrees tab, so that is what the resolver takes over there.
+    #[test]
+    fn three_panel_changes_region_becomes_the_resolver() {
+        let (_tmp, mut app) = test_app();
+        into_conflict_resolver(&mut app);
+        app.ctx.config.worktrees_layout = Some(WorktreesLayout::ThreePanel);
+        // The renderer decides the effective layout, so draw once before the
+        // key handlers are asked about it.
+        render_app(&mut app, 120, 40);
+        app.selected = app
+            .worktrees
+            .iter()
+            .position(|w| w.name == "feature")
+            .expect("the conflicted worktree is listed");
+        goto_tab(&mut app, Tab::Changes);
+        assert_eq!(app.tab, Tab::Worktrees, "folded into the Worktrees tab");
+        assert_eq!(app.worktrees_focus, WorktreesFocus::Files);
+
+        let rows = render_app_rows(&mut app, 120, 40);
+        assert!(
+            rows.iter().any(|r| r.contains("conflicts · feature")),
+            "the bottom region is the resolver: {rows:#?}"
+        );
+
+        // And it owns that region's keys.
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(
+            resolver(&app)
+                .current
+                .as_ref()
+                .expect("the resolver has a loaded file")
+                .actions[0],
+            Some(ResolutionAction::KeepTheirs)
+        );
     }
 
     #[test]
@@ -13540,6 +13991,7 @@ mod tests {
             marked: vec![false; lines.len()],
             lines,
             selected: 0,
+            own: Vec::new(),
         };
         // `a` marks every commit but leaves the art row alone.
         press(&mut app, KeyCode::Char('a'));
@@ -16254,6 +16706,317 @@ mod tests {
         assert!(app.stash_loading(), "stash list must load off-thread");
         settle_stash(&mut app);
         assert!(!app.stash_loading());
+    }
+
+    /// `c` on the Worktrees tab must not block on `git status`: the dialog is
+    /// on screen with a loading placeholder while the file list is still being
+    /// read, so the subject can be typed straight away.
+    #[test]
+    fn commit_dialog_opens_before_files_load() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        app.refresh();
+        app.selected = 0;
+        // Call the opener directly so press()'s settle doesn't hide the pending
+        // state.
+        app.open_commit();
+        match &app.view {
+            View::Commit { files, loading, .. } => {
+                assert!(*loading, "dialog opens before the file list exists");
+                assert!(files.is_empty(), "no files until the load lands");
+            }
+            _ => panic!("expected the commit dialog"),
+        }
+        assert!(app.commit_files_loading(), "status runs off-thread");
+        // The placeholder, not an empty file pane, is what reaches the screen.
+        let screen = render_app_rows(&mut app, 100, 30).join("\n");
+        assert!(screen.contains("reading changes"), "{screen}");
+
+        // Typing works while the load is still in flight.
+        type_str(&mut app, "wip");
+        settle_commit_files(&mut app);
+        match &app.view {
+            View::Commit {
+                files,
+                marked,
+                loading,
+                input,
+                ..
+            } => {
+                assert!(!*loading);
+                assert!(files.iter().any(|f| f.path == "a.txt"));
+                assert!(marked.iter().all(|m| *m), "everything marked by default");
+                assert_eq!(input.as_str(), "wip", "the typed subject survives");
+            }
+            _ => panic!("expected the commit dialog"),
+        }
+    }
+
+    /// Enter pressed while the file list is still loading is remembered and
+    /// replayed once the files arrive, rather than being dropped.
+    #[test]
+    fn commit_dialog_queues_a_submit_made_while_loading() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        app.refresh();
+        app.selected = 0;
+        app.open_commit();
+        type_str(&mut app, "queued commit");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match &app.view {
+            View::Commit { submit_pending, .. } => {
+                assert!(*submit_pending, "the submit is held, not dropped")
+            }
+            _ => panic!("expected the commit dialog"),
+        }
+        settle_commit_files(&mut app);
+        settle_busy(&mut app);
+        assert!(
+            app.message.as_deref().unwrap().starts_with("committed"),
+            "message: {:?}",
+            app.message
+        );
+    }
+
+    /// An empty subject is still rejected immediately, without waiting out the
+    /// load first.
+    #[test]
+    fn commit_dialog_rejects_an_empty_subject_while_loading() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        app.refresh();
+        app.selected = 0;
+        app.open_commit();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.message.as_deref(),
+            Some("commit message must not be empty")
+        );
+        match &app.view {
+            View::Commit { submit_pending, .. } => assert!(!*submit_pending),
+            _ => panic!("expected the commit dialog"),
+        }
+    }
+
+    /// A commit that git refuses puts the dialog back with the subject and body
+    /// intact, so the message never has to be retyped.
+    #[test]
+    fn a_failed_commit_keeps_the_typed_message() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        app.refresh();
+        app.selected = 0;
+        app.open_commit();
+        settle_commit_files(&mut app);
+        type_str(&mut app, "subject that must survive");
+        press(&mut app, KeyCode::Tab); // Message -> Body
+        type_str(&mut app, "body too");
+
+        // A rejecting pre-commit hook: the failure a real commit hits most
+        // often, and the one that used to cost the user their message.
+        let hooks = root.join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\necho lint failed >&2\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        settle_busy(&mut app);
+
+        assert!(app.error.is_some(), "the failure is reported");
+        match &app.view {
+            View::Commit {
+                input, body, focus, ..
+            } => {
+                assert_eq!(input.as_str(), "subject that must survive");
+                assert_eq!(body.text().trim(), "body too");
+                assert_eq!(*focus, CommitFocus::Body, "focus is where it was left");
+            }
+            _ => panic!("expected the commit dialog back"),
+        }
+    }
+
+    /// A successful commit closes the dialog rather than restoring the draft.
+    #[test]
+    fn a_successful_commit_closes_the_dialog() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        app.refresh();
+        app.selected = 0;
+        app.open_commit();
+        settle_commit_files(&mut app);
+        type_str(&mut app, "real commit");
+        press(&mut app, KeyCode::Enter);
+        settle_busy(&mut app);
+        assert!(matches!(app.view, View::List), "dialog is gone");
+        assert!(app.message.as_deref().unwrap().starts_with("committed"));
+    }
+
+    /// The commits panel bands the commits made on the worktree's own branch so
+    /// they read apart from the history it inherited from its base, and says in
+    /// the title how many those are.
+    #[test]
+    fn commits_panel_bands_the_branchs_own_commits() {
+        let (_tmp, mut app) = test_app();
+        app.ctx.config.worktrees_layout = Some(WorktreesLayout::ThreePanel);
+        let root = app.ctx.repo_root.clone();
+        git(&root, &["add", ".wtm.toml"]);
+        git(&root, &["commit", "-m", "inherited from main"]);
+        add_and_select_worktree(&mut app, "feature");
+        let wt = PathBuf::from(&app.worktrees[app.selected].path);
+        git(&wt, &["commit", "--allow-empty", "-m", "my own work"]);
+        app.refresh();
+        app.selected = app
+            .worktrees
+            .iter()
+            .position(|w| w.name == "feature")
+            .unwrap();
+
+        render_app(&mut app, 100, 30);
+        settle_preview(&mut app);
+        settle_commits(&mut app);
+        render_app(&mut app, 100, 30);
+
+        let panel = app.worktree_commits.as_ref().expect("commits panel");
+        let banded: Vec<&str> = panel
+            .lines
+            .iter()
+            .zip(panel.own.iter())
+            .filter(|(_, own)| **own)
+            .filter_map(|(l, _)| l.entry.as_ref().map(|e| e.subject.as_str()))
+            .collect();
+        assert_eq!(
+            banded,
+            ["my own work"],
+            "only the commit made on this branch is the branch's own"
+        );
+
+        // Park the cursor on the inherited commit, so the band on the row above
+        // is the commit's own styling rather than the selection highlight.
+        let base_row = panel
+            .lines
+            .iter()
+            .position(|l| {
+                l.entry
+                    .as_ref()
+                    .is_some_and(|e| e.subject == "inherited from main")
+            })
+            .expect("base commit is in the panel");
+        app.worktree_commits.as_mut().unwrap().selected = base_row;
+
+        // The title carries the legend, and the row itself is actually painted.
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::tui::ui::draw(frame, &mut app))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..30)
+            .map(|y| (0..100).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        assert!(
+            rows.iter().any(|r| r.contains("1 on this branch")),
+            "title legend: {}",
+            rows.join("\n")
+        );
+        let own_y = rows
+            .iter()
+            .position(|r| r.contains("my own work"))
+            .expect("own commit is on screen") as u16;
+        let base_y = rows
+            .iter()
+            .position(|r| r.contains("inherited from main"))
+            .expect("base commit is on screen") as u16;
+        // Sample a column inside the row rather than the border gutter.
+        assert_eq!(
+            buf[(20, own_y)].bg,
+            crate::tui::theme::OWN_COMMIT_BG,
+            "the branch's own commit is banded"
+        );
+        assert_ne!(
+            buf[(20, base_y)].bg,
+            crate::tui::theme::OWN_COMMIT_BG,
+            "inherited history is not"
+        );
+
+        // Selection still wins when the cursor lands on a banded commit, so the
+        // two never compete for the same row.
+        let own_row = own_y - (base_y - base_row as u16);
+        app.worktree_commits.as_mut().unwrap().selected = own_row as usize;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| crate::tui::ui::draw(frame, &mut app))
+            .unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(20, own_y)].bg,
+            crate::tui::theme::SELECTION_BG,
+            "the cursor row reads as selected, not merely banded"
+        );
+    }
+
+    /// The Branches tab scrolls like the worktree list, so it gets the same
+    /// overflow arrows: nothing above at the top, more below.
+    #[test]
+    fn branches_list_shows_scroll_arrows() {
+        let (_tmp, mut app) = test_app();
+        for i in 0..30 {
+            git(&app.ctx.repo_root, &["branch", &format!("extra-{i}")]);
+        }
+        app.tab = Tab::Branches;
+        app.ensure_branches(0);
+        settle_branches(&mut app);
+        assert!(app.branches.len() > 12, "need more branches than rows");
+
+        // A short terminal guarantees the list overflows its window.
+        app.branch_selected = 0;
+        let top = render_app_rows(&mut app, 100, 16).join("\n");
+        assert!(top.contains('\u{25bc}'), "more below at the top: {top}");
+        assert!(!top.contains('\u{25b2}'), "nothing above at the top: {top}");
+
+        app.branch_selected = app.branches.len() - 1;
+        let bottom = render_app_rows(&mut app, 100, 16).join("\n");
+        assert!(
+            bottom.contains('\u{25b2}'),
+            "more above at the bottom: {bottom}"
+        );
+    }
+
+    /// Same for the Stash tab's list of entries.
+    #[test]
+    fn stash_list_shows_scroll_arrows() {
+        let (_tmp, mut app) = test_app();
+        app.refresh();
+        app.selected = 0;
+        let root = app.ctx.repo_root.clone();
+        for i in 0..12 {
+            std::fs::write(root.join("stashed.txt"), format!("v{i}\n")).unwrap();
+            git(&root, &["add", "stashed.txt"]);
+            ops::stash_push(&app.ctx, "main", Some(&format!("entry {i}"))).unwrap();
+        }
+        app.open_stash_tab();
+        settle_stash(&mut app);
+        assert!(app.stash_entries.len() > 8, "need more entries than rows");
+
+        app.stash_selected = 0;
+        let top = render_app_rows(&mut app, 100, 14).join("\n");
+        assert!(top.contains('\u{25bc}'), "more below at the top: {top}");
+        assert!(!top.contains('\u{25b2}'), "nothing above at the top: {top}");
+
+        app.stash_selected = app.stash_entries.len() - 1;
+        let bottom = render_app_rows(&mut app, 100, 14).join("\n");
+        assert!(
+            bottom.contains('\u{25b2}'),
+            "more above at the bottom: {bottom}"
+        );
     }
 
     /// With more worktrees than the three-panel list can show, overflow arrows

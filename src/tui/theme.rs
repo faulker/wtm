@@ -14,6 +14,10 @@ pub const BORDER: Color = Color::DarkGray;
 /// grey rather than `Color::DarkGray`, which many terminals render bright
 /// enough to wash out the row's own colors (commit hashes, graph art).
 pub const SELECTION_BG: Color = Color::Indexed(236);
+/// Background band behind a commit that is the branch's own work (ahead of its
+/// comparison base). Deliberately darker than `SELECTION_BG` so the cursor row
+/// still reads as the brighter of the two when it lands on a marked commit.
+pub const OWN_COMMIT_BG: Color = Color::Indexed(234);
 /// Solid fill behind dialog/modal overlays so they read as a card over the UI.
 pub const DIALOG_BG: Color = Color::Black;
 /// Border color for dialog/modal overlays (stronger than panel chrome).

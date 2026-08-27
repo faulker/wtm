@@ -94,8 +94,13 @@ impl HelpTab {
     /// opening help lands on the relevant page instead of a fixed one. Views
     /// with no help of their own (dialogs, wizards, confirmations) fall back to
     /// `Basics`.
-    pub fn for_view(view: &View, tab: Tab) -> HelpTab {
+    ///
+    /// `resolving` is whether the changes pane is currently showing the conflict
+    /// resolver, which replaces the file list and diff wherever that pane is
+    /// drawn (the Changes tab, or the three-panel bottom region).
+    pub fn for_view(view: &View, tab: Tab, resolving: bool) -> HelpTab {
         match view {
+            View::List if resolving => HelpTab::Conflicts,
             View::List => match tab {
                 Tab::Worktrees => HelpTab::Worktrees,
                 Tab::Branches => HelpTab::Branches,
@@ -112,7 +117,6 @@ impl HelpTab {
             View::MoveChanges { .. } => HelpTab::Worktrees,
             View::OpenCommand { .. } => HelpTab::Worktrees,
             View::StashTarget { .. } => HelpTab::Changes,
-            View::ConflictResolver { .. } => HelpTab::Conflicts,
             _ => HelpTab::Basics,
         }
     }
@@ -587,7 +591,9 @@ pub const RESOLVER: &[Binding] = &[
     both(
         "q",
         "back",
-        "back to the list (the operation stays in progress)",
+        "back to the worktree list — the operation stays in progress, and this \
+         worktree's changes pane is still the resolver, so Enter on it walks \
+         straight back in where you left off",
     ),
 ];
 
@@ -712,9 +718,18 @@ const COMMITS_SECTIONS: &[Section] = &[
 ];
 
 const CONFLICTS_SECTIONS: &[Section] = &[Section {
-    heading: "conflict resolver  (after a merge/update conflict)",
+    heading: "conflict resolver  (the changes pane of a conflicted worktree)",
     bindings: RESOLVER,
-    notes: &[],
+    notes: &[
+        "A worktree with unmerged files has no ordinary changes view: the \
+         resolver takes the place of the file list and diff until the \
+         conflicts are settled, then the pane hands itself back with commit \
+         and the rest.",
+        "So there is nothing to get lost outside of. Open that worktree's \
+         changes (Enter on the Worktrees tab, or the ⚠ Changes tab) and you \
+         are back where you left off. `x` on the Worktrees tab is the same \
+         door, and also picks up a rebase you started in a terminal.",
+    ],
 }];
 
 #[cfg(test)]

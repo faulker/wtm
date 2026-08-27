@@ -59,8 +59,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         View::Log {
             name,
             lines,
+            own,
             selected,
-        } => draw_log(frame, main, name, lines, *selected, app.log_mode),
+        } => draw_log(frame, main, name, lines, own, *selected, app.log_mode),
         View::CommitDiff {
             label,
             rows,
@@ -111,27 +112,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             branch,
             lines,
             marked,
+            own,
             selected,
-        } => draw_branch_commits(frame, main, branch, lines, marked, *selected, app.log_mode),
-        View::ConflictResolver {
-            target,
-            source_label,
-            kind,
-            files,
-            resolved,
-            file,
-            current,
-            ..
-        } => draw_conflict_resolver(
+        } => draw_branch_commits(
             frame,
             main,
-            target,
-            source_label,
-            kind,
-            files,
-            resolved,
-            *file,
-            current.as_ref(),
+            branch,
+            lines,
+            marked,
+            own,
+            *selected,
+            app.log_mode,
         ),
         // The first-run setup wizard takes over the whole main area (there is no
         // repo state to show behind it); drawn in the overlay match below.
@@ -151,6 +142,23 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             match app.tab {
                 Tab::Worktrees => draw_worktrees_tab(frame, body, app),
                 Tab::Branches => draw_branches(frame, body, app),
+                // A conflicted worktree has no ordinary changes view: the
+                // resolver stands in for the file list and diff until every
+                // conflict is settled, then this pane hands itself back.
+                Tab::Changes if app.resolver.is_some() => {
+                    let r = app.resolver.as_ref().expect("checked just above");
+                    draw_conflict_resolver(
+                        frame,
+                        body,
+                        &r.target,
+                        &r.source_label,
+                        &r.kind,
+                        &r.files,
+                        &r.resolved,
+                        r.file,
+                        r.current.as_ref(),
+                    )
+                }
                 Tab::Changes => draw_diff(
                     frame,
                     body,
@@ -225,9 +233,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             input,
             body,
             focus,
+            loading,
+            ..
         } => {
             overlay_hit = draw_commit(
-                frame, main, name, files, marked, *cursor, input, body, focus,
+                frame, main, name, files, marked, *cursor, input, body, focus, *loading,
             )
         }
         View::Switch {
@@ -343,8 +353,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         | View::CommitDiff { .. }
         | View::StashDiff { .. }
         | View::Log { .. }
-        | View::BranchCommits { .. }
-        | View::ConflictResolver { .. } => list_hit,
+        | View::BranchCommits { .. } => list_hit,
         View::Commit { .. }
         | View::Switch { .. }
         | View::CherryPick { .. }
@@ -750,9 +759,23 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) -> Opt
     // Header takes the first inner row; remaining rows are the visible window.
     let visible = inner.height.saturating_sub(1) as usize;
     let total = app.worktrees.len();
-    // Overflow arrows on the left border gutter: up when rows sit above the
-    // viewport, down when more sit below (most visible in the three-panel
-    // four-row list).
+    draw_scroll_arrows(frame, area, offset, visible, total);
+    // The table header occupies the first inner row, so data rows start one
+    // line below it.
+    Some(RowList {
+        inner,
+        header: 1,
+        offset,
+        len: total,
+    })
+}
+
+/// Overflow arrows drawn in a panel's left border gutter: UP when rows sit
+/// above the viewport, DOWN when more sit below. Most visible in the
+/// three-panel Worktrees list, which is only a few rows tall. `visible` is the
+/// number of data rows on screen, so a caller with a table header subtracts it
+/// first; `area` is the panel rect including its border, not the inner rect.
+fn draw_scroll_arrows(frame: &mut Frame, area: Rect, offset: usize, visible: usize, total: usize) {
     if offset > 0 {
         let arrow = Rect {
             x: area.x,
@@ -777,14 +800,6 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) -> Opt
             arrow,
         );
     }
-    // The table header occupies the first inner row, so data rows start one
-    // line below it.
-    Some(RowList {
-        inner,
-        header: 1,
-        offset,
-        len: total,
-    })
 }
 
 /// Worktrees tab: the worktree table on top, a read-only changed-file
@@ -817,13 +832,30 @@ fn draw_worktrees_three_panel(frame: &mut Frame, area: Rect, app: &mut App) -> O
     // result also swaps the two panels below (`sync_three_panel_changes`).
     app.ensure_worktree_preview();
     let files_focused = focus == WorktreesFocus::Files;
-    if let Some(panel) = &app.worktree_commits {
+    if let Some(r) = &app.resolver {
+        // The resolver replaces both bottom panels, the same way it replaces the
+        // Changes tab's body: same two-pane geometry, conflicted files on the
+        // left instead of changed ones.
+        app.diff_path_hit = None;
+        app.files_list = draw_conflict_resolver(
+            frame,
+            changes_area,
+            &r.target,
+            &r.source_label,
+            &r.kind,
+            &r.files,
+            &r.resolved,
+            r.file,
+            r.current.as_ref(),
+        );
+    } else if let Some(panel) = &app.worktree_commits {
         app.diff_path_hit = None;
         app.files_list = draw_worktree_commits(
             frame,
             changes_area,
             &panel.branch,
             &panel.lines,
+            &panel.own,
             panel.selected,
             app.log_mode,
             files_focused,
@@ -1199,11 +1231,18 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
     // An unfinished merge/rebase/cherry-pick, or a worktree left with unmerged
-    // files, outranks the ordinary keymap: leaving the resolver with `q` used to
-    // strand the user with no visible way back in, since `x` is otherwise only
-    // documented in the help panel.
+    // files, outranks the ordinary keymap: there is nothing to do with such a
+    // worktree until it is resolved, so say how to get there rather than listing
+    // keys that will only report "you have unmerged paths".
+    //
+    // Not when the resolver itself has the keyboard, though: in the three-panel
+    // layout it lives inside the Worktrees tab, and pointing at a door the user
+    // is already standing in would cost them the keys that actually work.
+    let resolver_focused =
+        app.resolver.is_some() && app.three_panel && app.worktrees_focus == WorktreesFocus::Files;
     if matches!(app.view, View::List)
         && app.tab == Tab::Worktrees
+        && !resolver_focused
         && app
             .selected_worktree()
             .is_some_and(|w| w.conflicted > 0 || w.in_progress.is_some())
@@ -1211,6 +1250,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(
             Paragraph::new(hint_line_fitting(
                 &[
+                    hint("Enter", "resolve conflicts"),
                     hint("x", "resolve conflicts"),
                     hint("↑/↓", "worktree"),
                     hint("?", "help"),
@@ -1224,7 +1264,15 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let hints: &[Binding] = match &app.view {
         View::List => match app.tab {
             // Three-panel layout: the hints follow the focused panel, since the
-            // same keys act on a different list in each.
+            // same keys act on a different list in each — and the bottom region
+            // is the resolver while the worktree is conflicted.
+            Tab::Worktrees
+                if app.three_panel
+                    && app.worktrees_focus == WorktreesFocus::Files
+                    && app.resolver.is_some() =>
+            {
+                help::RESOLVER
+            }
             Tab::Worktrees
                 if app.three_panel
                     && app.worktrees_focus == WorktreesFocus::Files
@@ -1238,6 +1286,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             Tab::Worktrees if app.three_panel => help::WORKTREES_THREE_PANEL,
             Tab::Worktrees => help::WORKTREES,
             Tab::Branches => help::BRANCHES,
+            Tab::Changes if app.resolver.is_some() => help::RESOLVER,
             Tab::Changes => help::DIFF,
             Tab::Stash => help::STASH_LIST,
             Tab::Settings if app.settings.is_typing() => {
@@ -1328,7 +1377,6 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             hint("Enter", "apply"),
             hint("Esc", "cancel"),
         ],
-        View::ConflictResolver { .. } => help::RESOLVER,
         View::Commit { focus, .. } => match focus {
             CommitFocus::Files => help::COMMIT_FILES,
             CommitFocus::Message => &[
@@ -3032,9 +3080,12 @@ fn draw_commit(
     input: &super::app::TextInput,
     body: &super::app::TextArea,
     focus: &CommitFocus,
+    loading: bool,
 ) -> Option<RowList> {
     /// The four single-row fields: the two labels, the subject, and the hint.
     const CHROME: u16 = 4;
+    // While the file list is loading it is one placeholder row, so the dialog
+    // does not jump from full height to empty and back as the load lands.
     let list_rows = (files.len() as u16).clamp(1, 10);
     let popup = centered(area, 72, list_rows + 1 + CHROME + COMMIT_BODY_ROWS + 2);
     frame.render_widget(Clear, popup);
@@ -3066,6 +3117,32 @@ fn draw_commit(
     .areas(inner);
 
     let files_focused = *focus == CommitFocus::Files;
+    // `git status` runs off-thread, so the list is empty for the first frames
+    // of a large changeset. Say so rather than showing an empty pane.
+    if loading {
+        frame.render_widget(
+            Paragraph::new(Line::from("reading changes…".dim())),
+            files_area,
+        );
+        draw_commit_fields(
+            frame,
+            [
+                label_area,
+                prompt_area,
+                body_label_area,
+                body_area,
+                hint_area,
+            ],
+            input,
+            body,
+            focus,
+            marked,
+            files.len(),
+            loading,
+        );
+        // Nothing to click while the list is a placeholder.
+        return None;
+    }
     let items: Vec<ListItem> = files
         .iter()
         .enumerate()
@@ -3102,6 +3179,47 @@ fn draw_commit(
         len: files.len(),
     };
 
+    draw_commit_fields(
+        frame,
+        [
+            label_area,
+            prompt_area,
+            body_label_area,
+            body_area,
+            hint_area,
+        ],
+        input,
+        body,
+        focus,
+        marked,
+        files.len(),
+        loading,
+    );
+    Some(list_hit)
+}
+
+/// The commit dialog's lower half: the subject label and field, the body label
+/// and box, and the hint line. Split out so the loading state can draw them
+/// while the file list above is still a placeholder, which is what lets the
+/// user start typing a message before `git status` returns.
+#[allow(clippy::too_many_arguments)]
+fn draw_commit_fields(
+    frame: &mut Frame,
+    areas: [Rect; 5],
+    input: &super::app::TextInput,
+    body: &super::app::TextArea,
+    focus: &CommitFocus,
+    marked: &[bool],
+    total_files: usize,
+    loading: bool,
+) {
+    let [
+        label_area,
+        prompt_area,
+        body_label_area,
+        body_area,
+        hint_area,
+    ] = areas;
     // Labels make it obvious which field is which, and which one is live.
     let label_style = |on: bool| {
         if on {
@@ -3136,18 +3254,21 @@ fn draw_commit(
     draw_commit_body(frame, body_area, body, body_focused);
 
     let selected_count = marked.iter().filter(|m| **m).count();
+    let counts = if loading {
+        "reading changes…".to_string()
+    } else {
+        format!(
+            "{selected_count}/{total_files} file{}",
+            if total_files == 1 { "" } else { "s" }
+        )
+    };
     frame.render_widget(
         Paragraph::new(Line::styled(
-            format!(
-                "{selected_count}/{} file{} · Tab switches pane · Space toggles · ^S commits",
-                files.len(),
-                if files.len() == 1 { "" } else { "s" }
-            ),
+            format!("{counts} · Tab switches pane · Space toggles · ^S commits"),
             Style::new().dim(),
         )),
         hint_area,
     );
-    Some(list_hit)
 }
 
 /// The commit dialog's body box: a bordered multi-line field that scrolls
@@ -3239,23 +3360,30 @@ fn draw_stash_tab(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
     .highlight_symbol(Span::styled("▌ ", Style::new().fg(ACCENT)));
     let mut state = TableState::default().with_selected(Some(app.stash_selected));
     frame.render_stateful_widget(table, area, &mut state);
+    // Header takes the first inner row; the rest is the visible window.
+    let visible = inner.height.saturating_sub(1) as usize;
+    let total = app.stash_entries.len();
+    draw_scroll_arrows(frame, area, state.offset(), visible, total);
     Some(RowList {
         inner,
         header: 1,
         offset: state.offset(),
-        len: app.stash_entries.len(),
+        len: total,
     })
 }
 
 /// Top-of-main tab bar: the active tab in accent, the other dimmed, with a
 /// reminder that Tab switches between them.
 fn draw_tab_bar(frame: &mut Frame, area: Rect, app: &mut App) {
-    let tab_span = |label: String, active: bool| {
+    let tab_span = |label: String, active: bool, warn: bool| {
         if active {
+            let bg = if warn { theme::WARNING } else { ACCENT };
             Span::styled(
                 format!(" {label} "),
-                Style::new().fg(Color::Black).bg(ACCENT).bold(),
+                Style::new().fg(Color::Black).bg(bg).bold(),
             )
+        } else if warn {
+            Span::styled(format!(" {label} "), Style::new().fg(theme::WARNING).bold())
         } else {
             Span::styled(format!(" {label} "), Style::new().fg(BORDER))
         }
@@ -3275,7 +3403,12 @@ fn draw_tab_bar(frame: &mut Frame, area: Rect, app: &mut App) {
             spans.push(Span::raw(" "));
             x += 1;
         }
-        let span = tab_span(format!("{} {}", tab.glyph(), tab.title()), app.tab == tab);
+        // The Changes tab carries the conflict warning: while a resolver is up
+        // it *is* that tab, so this is the standing pointer back into a
+        // half-finished merge from wherever the user wandered off to.
+        let warn = tab == Tab::Changes && app.resolver.is_some();
+        let glyph = if warn { "⚠" } else { tab.glyph() };
+        let span = tab_span(format!("{} {}", glyph, tab.title()), app.tab == tab, warn);
         let width = span.width() as u16;
         if x < area.x + area.width {
             let rect = Rect {
@@ -3427,6 +3560,11 @@ fn draw_branches(frame: &mut Frame, area: Rect, app: &App) -> Option<RowList> {
     let mut state = TableState::default()
         .with_selected(Some(branch_row_of(&display_rows, app.branch_selected)));
     frame.render_stateful_widget(table, table_area, &mut state);
+    // The detail line already took a row off `inner`, so the visible window is
+    // `table_area` minus its own header. Rows are counted over `display_rows`
+    // (group headings included), matching the `RowList` returned below.
+    let visible = table_area.height.saturating_sub(1) as usize;
+    draw_scroll_arrows(frame, area, state.offset(), visible, display_rows.len());
     if let Some(b) = app.branches.get(app.branch_selected) {
         frame.render_widget(
             Paragraph::new(branch_detail_line(b, detail_area.width as usize)),
@@ -3638,6 +3776,30 @@ fn commit_spans(e: &crate::git::LogEntry, hash_width: usize) -> Vec<Span<'static
     spans
 }
 
+/// Base style for a commit row: the branch's own commits (ahead of the base it
+/// was created off) get a bold band so they read apart from the history the
+/// branch merely inherited. Ratatui patches `highlight_style` over this, so the
+/// cursor row still wins on a marked commit; the dim author/date span in
+/// `commit_spans` likewise keeps its own styling.
+fn commit_row_style(own: bool) -> Style {
+    if own {
+        Style::new().bold().bg(theme::OWN_COMMIT_BG)
+    } else {
+        Style::new()
+    }
+}
+
+/// Suffix for a commit panel's title naming how many of the rows are the
+/// branch's own work, so the band has a legend. Empty when none are.
+fn own_commit_note(own: &[bool]) -> String {
+    let count = own.iter().filter(|o| **o).count();
+    if count == 0 {
+        String::new()
+    } else {
+        format!(" · {count} on this branch")
+    }
+}
+
 /// Scrollable commit log, styled like the diff view. In tree mode rows carry
 /// graph art and some hold art alone; in flat mode every row is a commit.
 fn draw_log(
@@ -3645,10 +3807,15 @@ fn draw_log(
     area: Rect,
     name: &str,
     rows: &[GraphLine],
+    own: &[bool],
     selected: usize,
     mode: LogMode,
 ) -> Option<RowList> {
-    let block = panel(format!("log · {name} · {}", mode.label()));
+    let block = panel(format!(
+        "log · {name} · {}{}",
+        mode.label(),
+        own_commit_note(own)
+    ));
     if rows.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from("no commits".dim())).block(block),
@@ -3659,12 +3826,14 @@ fn draw_log(
     let inner = block.inner(area);
     let items: Vec<ListItem> = rows
         .iter()
-        .map(|row| {
+        .enumerate()
+        .map(|(i, row)| {
             let mut spans = graph_spans(&row.graph);
             if let Some(e) = &row.entry {
                 spans.extend(commit_spans(e, usize::MAX));
             }
             ListItem::new(Line::from(spans))
+                .style(commit_row_style(own.get(i).copied().unwrap_or(false)))
         })
         .collect();
     let list = List::new(items)
@@ -3807,16 +3976,25 @@ fn draw_commit_diff(
 /// Commit history filling the bottom of the three-panel Worktrees layout when
 /// the selected worktree is clean. Same row content as `draw_log` /
 /// `View::BranchCommits`, with the focus dimming used by the files panel.
+#[allow(clippy::too_many_arguments)]
 fn draw_worktree_commits(
     frame: &mut Frame,
     area: Rect,
     branch: &str,
     rows: &[GraphLine],
+    own: &[bool],
     selected: usize,
     mode: LogMode,
     focused: bool,
 ) -> Option<RowList> {
-    let block = focus_panel(format!("commits · {branch} · {}", mode.label()), focused);
+    let block = focus_panel(
+        format!(
+            "commits · {branch} · {}{}",
+            mode.label(),
+            own_commit_note(own)
+        ),
+        focused,
+    );
     if rows.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from("no commits".dim())).block(block),
@@ -3827,12 +4005,14 @@ fn draw_worktree_commits(
     let inner = block.inner(area);
     let items: Vec<ListItem> = rows
         .iter()
-        .map(|row| {
+        .enumerate()
+        .map(|(i, row)| {
             let mut spans = graph_spans(&row.graph);
             if let Some(e) = &row.entry {
                 spans.extend(commit_spans(e, 9));
             }
             ListItem::new(Line::from(spans))
+                .style(commit_row_style(own.get(i).copied().unwrap_or(false)))
         })
         .collect();
     let list = List::new(items)
@@ -3851,16 +4031,22 @@ fn draw_worktree_commits(
 
 /// A branch's commit history with a commit checkbox on each row. Marked commits
 /// (or the one under the cursor) are cherry-picked into a worktree via Enter.
+#[allow(clippy::too_many_arguments)]
 fn draw_branch_commits(
     frame: &mut Frame,
     area: Rect,
     branch: &str,
     rows: &[GraphLine],
     marked: &[bool],
+    own: &[bool],
     selected: usize,
     mode: LogMode,
 ) -> Option<RowList> {
-    let block = panel(format!("commits · {branch} · {}", mode.label()));
+    let block = panel(format!(
+        "commits · {branch} · {}{}",
+        mode.label(),
+        own_commit_note(own)
+    ));
     if rows.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from("no commits".dim())).block(block),
@@ -3880,6 +4066,7 @@ fn draw_branch_commits(
                 spans.extend(graph_spans(&row.graph));
                 return ListItem::new(Line::from(spans));
             };
+            let style = commit_row_style(own.get(i).copied().unwrap_or(false));
             let checked = marked.get(i).copied().unwrap_or(false);
             let mut spans = vec![if checked {
                 Span::styled("[x] ", Style::new().fg(theme::SUCCESS))
@@ -3889,7 +4076,7 @@ fn draw_branch_commits(
             spans.extend(graph_spans(&row.graph));
             // Full hashes are stored for cherry-pick; show an abbreviated form.
             spans.extend(commit_spans(e, 9));
-            ListItem::new(Line::from(spans))
+            ListItem::new(Line::from(spans)).style(style)
         })
         .collect();
     let list = List::new(items)
@@ -5193,7 +5380,7 @@ mod tests {
             },
         ];
         let out = render(78, 6, |frame, area| {
-            draw_log(frame, area, "main", &rows, 0, LogMode::Tree);
+            draw_log(frame, area, "main", &rows, &[], 0, LogMode::Tree);
         });
         assert!(out[0].contains("log · main · tree"), "{out:#?}");
         // git's `*` and `|` become `●` and `│`; the `\` becomes `╲`.
@@ -5256,7 +5443,7 @@ mod tests {
             entry: Some(entry("1a2b3c4", "fix parser", &[])),
         }];
         let out = render(78, 4, |frame, area| {
-            draw_log(frame, area, "main", &rows, 0, LogMode::Flat);
+            draw_log(frame, area, "main", &rows, &[], 0, LogMode::Flat);
         });
         assert!(out[0].contains("log · main · flat"), "{out:#?}");
         assert!(out[1].contains("1a2b3c4 fix parser"), "{out:#?}");
@@ -5278,7 +5465,16 @@ mod tests {
             },
         ];
         let out = render(78, 5, |frame, area| {
-            draw_branch_commits(frame, area, "main", &rows, &[true, false], 0, LogMode::Tree);
+            draw_branch_commits(
+                frame,
+                area,
+                "main",
+                &rows,
+                &[true, false],
+                &[],
+                0,
+                LogMode::Tree,
+            );
         });
         assert!(out[0].contains("commits · main · tree"), "{out:#?}");
         // A marked commit, its art, then the hash abbreviated to 9 chars.
@@ -5303,7 +5499,7 @@ mod tests {
     #[test]
     fn empty_log_says_so() {
         let out = render(40, 4, |frame, area| {
-            draw_log(frame, area, "main", &[], 0, LogMode::Tree);
+            draw_log(frame, area, "main", &[], &[], 0, LogMode::Tree);
         });
         assert!(out[1].contains("no commits"), "{out:#?}");
     }
@@ -5683,7 +5879,16 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(40, 4)).unwrap();
         terminal
             .draw(|frame| {
-                draw_worktree_commits(frame, frame.area(), "main", &rows, 0, LogMode::Flat, true);
+                draw_worktree_commits(
+                    frame,
+                    frame.area(),
+                    "main",
+                    &rows,
+                    &[],
+                    0,
+                    LogMode::Flat,
+                    true,
+                );
             })
             .unwrap();
         let focused = terminal.backend().buffer().clone();
@@ -5695,7 +5900,16 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                draw_worktree_commits(frame, frame.area(), "main", &rows, 0, LogMode::Flat, false);
+                draw_worktree_commits(
+                    frame,
+                    frame.area(),
+                    "main",
+                    &rows,
+                    &[],
+                    0,
+                    LogMode::Flat,
+                    false,
+                );
             })
             .unwrap();
         let idle = terminal.backend().buffer().clone();
@@ -6108,6 +6322,7 @@ mod tests {
                 &TextInput::with_value("subject"),
                 &body,
                 &CommitFocus::Body,
+                false,
             );
         });
         assert!(
@@ -6144,6 +6359,7 @@ mod tests {
                 &TextInput::with_value("subject"),
                 &super::super::app::TextArea::default(),
                 &CommitFocus::Files,
+                false,
             );
         });
         let screen = out.join("\n");
@@ -6183,6 +6399,7 @@ mod tests {
                 &TextInput::with_value("subject here"),
                 &super::super::app::TextArea::default(),
                 &CommitFocus::Message,
+                false,
             );
         });
         assert!(out.iter().any(|r| r.contains("Commit message")), "{out:#?}");

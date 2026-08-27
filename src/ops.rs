@@ -335,40 +335,37 @@ struct BaseStatus {
     behind: bool,
 }
 
-/// Resolves the comparison base for `branch`:
+/// Resolves the ref `branch`'s status is measured against:
 /// 1. recorded `created_from` when that ref still exists
 /// 2. else the repo default branch tip (when it exists and is not `branch`)
 /// 3. else `git merge-base` against the default / `origin/HEAD`
 ///
-/// Returns an empty status when nothing is comparable (default branch itself,
-/// missing refs, etc.).
-fn resolve_base_status(
+/// Returns the ref to compare with, the label reported as `created_from`
+/// (which differs from the ref for a remote tip or a merge-base SHA), and
+/// which kind of comparison it is. `None` when nothing is comparable (the
+/// default branch itself, missing refs, etc.).
+fn resolve_base_ref(
     repo_root: &Path,
     branch: &str,
     recorded: Option<&str>,
     default: Option<&str>,
-) -> BaseStatus {
+) -> Option<(String, String, BaseCompareKind)> {
     if !git::branch_exists(repo_root, branch) {
-        return BaseStatus {
-            label: None,
-            changed: false,
-            behind: false,
-        };
+        return None;
     }
     // Prefer a recorded creation base that still resolves.
     if let Some(base) = recorded.filter(|b| git::ref_exists(repo_root, b)) {
-        return base_status_vs(repo_root, base, branch, BaseCompareKind::Tip);
+        return Some((base.to_string(), base.to_string(), BaseCompareKind::Tip));
     }
     // Fall back to the default branch tip when it is a different, resolvable ref.
     if let Some(def) = default.filter(|d| *d != branch) {
         if git::ref_exists(repo_root, def) {
-            return base_status_vs(repo_root, def, branch, BaseCompareKind::Tip);
+            return Some((def.to_string(), def.to_string(), BaseCompareKind::Tip));
         }
         // Local default missing: try the remote-tracking tip of the same name.
         let remote_tip = format!("origin/{def}");
         if git::ref_exists(repo_root, &remote_tip) {
-            return base_status_vs(repo_root, &remote_tip, branch, BaseCompareKind::Tip)
-                .with_label(def.to_string());
+            return Some((remote_tip, def.to_string(), BaseCompareKind::Tip));
         }
     }
     // Last resort: merge-base against a resolvable parent (changed only).
@@ -396,15 +393,47 @@ fn resolve_base_status(
         if let Ok(mb) = git::merge_base(repo_root, branch, &parent)
             && !mb.is_empty()
         {
-            return base_status_vs(repo_root, &mb, branch, BaseCompareKind::MergeBase)
-                .with_label(label);
+            return Some((mb, label, BaseCompareKind::MergeBase));
         }
     }
-    BaseStatus {
-        label: None,
-        changed: false,
-        behind: false,
-    }
+    None
+}
+
+/// Resolved comparison base for a branch's status flags, from the ladder in
+/// [`resolve_base_ref`]. Empty when nothing is comparable.
+fn resolve_base_status(
+    repo_root: &Path,
+    branch: &str,
+    recorded: Option<&str>,
+    default: Option<&str>,
+) -> BaseStatus {
+    let Some((base, label, kind)) = resolve_base_ref(repo_root, branch, recorded, default) else {
+        return BaseStatus {
+            label: None,
+            changed: false,
+            behind: false,
+        };
+    };
+    base_status_vs(repo_root, &base, branch, kind).with_label(label)
+}
+
+/// Hashes of the commits unique to `branch` versus its comparison base, so a
+/// log view can mark out the branch's own work from the history it inherited.
+/// Uses the same base ladder as the `changed`/`outdated` flags in [`list`],
+/// including the `[created_from]` map from `.wtm.toml`. Empty when `branch` is
+/// the default branch or no base resolves.
+pub fn branch_own_commits(ctx: &Ctx, branch: &str) -> Result<HashSet<String>> {
+    let default = git::default_branch(&ctx.repo_root).ok();
+    let recorded = crate::config::load_created_from(&ctx.repo_root).unwrap_or_default();
+    let Some((base, _, _)) = resolve_base_ref(
+        &ctx.repo_root,
+        branch,
+        recorded.get(branch).map(String::as_str),
+        default.as_deref(),
+    ) else {
+        return Ok(HashSet::new());
+    };
+    Ok(git::commits_ahead_hashes(&ctx.repo_root, &base, branch)?)
 }
 
 impl BaseStatus {
@@ -2903,6 +2932,56 @@ mod tests {
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    #[test]
+    fn branch_own_commits_covers_only_work_added_since_the_base() {
+        let (_tmp, ctx) = temp_ctx();
+        git(&ctx.repo_root, &["checkout", "-b", "feature"]);
+        git(&ctx.repo_root, &["commit", "--allow-empty", "-m", "mine"]);
+        git(&ctx.repo_root, &["checkout", "main"]);
+
+        // No `[created_from]` recorded, so the default branch is the base.
+        let own = branch_own_commits(&ctx, "feature").unwrap();
+        assert_eq!(own.len(), 1, "just the commit made on feature");
+        let tip = git::rev_parse(&ctx.repo_root, "feature").unwrap();
+        assert!(own.contains(&tip));
+
+        // The default branch has no base of its own, so nothing is marked and
+        // its log renders unhighlighted.
+        assert!(branch_own_commits(&ctx, "main").unwrap().is_empty());
+        // An unknown branch degrades to empty rather than erroring.
+        assert!(branch_own_commits(&ctx, "nope").unwrap().is_empty());
+    }
+
+    #[test]
+    fn branch_own_commits_honours_a_recorded_creation_base() {
+        let (_tmp, ctx) = temp_ctx();
+        // `release` forks off main and gains a commit of its own.
+        git(&ctx.repo_root, &["checkout", "-b", "release"]);
+        git(
+            &ctx.repo_root,
+            &["commit", "--allow-empty", "-m", "release work"],
+        );
+        // `feature` forks off `release`, so measured against main it would also
+        // own "release work"; against its recorded base it owns only its own.
+        git(&ctx.repo_root, &["checkout", "-b", "feature"]);
+        git(
+            &ctx.repo_root,
+            &["commit", "--allow-empty", "-m", "feature work"],
+        );
+        git(&ctx.repo_root, &["checkout", "main"]);
+
+        assert_eq!(
+            branch_own_commits(&ctx, "feature").unwrap().len(),
+            2,
+            "without a recorded base, both commits look like feature's"
+        );
+        crate::config::set_created_from(&ctx.repo_root, "feature", "release").unwrap();
+        let own = branch_own_commits(&ctx, "feature").unwrap();
+        assert_eq!(own.len(), 1, "recorded base cuts the inherited commit out");
+        let tip = git::rev_parse(&ctx.repo_root, "feature").unwrap();
+        assert!(own.contains(&tip));
     }
 
     /// Creates a worktree for `branch` with no setup steps, returning its path.
