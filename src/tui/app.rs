@@ -172,8 +172,20 @@ impl<T> Task<T> {
     }
 }
 
-/// How often the diff view recomputes itself to pick up outside edits.
+/// How often the diff view recomputes itself to pick up outside edits while the
+/// user is actively driving the app.
 const DIFF_REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// The same refresh once the app has been sitting untouched for
+/// `IDLE_AFTER`. A `git status` plus a `git diff` every second forever is the
+/// single most expensive thing wtm does while nobody is looking at it, and an
+/// unattended pane does not need second-by-second freshness: `r` and the next
+/// keypress both bring it back to the fast schedule.
+const IDLE_DIFF_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+
+/// No key or mouse event for this long means nobody is driving the app, so the
+/// background schedules back off (see `App::is_idle`).
+const IDLE_AFTER: Duration = Duration::from_secs(20);
 
 /// How often the worktree/branch lists reload themselves so work done outside
 /// the app (an agent committing, a teammate's branch landing) shows up without
@@ -1520,6 +1532,62 @@ impl RowList {
     }
 }
 
+/// Which column of the resolver's three-column hunk view a click landed in.
+/// Clicking a side takes it, the way pressing its key does, so the pane works
+/// with the mouse alone.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ResolverColumn {
+    Theirs,
+    Final,
+    Ours,
+}
+
+/// Geometry of the resolver's detail pane, recorded by the renderer each frame
+/// so the wheel and clicks can be resolved against what is actually on screen.
+#[derive(Clone)]
+pub struct ResolverHits {
+    /// The scrolling body rect (inside the panel, below the sticky legend).
+    pub body: Rect,
+    /// Scroll offset the body was drawn with.
+    pub scroll: u16,
+    /// First and last content line of each hunk's block, indexed by hunk.
+    pub hunks: Vec<(usize, usize)>,
+    /// Column boundaries of the three-column view, as the x of the first
+    /// column past THEIRS and past FINAL. `None` in the narrow (stacked)
+    /// layout, where a click can only pick the hunk.
+    pub columns: Option<(u16, u16)>,
+}
+
+impl ResolverHits {
+    /// Whether (`col`, `row`) is inside the scrolling body.
+    pub fn contains(&self, col: u16, row: u16) -> bool {
+        rect_contains(self.body, col, row)
+    }
+
+    /// The hunk a click at (`col`, `row`) landed on, with the column it hit
+    /// when the three-column view is up.
+    pub fn hit(&self, col: u16, row: u16) -> Option<(usize, Option<ResolverColumn>)> {
+        if !self.contains(col, row) {
+            return None;
+        }
+        let line = (row - self.body.y) as usize + self.scroll as usize;
+        let hunk = self
+            .hunks
+            .iter()
+            .position(|(first, last)| line >= *first && line <= *last)?;
+        let column = self.columns.map(|(theirs_end, final_end)| {
+            if col < theirs_end {
+                ResolverColumn::Theirs
+            } else if col < final_end {
+                ResolverColumn::Final
+            } else {
+                ResolverColumn::Ours
+            }
+        });
+        Some((hunk, column))
+    }
+}
+
 /// State behind the Changes tab: a per-file changes browser for one worktree,
 /// with a list of changed files on the left and the selected file's diff on the
 /// right. Files can be marked for commit, stashed, or reverted from here.
@@ -1621,6 +1689,21 @@ pub struct App {
     /// file list and diff, because the worktree it is pointed at is mid-merge.
     /// Reconciled by `sync_resolver_panel`; outranks `worktree_commits`.
     pub resolver: Option<ResolverState>,
+    /// First visible line of the resolver's detail pane. The pane used to have
+    /// no scroll of its own — it was pinned to the current hunk — so a hunk
+    /// taller than the pane had a bottom nobody could reach.
+    pub resolver_scroll: u16,
+    /// Set when the hunk or file cursor moves, so the next frame scrolls the
+    /// pane to bring that hunk into view and then hands the scroll back to the
+    /// user. Cleared by the renderer once it has been honoured.
+    pub resolver_follow: bool,
+    /// Largest useful `resolver_scroll`, recorded by the renderer each frame
+    /// (only it knows the rendered height); keys clamp against it.
+    pub resolver_max_scroll: u16,
+    /// Height of the resolver's scrolling body, for page-sized scrolling.
+    pub resolver_page: u16,
+    /// Geometry of the resolver's detail pane, for the wheel and clicks.
+    pub resolver_hits: Option<ResolverHits>,
     /// When `Some`, the three-panel bottom area shows this commit list instead
     /// of the changes/diff panels (selected worktree is clean).
     /// In-flight file-list load for an open commit dialog, keyed by worktree
@@ -1722,6 +1805,11 @@ pub struct App {
     pub worktree_base: Option<String>,
     /// Advances once per event-loop tick; drives the busy-overlay spinner.
     pub tick_count: u64,
+    /// When the last key or mouse event arrived. The event loop and the diff
+    /// auto-refresh both slow down once this goes stale (`is_idle`), so an app
+    /// left open in a background tab stops redrawing and stops shelling out to
+    /// git ten and one times a second respectively.
+    pub last_input: Instant,
     /// Whether commit history is drawn as a graph or a flat list, shared by the
     /// log and branch-commit views. Toggled with `t`.
     pub log_mode: LogMode,
@@ -1809,6 +1897,11 @@ impl App {
             files_list: None,
             changes: ChangesTab::default(),
             resolver: None,
+            resolver_scroll: 0,
+            resolver_follow: true,
+            resolver_max_scroll: 0,
+            resolver_page: 1,
+            resolver_hits: None,
             commit_files_pending: None,
             worktree_commits: None,
             commits_pending: None,
@@ -1844,6 +1937,7 @@ impl App {
             error_max_scroll: 0,
             worktree_base,
             tick_count: 0,
+            last_input: Instant::now(),
             log_mode: LogMode::Tree,
             file_tree: true,
             collapsed_folders: HashSet::new(),
@@ -2154,6 +2248,35 @@ impl App {
 
     /// Background work driven by the event loop's poll timeout: auto-refreshes
     /// the diff view and drains progress from an in-flight create.
+    /// True when no key or mouse event has arrived for `IDLE_AFTER`. Nothing on
+    /// screen is waiting on the user then, so the background schedules can back
+    /// off; the next keypress puts them straight back.
+    pub fn is_idle(&self) -> bool {
+        self.last_input.elapsed() >= IDLE_AFTER
+    }
+
+    /// Whether the screen has something moving on it that only a redraw can
+    /// advance: a spinner, or a background result the next tick has to pick up.
+    ///
+    /// The event loop redraws on this schedule and waits much longer for input
+    /// otherwise. A TUI that repaints ten times a second forever keeps the
+    /// terminal's renderer (and the GPU behind it) awake for frames that are
+    /// identical, which is exactly the kind of idle drain a laptop notices.
+    pub fn needs_fast_tick(&self) -> bool {
+        matches!(self.view, View::Busy { .. } | View::Creating { .. })
+            || self.changes.pending.is_some()
+            || self.preview_pending.is_some()
+            || self.commit_files_pending.is_some()
+            || self.commits_pending.is_some()
+            || self.status_refresh_pending.is_some()
+            || self.stash_pending.is_some()
+            || self.branches_pending.is_some()
+            || self.update_check.is_some()
+            // A status message auto-clears on a timer, so keep ticking until it
+            // has gone; four seconds of fast ticks is not a battery problem.
+            || self.message.is_some()
+    }
+
     pub fn tick(&mut self) {
         // Advance the spinner clock every tick so the busy overlay keeps
         // animating even while a background op holds the screen.
@@ -2282,7 +2405,15 @@ impl App {
             self.tab == Tab::Changes || (self.tab == Tab::Worktrees && self.three_panel);
         if diff_on_screen && matches!(self.view, View::List) {
             self.poll_diff_load();
-            if self.changes.last_refresh.elapsed() >= DIFF_REFRESH_INTERVAL {
+            // Every refresh is a `git status` plus a `git diff`. Second-by-
+            // second is right while the user is working the pane and pure
+            // battery drain once they have walked away from it.
+            let interval = if self.is_idle() {
+                IDLE_DIFF_REFRESH_INTERVAL
+            } else {
+                DIFF_REFRESH_INTERVAL
+            };
+            if self.changes.last_refresh.elapsed() >= interval {
                 self.refresh_diff();
             }
             return;
@@ -2440,6 +2571,7 @@ impl App {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) {
+        self.last_input = Instant::now();
         self.message = None;
         // A modal error popup owns every key until it is dismissed, so nothing
         // reaches Ctrl+C handling or the view underneath. Only q/Esc close it:
@@ -4039,6 +4171,7 @@ impl App {
     /// moves the file cursor like the arrow keys, elsewhere it scrolls the
     /// diff text.
     pub fn on_mouse(&mut self, mouse: MouseEvent) {
+        self.last_input = Instant::now();
         // A left click moves the selection to the clicked row, mirroring the
         // arrow keys. The help panel is modal, so a click on the view behind it
         // must not move that view's cursor.
@@ -4094,7 +4227,11 @@ impl App {
                 .files_list
                 .is_some_and(|rl| rl.contains(mouse.column, mouse.row))
             {
-                if let Some(panel) = &mut self.worktree_commits {
+                // The resolver owns both bottom panels while the worktree is
+                // conflicted, so its file list is what `files_list` points at.
+                if self.resolver.is_some() {
+                    self.resolver_move_file(if down { 1 } else { -1 });
+                } else if let Some(panel) = &mut self.worktree_commits {
                     if down {
                         if let Some(i) = seek_commit_row(&panel.lines, panel.selected, true) {
                             panel.selected = i;
@@ -4121,6 +4258,8 @@ impl App {
                 } else if self.selected > 0 {
                     self.selected -= 1;
                 }
+            } else if self.resolver.is_some() {
+                self.scroll_resolver(if down { 3 } else { -3 });
             } else if self.worktree_commits.is_none() {
                 self.changes.scroll = delta(self.changes.scroll);
             }
@@ -4152,6 +4291,17 @@ impl App {
         // Over the Changes tab's file list: one file-cursor step per wheel
         // notch; anywhere else on that tab the wheel scrolls the diff text.
         if matches!(self.view, View::List) && self.tab == Tab::Changes {
+            // Conflicted worktree: the resolver is the tab's body, so the wheel
+            // steps its file cursor over the list and scrolls its hunks
+            // anywhere else — the same split the diff view has.
+            if self.resolver.is_some() {
+                if over_list {
+                    self.resolver_move_file(if down { 1 } else { -1 });
+                } else {
+                    self.scroll_resolver(if down { 3 } else { -3 });
+                }
+                return;
+            }
             let c = &mut self.changes;
             if over_list {
                 let moved = if down {
@@ -4369,6 +4519,37 @@ impl App {
             self.last_click = None;
             return;
         }
+        // While a worktree is conflicted the resolver stands in for the changes
+        // panels, so its own file list and hunk pane get the click first: a
+        // click on a conflicted file opens it, and a click on a hunk's THEIRS
+        // or OURS column takes that side, the mouse equivalent of t and o.
+        if self.resolver.is_some() {
+            if let Some(idx) = self.files_list.and_then(|rl| rl.hit(col, row)) {
+                self.worktrees_focus = WorktreesFocus::Files;
+                self.select_resolver_file(idx);
+                return;
+            }
+            if let Some((hunk, column)) = self
+                .resolver_hits
+                .as_ref()
+                .and_then(|hits| hits.hit(col, row))
+            {
+                self.worktrees_focus = WorktreesFocus::Files;
+                self.select_resolver_hunk(hunk);
+                match column {
+                    Some(ResolverColumn::Theirs) => {
+                        self.resolver_set_action(ResolutionAction::KeepTheirs);
+                    }
+                    Some(ResolverColumn::Ours) => {
+                        self.resolver_set_action(ResolutionAction::KeepOurs);
+                    }
+                    // The FINAL column shows the result; clicking it just moves
+                    // the cursor to that hunk, leaving the decision alone.
+                    Some(ResolverColumn::Final) | None => {}
+                }
+                return;
+            }
+        }
         // Three-panel layout: a click in the changed-file (or commit) panel
         // takes the focus (the mouse equivalent of Enter) and lands the cursor.
         if let Some(idx) = self.files_list.and_then(|rl| rl.hit(col, row)) {
@@ -4431,15 +4612,7 @@ impl App {
                 // The resolver stands in for the file list while this
                 // worktree is conflicted, so a click there picks a conflicted
                 // file rather than a changed one.
-                Tab::Changes if self.resolver.is_some() => {
-                    if let Some(r) = &mut self.resolver {
-                        if idx >= r.files.len() || r.file == idx {
-                            return;
-                        }
-                        r.file = idx;
-                    }
-                    self.load_resolver_file();
-                }
+                Tab::Changes if self.resolver.is_some() => self.select_resolver_file(idx),
                 Tab::Changes => {
                     let c = &mut self.changes;
                     if idx >= c.rows.len() || c.selected == idx {
@@ -7793,6 +7966,10 @@ impl App {
         if let Some(r) = &mut self.resolver {
             r.current = loaded;
         }
+        // A different file's hunks have nothing to do with where the last one
+        // was scrolled to, so start at the top and follow the cursor again.
+        self.resolver_scroll = 0;
+        self.resolver_follow = true;
     }
 
     /// Key handling for the conflict resolver.
@@ -7810,8 +7987,36 @@ impl App {
             }
             KeyCode::Left | KeyCode::Char('[') | KeyCode::Char('h') => self.resolver_move_file(-1),
             KeyCode::Right | KeyCode::Char(']') | KeyCode::Char('l') => self.resolver_move_file(1),
-            KeyCode::Down | KeyCode::Char('j') => self.resolver_move_hunk(1),
-            KeyCode::Up | KeyCode::Char('k') => self.resolver_move_hunk(-1),
+            // Shift+↑/↓ and ⇧J/⇧K scroll the pane, matching the diff views. The
+            // plain arrows move the hunk cursor and fall back to scrolling once
+            // it has nowhere left to go, so ↓ on the last hunk of a long file
+            // still walks to the bottom instead of doing nothing at all.
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => self.scroll_resolver(-3),
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => self.scroll_resolver(3),
+            KeyCode::Char('J') => self.scroll_resolver(3),
+            KeyCode::Char('K') => self.scroll_resolver(-3),
+            KeyCode::Down | KeyCode::Char('j') => {
+                if !self.resolver_move_hunk(1) {
+                    self.scroll_resolver(1);
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if !self.resolver_move_hunk(-1) {
+                    self.scroll_resolver(-1);
+                }
+            }
+            KeyCode::PageDown | KeyCode::Char(' ') => {
+                self.scroll_resolver(self.resolver_page.max(1) as i32);
+            }
+            KeyCode::PageUp => self.scroll_resolver(-(self.resolver_page.max(1) as i32)),
+            KeyCode::Home | KeyCode::Char('g') => {
+                self.resolver_scroll = 0;
+                self.resolver_follow = false;
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                self.resolver_scroll = self.resolver_max_scroll;
+                self.resolver_follow = false;
+            }
             KeyCode::Char('o') => self.resolver_set_action(ResolutionAction::KeepOurs),
             KeyCode::Char('t') => self.resolver_set_action(ResolutionAction::KeepTheirs),
             KeyCode::Char('b') => self.resolver_set_action(ResolutionAction::KeepBoth),
@@ -7858,13 +8063,84 @@ impl App {
     }
 
     /// Moves the hunk cursor within the current file by `delta`, clamped.
-    fn resolver_move_hunk(&mut self, delta: isize) {
-        if let Some(rf) = self.resolver.as_mut().and_then(|r| r.current.as_mut()) {
+    /// Returns whether the cursor actually moved, so the caller can scroll
+    /// instead when it is already at the first or last hunk.
+    fn resolver_move_hunk(&mut self, delta: isize) -> bool {
+        let moved = if let Some(rf) = self.resolver.as_mut().and_then(|r| r.current.as_mut()) {
             let n = rf.actions.len();
-            if n > 0 {
-                rf.hunk = (rf.hunk as isize + delta).clamp(0, n as isize - 1) as usize;
+            if n == 0 {
+                false
+            } else {
+                let next = (rf.hunk as isize + delta).clamp(0, n as isize - 1) as usize;
+                let moved = next != rf.hunk;
+                rf.hunk = next;
+                moved
             }
+        } else {
+            false
+        };
+        // Follow the cursor even when it stayed put: a hunk scrolled out of
+        // view comes back on the next arrow press rather than needing the user
+        // to guess where the cursor went.
+        self.resolver_follow = true;
+        moved
+    }
+
+    /// Records what the renderer worked out about the resolver's detail pane:
+    /// where it ended up scrolled, how far it can scroll, how tall it is, and
+    /// where its hunks landed. Only the renderer knows any of this, and the
+    /// keys and mouse need all of it, so it comes back the same way the error
+    /// popup's scroll extent does.
+    pub fn apply_resolver_draw(
+        &mut self,
+        scroll: u16,
+        max_scroll: u16,
+        page: u16,
+        hits: Option<ResolverHits>,
+    ) {
+        self.resolver_scroll = scroll;
+        self.resolver_max_scroll = max_scroll;
+        self.resolver_page = page;
+        self.resolver_hits = hits;
+        // Honoured; from here the pane stays where the user leaves it until
+        // the cursor moves again.
+        self.resolver_follow = false;
+    }
+
+    /// Puts the file cursor on `idx` and loads that file, for a click on the
+    /// conflicted-file list. Out-of-range and no-op clicks are ignored.
+    fn select_resolver_file(&mut self, idx: usize) {
+        let moved = match &mut self.resolver {
+            Some(r) if idx < r.files.len() && r.file != idx => {
+                r.file = idx;
+                true
+            }
+            _ => false,
+        };
+        if moved {
+            self.load_resolver_file();
         }
+    }
+
+    /// Puts the hunk cursor on `idx`, for a click in the detail pane.
+    fn select_resolver_hunk(&mut self, idx: usize) {
+        if let Some(rf) = self
+            .resolver
+            .as_mut()
+            .and_then(|r| r.current.as_mut())
+            .filter(|rf| idx < rf.actions.len())
+        {
+            rf.hunk = idx;
+        }
+    }
+
+    /// Scrolls the resolver's detail pane by `delta` lines, clamped to the
+    /// content, and takes the pane off hunk-following until the cursor moves
+    /// again so the view stays exactly where the user put it.
+    fn scroll_resolver(&mut self, delta: i32) {
+        let next = (self.resolver_scroll as i32 + delta).max(0) as u16;
+        self.resolver_scroll = next.min(self.resolver_max_scroll);
+        self.resolver_follow = false;
     }
 
     /// Records `action` for the current hunk of the current file. The choice is
@@ -13144,6 +13420,91 @@ mod tests {
         );
     }
 
+    /// The resolver's hunk pane had no scroll of its own: it was pinned to the
+    /// current hunk every frame, so ↓ on the last hunk did nothing at all and
+    /// anything below it was unreachable. Now the arrows fall through to
+    /// scrolling once the cursor has nowhere left to go.
+    #[test]
+    fn resolver_arrows_scroll_once_the_hunk_cursor_runs_out() {
+        let (_tmp, mut app) = test_app();
+        into_conflict_resolver_multi_hunk(&mut app);
+        // A short pane, so the two hunks do not both fit and there is
+        // somewhere to scroll to.
+        render_app(&mut app, 150, 16);
+        assert!(app.resolver_max_scroll > 0, "the pane has more content");
+        // Down to the last hunk, then back to the top of the pane: the cursor
+        // has nowhere further to go, which is exactly when ↓ used to be dead.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Home);
+        render_app(&mut app, 150, 16);
+        assert_eq!(app.resolver_scroll, 0);
+        press(&mut app, KeyCode::Down);
+        render_app(&mut app, 150, 16);
+        assert_eq!(
+            app.resolver_scroll, 1,
+            "↓ on the last hunk scrolls instead of doing nothing"
+        );
+        // Explicit scroll keys work from anywhere.
+        press(&mut app, KeyCode::Home);
+        assert_eq!(app.resolver_scroll, 0);
+        press(&mut app, KeyCode::End);
+        assert_eq!(app.resolver_scroll, app.resolver_max_scroll);
+        press_shift(&mut app, KeyCode::Up);
+        assert_eq!(app.resolver_scroll, app.resolver_max_scroll.max(3) - 3);
+    }
+
+    /// The wheel works everywhere else in the app; in the resolver it used to
+    /// fall through to the changed-file list hiding behind the pane.
+    #[test]
+    fn resolver_wheel_scrolls_the_hunks_and_steps_the_file_list() {
+        let (_tmp, mut app) = test_app();
+        into_conflict_resolver_multi_hunk(&mut app);
+        render_app(&mut app, 150, 16);
+        let hits = app.resolver_hits.clone().expect("hunk pane geometry");
+        let (col, row) = (hits.body.x + 1, hits.body.y + 1);
+        let wheel = |app: &mut App, kind| {
+            app.on_mouse(MouseEvent {
+                kind,
+                column: col,
+                row,
+                modifiers: KeyModifiers::empty(),
+            });
+        };
+        wheel(&mut app, MouseEventKind::ScrollDown);
+        assert_eq!(app.resolver_scroll, 3, "a notch scrolls the hunk pane");
+        wheel(&mut app, MouseEventKind::ScrollUp);
+        assert_eq!(app.resolver_scroll, 0);
+    }
+
+    /// Clicking a side takes it, so the pane can be driven with the mouse
+    /// alone: the column under the pointer is the decision.
+    #[test]
+    fn resolver_click_on_a_side_column_takes_that_side() {
+        let (_tmp, mut app) = test_app();
+        into_conflict_resolver(&mut app);
+        render_app(&mut app, 150, 24);
+        let hits = app.resolver_hits.clone().expect("hunk pane geometry");
+        let (theirs_end, final_end) = hits.columns.expect("three columns at this width");
+        let (first, _) = hits.hunks[0];
+        let row = hits.body.y + (first as u16 - hits.scroll) + 1;
+        let action = |app: &App| {
+            resolver(app)
+                .current
+                .as_ref()
+                .expect("a loaded file")
+                .actions[0]
+                .clone()
+        };
+        click(&mut app, theirs_end - 2, row);
+        assert_eq!(action(&app), Some(ResolutionAction::KeepTheirs));
+        click(&mut app, final_end + 2, row);
+        assert_eq!(action(&app), Some(ResolutionAction::KeepOurs));
+        // The middle column is the result, not a side: clicking it decides
+        // nothing.
+        click(&mut app, theirs_end + 2, row);
+        assert_eq!(action(&app), Some(ResolutionAction::KeepOurs));
+    }
+
     #[test]
     fn resolver_hunk_action_selection_updates_state() {
         let (_tmp, mut app) = test_app();
@@ -15726,6 +16087,53 @@ mod tests {
         let path = app.changes.files[idx].path.clone();
         render_app(app, 100, 30);
         path
+    }
+
+    /// The event loop asks the app how fast to tick. A screen with nothing
+    /// moving on it must say "slowly": redrawing an unchanged frame ten times a
+    /// second is what kept the terminal (and the laptop) busy for nothing.
+    #[test]
+    fn an_idle_screen_does_not_ask_for_fast_ticks() {
+        let (_tmp, mut app) = test_app();
+        app.message = None;
+        assert!(!app.needs_fast_tick(), "nothing in flight, nothing moving");
+        assert!(!app.is_idle(), "a freshly built app counts as active");
+        // A status message clears itself on a timer, so it keeps the fast tick
+        // until it has gone.
+        app.message = Some("done".to_string());
+        assert!(app.needs_fast_tick());
+        app.message = None;
+        // A background op is the other reason to keep ticking.
+        app.update_check = Some(Task::new(std::sync::mpsc::channel().1));
+        assert!(app.needs_fast_tick());
+        app.update_check = None;
+        app.last_input = Instant::now() - IDLE_AFTER;
+        assert!(app.is_idle(), "untouched for long enough to park");
+    }
+
+    /// The Changes tab re-runs `git status` and `git diff` every second to pick
+    /// up outside edits. That is right while someone is working the pane and
+    /// pure drain once they have walked away, so it backs off when idle.
+    #[test]
+    fn the_diff_refresh_backs_off_when_nobody_is_driving() {
+        let (_tmp, mut app) = test_app();
+        changes_tab_with_one_file(&mut app);
+        // Due for a refresh on the active schedule, but not on the idle one.
+        app.changes.last_refresh = Instant::now() - DIFF_REFRESH_INTERVAL;
+        app.last_input = Instant::now() - IDLE_AFTER;
+        let before = app.changes.last_refresh;
+        app.tick();
+        assert_eq!(
+            app.changes.last_refresh, before,
+            "an untouched pane waits for the longer interval"
+        );
+        // A keypress puts it straight back on the fast schedule.
+        app.last_input = Instant::now();
+        app.tick();
+        assert!(
+            app.changes.last_refresh > before,
+            "the pane refreshes again as soon as it is being used"
+        );
     }
 
     /// Shift+U discards every uncommitted change in the worktree: tracked

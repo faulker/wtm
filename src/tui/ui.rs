@@ -14,7 +14,7 @@ use ratatui::widgets::{
 
 use super::app::{
     App, BranchRow, CheckoutCandidate, CherryTarget, CommitFocus, ConfirmOption, CreateOutcome,
-    DiffRow, LogMode, Modal, ResolverFile, RowList, Tab, TextInput, UpstreamRow, View,
+    DiffRow, LogMode, Modal, ResolverFile, ResolverHits, RowList, Tab, TextInput, UpstreamRow, View,
     WorktreesFocus, branch_display_rows, branch_row_of, filtered_candidates, upstream_rows,
 };
 use super::config_editor::{
@@ -54,6 +54,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.preview_list = None;
     app.files_list = None;
     app.diff_path_hit = None;
+    app.resolver_hits = None;
     // The full-screen view's clickable list, if any.
     let list_hit = match &app.view {
         View::Log {
@@ -146,18 +147,24 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 // resolver stands in for the file list and diff until every
                 // conflict is settled, then this pane hands itself back.
                 Tab::Changes if app.resolver.is_some() => {
-                    let r = app.resolver.as_ref().expect("checked just above");
-                    draw_conflict_resolver(
-                        frame,
-                        body,
-                        &r.target,
-                        &r.source_label,
-                        &r.kind,
-                        &r.files,
-                        &r.resolved,
-                        r.file,
-                        r.current.as_ref(),
-                    )
+                    let out = {
+                        let r = app.resolver.as_ref().expect("checked just above");
+                        draw_conflict_resolver(
+                            frame,
+                            body,
+                            &r.target,
+                            &r.source_label,
+                            &r.kind,
+                            &r.files,
+                            &r.resolved,
+                            r.file,
+                            r.current.as_ref(),
+                            app.resolver_scroll,
+                            app.resolver_follow,
+                        )
+                    };
+                    app.apply_resolver_draw(out.scroll, out.max_scroll, out.page, out.hits);
+                    out.list
                 }
                 Tab::Changes => draw_diff(
                     frame,
@@ -837,7 +844,7 @@ fn draw_worktrees_three_panel(frame: &mut Frame, area: Rect, app: &mut App) -> O
         // Changes tab's body: same two-pane geometry, conflicted files on the
         // left instead of changed ones.
         app.diff_path_hit = None;
-        app.files_list = draw_conflict_resolver(
+        let out = draw_conflict_resolver(
             frame,
             changes_area,
             &r.target,
@@ -847,7 +854,11 @@ fn draw_worktrees_three_panel(frame: &mut Frame, area: Rect, app: &mut App) -> O
             &r.resolved,
             r.file,
             r.current.as_ref(),
+            app.resolver_scroll,
+            app.resolver_follow,
         );
+        app.files_list = out.list;
+        app.apply_resolver_draw(out.scroll, out.max_scroll, out.page, out.hits);
     } else if let Some(panel) = &app.worktree_commits {
         app.diff_path_hit = None;
         app.files_list = draw_worktree_commits(
@@ -4747,6 +4758,184 @@ fn incoming_source(kind: &ResolveKind) -> &'static str {
     }
 }
 
+/// Narrowest detail pane the three-column THEIRS → FINAL ← OURS view fits in.
+/// Below this the resolver falls back to stacked side blocks, which read fine
+/// in a 40-column pane where three columns would be shredded.
+const RESOLVER_COLUMNS_MIN_WIDTH: usize = 76;
+
+/// Fits one line of code into exactly `width` columns for a three-column cell:
+/// tabs expanded so the columns line up, an ellipsis where a long line is cut,
+/// and padded out so the next column's separator lands in the same place on
+/// every row.
+fn cell_text(text: &str, width: usize) -> String {
+    let expanded = text.replace('\t', "    ");
+    let len = expanded.chars().count();
+    let mut out: String = if len > width {
+        let mut s: String = expanded.chars().take(width.saturating_sub(1)).collect();
+        s.push('…');
+        s
+    } else {
+        expanded
+    };
+    let len = out.chars().count();
+    if len < width {
+        out.push_str(&" ".repeat(width - len));
+    }
+    out
+}
+
+/// The lines FINAL holds for a hunk, each tagged with the side it came from so
+/// a mixed resolution shows at a glance which lines are whose.
+fn final_lines(ours: &str, theirs: &str, action: Option<&ResolutionAction>) -> Vec<(String, Color)> {
+    let ours_lines = || {
+        ours.lines()
+            .map(|l| (l.to_string(), OURS_COLOR))
+            .collect::<Vec<_>>()
+    };
+    let theirs_lines = || {
+        theirs
+            .lines()
+            .map(|l| (l.to_string(), THEIRS_COLOR))
+            .collect::<Vec<_>>()
+    };
+    match action {
+        None => Vec::new(),
+        Some(ResolutionAction::KeepOurs) => ours_lines(),
+        Some(ResolutionAction::KeepTheirs) => theirs_lines(),
+        Some(ResolutionAction::KeepBoth) => {
+            let mut v = ours_lines();
+            v.extend(theirs_lines());
+            v
+        }
+        Some(ResolutionAction::KeepBothReversed) => {
+            let mut v = theirs_lines();
+            v.extend(ours_lines());
+            v
+        }
+    }
+}
+
+/// One hunk drawn as three columns: the incoming side on the left, what will be
+/// written in the middle, and the current side on the right, with arrows
+/// pointing at the middle. This is the shape every other merge tool uses, and
+/// it makes "both" read as what it is — two blocks stacked in FINAL — instead
+/// of a word on a header.
+struct HunkColumns<'a> {
+    ours: &'a str,
+    theirs: &'a str,
+    ours_label: &'a str,
+    theirs_label: &'a str,
+    action: Option<&'a ResolutionAction>,
+    /// Width of one column, in cells.
+    width: usize,
+}
+
+/// Renders `h` into `lines`, three cells to a row.
+fn push_hunk_columns(lines: &mut Vec<Line<'static>>, h: &HunkColumns) {
+    let w = h.width;
+    let (ours_state, theirs_state) = side_states(h.action);
+    let sep = || Span::styled(" │ ", Style::new().fg(BORDER));
+    let head = |state: SideState, color: Color, text: String| {
+        let (glyph, _) = state.marks();
+        let style = if state == SideState::Dropped {
+            Style::new().fg(color).dim()
+        } else {
+            Style::new().fg(color).bold()
+        };
+        Span::styled(cell_text(&format!("{glyph} {text}"), w), style)
+    };
+    lines.push(Line::from(vec![
+        head(
+            theirs_state,
+            THEIRS_COLOR,
+            format!("[t] THEIRS · {} ▶", h.theirs_label),
+        ),
+        sep(),
+        Span::styled(
+            cell_text("FINAL", w),
+            Style::new().fg(theme::RESULT).bold(),
+        ),
+        sep(),
+        head(
+            ours_state,
+            OURS_COLOR,
+            format!("◀ OURS · {} [o]", h.ours_label),
+        ),
+    ]));
+
+    let theirs: Vec<&str> = h.theirs.lines().collect();
+    let ours: Vec<&str> = h.ours.lines().collect();
+    let result = final_lines(h.ours, h.theirs, h.action);
+    // An undecided hunk says so in FINAL rather than leaving the column blank:
+    // the empty middle is exactly what the user has to act on.
+    let placeholder = [(
+        "⟨ nothing chosen — t / o / b ⟩".to_string(),
+        theme::WARNING,
+    )];
+    let result: &[(String, Color)] = if h.action.is_none() {
+        &placeholder
+    } else if result.is_empty() {
+        &[]
+    } else {
+        &result
+    };
+
+    const MAX: usize = 200;
+    let rows = theirs.len().max(ours.len()).max(result.len()).min(MAX);
+    let side_style = |state: SideState, color: Color| {
+        if state == SideState::Dropped {
+            Style::new().fg(BORDER).dim()
+        } else {
+            Style::new().fg(color)
+        }
+    };
+    for i in 0..rows {
+        let their_cell = theirs.get(i).copied().unwrap_or("");
+        let our_cell = ours.get(i).copied().unwrap_or("");
+        let (final_cell, final_color) = match result.get(i) {
+            Some((text, color)) => (text.as_str(), *color),
+            None => ("", theme::RESULT),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                cell_text(their_cell, w),
+                side_style(theirs_state, THEIRS_COLOR),
+            ),
+            sep(),
+            Span::styled(cell_text(final_cell, w), Style::new().fg(final_color)),
+            sep(),
+            Span::styled(cell_text(our_cell, w), side_style(ours_state, OURS_COLOR)),
+        ]));
+    }
+    let hidden = theirs
+        .len()
+        .max(ours.len())
+        .max(result.len())
+        .saturating_sub(rows);
+    if hidden > 0 {
+        lines.push(Line::styled(
+            format!("… {hidden} more line(s) — e edits this hunk in full"),
+            Style::new().fg(BORDER).dim(),
+        ));
+    }
+}
+
+/// What one `draw_conflict_resolver` pass worked out about the pane, handed
+/// back so the app can clamp keys and route clicks against what was drawn.
+struct ResolverDraw {
+    /// Clickable geometry of the conflicted-file list.
+    list: Option<RowList>,
+    /// Clickable geometry of the hunk pane.
+    hits: Option<ResolverHits>,
+    /// The scroll offset actually used (the hunk-following one, when the
+    /// cursor has just moved).
+    scroll: u16,
+    /// Largest useful scroll offset for this content.
+    max_scroll: u16,
+    /// Height of the scrolling body, for page-sized scrolling.
+    page: u16,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_conflict_resolver(
     frame: &mut Frame,
@@ -4758,7 +4947,9 @@ fn draw_conflict_resolver(
     resolved: &[bool],
     file: usize,
     current: Option<&ResolverFile>,
-) -> Option<RowList> {
+    scroll: u16,
+    follow: bool,
+) -> ResolverDraw {
     let [list_area, detail_area] =
         Layout::horizontal([Constraint::Length(36), Constraint::Min(20)]).areas(area);
 
@@ -4825,7 +5016,13 @@ fn draw_conflict_resolver(
             ),
         ]);
         frame.render_widget(para, inner);
-        return list_hit;
+        return ResolverDraw {
+            list: list_hit,
+            hits: None,
+            scroll: 0,
+            max_scroll: 0,
+            page: inner.height.max(1),
+        };
     };
 
     // Spell out which side is which. For a merge, OURS is what is already in
@@ -4845,16 +5042,10 @@ fn draw_conflict_resolver(
     // means is on screen at the last hunk as much as at the first. It used to
     // ride along at the top of the scrolled text and vanish after the first
     // hunk, which left every later hunk as two anonymous blocks of code.
+    // Listed in the order the hunks put them on screen — theirs, then ours —
+    // so the legend and the columns under it never disagree about which side
+    // is on which hand.
     let mut legend: Vec<Line<'static>> = vec![
-        Line::from(vec![
-            Span::styled("OURS · ", Style::new().fg(OURS_COLOR).bold()),
-            Span::styled(
-                rf.file.ours_label.clone(),
-                Style::new().fg(OURS_COLOR).bold(),
-            ),
-            Span::styled("  [o]  ", Style::new().fg(ACCENT).dim()),
-            Span::styled(ours_origin, Style::new().fg(OURS_COLOR)),
-        ]),
         Line::from(vec![
             Span::styled("THEIRS · ", Style::new().fg(THEIRS_COLOR).bold()),
             Span::styled(
@@ -4863,6 +5054,15 @@ fn draw_conflict_resolver(
             ),
             Span::styled("  [t]  ", Style::new().fg(ACCENT).dim()),
             Span::styled(theirs_origin.clone(), Style::new().fg(THEIRS_COLOR)),
+        ]),
+        Line::from(vec![
+            Span::styled("OURS · ", Style::new().fg(OURS_COLOR).bold()),
+            Span::styled(
+                rf.file.ours_label.clone(),
+                Style::new().fg(OURS_COLOR).bold(),
+            ),
+            Span::styled("  [o]  ", Style::new().fg(ACCENT).dim()),
+            Span::styled(ours_origin, Style::new().fg(OURS_COLOR)),
         ]),
     ];
     if swapped {
@@ -4895,10 +5095,18 @@ fn draw_conflict_resolver(
     // Text width inside the pane, leaving the scrollbar column free.
     let body_w = inner.width.saturating_sub(1) as usize;
 
+    // Three columns need room for three readable cells; a narrow pane keeps the
+    // stacked layout instead of shredding every line of code into ten columns.
+    let columns = body_w >= RESOLVER_COLUMNS_MIN_WIDTH;
+    let col_w = body_w.saturating_sub(6) / 3;
+
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut hunk_i = 0usize;
     // Line offset of the current hunk's header, used to keep it in view.
     let mut current_line = 0usize;
+    // First and last line of each hunk's block, so a click can find the hunk
+    // (and the wheel can be told what it is scrolling over).
+    let mut hunk_spans: Vec<(usize, usize)> = Vec::new();
     for seg in &rf.file.segments {
         match seg {
             ConflictSegment::Plain(text) => {
@@ -4908,6 +5116,7 @@ fn draw_conflict_resolver(
             }
             ConflictSegment::Hunk { ours, theirs, .. } => {
                 let is_cur = hunk_i == rf.hunk;
+                let block_start = lines.len();
                 if is_cur {
                     current_line = lines.len();
                 }
@@ -4930,32 +5139,46 @@ fn draw_conflict_resolver(
                     Span::styled(label, hstyle.fg(color)),
                     Span::styled(" ".repeat(if is_cur { pad } else { 0 }), hstyle),
                 ]));
-                push_side(
-                    &mut lines,
-                    &SideView {
-                        corner: "┌",
-                        side: "OURS",
-                        label: &rf.file.ours_label,
-                        key: 'o',
-                        color: OURS_COLOR,
-                        note: "",
-                    },
-                    ours,
-                    ours_state,
-                );
-                push_side(
-                    &mut lines,
-                    &SideView {
-                        corner: "├",
-                        side: "THEIRS",
-                        label: &rf.file.theirs_label,
-                        key: 't',
-                        color: THEIRS_COLOR,
-                        note: "",
-                    },
-                    theirs,
-                    theirs_state,
-                );
+                if columns {
+                    push_hunk_columns(
+                        &mut lines,
+                        &HunkColumns {
+                            ours,
+                            theirs,
+                            ours_label: &rf.file.ours_label,
+                            theirs_label: &rf.file.theirs_label,
+                            action,
+                            width: col_w,
+                        },
+                    );
+                } else {
+                    push_side(
+                        &mut lines,
+                        &SideView {
+                            corner: "┌",
+                            side: "OURS",
+                            label: &rf.file.ours_label,
+                            key: 'o',
+                            color: OURS_COLOR,
+                            note: "",
+                        },
+                        ours,
+                        ours_state,
+                    );
+                    push_side(
+                        &mut lines,
+                        &SideView {
+                            corner: "├",
+                            side: "THEIRS",
+                            label: &rf.file.theirs_label,
+                            key: 't',
+                            color: THEIRS_COLOR,
+                            note: "",
+                        },
+                        theirs,
+                        theirs_state,
+                    );
+                }
                 lines.push(Line::from(vec![
                     Span::styled("  └ ", Style::new().fg(BORDER)),
                     Span::styled("b", Style::new().fg(Color::Cyan).bold()),
@@ -4965,7 +5188,10 @@ fn draw_conflict_resolver(
                     Span::styled("e", Style::new().fg(MANUAL_COLOR).bold()),
                     Span::styled(" edit hunk", Style::new().dim()),
                 ]));
+                // The trailing blank belongs to the hunk for hit-testing too,
+                // so there is no dead row between one hunk and the next.
                 lines.push(Line::from(""));
+                hunk_spans.push((block_start, lines.len().saturating_sub(1)));
                 hunk_i += 1;
             }
         }
@@ -4979,11 +5205,25 @@ fn draw_conflict_resolver(
     .areas(inner);
     frame.render_widget(Paragraph::new(legend), legend_area);
 
-    // Scroll so the current hunk's header sits near the top of the pane, but
-    // never past the end of the content.
+    // The pane scrolls on its own (wheel, Shift+↑/↓, PageUp/Down) and only
+    // jumps to the cursor when the cursor is what moved: pinning it to the
+    // current hunk on every frame is what used to make the bottom of a tall
+    // hunk unreachable.
     let total = lines.len();
-    let max_scroll = total.saturating_sub(body_area.height as usize);
-    let scroll = current_line.saturating_sub(1).min(max_scroll) as u16;
+    let height = body_area.height as usize;
+    let max_scroll = total.saturating_sub(height);
+    let scroll = if follow {
+        // Park the current hunk's header one line down from the top: the whole
+        // hunk is then on screen when it fits, and starts at its first line
+        // when it doesn't.
+        let first = hunk_spans
+            .get(rf.hunk)
+            .map(|(first, _)| *first)
+            .unwrap_or(current_line);
+        first.saturating_sub(1).min(max_scroll)
+    } else {
+        (scroll as usize).min(max_scroll)
+    } as u16;
     frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), body_area);
     let mut sb = ScrollbarState::new(max_scroll).position(scroll as usize);
     frame.render_stateful_widget(
@@ -5012,7 +5252,25 @@ fn draw_conflict_resolver(
     ]);
     frame.render_widget(Paragraph::new(hint), hint_area);
     // The manual hunk editor floats over the resolver as a modal (`draw_modal`).
-    list_hit
+    ResolverDraw {
+        list: list_hit,
+        hits: Some(ResolverHits {
+            body: body_area,
+            scroll,
+            hunks: hunk_spans,
+            // Cell x of the first column past THEIRS, and past FINAL. The
+            // separators are three cells wide and belong to neither side.
+            columns: columns.then(|| {
+                (
+                    body_area.x + col_w as u16 + 3,
+                    body_area.x + (col_w as u16) * 2 + 6,
+                )
+            }),
+        }),
+        scroll,
+        max_scroll: max_scroll as u16,
+        page: body_area.height.max(1),
+    }
 }
 
 /// Style for one raw line of a conflicted file in the conflict editor: the
@@ -6434,9 +6692,22 @@ mod tests {
         }
     }
 
-    /// Renders the resolver over a two-hunk file.
+    /// Renders the resolver over a two-hunk file, at a width that keeps the
+    /// stacked (narrow) layout.
     fn render_resolver(kind: ResolveKind, rf: &ResolverFile) -> Vec<String> {
-        render(96, 30, |frame, area| {
+        render_resolver_at(96, 30, kind, rf, 0, true)
+    }
+
+    /// Renders the resolver at an explicit size and scroll position.
+    fn render_resolver_at(
+        width: u16,
+        height: u16,
+        kind: ResolveKind,
+        rf: &ResolverFile,
+        scroll: u16,
+        follow: bool,
+    ) -> Vec<String> {
+        render(width, height, |frame, area| {
             draw_conflict_resolver(
                 frame,
                 area,
@@ -6447,6 +6718,8 @@ mod tests {
                 &[false],
                 0,
                 Some(rf),
+                scroll,
+                follow,
             );
         })
     }
@@ -6673,6 +6946,122 @@ mod tests {
             out.iter()
                 .any(|r| r.contains("the branch you're rebasing onto")),
             "ours is described as the rebase target: {out:#?}"
+        );
+    }
+
+    /// A pane wide enough for it lays each hunk out the way every other merge
+    /// tool does: the incoming side on the left, what will be written in the
+    /// middle, the current side on the right, arrows pointing inwards.
+    #[test]
+    fn resolver_lays_wide_hunks_out_as_theirs_final_ours() {
+        let rf = resolver_file(vec![None, None], 0);
+        let out = render_resolver_at(150, 30, ResolveKind::Merge, &rf, 0, true);
+        let header = out
+            .iter()
+            .find(|r| r.contains("FINAL"))
+            .unwrap_or_else(|| panic!("no three-column header: {out:#?}"));
+        let theirs = header.find("THEIRS").expect(header);
+        let mid = header.find("FINAL").expect(header);
+        let ours = header.find("OURS").expect(header);
+        assert!(
+            theirs < mid && mid < ours,
+            "theirs → final ← ours, left to right: {header}"
+        );
+        assert!(header.contains('▶') && header.contains('◀'), "{header}");
+    }
+
+    /// Picking a side rewrites FINAL, which is the whole point of showing it:
+    /// the decision is visible as the text it produces, not as a word.
+    #[test]
+    fn resolver_final_column_shows_the_chosen_side() {
+        let theirs = resolver_file(vec![Some(ResolutionAction::KeepTheirs), None], 0);
+        let out = render_resolver_at(150, 30, ResolveKind::Merge, &theirs, 0, true);
+        // The row carrying the first hunk's two sides also carries FINAL, so
+        // "yours" appearing twice on it is theirs *and* the result.
+        let row = out
+            .iter()
+            .find(|r| r.contains("yours();"))
+            .unwrap_or_else(|| panic!("{out:#?}"));
+        assert_eq!(row.matches("yours();").count(), 2, "theirs → final: {row}");
+        assert_eq!(row.matches("mine();").count(), 1, "ours still shown: {row}");
+
+        let ours = resolver_file(vec![Some(ResolutionAction::KeepOurs), None], 0);
+        let out = render_resolver_at(150, 30, ResolveKind::Merge, &ours, 0, true);
+        let row = out
+            .iter()
+            .find(|r| r.contains("mine();"))
+            .unwrap_or_else(|| panic!("{out:#?}"));
+        assert_eq!(row.matches("mine();").count(), 2, "ours → final: {row}");
+    }
+
+    /// Keeping both is a mix, and FINAL shows it as one: two lines, in the
+    /// order they will be written.
+    #[test]
+    fn resolver_final_column_stacks_both_sides_when_mixing() {
+        let rf = resolver_file(vec![Some(ResolutionAction::KeepBoth), None], 0);
+        let out = render_resolver_at(150, 30, ResolveKind::Merge, &rf, 0, true);
+        let first = out.iter().position(|r| r.contains("mine();")).unwrap();
+        // Ours first, then theirs on the row below it, both inside FINAL.
+        let second = out
+            .iter()
+            .skip(first + 1)
+            .position(|r| r.contains("yours();"))
+            .map(|i| i + first + 1)
+            .unwrap_or_else(|| panic!("{out:#?}"));
+        assert!(second > first, "ours then theirs: {out:#?}");
+        let reversed = resolver_file(vec![Some(ResolutionAction::KeepBothReversed), None], 0);
+        let out = render_resolver_at(150, 30, ResolveKind::Merge, &reversed, 0, true);
+        let row = out
+            .iter()
+            .find(|r| r.contains("yours();"))
+            .unwrap_or_else(|| panic!("{out:#?}"));
+        assert_eq!(
+            row.matches("yours();").count(),
+            2,
+            "theirs leads the mix: {row}"
+        );
+    }
+
+    /// An empty FINAL would read as "this hunk is fine as it is", which is the
+    /// opposite of the truth, so it says what it is waiting for.
+    #[test]
+    fn resolver_final_column_says_when_nothing_is_chosen() {
+        let rf = resolver_file(vec![None, None], 0);
+        let out = render_resolver_at(150, 30, ResolveKind::Merge, &rf, 0, true);
+        assert!(
+            out.iter().any(|r| r.contains("nothing chosen")),
+            "{out:#?}"
+        );
+    }
+
+    /// A narrow pane can't fit three columns of code, so it keeps the stacked
+    /// blocks rather than shredding every line.
+    #[test]
+    fn resolver_keeps_stacked_blocks_on_a_narrow_pane() {
+        let rf = resolver_file(vec![None, None], 0);
+        let out = render_resolver_at(90, 30, ResolveKind::Merge, &rf, 0, true);
+        assert!(
+            !out.iter().any(|r| r.contains("FINAL")),
+            "no columns this narrow: {out:#?}"
+        );
+        assert!(
+            out.iter().any(|r| r.contains("keep") || r.contains("OURS")),
+            "{out:#?}"
+        );
+    }
+
+    /// The pane scrolls on its own. It used to be pinned to the current hunk,
+    /// so anything below the last hunk's first screenful was unreachable.
+    #[test]
+    fn resolver_body_scrolls_independently_of_the_hunk_cursor() {
+        let rf = resolver_file(vec![None, None], 0);
+        let top = render_resolver_at(150, 12, ResolveKind::Merge, &rf, 0, false);
+        let down = render_resolver_at(150, 12, ResolveKind::Merge, &rf, 4, false);
+        assert_ne!(top, down, "a scrolled pane shows different lines");
+        assert!(
+            down.iter().any(|r| r.contains("hunk 2 of 2")),
+            "scrolling reaches the second hunk with the cursor still on the \
+             first: {down:#?}"
         );
     }
 

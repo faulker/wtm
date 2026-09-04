@@ -13,11 +13,26 @@ use std::time::Duration;
 use anyhow::Result;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::supports_keyboard_enhancement;
+
+/// Turns on button and wheel reporting (`?1000h`) with SGR-encoded coordinates
+/// (`?1006h`), and nothing else.
+///
+/// Deliberately not crossterm's `EnableMouseCapture`, which also turns on drag
+/// (`?1002h`) and any-motion (`?1003h`) tracking. wtm only ever acts on clicks
+/// and the wheel, and motion tracking means the terminal sends an event for
+/// every cell the pointer crosses — each one waking the event loop for a full
+/// redraw of a screen that did not change. Merely moving the mouse across the
+/// window was enough to peg wtm (and the terminal drawing it) for as long as
+/// the pointer kept moving.
+const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1006h";
+
+/// Undoes `MOUSE_ON`, innermost mode first.
+const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1000l";
 
 use crate::ops::Ctx;
 use app::App;
@@ -30,8 +45,9 @@ use app::App;
 pub fn run(ctx: Ctx) -> Result<()> {
     let mut app = App::new(ctx)?;
     let mut terminal = ratatui::init();
-    // Mouse capture lets the diff and log views respond to the scroll wheel.
-    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    // Mouse reporting lets the diff, log, and resolver views respond to clicks
+    // and the scroll wheel.
+    let _ = write_stdout(MOUSE_ON);
     // On terminals that support the Kitty keyboard protocol (Ghostty, kitty,
     // WezTerm, foot, recent iTerm2) this makes modified keys like Shift+Up/Down
     // report their modifier reliably instead of looking like a bare arrow key.
@@ -46,7 +62,7 @@ pub fn run(ctx: Ctx) -> Result<()> {
     if enhanced {
         let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     }
-    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = write_stdout(MOUSE_OFF);
     ratatui::restore();
     result?;
     if let Some(exe) = &app.restart_exe {
@@ -57,6 +73,16 @@ pub fn run(ctx: Ctx) -> Result<()> {
         return exec_in_terminal(cmd, dir);
     }
     Ok(())
+}
+
+/// Writes a terminal control string straight to stdout, flushed. Used for the
+/// mouse modes, which are set by hand rather than through crossterm's
+/// all-or-nothing capture command.
+fn write_stdout(s: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    out.write_all(s.as_bytes())?;
+    out.flush()
 }
 
 /// Runs a `CommandMode::Terminal` open command in place of the TUI, inheriting
@@ -73,6 +99,21 @@ fn exec_in_terminal(cmd: &str, dir: &str) -> Result<()> {
     std::process::exit(status.code().unwrap_or(0));
 }
 
+/// How long the loop waits for input while something on screen is moving: a
+/// spinner frame, or a background result a tick has to pick up.
+const ACTIVE_POLL: Duration = Duration::from_millis(100);
+
+/// How long it waits when nothing is. Input still wakes the loop the instant it
+/// arrives, so this only sets how often an untouched screen repaints itself —
+/// ten frames a second of an identical screen is what keeps a terminal (and the
+/// GPU behind it) burning battery with wtm just sitting open.
+const IDLE_POLL: Duration = Duration::from_millis(750);
+
+/// And how long once nobody has touched the app at all for a while (see
+/// `App::is_idle`). A pane left open in a background window has nothing to
+/// repaint for; the first keypress puts it straight back on `IDLE_POLL`.
+const PARKED_POLL: Duration = Duration::from_millis(2000);
+
 /// Draw/input loop. Polls with a timeout so background create progress keeps
 /// the screen updating even without keypresses.
 fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
@@ -86,7 +127,14 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         }
         app.tick();
         terminal.draw(|frame| ui::draw(frame, app))?;
-        if event::poll(Duration::from_millis(100))? {
+        let timeout = if app.needs_fast_tick() {
+            ACTIVE_POLL
+        } else if app.is_idle() {
+            PARKED_POLL
+        } else {
+            IDLE_POLL
+        };
+        if event::poll(timeout)? {
             dispatch_event(app, event::read()?)?;
         }
     }

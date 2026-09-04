@@ -44,3 +44,8 @@ pub const WARNING: Color = Color::Yellow;
 pub const DANGER: Color = Color::Red;
 /// Secondary emphasis, reserved for diff headers and similar accents.
 pub const INFO: Color = Color::Magenta;
+
+/// The conflict resolver's FINAL column: the text that will actually be
+/// written. Neutral on purpose, so the lines inside it keep the color of the
+/// side they came from and a mixed resolution reads as exactly that.
+pub const RESULT: Color = Color::White;

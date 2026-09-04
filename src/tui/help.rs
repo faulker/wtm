@@ -533,13 +533,30 @@ pub const COMMIT_DIFF: &[Binding] = &[
 
 pub const RESOLVER: &[Binding] = &[
     both("←/→", "file", "move between conflicted files"),
-    both("↑/↓", "hunk", "move between hunks in the file"),
+    both(
+        "↑/↓",
+        "hunk",
+        "move between hunks in the file; on the first or last hunk they scroll \
+         the pane instead, so a hunk taller than the screen still reads to the \
+         end",
+    ),
+    help_only(
+        "⇧↑/⇧↓, ⇧J/⇧K, PgUp/PgDn, g/⇧G, wheel",
+        "scroll the hunk pane on its own, leaving the cursor where it is",
+    ),
     both(
         "o/t",
         "ours/theirs",
         "keep ours / theirs for the hunk (each hunk names both sides and the \
          branch each came from — mid-rebase they are swapped, so \"theirs\" is \
          your own commit)",
+    ),
+    help_only(
+        "click",
+        "on a wide enough pane each hunk is drawn as THEIRS ▶ FINAL ◀ OURS, \
+         with FINAL showing the text that will actually be written; clicking \
+         either side column takes it, and clicking a hunk moves the cursor \
+         there",
     ),
     both(
         "b/⇧B",
