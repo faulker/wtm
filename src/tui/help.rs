@@ -572,8 +572,9 @@ pub const RESOLVER: &[Binding] = &[
         "e",
         "edit",
         "edit the whole file, full screen, with the cursor on the hunk you are \
-         looking at; line numbers on the left, scrolls in every direction, \
-         Ctrl+S saves to disk and re-reads it, Esc discards",
+         looking at; line numbers on the left, scrolls in every direction \
+         (arrows, PgUp/PgDn, or the wheel), Ctrl+S saves to disk and re-reads \
+         it, Esc discards",
     ),
     both(
         "⇧E",

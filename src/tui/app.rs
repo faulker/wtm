@@ -1178,6 +1178,18 @@ impl TextArea {
         }
     }
 
+    /// Steps the cursor by one wheel notch. The editor has no viewport of its
+    /// own — the renderer derives one from the cursor — so scrolling is moving
+    /// the cursor, three lines at a time to match the wheel everywhere else.
+    pub fn scroll(&mut self, down: bool) {
+        self.row = if down {
+            (self.row + 3).min(self.lines.len().saturating_sub(1))
+        } else {
+            self.row.saturating_sub(3)
+        };
+        self.col = self.col.min(self.cur_len());
+    }
+
     /// Puts the cursor at the start of `row` (clamped to the last line). Used
     /// to open the conflict editor already sitting on the hunk in view.
     pub fn go_to_line(&mut self, row: usize) {
@@ -1740,9 +1752,6 @@ pub struct App {
     /// (potentially many git invocations behind) branch list never blocks
     /// the tab switch. Drained by `poll_branches_load` each tick.
     branches_pending: Option<Task<Result<ops::BranchListResult, String>>>,
-    /// The selection `poll_branches_load` should clamp and apply once the
-    /// in-flight `branches_pending` load lands.
-    branches_want_selected: usize,
     /// When the current `branches` cache was last filled. `None` means never
     /// loaded (or invalidated); the next `ensure_branches` will kick off a load.
     branches_loaded_at: Option<Instant>,
@@ -1913,7 +1922,6 @@ impl App {
             show_archived: false,
             branch_selected: 0,
             branches_pending: None,
-            branches_want_selected: 0,
             branches_loaded_at: None,
             stash_name: String::new(),
             stash_entries: Vec::new(),
@@ -2207,7 +2215,7 @@ impl App {
         // Branches use their own cache timeout (`branches_refresh_mins`); only
         // refresh them here when the cache has gone stale while the tab is open.
         if self.tab == Tab::Branches {
-            self.ensure_branches(self.branch_selected);
+            self.ensure_branches();
         }
     }
 
@@ -2371,7 +2379,7 @@ impl App {
                             | BusyThen::Restart { .. } => {}
                             BusyThen::Stash(name) => self.reload_stash_tab(name),
                             BusyThen::Branch => {
-                                self.load_branches(self.branch_selected);
+                                self.load_branches();
                             }
                         }
                     }
@@ -3754,7 +3762,13 @@ impl App {
         self.worktrees_focus = WorktreesFocus::List;
         self.tab = tab;
         match self.tab {
-            Tab::Branches => self.ensure_branches(0),
+            // Entering the tab starts at the top, the same as it always
+            // has; from there the cursor is the user's, including while a
+            // background reload is still running.
+            Tab::Branches => {
+                self.branch_selected = 0;
+                self.ensure_branches();
+            }
             // Landing on Changes shows whichever worktree is highlighted on the
             // Worktrees tab. Coming back to the same worktree keeps the cursor
             // where it was and just re-reads the working tree.
@@ -4209,6 +4223,16 @@ impl App {
         }
         if self.show_help {
             self.help_scroll = delta(self.help_scroll);
+            return;
+        }
+        // A modal covers the view behind it, so the wheel belongs to the modal
+        // rather than to whatever it is hiding. The whole-file conflict editor
+        // is the one that scrolls: it derives its viewport from the cursor, so
+        // a notch steps the cursor. The other modals have nothing to scroll.
+        if let Some(modal) = &mut self.modal {
+            if let Modal::FileEditor { editor, .. } = modal {
+                editor.scroll(down);
+            }
             return;
         }
         // Whether the pointer sits over the active view's row list (the
@@ -6384,7 +6408,7 @@ impl App {
                 // change, so whichever list the picker was opened from is
                 // stale until it reloads.
                 match self.tab {
-                    Tab::Branches => self.load_branches(self.branch_selected),
+                    Tab::Branches => self.load_branches(),
                     _ => self.refresh(),
                 }
             }
@@ -6908,8 +6932,7 @@ impl App {
     /// `branches` is left as-is (stale) until the result lands in
     /// `poll_branches_load`, so re-entering the tab shows the previous list
     /// immediately instead of flashing empty.
-    fn load_branches(&mut self, selected: usize) {
-        self.branches_want_selected = selected;
+    fn load_branches(&mut self) {
         let (tx, rx) = channel();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
@@ -6921,9 +6944,8 @@ impl App {
 
     /// Loads the Branches tab only when the cache is missing, dirty, or older
     /// than `branches_refresh_mins`. A load already in flight is left alone.
-    fn ensure_branches(&mut self, selected: usize) {
+    fn ensure_branches(&mut self) {
         if self.branches_pending.is_some() {
-            self.branches_want_selected = selected;
             return;
         }
         let timeout =
@@ -6932,10 +6954,12 @@ impl App {
             .branches_loaded_at
             .is_some_and(|at| at.elapsed() < timeout);
         if fresh && !self.branches.is_empty() {
-            self.branch_selected = selected.min(self.branches.len().saturating_sub(1));
+            self.branch_selected = self
+                .branch_selected
+                .min(self.branches.len().saturating_sub(1));
             return;
         }
-        self.load_branches(selected);
+        self.load_branches();
     }
 
     /// Drops the Branches tab cache so the next `ensure_branches` reloads.
@@ -6959,8 +6983,23 @@ impl App {
         self.branches_pending = None;
         match result {
             Ok(r) => {
+                // Building the list is a git invocation per branch, so the
+                // cursor has usually moved by the time the result lands. Snap
+                // it back to the index captured when the load started and the
+                // user's own navigation (or a delete's cursor nudge) is undone
+                // under them, so re-anchor on the branch they are sitting on
+                // now and only fall back to the index when it is gone.
+                let anchor = self
+                    .branches
+                    .get(self.branch_selected)
+                    .map(|b| b.name.clone());
                 self.branches_all = r.branches;
-                self.apply_archived_filter(self.branches_want_selected);
+                self.apply_archived_filter(self.branch_selected);
+                if let Some(name) = anchor
+                    && let Some(i) = self.branches.iter().position(|b| b.name == name)
+                {
+                    self.branch_selected = i;
+                }
                 self.branches_loaded_at = Some(Instant::now());
             }
             Err(e) => {
@@ -7091,7 +7130,7 @@ impl App {
                 self.branch_selected = self.branch_selected.saturating_sub(1)
             }
             KeyCode::Char('r') => {
-                self.load_branches(self.branch_selected);
+                self.load_branches();
                 self.message = Some("refreshed".to_string());
             }
             // `f` refreshes every branch's ahead/behind against the remotes;
@@ -8592,7 +8631,7 @@ impl App {
         match ops::branch_rename(&self.ctx, &old, &new) {
             Ok(r) => {
                 self.message = Some(format!("renamed branch '{}' to '{}'", r.old, r.new));
-                self.load_branches(self.branch_selected);
+                self.load_branches();
             }
             Err(e) => self.set_error(format!("{e:#}")),
         }
@@ -8617,7 +8656,7 @@ impl App {
                 // Drop the row now rather than letting it sit on screen until
                 // the background reload lands.
                 self.forget_branch(&target.name);
-                self.load_branches(self.branch_selected);
+                self.load_branches();
             }
             Err(e) => {
                 self.set_error(format!("{e:#} — press f to force"));
@@ -13476,6 +13515,85 @@ mod tests {
         assert_eq!(app.resolver_scroll, 0);
     }
 
+    /// The whole-file editor floats over the hunk pane, so a notch belongs to
+    /// the editor: without this the wheel scrolled the pane hidden behind it
+    /// while the file the user was reading stayed put.
+    #[test]
+    fn file_editor_wheel_scrolls_the_editor_not_the_pane_behind_it() {
+        let (_tmp, mut app) = test_app();
+        into_conflict_resolver_multi_hunk(&mut app);
+        render_app(&mut app, 150, 16);
+        let hits = app.resolver_hits.clone().expect("hunk pane geometry");
+        let (col, row) = (hits.body.x + 1, hits.body.y + 1);
+        let wheel = |app: &mut App, kind| {
+            app.on_mouse(MouseEvent {
+                kind,
+                column: col,
+                row,
+                modifiers: KeyModifiers::empty(),
+            });
+        };
+        // `E` opens the whole file at the top.
+        press(&mut app, KeyCode::Char('E'));
+        render_app(&mut app, 150, 16);
+        let pane_scroll = app.resolver_scroll;
+
+        wheel(&mut app, MouseEventKind::ScrollDown);
+        match &app.modal {
+            Some(Modal::FileEditor { editor, .. }) => {
+                assert_eq!(editor.row, 3, "a notch steps the editor's cursor")
+            }
+            _ => panic!("expected the whole-file editor"),
+        }
+        assert_eq!(
+            app.resolver_scroll, pane_scroll,
+            "the pane behind the editor must not move"
+        );
+
+        wheel(&mut app, MouseEventKind::ScrollUp);
+        match &app.modal {
+            Some(Modal::FileEditor { editor, .. }) => assert_eq!(editor.row, 0),
+            _ => panic!("expected the whole-file editor"),
+        }
+        assert_eq!(app.resolver_scroll, pane_scroll);
+    }
+
+    /// The hunk pane records its geometry as it draws, even with the editor on
+    /// top of it. A click meant for the editor must not reach through and take
+    /// a side on the hunk behind it.
+    #[test]
+    fn file_editor_click_does_not_reach_the_hunks_behind_it() {
+        let (_tmp, mut app) = test_app();
+        into_conflict_resolver(&mut app);
+        render_app(&mut app, 150, 24);
+        let hits = app.resolver_hits.clone().expect("hunk pane geometry");
+        let (theirs_end, _) = hits.columns.expect("three columns at this width");
+        let (first, _) = hits.hunks[0];
+        let row = hits.body.y + (first as u16 - hits.scroll) + 1;
+        let action = |app: &App| {
+            resolver(app)
+                .current
+                .as_ref()
+                .expect("a loaded file")
+                .actions[0]
+                .clone()
+        };
+        let before = action(&app);
+
+        press(&mut app, KeyCode::Char('E'));
+        render_app(&mut app, 150, 24);
+        assert!(
+            app.resolver_hits.is_none(),
+            "the editor covers the pane, so its rows take no clicks"
+        );
+        click(&mut app, theirs_end - 2, row);
+        assert_eq!(action(&app), before, "the hunk behind the editor is untouched");
+        assert!(
+            matches!(app.modal, Some(Modal::FileEditor { .. })),
+            "the editor stays open"
+        );
+    }
+
     /// Clicking a side takes it, so the pane can be driven with the mouse
     /// alone: the column under the pointer is the decision.
     #[test]
@@ -14381,6 +14499,69 @@ mod tests {
         settle_busy(&mut app);
         let err = app.error.clone().expect("expected an upstream error");
         assert!(err.contains("no upstream"), "unexpected error: {err}");
+    }
+
+    /// Building the branch list is a git invocation per branch, so the cursor
+    /// has usually moved by the time a reload lands (a delete kicks one off,
+    /// and the user carries on navigating while it runs). The result must not
+    /// snap the cursor back to wherever it was when the reload started.
+    #[test]
+    fn a_landing_branch_reload_keeps_the_cursor_where_the_user_put_it() {
+        let (_tmp, mut app) = test_app();
+        for i in 0..5 {
+            git(&app.ctx.repo_root, &["branch", &format!("extra-{i}")]);
+        }
+        app.tab = Tab::Branches;
+        app.ensure_branches();
+        settle_branches(&mut app);
+        assert!(app.branches.len() > 3, "need a few branches to move between");
+
+        // A reload starts with the cursor at the top…
+        app.branch_selected = 0;
+        app.load_branches();
+        // …and the user moves it while the git calls are still running.
+        app.branch_selected = 2;
+        let want = app.branches[2].name.clone();
+        settle_branches(&mut app);
+
+        assert_eq!(
+            app.branches[app.branch_selected].name, want,
+            "the reload moved the cursor off the branch the user selected"
+        );
+    }
+
+    /// Deleting a branch reloads in the background; the cursor nudge the
+    /// delete makes must survive the result landing, even though the branch it
+    /// started on is gone.
+    #[test]
+    fn a_branch_delete_reload_keeps_the_nudged_cursor() {
+        let (_tmp, mut app) = test_app();
+        for i in 0..5 {
+            git(&app.ctx.repo_root, &["branch", &format!("extra-{i}")]);
+        }
+        app.tab = Tab::Branches;
+        app.ensure_branches();
+        settle_branches(&mut app);
+
+        app.branch_selected = 3;
+        let gone = app.branches[3].name.clone();
+        let want = app.branches[2].name.clone();
+        app.branch_delete(
+            BranchDeleteTarget {
+                name: gone.clone(),
+                remote: None,
+                local_only_row: true,
+            },
+            true,
+            ops::DeleteScope::Local,
+        );
+        settle_branches(&mut app);
+
+        assert!(app.branches.iter().all(|b| b.name != gone), "still listed");
+        assert_eq!(
+            app.branches[app.branch_selected].name, want,
+            "the delete's cursor nudge was undone by the reload"
+        );
     }
 
     #[test]
@@ -17380,7 +17561,7 @@ mod tests {
             git(&app.ctx.repo_root, &["branch", &format!("extra-{i}")]);
         }
         app.tab = Tab::Branches;
-        app.ensure_branches(0);
+        app.ensure_branches();
         settle_branches(&mut app);
         assert!(app.branches.len() > 12, "need more branches than rows");
 

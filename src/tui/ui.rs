@@ -392,6 +392,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         app.files_list = None;
         app.diff_path_hit = None;
     }
+    // The resolver's hunk pane records its geometry as it draws, but a modal
+    // (the whole-file editor above all) covers it: without this, a click meant
+    // for the editor lands on a hunk behind it and takes a side.
+    if app.modal.is_some() {
+        app.resolver_hits = None;
+    }
 
     // The error popup sits on top of absolutely everything, including the
     // help overlay, and suppresses clicks on whatever is behind it. Cloned so
@@ -5502,7 +5508,7 @@ fn modal_footer_hints(modal: &Modal) -> &'static [Binding] {
     ];
     const FILE: &[Binding] = &[
         hint("type", "edit the file"),
-        hint("↑↓←→", "move"),
+        hint("↑↓←→/wheel", "move"),
         hint("Ctrl+S", "save to disk"),
         hint("Esc", "cancel"),
     ];
