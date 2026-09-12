@@ -168,6 +168,10 @@ pub const WORKTREES: &[Binding] = &[
         "click",
         "a tab switches to it; a changed file opens it on the Changes tab",
     ),
+    help_only(
+        "click a path",
+        "copy it: the worktree path in the header, or any row's PATH cell",
+    ),
     both("n", "new", "new worktree (new branch or existing branch)"),
     both(
         "b",
@@ -237,6 +241,11 @@ pub const WORKTREES_THREE_PANEL: &[Binding] = &[
         "focus the changed-file panel (or commit list when clean)",
     ),
     both("⇧↑/⇧↓", "scroll diff", "scroll the diff (or J/K)"),
+    help_only(
+        "click a path",
+        "copy it: the header path, a row's PATH cell, or the branch name on \
+         the commits panel's title",
+    ),
     both("n", "new", "new worktree (new branch or existing branch)"),
     both(
         "c",

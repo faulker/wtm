@@ -239,6 +239,8 @@ Each worktree shows its change count, ahead/behind, and a **FLAGS** column: `unp
 
 The panel underneath the list shows the changed files of whichever worktree you have selected, so you can see what an agent has been up to without leaving the list. When there are more files than fit, `⇧↑`/`⇧↓` or the mouse wheel over the panel scroll it, and the border shows your position (`10-18/27`). Lists that scroll (worktrees, branches, stashes) mark the overflow with `▲`/`▼` in the left border. Clicking a file there opens it on the Changes tab.
 
+A worktree's path is click-to-copy in both places it appears: the one in the header (the selected worktree's root) and the **PATH** cell on any row. The cell copies the whole path even where it is shown front-trimmed to fit, and the click still selects that row.
+
 `b` switches the selected worktree to another branch. `⇧R` renames a worktree.
 
 The TUI is meant to be left open all day, so it paces itself: it redraws on your input, keeps a fast (10/s) tick only while something is actually moving — a spinner, a background load — and drops to a slow tick once it has been sitting untouched, when the changed-file refresh that re-runs `git status` also backs off from every second to every fifteen. It asks the terminal for button and wheel reporting only, not the pointer-motion tracking most TUIs enable by default, so moving the mouse across the window doesn't wake it at all. Idle in a conflict resolver, that is about a quarter of the CPU it used to burn.
@@ -247,7 +249,7 @@ The TUI is meant to be left open all day, so it paces itself: it redraws on your
 
 The default Worktrees tab is `two_panel` (list plus the changed-file preview). `wtm config set --global worktrees_layout three_panel` (or the `worktrees_layout` row on the Settings tab) swaps that for a **three-panel** layout: a compact scrollable worktree list on top, and the Changes tab's file list and syntax-highlighted diff filling the space below it.
 
-When the highlighted worktree is clean, that bottom area shows the branch's commit list instead (navigate and open a commit the same way as Branches → Enter). The commits the branch added since it forked are drawn bold on a tinted band, and the panel title counts them (`3 on this branch`), so its own work reads apart from the history it inherited. The same marking is on the full-screen log (`l`) and the Branches tab's commit history.
+When the highlighted worktree is clean, that bottom area shows the branch's commit list instead (navigate and open a commit the same way as Branches → Enter). The branch name in that panel's title is click-to-copy. The commits the branch added since it forked are drawn bold on a tinted band, and the panel title counts them (`3 on this branch`), so its own work reads apart from the history it inherited. The same marking is on the full-screen log (`l`) and the Branches tab's commit history.
 
 `Enter` hands the keyboard to the panel below and `q`/`Esc` gives it back, so the app still only quits from the worktree list. The bottom panel is the selected worktree's, so the worktree keys (`p` pull, `P` push, `f` fetch, `c` commit, and the rest) keep working while it holds the keyboard. Two keys mean what the focused panel is showing rather than what the list above it is: over the files, `d` deletes the file under the cursor (delete-worktree stays on the list above); over the commits, `u` opens the undo wizard for the commit under the cursor.
 
@@ -298,7 +300,7 @@ From here:
 
 ![The commit log drawn as a tree, with branch and tag names marked on the commits they point at and a fork and merge visible in the graph](docs/images/tui-log.png)
 
-`l` draws the log as a commit tree, with branch and tag names on the commits they point at, so forks and merges are visible at a glance. `↑`/`↓` move between commits and `Enter` browses into one (a read-only view of the files it changed, same tree + diff layout as Changes). `t` switches between the tree and a flat list; the choice carries over to the Branches tab's commit history. `u` opens the [undo wizard](#undoing-a-commit) for the highlighted commit.
+`l` draws the log as a commit tree, with branch and tag names on the commits they point at, so forks and merges are visible at a glance. Every row's graph art is padded to the widest, so the hashes and subjects sit in one column instead of stepping in and out with the topology, and each commit's hash takes the colour of the lane its dot is drawn in. `↑`/`↓` move between commits and `Enter` browses into one (a read-only view of the files it changed, same tree + diff layout as Changes). `t` switches between the tree and a flat list; the choice carries over to the Branches tab's commit history. `u` opens the [undo wizard](#undoing-a-commit) for the highlighted commit.
 
 ### Stash
 
@@ -356,6 +358,8 @@ When a merge, rebase, update, cherry-pick, or stash pop hits a conflict, the **c
 It lists the conflicted files (each with a resolved/unresolved marker) and shows the selected file's hunks. On a pane with room for it, each hunk is laid out the way other merge tools do it — **THEIRS ▶ FINAL ◀ OURS** — with the incoming side on the left, the current side on the right, and **FINAL** in the middle showing the text that will actually be written. Pick a side and FINAL rewrites itself; keep both and FINAL stacks them in the order they'll land, each line still in its own side's colour, so a mixed resolution reads as exactly that. An undecided hunk says so in the middle instead of sitting empty. On a narrower pane the hunk falls back to stacked OURS/THEIRS blocks, each side numbered from 1 down its own gutter so line 2 of OURS reads against line 2 of THEIRS.
 
 Every hunk names both of its sides in place: the branch each came from, the key that takes it, and a `✓ keep` / `✗ drop` verdict once you've decided. A pinned legend at the top of the pane says where each side comes from and stays put as you scroll, and the footer counts how many hunks are decided. During a **rebase** git swaps the two, so OURS is the branch you are rebasing onto and THEIRS is your own commit being replayed; the resolver flags that in the legend.
+
+Switching files costs a file read and nothing more (the worktree is resolved once, when the resolver opens), and the read runs off-thread, so holding `←`/`→` through a long list of conflicts keeps up with the keys. The file being read is marked `⟳` in the list and named in the pane, so a keypress is visibly registered before its hunks are there to show.
 
 `←`/`→` move between files, `↑`/`↓` between hunks; `o`/`t` keep ours/theirs for the current hunk, `b`/`⇧B` **keep both** (ours-then-theirs or reversed, on separate lines), `⇧O`/`⇧T` take the whole file's side. The pane scrolls on its own with `⇧↑`/`⇧↓`, `⇧J`/`⇧K`, `PgUp`/`PgDn`, `g`/`⇧G`, or the wheel, and `↑`/`↓` fall through to scrolling once the cursor is on the first or last hunk, so a hunk taller than the screen still reads to the end. The mouse works throughout: the wheel steps the file list and scrolls the hunks, a click picks a file or a hunk, and a click on a hunk's THEIRS or OURS column takes that side.
 

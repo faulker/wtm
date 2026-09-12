@@ -13,9 +13,10 @@ use ratatui::widgets::{
 };
 
 use super::app::{
-    App, BranchRow, CheckoutCandidate, CherryTarget, CommitFocus, ConfirmOption, CreateOutcome,
-    DiffRow, LogMode, Modal, ResolverFile, ResolverHits, RowList, Tab, TextInput, UpstreamRow, View,
-    WorktreesFocus, branch_display_rows, branch_row_of, filtered_candidates, upstream_rows,
+    App, BranchRow, CheckoutCandidate, CherryTarget, CommitFocus, ConfirmOption, CopyHit,
+    CreateOutcome, DiffRow, LogMode, Modal, ResolverFile, ResolverHits, RowList, Tab, TextInput,
+    UpstreamRow, View, WorktreesFocus, branch_display_rows, branch_row_of, filtered_candidates,
+    upstream_rows,
 };
 use super::config_editor::{
     BRANCHES_REFRESH_ROW, CHECK_ROW, COPY_ROW, ConfigEditor, DIFF_LINE_NUMBERS_ROW, FIELD_ROWS,
@@ -47,9 +48,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .areas(frame.area());
 
-    draw_header(frame, header, app);
     // Click targets are re-recorded from scratch each frame by whoever draws
-    // them, so last frame's geometry can't outlive what's on screen.
+    // them, so last frame's geometry can't outlive what's on screen. Cleared
+    // before the header draws, since the header records one of them.
+    app.copy_hits.clear();
+    draw_header(frame, header, app);
     app.tab_hits.clear();
     app.preview_list = None;
     app.files_list = None;
@@ -159,6 +162,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                             &r.resolved,
                             r.file,
                             r.current.as_ref(),
+                            r.loading.as_deref(),
                             app.resolver_scroll,
                             app.resolver_follow,
                         )
@@ -391,6 +395,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         app.preview_list = None;
         app.files_list = None;
         app.diff_path_hit = None;
+        // The header keeps drawing under an overlay, so its path hit (and every
+        // other copy region) has to be taken back here rather than skipped at
+        // the point it was recorded.
+        app.copy_hits.clear();
     }
     // The resolver's hunk pane records its geometry as it draws, but a modal
     // (the whole-file editor above all) covers it: without this, a click meant
@@ -468,7 +476,7 @@ fn focus_panel(title: impl Into<String>, focused: bool) -> Block<'static> {
 /// Top bar: app badge and the selected worktree's path on the left; the
 /// worktree count on the right, or the transient status/error message when one
 /// is present. Falls back to the repo root when nothing is selected.
-fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_header(frame: &mut Frame, area: Rect, app: &mut App) {
     let count = app.worktrees.len();
     let path = app
         .worktrees
@@ -476,6 +484,22 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         .map(|wt| wt.path.as_str())
         .map(str::to_string)
         .unwrap_or_else(|| app.ctx.repo_root.display().to_string());
+    // The badge plus the two spaces after it, so the path's own rect can be
+    // recorded for a click-to-copy without re-measuring the badge.
+    const BADGE_W: u16 = 7;
+    if !path.is_empty() {
+        app.copy_hits.push(CopyHit {
+            rect: Rect {
+                x: area.x + BADGE_W,
+                y: area.y,
+                width: (path.chars().count() as u16).min(area.width.saturating_sub(BADGE_W)),
+                height: 1,
+            },
+            value: path.clone(),
+            label: "path",
+            row: None,
+        });
+    }
     let left = Line::from(vec![
         Span::styled(" wtm ", Style::new().fg(Color::Black).bg(ACCENT).bold()),
         Span::raw("  "),
@@ -773,6 +797,38 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) -> Opt
     let visible = inner.height.saturating_sub(1) as usize;
     let total = app.worktrees.len();
     draw_scroll_arrows(frame, area, offset, visible, total);
+    // Each visible PATH cell is click-to-copy, and copies the whole path even
+    // where the cell shows a front-trimmed form of it. The hit is only as wide
+    // as the text actually drawn, so the empty run to the right of a short path
+    // stays an ordinary row click.
+    let path_x = inner.x
+        + HIGHLIGHT_SYMBOL_W
+        + name_w
+        + CHANGES_W
+        + UPSTREAM_W
+        + FLAGS_W
+        + COLUMN_SPACING * 4;
+    // Room left for the column, so a terminal too narrow to reach it records no
+    // hits at all rather than a rect hanging off the panel.
+    let path_room = (inner.x + inner.width).saturating_sub(path_x);
+    for (i, wt) in app.worktrees.iter().enumerate().skip(offset).take(visible) {
+        let drawn = truncate_start(&wt.path, path_w).chars().count() as u16;
+        let width = drawn.min(path_room);
+        if width == 0 {
+            continue;
+        }
+        app.copy_hits.push(CopyHit {
+            rect: Rect {
+                x: path_x,
+                y: inner.y + 1 + (i - offset) as u16,
+                width,
+                height: 1,
+            },
+            value: wt.path.clone(),
+            label: "path",
+            row: Some(i),
+        });
+    }
     // The table header occupies the first inner row, so data rows start one
     // line below it.
     Some(RowList {
@@ -860,6 +916,7 @@ fn draw_worktrees_three_panel(frame: &mut Frame, area: Rect, app: &mut App) -> O
             &r.resolved,
             r.file,
             r.current.as_ref(),
+            r.loading.as_deref(),
             app.resolver_scroll,
             app.resolver_follow,
         );
@@ -876,6 +933,7 @@ fn draw_worktrees_three_panel(frame: &mut Frame, area: Rect, app: &mut App) -> O
             panel.selected,
             app.log_mode,
             files_focused,
+            &mut app.copy_hits,
         );
     } else if app.commits_loading() {
         app.diff_path_hit = None;
@@ -3725,11 +3783,50 @@ fn draw_switch(
     hit
 }
 
+/// Widest graph column any row is padded out to. Past this one deep merge fan
+/// would push every subject off the right-hand edge, so the column stops growing
+/// and the rare wider row overflows it instead.
+const GRAPH_WIDTH_MAX: usize = 24;
+
+/// Widest graph art across `rows`, in characters, so every row can be padded to
+/// one width and the commit fields start in the same column on every line.
+/// git's art is only as wide as each line's own topology needs (`*` on the
+/// trunk, `| | *` three lanes over), which left the hashes and subjects stepping
+/// in and out down the panel. Trailing spaces don't count: git pads a merge line
+/// out to make room for the parents it is about to fan, and widening the column
+/// for art nothing is drawn in would indent the whole log for nothing.
+fn graph_width(rows: &[GraphLine]) -> usize {
+    rows.iter()
+        .map(|r| r.graph.trim_end().chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(GRAPH_WIDTH_MAX)
+}
+
+/// Color of graph column `col`. git spaces lanes two columns apart, so halving
+/// the column index gives each lane one stable color.
+fn lane_color_at(col: usize) -> Color {
+    GRAPH_COLORS[(col / 2) % GRAPH_COLORS.len()]
+}
+
+/// Color of the lane a commit's node (`*`) is drawn in, so its hash can be
+/// tinted to match the branch line it hangs off. `None` for a row with no node:
+/// flat mode carries no art at all, so there is no lane to borrow a color from.
+fn lane_color(graph: &str) -> Option<Color> {
+    graph.chars().position(|c| c == '*').map(lane_color_at)
+}
+
 /// Renders one `git log --graph` art prefix, translating git's ASCII (`* | / \`)
-/// into box-drawing characters and coloring each column by its lane. Empty in
-/// flat mode, where rows carry no art.
-fn graph_spans(graph: &str) -> Vec<Span<'static>> {
-    graph
+/// into box-drawing characters and coloring each column by its lane. Padded out
+/// to `width` (from `graph_width`) plus one separating space, so whatever comes
+/// after it starts in the same column on every row. Empty in flat mode, where
+/// rows carry no art and `width` is 0.
+fn graph_spans(graph: &str, width: usize) -> Vec<Span<'static>> {
+    let art = graph.trim_end();
+    if art.is_empty() && width == 0 {
+        return Vec::new();
+    }
+    let mut spans: Vec<Span<'static>> = art
         .chars()
         .enumerate()
         .map(|(col, c)| {
@@ -3741,12 +3838,12 @@ fn graph_spans(graph: &str) -> Vec<Span<'static>> {
                 '_' | '-' => '─',
                 other => other,
             };
-            // git spaces lanes two columns apart, so halving the column index
-            // gives each lane one stable color.
-            let color = GRAPH_COLORS[(col / 2) % GRAPH_COLORS.len()];
-            Span::styled(ch.to_string(), Style::new().fg(color))
+            Span::styled(ch.to_string(), Style::new().fg(lane_color_at(col)))
         })
-        .collect()
+        .collect();
+    let drawn = art.chars().count();
+    spans.push(Span::raw(" ".repeat(width.saturating_sub(drawn) + 1)));
+    spans
 }
 
 /// Ref decorations next to a commit (`(HEAD -> main, origin/main)`), colored the
@@ -3777,12 +3874,19 @@ fn ref_spans(refs: &[String]) -> Vec<Span<'static>> {
 }
 
 /// The commit fields (hash, refs, subject, author/date) drawn after the graph.
-/// `hash_width` abbreviates the full hashes the branch view stores.
-fn commit_spans(e: &crate::git::LogEntry, hash_width: usize) -> Vec<Span<'static>> {
+/// `hash_width` abbreviates the full hashes the branch view stores. `lane` is
+/// the color of the graph lane this commit's node sits in, so the hash reads as
+/// belonging to the same branch line as the dot beside it; flat mode has no
+/// lanes and falls back to a plain yellow hash.
+fn commit_spans(
+    e: &crate::git::LogEntry,
+    hash_width: usize,
+    lane: Option<Color>,
+) -> Vec<Span<'static>> {
     let short = &e.hash[..e.hash.len().min(hash_width)];
     let mut spans = vec![Span::styled(
         format!("{short} "),
-        Style::new().fg(Color::Yellow),
+        Style::new().fg(lane.unwrap_or(Color::Yellow)),
     )];
     spans.extend(ref_spans(&e.refs));
     spans.push(Span::raw(format!("{}  ", e.subject)));
@@ -3841,13 +3945,14 @@ fn draw_log(
         return None;
     }
     let inner = block.inner(area);
+    let graph_w = graph_width(rows);
     let items: Vec<ListItem> = rows
         .iter()
         .enumerate()
         .map(|(i, row)| {
-            let mut spans = graph_spans(&row.graph);
+            let mut spans = graph_spans(&row.graph, graph_w);
             if let Some(e) = &row.entry {
-                spans.extend(commit_spans(e, usize::MAX));
+                spans.extend(commit_spans(e, usize::MAX, lane_color(&row.graph)));
             }
             ListItem::new(Line::from(spans))
                 .style(commit_row_style(own.get(i).copied().unwrap_or(false)))
@@ -4003,6 +4108,9 @@ fn draw_worktree_commits(
     selected: usize,
     mode: LogMode,
     focused: bool,
+    // Click-to-copy regions to add the title's branch name to, so the name
+    // sitting in the border can be lifted out without retyping it.
+    copy_hits: &mut Vec<CopyHit>,
 ) -> Option<RowList> {
     let block = focus_panel(
         format!(
@@ -4012,6 +4120,28 @@ fn draw_worktree_commits(
         ),
         focused,
     );
+    if !branch.is_empty() {
+        // `focus_panel` draws its title one cell in from the border with a
+        // leading space, and "commits · " runs ahead of the name.
+        const TITLE_X: u16 = 2;
+        let prefix = "commits · ".chars().count() as u16;
+        let start = TITLE_X + prefix;
+        let room = area.width.saturating_sub(start + 1);
+        let width = (branch.chars().count() as u16).min(room);
+        if width > 0 {
+            copy_hits.push(CopyHit {
+                rect: Rect {
+                    x: area.x + start,
+                    y: area.y,
+                    width,
+                    height: 1,
+                },
+                value: branch.to_string(),
+                label: "branch",
+                row: None,
+            });
+        }
+    }
     if rows.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from("no commits".dim())).block(block),
@@ -4020,13 +4150,14 @@ fn draw_worktree_commits(
         return None;
     }
     let inner = block.inner(area);
+    let graph_w = graph_width(rows);
     let items: Vec<ListItem> = rows
         .iter()
         .enumerate()
         .map(|(i, row)| {
-            let mut spans = graph_spans(&row.graph);
+            let mut spans = graph_spans(&row.graph, graph_w);
             if let Some(e) = &row.entry {
-                spans.extend(commit_spans(e, 9));
+                spans.extend(commit_spans(e, 9, lane_color(&row.graph)));
             }
             ListItem::new(Line::from(spans))
                 .style(commit_row_style(own.get(i).copied().unwrap_or(false)))
@@ -4072,6 +4203,7 @@ fn draw_branch_commits(
         return None;
     }
     let inner = block.inner(area);
+    let graph_w = graph_width(rows);
     let items: Vec<ListItem> = rows
         .iter()
         .enumerate()
@@ -4080,7 +4212,7 @@ fn draw_branch_commits(
                 // An art-only row has no checkbox; pad past that column so its
                 // graph still lines up with the commits above and below.
                 let mut spans = vec![Span::raw("    ")];
-                spans.extend(graph_spans(&row.graph));
+                spans.extend(graph_spans(&row.graph, graph_w));
                 return ListItem::new(Line::from(spans));
             };
             let style = commit_row_style(own.get(i).copied().unwrap_or(false));
@@ -4090,9 +4222,9 @@ fn draw_branch_commits(
             } else {
                 Span::styled("[ ] ", Style::new().dim())
             }];
-            spans.extend(graph_spans(&row.graph));
+            spans.extend(graph_spans(&row.graph, graph_w));
             // Full hashes are stored for cherry-pick; show an abbreviated form.
-            spans.extend(commit_spans(e, 9));
+            spans.extend(commit_spans(e, 9, lane_color(&row.graph)));
             ListItem::new(Line::from(spans)).style(style)
         })
         .collect();
@@ -4953,6 +5085,10 @@ fn draw_conflict_resolver(
     resolved: &[bool],
     file: usize,
     current: Option<&ResolverFile>,
+    // Path whose contents are still being read, when one is. The pane can't
+    // show hunks yet and must not claim the file is resolved, so both panels
+    // say it is loading instead.
+    loading: Option<&str>,
     scroll: u16,
     follow: bool,
 ) -> ResolverDraw {
@@ -4965,7 +5101,11 @@ fn draw_conflict_resolver(
         .enumerate()
         .map(|(i, path)| {
             let done = resolved.get(i).copied().unwrap_or(false);
-            let mark = if done {
+            // The file being read gets its own marker, so pressing → says the
+            // keypress landed even before the hunks are there to show.
+            let mark = if loading == Some(path.as_str()) {
+                Span::styled("⟳ ", Style::new().fg(ACCENT).bold())
+            } else if done {
                 Span::styled("✓ ", Style::new().fg(theme::SUCCESS))
             } else {
                 Span::styled("• ", Style::new().fg(theme::WARNING))
@@ -5003,6 +5143,27 @@ fn draw_conflict_resolver(
     let block = panel(format!("resolve · {path}"));
     let inner = block.inner(detail_area);
     frame.render_widget(block, detail_area);
+
+    // A file still being read has no hunks yet, and it is emphatically not
+    // resolved: saying so for the moment the read takes would be a lie the user
+    // might act on.
+    if let Some(path) = loading {
+        let para = Paragraph::new(vec![
+            Line::from(""),
+            Line::styled(
+                format!("  ⟳ loading {path}…"),
+                Style::new().fg(ACCENT).bold(),
+            ),
+        ]);
+        frame.render_widget(para, inner);
+        return ResolverDraw {
+            list: list_hit,
+            hits: None,
+            scroll: 0,
+            max_scroll: 0,
+            page: inner.height.max(1),
+        };
+    }
 
     let Some(rf) = current else {
         let para = Paragraph::new(vec![
@@ -5626,7 +5787,8 @@ mod tests {
     }
 
     /// The tree view draws git's art as box-drawing characters, keeps the
-    /// art-only connector rows, and decorates the refs.
+    /// art-only connector rows, decorates the refs, and pads every row's art to
+    /// the widest so the hashes line up in one column.
     #[test]
     fn log_tree_draws_graph_art_and_refs() {
         let rows = vec![
@@ -5649,11 +5811,112 @@ mod tests {
         assert!(out[0].contains("log · main · tree"), "{out:#?}");
         // git's `*` and `|` become `●` and `│`; the `\` becomes `╲`.
         assert!(
-            out[1].contains("● 1a2b3c4 (HEAD -> main) merge feature"),
+            out[1].contains("●   1a2b3c4 (HEAD -> main) merge feature"),
             "{out:#?}"
         );
         assert!(out[2].contains("│╲"), "{out:#?}");
         assert!(out[3].contains("│ ● 5d6e7f8 add tests"), "{out:#?}");
+        // The trunk commit's art is one column wide and the branch commit's is
+        // three, so only padding to a shared width can put both hashes here.
+        let hash_col = |line: &str| line.find("1a2b3c4").or_else(|| line.find("5d6e7f8"));
+        assert_eq!(hash_col(&out[1]), hash_col(&out[3]), "{out:#?}");
+    }
+
+    /// The graph column is as wide as the widest art any row draws, ignoring the
+    /// trailing padding git leaves on a merge line, and never wider than the cap.
+    #[test]
+    fn graph_width_ignores_trailing_pad_and_stops_at_the_cap() {
+        let rows = |arts: &[&str]| -> Vec<GraphLine> {
+            arts.iter()
+                .map(|a| GraphLine {
+                    graph: (*a).to_string(),
+                    entry: None,
+                })
+                .collect()
+        };
+        // "*   " is a merge line: git pads it for the parents it is about to
+        // fan, and counting that would indent the whole log for nothing.
+        assert_eq!(graph_width(&rows(&["* ", "*   ", "| * "])), 3);
+        assert_eq!(graph_width(&rows(&[])), 0);
+        // Flat mode carries no art at all.
+        assert_eq!(graph_width(&rows(&["", ""])), 0);
+        let wide = "| ".repeat(40);
+        assert_eq!(graph_width(&rows(&[&wide])), GRAPH_WIDTH_MAX);
+    }
+
+    /// A commit's hash takes the color of the lane its node sits in, so hash and
+    /// dot read as one branch line. Flat rows have no lane and keep yellow.
+    #[test]
+    fn the_hash_takes_its_lanes_color() {
+        assert_eq!(lane_color("* "), Some(GRAPH_COLORS[0]));
+        assert_eq!(lane_color("| * "), Some(GRAPH_COLORS[1]));
+        assert_eq!(lane_color("| | * "), Some(GRAPH_COLORS[2]));
+        // A connector-only row has no node, and neither does a flat-mode row.
+        assert_eq!(lane_color("|\\"), None);
+        assert_eq!(lane_color(""), None);
+
+        // And the color reaches the screen: the second commit is one lane over,
+        // so its hash must not match the trunk commit's.
+        let rows = vec![
+            GraphLine {
+                graph: "* ".into(),
+                entry: Some(entry("1a2b3c4", "merge feature", &[])),
+            },
+            GraphLine {
+                graph: "| * ".into(),
+                entry: Some(entry("5d6e7f8", "add tests", &[])),
+            },
+        ];
+        let backend = ratatui::backend::TestBackend::new(78, 5);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_log(frame, frame.area(), "main", &rows, &[], 0, LogMode::Tree);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let hash_fg = |line: &str, y: u16| {
+            let x = line.find("1a2b3c4").or_else(|| line.find("5d6e7f8")).unwrap() as u16;
+            buf[(x, y)].style().fg
+        };
+        let text: Vec<String> = (0..5)
+            .map(|y| (0..78).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect();
+        assert_eq!(hash_fg(&text[1], 1), Some(GRAPH_COLORS[0]), "{text:#?}");
+        assert_eq!(hash_fg(&text[2], 2), Some(GRAPH_COLORS[1]), "{text:#?}");
+    }
+
+    /// A file still being read is neither shown as hunks nor claimed resolved:
+    /// both panels say it is loading, so pressing → reads as registered.
+    #[test]
+    fn the_resolver_says_which_file_it_is_loading() {
+        let out = render(78, 8, |frame, area| {
+            draw_conflict_resolver(
+                frame,
+                area,
+                "wt",
+                "feature/login",
+                &ResolveKind::Merge,
+                &["src/main.rs".to_string(), "src/lib.rs".to_string()],
+                &[false, false],
+                1,
+                None,
+                Some("src/lib.rs"),
+                0,
+                false,
+            );
+        });
+        let screen = out.join("\n");
+        assert!(screen.contains("loading src/lib.rs…"), "{out:#?}");
+        assert!(
+            !screen.contains("resolved — no conflicts"),
+            "a loading file must not be called resolved: {out:#?}"
+        );
+        // The row being read is marked in the file list too.
+        assert!(
+            out.iter().any(|l| l.contains("⟳ src/lib.rs")),
+            "{out:#?}"
+        );
     }
 
     /// The footer and the help panel now read the same bindings, so a help-only
@@ -5742,7 +6005,7 @@ mod tests {
         });
         assert!(out[0].contains("commits · main · tree"), "{out:#?}");
         // A marked commit, its art, then the hash abbreviated to 9 chars.
-        assert!(out[1].contains("[x] ● 1a2b3c4d5 merge feature"), "{out:#?}");
+        assert!(out[1].contains("[x] ●  1a2b3c4d5 merge feature"), "{out:#?}");
         // The connector must sit under the commit's lane rather than under the
         // checkbox column. Both searches skip the panel's left border, which is
         // itself a `│`.
@@ -6152,6 +6415,7 @@ mod tests {
                     0,
                     LogMode::Flat,
                     true,
+                    &mut Vec::new(),
                 );
             })
             .unwrap();
@@ -6173,6 +6437,7 @@ mod tests {
                     0,
                     LogMode::Flat,
                     false,
+                    &mut Vec::new(),
                 );
             })
             .unwrap();
@@ -6724,6 +6989,7 @@ mod tests {
                 &[false],
                 0,
                 Some(rf),
+                None,
                 scroll,
                 follow,
             );

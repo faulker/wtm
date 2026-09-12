@@ -339,6 +339,26 @@ fn flat_lines(entries: Vec<LogEntry>) -> Vec<GraphLine> {
         .collect()
 }
 
+/// Reads and parses one conflicted file for the resolver. A file read and a
+/// parse and nothing more: `cx` already holds everything about the worktree that
+/// would otherwise be re-derived per file. `None` means the file has no
+/// conflicts left, or could not be read at all, which the pane shows as
+/// resolved either way.
+fn read_resolver_file(cx: &ops::ConflictContext, path: &str) -> Option<ResolverFile> {
+    let cf = ops::read_conflict_in(cx, path).ok()?;
+    let hunks = cf
+        .segments
+        .iter()
+        .filter(|s| matches!(s, ConflictSegment::Hunk { .. }))
+        .count();
+    // A file with no hunks left is fully resolved; show nothing.
+    (hunks > 0).then(|| ResolverFile {
+        file: cf,
+        actions: vec![None; hunks],
+        hunk: 0,
+    })
+}
+
 /// A branch offered for checkout in the new-worktree dialog. Local branches
 /// carry `remote: None` and are checked out directly. Remote-only branches (a
 /// teammate's branch that has no local copy yet) carry their remote ref (e.g.
@@ -1011,6 +1031,12 @@ pub enum View {
 pub struct ResolverState {
     /// Worktree being resolved (addressed by name in ops).
     pub target: String,
+    /// Where the worktree lives and what to call each side, resolved once when
+    /// the resolver is built. Switching files used to go through
+    /// `ops::read_conflict`, which re-resolved the worktree every time — a whole
+    /// `ops::list` (a `git status` per worktree) plus several `rev-parse`s for
+    /// what is otherwise a single file read.
+    pub cx: ops::ConflictContext,
     /// What is being merged in, for the header (e.g. the source branch).
     pub source_label: String,
     /// The in-progress operation this resolver finishes (merge, cherry-pick,
@@ -1025,6 +1051,19 @@ pub struct ResolverState {
     /// Parsed state of the file under the cursor, when it loaded and still has
     /// conflicts. `None` on an already-resolved file or a load error.
     pub current: Option<ResolverFile>,
+    /// Path whose contents are being read on a background thread, so the pane
+    /// can say which file it is settling on. Holding ←/→ moves the cursor every
+    /// keypress; without this the pane would sit on the last file that finished
+    /// loading and look like it had missed the keys.
+    pub loading: Option<String>,
+}
+
+/// Result of a background resolver file read, matched back to the cursor by
+/// `gen` and `path` so a read for a file the user has since left is dropped.
+pub struct ResolverLoad {
+    generation: u64,
+    path: String,
+    file: Option<ResolverFile>,
 }
 
 /// A conflicted file loaded into the resolver: its parsed contents plus the
@@ -1510,6 +1549,24 @@ pub struct RowList {
     pub len: usize,
 }
 
+/// A click-to-copy region the renderer recorded for the current frame. The
+/// worktree path and the branch name get read out loud far more often than they
+/// get typed, so the places they already sit on screen double as copy buttons.
+#[derive(Clone)]
+pub struct CopyHit {
+    /// Screen rect a click has to land in.
+    pub rect: Rect,
+    /// Text the click puts on the clipboard.
+    pub value: String,
+    /// What that text is, for the "copied the <label>" confirmation.
+    pub label: &'static str,
+    /// Worktree row to move the cursor onto as well. Set for the hits inside
+    /// the worktree table, where a click on the PATH cell is still a click on
+    /// that row and should select it like any other cell would; `None` for the
+    /// hits that sit on a panel border, outside every list.
+    pub row: Option<usize>,
+}
+
 /// Whether a click at `col`/`row` landed inside `rect`. Used for the click
 /// targets the renderer records as bare rects (tab labels, the diff panel's path
 /// title) rather than as a `RowList`.
@@ -1716,6 +1773,12 @@ pub struct App {
     pub resolver_page: u16,
     /// Geometry of the resolver's detail pane, for the wheel and clicks.
     pub resolver_hits: Option<ResolverHits>,
+    /// Background read of the resolver's selected file, so a burst of ←/→ never
+    /// blocks the event loop and the cursor keeps up with the keys.
+    resolver_pending: Option<Task<ResolverLoad>>,
+    /// Bumped on every resolver file load; a result arriving with a stale token
+    /// belongs to a file the cursor has already left.
+    resolver_load_gen: u64,
     /// When `Some`, the three-panel bottom area shows this commit list instead
     /// of the changes/diff panels (selected worktree is clean).
     /// In-flight file-list load for an open commit dialog, keyed by worktree
@@ -1783,6 +1846,11 @@ pub struct App {
     /// renderer so a click on one selects that tab. Empty when the bar is not
     /// on screen or something (modal, help, error) covers it.
     pub tab_hits: Vec<(Rect, Tab)>,
+    /// Click-to-copy regions recorded by the renderer each frame: the header's
+    /// worktree path, the worktree table's PATH column, and the branch name on
+    /// the commit panel's title. Cleared and refilled every draw, and emptied
+    /// while a dialog, overlay, or modal covers the home view.
+    pub copy_hits: Vec<CopyHit>,
     /// Screen rect of the Changes tab's diff-panel path title, recorded by the
     /// renderer so a click there copies the path. `None` unless a file's diff is
     /// on screen.
@@ -1911,6 +1979,8 @@ impl App {
             resolver_max_scroll: 0,
             resolver_page: 1,
             resolver_hits: None,
+            resolver_pending: None,
+            resolver_load_gen: 0,
             commit_files_pending: None,
             worktree_commits: None,
             commits_pending: None,
@@ -1935,6 +2005,7 @@ impl App {
             modal: None,
             row_list: None,
             tab_hits: Vec::new(),
+            copy_hits: Vec::new(),
             diff_path_hit: None,
             last_click: None,
             message: None,
@@ -2279,6 +2350,7 @@ impl App {
             || self.status_refresh_pending.is_some()
             || self.stash_pending.is_some()
             || self.branches_pending.is_some()
+            || self.resolver_pending.is_some()
             || self.update_check.is_some()
             // A status message auto-clears on a timer, so keep ticking until it
             // has gone; four seconds of fast ticks is not a battery problem.
@@ -2304,6 +2376,9 @@ impl App {
         // off-thread so selection changes stay responsive.
         self.poll_preview_load();
         self.poll_commits_load();
+        // And the resolver's conflicted file, so holding ←/→ through a long list
+        // of conflicts never blocks the event loop on a file read.
+        self.poll_resolver_load();
         self.poll_status_refresh();
         self.poll_stash_load();
         // The commit dialog opens before its file list exists, so drain that
@@ -4516,6 +4591,16 @@ impl App {
         }
     }
 
+    /// Copies one click-to-copy value, naming what it was so the confirmation
+    /// says "copied the branch" rather than leaving the user to guess which of
+    /// the two things under the pointer went to the clipboard.
+    fn copy_value(&mut self, value: &str, label: &str) {
+        match platform::copy_to_clipboard(value) {
+            Ok(()) => self.message = Some(format!("copied the {label} '{value}'")),
+            Err(e) => self.set_error(format!("cannot copy to the clipboard: {e:#}")),
+        }
+    }
+
     /// Selects the list row under a left click, if one landed on the active
     /// view's clickable list. Loads the diff for a newly selected file so a
     /// click behaves exactly like arrowing onto the row.
@@ -4540,6 +4625,30 @@ impl App {
             self.open_copy_path_modal();
             // Don't let the same click also register as half of a double click on
             // the title, which would then try to open the file.
+            self.last_click = None;
+            return;
+        }
+        // The other click-to-copy values: the header's worktree path, the
+        // worktree table's PATH column, and the branch name on the commit
+        // panel's title. Two of the three sit on chrome outside every list; the
+        // PATH cells are inside the worktree table and carry their own row, so
+        // clicking one still selects that worktree the way any other cell does.
+        if let Some(hit) = self
+            .copy_hits
+            .iter()
+            .find(|h| rect_contains(h.rect, col, row))
+            .cloned()
+        {
+            if let Some(idx) = hit.row.filter(|i| *i < self.worktrees.len()) {
+                self.worktrees_focus = WorktreesFocus::List;
+                if self.selected != idx {
+                    self.selected = idx;
+                    self.preview_scroll = 0;
+                }
+            }
+            self.copy_value(&hit.value, hit.label);
+            // A second click on the same cell is another copy, not a double
+            // click asking the row to open.
             self.last_click = None;
             return;
         }
@@ -7827,14 +7936,23 @@ impl App {
         files: Vec<String>,
     ) {
         let resolved = vec![false; files.len()];
+        let cx = match ops::conflict_context(&self.ctx, &target) {
+            Ok(cx) => cx,
+            Err(e) => {
+                self.set_error(format!("{e:#}"));
+                return;
+            }
+        };
         self.resolver = Some(ResolverState {
             target: target.clone(),
+            cx,
             source_label,
             kind,
             files,
             resolved,
             file: 0,
             current: None,
+            loading: None,
         });
         self.load_resolver_file();
         // The resolver *is* the changes pane, so opening one means putting that
@@ -7872,12 +7990,14 @@ impl App {
         };
         Ok(Some(ResolverState {
             target: name.to_string(),
+            cx: ops::conflict_context(&self.ctx, name).map_err(|e| format!("{e:#}"))?,
             source_label: format!("{} in progress", kind.label()),
             kind,
             resolved: vec![false; files.len()],
             files,
             file: 0,
             current: None,
+            loading: None,
         }))
     }
 
@@ -7980,35 +8100,75 @@ impl App {
     /// with no remaining conflict markers (already resolved) or a read error
     /// leaves `current` empty, which the renderer shows as "resolved".
     fn load_resolver_file(&mut self) {
-        let target_path = self
-            .resolver
-            .as_ref()
-            .and_then(|r| r.files.get(r.file).map(|p| (r.target.clone(), p.clone())));
-        let Some((target, path)) = target_path else {
+        let Some(r) = &mut self.resolver else {
             return;
         };
-        let loaded = ops::read_conflict(&self.ctx, &target, &path)
-            .ok()
-            .and_then(|cf| {
-                let hunks = cf
-                    .segments
-                    .iter()
-                    .filter(|s| matches!(s, ConflictSegment::Hunk { .. }))
-                    .count();
-                // A file with no hunks left is fully resolved; show nothing.
-                (hunks > 0).then(|| ResolverFile {
-                    file: cf,
-                    actions: vec![None; hunks],
-                    hunk: 0,
-                })
-            });
-        if let Some(r) = &mut self.resolver {
-            r.current = loaded;
-        }
+        let Some(path) = r.files.get(r.file).cloned() else {
+            r.current = None;
+            r.loading = None;
+            self.resolver_pending = None;
+            return;
+        };
+        let cx = r.cx.clone();
+        // The previous file's hunks are not this file's, so drop them rather
+        // than leave the pane showing a resolution that belongs elsewhere.
+        r.current = None;
+        r.loading = Some(path.clone());
         // A different file's hunks have nothing to do with where the last one
         // was scrolled to, so start at the top and follow the cursor again.
         self.resolver_scroll = 0;
         self.resolver_follow = true;
+        self.resolver_load_gen += 1;
+        let generation = self.resolver_load_gen;
+        // Tests assert on the loaded file immediately after the move that
+        // triggered it, and a test run must never be left waiting on a thread:
+        // read inline for them, exactly as `start_update_check` does.
+        if cfg!(test) {
+            let file = read_resolver_file(&cx, &path);
+            self.apply_resolver_load(ResolverLoad {
+                generation,
+                path,
+                file,
+            });
+            return;
+        }
+        let (tx, rx) = channel::<ResolverLoad>();
+        std::thread::spawn(move || {
+            let file = read_resolver_file(&cx, &path);
+            let _ = tx.send(ResolverLoad {
+                generation,
+                path,
+                file,
+            });
+        });
+        self.resolver_pending = Some(Task::new(rx));
+    }
+
+    /// Picks up a finished background resolver read. Only the newest result
+    /// matters: holding ←/→ starts one read per keypress, and every one but the
+    /// last is for a file the cursor has already left.
+    fn poll_resolver_load(&mut self) {
+        let Some(load) = self.resolver_pending.as_ref().and_then(Task::poll_latest) else {
+            return;
+        };
+        self.resolver_pending = None;
+        self.apply_resolver_load(load);
+    }
+
+    /// Puts a finished read into the resolver, unless the cursor has moved on
+    /// since it started — in which case a newer read is already in flight and
+    /// this result would flash the wrong file's hunks on the way past.
+    fn apply_resolver_load(&mut self, load: ResolverLoad) {
+        if load.generation != self.resolver_load_gen {
+            return;
+        }
+        if let Some(r) = &mut self.resolver {
+            if r.files.get(r.file).map(String::as_str) != Some(load.path.as_str()) {
+                return;
+            }
+            r.current = load.file;
+            r.loading = None;
+        }
     }
 
     /// Key handling for the conflict resolver.
@@ -8436,17 +8596,30 @@ impl App {
                 r.resolved.clear();
                 r.file = 0;
                 r.current = None;
+                r.loading = None;
             }
+            // Nothing left to read; a load still in flight would put a file
+            // that no longer exists in the list back on screen.
+            self.resolver_pending = None;
+            self.resolver_load_gen += 1;
             self.message = Some("every conflict is resolved · press c to finish".to_string());
             return;
         }
         let keep = current_path
             .and_then(|p| files.iter().position(|f| *f == p))
             .unwrap_or(0);
+        // A reload follows something that may have moved the worktree on: a
+        // rebase continuing to the next commit renames the incoming side. This
+        // is the one explicit user action, so re-deriving the side labels here
+        // costs nothing the file switches have to pay.
+        let cx = ops::conflict_context(&self.ctx, &target).ok();
         if let Some(r) = &mut self.resolver {
             r.resolved = vec![false; files.len()];
             r.files = files;
             r.file = keep;
+            if let Some(cx) = cx {
+                r.cx = cx;
+            }
         }
         self.load_resolver_file();
         self.message = Some("reloaded conflicts from disk".to_string());
@@ -16473,6 +16646,196 @@ mod tests {
         // A click on a different cell doesn't pair with the one before it.
         click(&mut app, col + 1, row);
         assert!(platform::take_recorded().is_empty(), "different cell");
+    }
+
+    /// The worktree path in the header is click-to-copy: one click, one
+    /// clipboard write, no chooser (a worktree root has only the one form).
+    #[test]
+    fn clicking_the_header_path_copies_it() {
+        let (_tmp, mut app) = test_app();
+        render_app(&mut app, 100, 24);
+        let hit = app
+            .copy_hits
+            .iter()
+            .find(|h| h.rect.y == 0)
+            .expect("the header records its path")
+            .clone();
+        let expected = app.worktrees[app.selected].path.clone();
+        assert_eq!(hit.value, expected);
+        platform::take_recorded();
+
+        click(&mut app, hit.rect.x + 1, hit.rect.y);
+        assert_eq!(platform::take_recorded(), vec![format!("copy {expected}")]);
+        assert_eq!(
+            app.message.as_deref(),
+            Some(&*format!("copied the path '{expected}'"))
+        );
+        assert!(app.modal.is_none(), "no chooser for a worktree root");
+    }
+
+    /// A click on the worktree table's PATH cell copies the whole path (even
+    /// where the cell shows a front-trimmed form of it) and still selects that
+    /// row, the way a click anywhere else on it would.
+    #[test]
+    fn clicking_a_worktrees_path_cell_copies_it_and_selects_the_row() {
+        let (_tmp, mut app) = test_app();
+        add_and_select_worktree(&mut app, "second");
+        app.selected = 0;
+        render_app(&mut app, 120, 24);
+        // Row 1's cell, so the click has a selection to move as well.
+        let hit = app
+            .copy_hits
+            .iter()
+            .find(|h| h.row == Some(1))
+            .expect("the table records a hit per visible PATH cell")
+            .clone();
+        let expected = app.worktrees[1].path.clone();
+        assert_eq!(hit.value, expected, "the untrimmed path is what gets copied");
+        platform::take_recorded();
+
+        click(&mut app, hit.rect.x, hit.rect.y);
+        assert_eq!(platform::take_recorded(), vec![format!("copy {expected}")]);
+        assert_eq!(app.selected, 1, "the click still selects the row");
+        assert_eq!(app.worktrees_focus, WorktreesFocus::List);
+    }
+
+    /// The branch name on the three-panel commits title is click-to-copy, so a
+    /// branch can be lifted out of the border without retyping it.
+    #[test]
+    fn clicking_the_commits_panel_branch_copies_it() {
+        let (_tmp, mut app) = test_app();
+        // The renderer reads the layout back off the config each frame, so the
+        // config is what has to say three-panel, not the flag.
+        app.ctx.config.worktrees_layout = Some(WorktreesLayout::ThreePanel);
+        app.three_panel = true;
+        app.tab = Tab::Worktrees;
+        app.worktree_commits = Some(WorktreeCommitsPanel {
+            name: app.worktrees[app.selected].name.clone(),
+            branch: "feature/login".to_string(),
+            from_branch: true,
+            lines: Vec::new(),
+            own: Vec::new(),
+            selected: 0,
+        });
+        render_app(&mut app, 120, 24);
+        let hit = app
+            .copy_hits
+            .iter()
+            .find(|h| h.label == "branch")
+            .expect("the commits title records its branch name")
+            .clone();
+        assert_eq!(hit.value, "feature/login");
+        platform::take_recorded();
+
+        click(&mut app, hit.rect.x, hit.rect.y);
+        assert_eq!(
+            platform::take_recorded(),
+            vec!["copy feature/login".to_string()]
+        );
+        assert_eq!(
+            app.message.as_deref(),
+            Some("copied the branch 'feature/login'")
+        );
+    }
+
+    /// Click-to-copy regions belong to the home view: a modal floats over all of
+    /// them, and a click there must not reach the path behind it.
+    #[test]
+    fn a_modal_takes_the_copy_regions_off_the_screen() {
+        let (_tmp, mut app) = test_app();
+        add_and_select_worktree(&mut app, "doomed");
+        render_app(&mut app, 100, 24);
+        assert!(!app.copy_hits.is_empty(), "the home view records some");
+
+        press(&mut app, KeyCode::Char('d'));
+        assert!(app.modal.is_some(), "delete opened its confirm");
+        render_app(&mut app, 100, 24);
+        assert!(app.copy_hits.is_empty(), "a modal covers them");
+    }
+
+    /// Resolver file reads run off-thread, so a result can land after the cursor
+    /// has moved on. Applying one then would flash the wrong file's hunks, so
+    /// both a stale generation and a stale path are dropped.
+    #[test]
+    fn a_stale_resolver_read_is_dropped() {
+        let (_tmp, mut app) = test_app();
+        let name = app.worktrees[app.selected].name.clone();
+        let files = vec!["a.txt".to_string(), "b.txt".to_string()];
+        app.resolver = Some(ResolverState {
+            target: name.clone(),
+            cx: ops::conflict_context(&app.ctx, &name).unwrap(),
+            source_label: "merge in progress".to_string(),
+            kind: ops::ResolveKind::Merge,
+            resolved: vec![false; files.len()],
+            files,
+            file: 0,
+            current: None,
+            loading: Some("a.txt".to_string()),
+        });
+        app.resolver_load_gen = 7;
+
+        // A result from an older load: a newer one is already in flight.
+        app.apply_resolver_load(ResolverLoad {
+            generation: 6,
+            path: "a.txt".to_string(),
+            file: None,
+        });
+        assert_eq!(
+            resolver(&app).loading.as_deref(),
+            Some("a.txt"),
+            "a stale generation must not clear the loading marker"
+        );
+
+        // Current generation, but for a file the cursor has left.
+        app.apply_resolver_load(ResolverLoad {
+            generation: 7,
+            path: "b.txt".to_string(),
+            file: None,
+        });
+        assert_eq!(resolver(&app).loading.as_deref(), Some("a.txt"));
+
+        // The matching result lands and takes the marker down.
+        app.apply_resolver_load(ResolverLoad {
+            generation: 7,
+            path: "a.txt".to_string(),
+            file: None,
+        });
+        assert!(resolver(&app).loading.is_none());
+    }
+
+    /// Switching conflicted files must not re-resolve the worktree: the resolver
+    /// holds a `ConflictContext` for that, and the read is the file and nothing
+    /// else. The marker comes down once the read lands.
+    #[test]
+    fn switching_conflicted_files_reads_only_the_file() {
+        let (_tmp, mut app) = test_app();
+        into_conflict_resolver_two_files(&mut app);
+        let before = resolver(&app).cx.dir.clone();
+        assert!(
+            resolver(&app).files.len() >= 2,
+            "need two conflicted files: {:?}",
+            resolver(&app).files
+        );
+        let first = resolver(&app).files[0].clone();
+
+        app.resolver_move_file(1);
+        assert_eq!(resolver(&app).file, 1, "the cursor moved on the keypress");
+        assert_eq!(
+            resolver(&app).cx.dir,
+            before,
+            "the worktree is resolved once, not per file"
+        );
+        // The inline read used under test lands immediately, so the marker is
+        // already down and the new file's hunks are on screen.
+        assert!(resolver(&app).loading.is_none());
+        assert!(resolver(&app).current.is_some(), "the second file loaded");
+
+        app.resolver_move_file(-1);
+        assert_eq!(resolver(&app).file, 0);
+        assert_eq!(
+            resolver(&app).current.as_ref().map(|rf| rf.file.path.clone()),
+            Some(first)
+        );
     }
 
     /// Clicking the diff panel's path title asks which form of the path to copy;

@@ -2259,49 +2259,92 @@ pub fn list_conflicts(ctx: &Ctx, target: &str) -> Result<Vec<String>> {
     git::conflicted_files(Path::new(&info.path)).map_err(Into::into)
 }
 
-/// Reads and parses the conflicted file at `path` (relative to the worktree
-/// root) in the worktree named `target`. `ours_label`/`theirs_label` are taken
-/// from the file's own conflict markers when git wrote them there, falling
-/// back to the worktree's checked-out branch and the short hash of
-/// `MERGE_HEAD` respectively.
-pub fn read_conflict(ctx: &Ctx, target: &str, path: &str) -> Result<ConflictFile> {
+/// The parts of a conflicted worktree's identity that don't change from file to
+/// file: where it lives, and what to call each side when a file's own conflict
+/// markers don't say. Every field here costs at least one git invocation to
+/// work out (and resolving the worktree costs a whole `list`, which runs a
+/// `git status` per worktree), so the resolver works one out per worktree and
+/// reuses it for every file the user opens.
+#[derive(Debug, Clone)]
+pub struct ConflictContext {
+    /// Filesystem root of the worktree.
+    pub dir: PathBuf,
+    /// Our side's name when the markers don't give a usable one.
+    ours: String,
+    /// Their side's name as the rebase state files give it. Outranks the
+    /// markers' own label, because mid-rebase git writes a bare commit hash
+    /// there while the worktree sits on a detached HEAD.
+    rebase_theirs: Option<String>,
+    /// Their side's name from the in-progress operation's ref, used when
+    /// neither the rebase state nor the markers name it.
+    head_theirs: String,
+}
+
+/// Works out the [`ConflictContext`] for the worktree named `target`.
+pub fn conflict_context(ctx: &Ctx, target: &str) -> Result<ConflictContext> {
     let info = find(ctx, target)?.ok_or_else(|| not_found(ctx, target))?;
-    let dir = Path::new(&info.path);
-    let full = dir.join(path);
-    let text =
-        std::fs::read_to_string(&full).with_context(|| format!("reading {}", full.display()))?;
-    let (marker_ours, marker_theirs) = conflict::marker_labels(&text);
+    let dir = PathBuf::from(&info.path);
     // Git's own labels are the first choice, but on a merge it writes the
     // useless "HEAD" for our side, and on a rebase it writes "HEAD" plus a bare
     // commit hash while the worktree sits on a detached HEAD. The side labels
     // are the whole basis for deciding which change to keep, so name them from
     // the rebase state files first, then the checked-out branch.
-    let (rebase_ours, rebase_theirs) = if git::is_rebasing(dir) {
-        git::rebase_side_names(dir)
+    let (rebase_ours, rebase_theirs) = if git::is_rebasing(&dir) {
+        git::rebase_side_names(&dir)
     } else {
         (None, None)
     };
-    let ours_label = marker_ours
-        .filter(|l| l != "HEAD")
-        .or(rebase_ours)
-        .or_else(|| info.branch.clone())
-        .unwrap_or_else(|| "HEAD".to_string());
     // Each in-progress operation names the incoming side with a different ref,
     // so try each in turn rather than assuming a merge.
-    let theirs_label = rebase_theirs
-        .or(marker_theirs)
-        .or_else(|| {
-            ["MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD"]
-                .iter()
-                .find_map(|r| git::run(dir, &["rev-parse", "--short", r]).ok())
-        })
+    let head_theirs = ["MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD"]
+        .iter()
+        .find_map(|r| git::run(&dir, &["rev-parse", "--short", r]).ok())
         .unwrap_or_else(|| "incoming".to_string());
+    Ok(ConflictContext {
+        dir,
+        ours: rebase_ours
+            .or_else(|| info.branch.clone())
+            .unwrap_or_else(|| "HEAD".to_string()),
+        rebase_theirs,
+        head_theirs,
+    })
+}
+
+/// Reads and parses the conflicted file at `path` (relative to the worktree
+/// root) using an already-resolved [`ConflictContext`]. A file read and a parse,
+/// nothing else: this is what switching files in the resolver costs.
+pub fn read_conflict_in(cx: &ConflictContext, path: &str) -> Result<ConflictFile> {
+    let full = cx.dir.join(path);
+    let text =
+        std::fs::read_to_string(&full).with_context(|| format!("reading {}", full.display()))?;
+    let (marker_ours, marker_theirs) = conflict::marker_labels(&text);
+    let ours_label = marker_ours
+        .filter(|l| l != "HEAD")
+        .unwrap_or_else(|| cx.ours.clone());
+    let theirs_label = cx
+        .rebase_theirs
+        .clone()
+        .or(marker_theirs)
+        .unwrap_or_else(|| cx.head_theirs.clone());
     Ok(ConflictFile {
         path: path.to_string(),
         segments: conflict::parse(&text),
         ours_label,
         theirs_label,
     })
+}
+
+/// Reads and parses the conflicted file at `path` (relative to the worktree
+/// root) in the worktree named `target`. `ours_label`/`theirs_label` are taken
+/// from the file's own conflict markers when git wrote them there, falling
+/// back to the worktree's checked-out branch and the short hash of
+/// `MERGE_HEAD` respectively.
+///
+/// One-shot: resolves the worktree and both fallback labels, then reads the
+/// file. Callers walking several files of the same worktree should hold a
+/// [`conflict_context`] and use [`read_conflict_in`] instead.
+pub fn read_conflict(ctx: &Ctx, target: &str, path: &str) -> Result<ConflictFile> {
+    read_conflict_in(&conflict_context(ctx, target)?, path)
 }
 
 /// Writes `resolved_text` to `path` in the worktree named `target` and stages
