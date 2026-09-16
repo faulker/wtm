@@ -15,8 +15,8 @@ use toml_edit::{Array, DocumentMut, value as toml_value};
 
 use crate::cli::ConfigAction;
 use crate::config::{
-    self, CONFIG_FILE, CommandMode, Config, DEFAULT_LOCATION, FileConfig, LOCATION_PRESETS,
-    OpenCommand, OpenCommandList,
+    self, CONFIG_FILE, CommandMode, Config, ConflictEditor, DEFAULT_LOCATION, FileConfig,
+    LOCATION_PRESETS, OpenCommand, OpenCommandList,
 };
 use crate::git;
 use crate::output;
@@ -51,6 +51,13 @@ const KEYS: &[(&str, &str)] = &[
     (
         "diff_line_numbers",
         "show a line-number gutter in the diff pane (true/false, default true)",
+    ),
+    (
+        "conflict_editor",
+        "editor the conflict resolver's e key opens a file in; a shell template \
+         with {path} (the file), {name}, {branch}. Runs in this terminal; give \
+         { command = \"...\", mode = \"background\" } for a detached GUI editor. \
+         Unset means wtm's built-in editor",
     ),
     (
         "setup.copy",
@@ -222,6 +229,8 @@ pub fn repo_config_fields(
     let worktrees_layout = effective_worktrees_layout(global_config, &cfg);
     let branches_refresh_mins = effective_branches_refresh_mins(global_config, &cfg);
     let diff_line_numbers = effective_diff_line_numbers(global_config, &cfg);
+    let conflict_editor =
+        Config::merge(load_global_file(global_config), cfg.clone()).conflict_editor;
     let setup = cfg.setup.clone().unwrap_or_default();
     let copy = setup
         .copy
@@ -254,6 +263,7 @@ pub fn repo_config_fields(
         worktrees_layout,
         branches_refresh_mins,
         diff_line_numbers,
+        conflict_editor,
         copy,
         run,
     })
@@ -342,6 +352,9 @@ pub struct RepoConfigFields {
     pub branches_refresh_mins: String,
     /// `""`, `"true"`, or `"false"`; lives in the global config.
     pub diff_line_numbers: String,
+    /// The resolver's external editor, `None` for the built-in one; lives in
+    /// the global config.
+    pub conflict_editor: Option<ConflictEditor>,
     /// Files copied into each new worktree. Kept as a list so a path
     /// containing a comma survives a round trip through the TUI's list editor.
     pub copy: Vec<String>,
@@ -381,6 +394,7 @@ pub fn save_config_edits(
     apply_unset(&mut doc, "worktrees_layout")?;
     apply_unset(&mut doc, "branches_refresh_mins")?;
     apply_unset(&mut doc, "diff_line_numbers")?;
+    apply_unset(&mut doc, "conflict_editor")?;
     save_doc(&file, &doc)?;
     if let Some(path) = global_config {
         save_global_setting(path, "auto_update_check", &fields.auto_update_check)?;
@@ -388,9 +402,57 @@ pub fn save_config_edits(
         save_global_setting(path, "worktrees_layout", &fields.worktrees_layout)?;
         save_global_setting(path, "branches_refresh_mins", &fields.branches_refresh_mins)?;
         save_global_setting(path, "diff_line_numbers", &fields.diff_line_numbers)?;
+        save_global_conflict_editor(path, fields.conflict_editor.as_ref())?;
         save_global_commands(path, &global_cmds)?;
     }
     Ok(file)
+}
+
+/// Writes (or clears) `conflict_editor` in the global config at `path`,
+/// leaving the file untouched when the key is absent and stays that way.
+fn save_global_conflict_editor(path: &Path, editor: Option<&ConflictEditor>) -> Result<()> {
+    let mut doc = load_doc(path)?;
+    let present = doc.get("conflict_editor").is_some();
+    match editor.filter(|e| !e.command.trim().is_empty()) {
+        Some(editor) => set_conflict_editor(&mut doc, editor),
+        None if present => {
+            apply_unset(&mut doc, "conflict_editor")?;
+        }
+        None => return Ok(()),
+    }
+    save_doc(path, &doc)
+}
+
+/// Writes `conflict_editor` in the shape it loads back from: a bare string
+/// for the terminal-mode default, a `{ command, mode }` table otherwise.
+fn set_conflict_editor(doc: &mut DocumentMut, editor: &ConflictEditor) {
+    let command = editor.command.trim();
+    if editor.mode == CommandMode::Terminal {
+        doc["conflict_editor"] = toml_value(command);
+    } else {
+        let mut table = toml_edit::InlineTable::new();
+        table.insert("command", command.into());
+        table.insert("mode", editor.mode.as_str().into());
+        doc["conflict_editor"] = toml_value(table);
+    }
+}
+
+/// Parses a `conflict_editor` value as typed on the command line: a bare
+/// template, or a `{ command = "…", mode = "…" }` inline table for a
+/// background editor.
+fn parse_conflict_editor(raw: &str) -> Result<ConflictEditor> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        bail!("empty value; use `wtm config unset conflict_editor` for the built-in editor");
+    }
+    if !raw.starts_with('{') {
+        return Ok(ConflictEditor::new(raw));
+    }
+    let parsed: FileConfig = toml::from_str(&format!("conflict_editor = {raw}"))
+        .context("expected a template or { command = \"…\", mode = \"background\" }")?;
+    parsed
+        .conflict_editor
+        .context("expected a template or { command = \"…\", mode = \"background\" }")
 }
 
 /// Writes the globally-saved open commands to the user-wide config at `path`,
@@ -547,6 +609,10 @@ fn show(cwd: &Path, json: bool) -> Result<()> {
                 "value": cfg.diff_line_numbers(),
                 "source": cfg.diff_line_numbers_source,
             },
+            "conflict_editor": {
+                "value": cfg.conflict_editor,
+                "source": cfg.conflict_editor_source,
+            },
             "version": crate::update::CURRENT_VERSION,
             "setup": {
                 "copy": { "value": cfg.setup.copy, "source": cfg.copy_source },
@@ -602,6 +668,18 @@ fn show(cwd: &Path, json: bool) -> Result<()> {
         cfg.diff_line_numbers(),
         cfg.diff_line_numbers_source
     );
+    match &cfg.conflict_editor {
+        Some(editor) => println!(
+            "  conflict_editor = {:?}   ({}, {})",
+            editor.command,
+            cfg.conflict_editor_source,
+            editor.mode.as_str()
+        ),
+        None => println!(
+            "  conflict_editor = (built-in)   ({})",
+            cfg.conflict_editor_source
+        ),
+    }
     println!(
         "  setup.copy   = {:?}   ({})",
         cfg.setup.copy, cfg.copy_source
@@ -648,6 +726,13 @@ fn get(cwd: &Path, key: &str, json: bool) -> Result<()> {
         "worktrees_layout" => json!(cfg.worktrees_layout().as_str()),
         "branches_refresh_mins" => json!(cfg.branches_refresh_mins()),
         "diff_line_numbers" => json!(cfg.diff_line_numbers()),
+        // `get` prints the template; `--json` on `show` keeps the mode.
+        "conflict_editor" => json!(
+            cfg.conflict_editor
+                .as_ref()
+                .map(|e| e.command.clone())
+                .unwrap_or_default()
+        ),
         "setup.copy" => json!(cfg.setup.copy),
         "setup.run" => json!(cfg.setup.run),
         _ => unreachable!("known_key checked"),
@@ -977,6 +1062,7 @@ fn apply_set(doc: &mut DocumentMut, key: &str, raw: &str) -> Result<()> {
         "diff_line_numbers" => {
             doc["diff_line_numbers"] = toml_value(parse_bool(raw)?);
         }
+        "conflict_editor" => set_conflict_editor(doc, &parse_conflict_editor(raw)?),
         "setup.copy" | "setup.run" => {
             let sub = key.strip_prefix("setup.").unwrap();
             let setup = doc
@@ -1001,6 +1087,7 @@ fn apply_unset(doc: &mut DocumentMut, key: &str) -> Result<bool> {
         "worktrees_layout" => doc.remove("worktrees_layout").is_some(),
         "branches_refresh_mins" => doc.remove("branches_refresh_mins").is_some(),
         "diff_line_numbers" => doc.remove("diff_line_numbers").is_some(),
+        "conflict_editor" => doc.remove("conflict_editor").is_some(),
         "setup.copy" | "setup.run" => {
             let sub = key.strip_prefix("setup.").unwrap();
             let removed = doc
@@ -1383,9 +1470,57 @@ mod tests {
             worktrees_layout: String::new(),
             branches_refresh_mins: String::new(),
             diff_line_numbers: String::new(),
+            conflict_editor: None,
             copy: copy.iter().map(|s| (*s).to_string()).collect(),
             run: run.iter().map(|s| (*s).to_string()).collect(),
         }
+    }
+
+    /// `conflict_editor` round-trips through the CLI in both spellings and
+    /// through the Settings editor, which keeps it in the global file: a bare
+    /// template stays a bare string, a background editor becomes a table, and
+    /// clearing the field removes the key.
+    #[test]
+    fn conflict_editor_round_trips_through_cli_and_editor() {
+        let mut doc = DocumentMut::new();
+        apply_set(&mut doc, "conflict_editor", "nvim {path}").unwrap();
+        assert_eq!(doc.to_string(), "conflict_editor = \"nvim {path}\"\n");
+        apply_set(
+            &mut doc,
+            "conflict_editor",
+            r#"{ command = "code {path}", mode = "background" }"#,
+        )
+        .unwrap();
+        let cfg: FileConfig = toml::from_str(&doc.to_string()).unwrap();
+        assert_eq!(
+            cfg.conflict_editor,
+            Some(ConflictEditor::new("code {path}").with_mode(CommandMode::Background))
+        );
+        assert!(apply_set(&mut doc, "conflict_editor", "  ").is_err());
+        assert!(apply_set(&mut doc, "conflict_editor", "{ mode = \"terminal\" }").is_err());
+        assert!(apply_unset(&mut doc, "conflict_editor").unwrap());
+        assert!(doc.get("conflict_editor").is_none());
+
+        let repo = tempfile::tempdir().unwrap();
+        let global = repo.path().join("global.toml");
+        let mut f = fields("sibling", &[], &[], &[]);
+        f.conflict_editor = Some(ConflictEditor::new("hx {path}"));
+        save_config_edits(repo.path(), Some(&global), &f).unwrap();
+        let loaded = repo_config_fields(repo.path(), Some(&global)).unwrap();
+        assert_eq!(
+            loaded.conflict_editor,
+            Some(ConflictEditor::new("hx {path}"))
+        );
+        assert!(
+            !std::fs::read_to_string(repo.path().join(CONFIG_FILE))
+                .unwrap()
+                .contains("conflict_editor"),
+            "the editor is a wtm-wide preference and belongs in the global file"
+        );
+        f.conflict_editor = None;
+        save_config_edits(repo.path(), Some(&global), &f).unwrap();
+        let loaded = repo_config_fields(repo.path(), Some(&global)).unwrap();
+        assert_eq!(loaded.conflict_editor, None);
     }
 
     #[test]

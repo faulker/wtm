@@ -1056,6 +1056,10 @@ pub struct ResolverState {
     /// keypress; without this the pane would sit on the last file that finished
     /// loading and look like it had missed the keys.
     pub loading: Option<String>,
+    /// Modification time of the file under the cursor as of its last read, so
+    /// the periodic status refresh can tell an outside edit (an editor, a
+    /// mergetool) from the bytes it already parsed. `None` until a read lands.
+    pub current_mtime: Option<std::time::SystemTime>,
 }
 
 /// Result of a background resolver file read, matched back to the cursor by
@@ -1064,6 +1068,14 @@ pub struct ResolverLoad {
     generation: u64,
     path: String,
     file: Option<ResolverFile>,
+    /// The file's mtime at the moment it was read; see `ResolverState::current_mtime`.
+    mtime: Option<std::time::SystemTime>,
+}
+
+/// Modification time of `path`, or `None` when it cannot be stat'ed (a file
+/// deleted on one side of the conflict, say).
+fn file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
 /// A conflicted file loaded into the resolver: its parsed contents plus the
@@ -1422,6 +1434,15 @@ pub fn current_file_index(rows: &[DiffRow], cursor: usize) -> Option<usize> {
         Some(DiffRow::File { index, .. }) => Some(*index),
         _ => None,
     }
+}
+
+/// Finds the row showing the file at `path`, if it is listed (and not hidden
+/// under a collapsed folder).
+pub fn row_for_path(rows: &[DiffRow], files: &[StatusEntry], path: &str) -> Option<usize> {
+    rows.iter().position(|row| match row {
+        DiffRow::File { index, .. } => files.get(*index).is_some_and(|f| f.path == path),
+        DiffRow::Folder { .. } => false,
+    })
 }
 
 /// Which part of the commit dialog has keyboard focus.
@@ -1932,6 +1953,11 @@ pub struct App {
     /// worktree directory to run it in. `tui::run` executes it after restoring
     /// the terminal, so an interactive program gets this terminal to itself.
     pub exec_on_exit: Option<(String, String)>,
+    /// Set by a terminal-mode `conflict_editor`: the shell command and the
+    /// worktree directory to run it in. Unlike `exec_on_exit` the TUI comes
+    /// back: `tui::run` suspends the terminal, waits for the editor to exit,
+    /// restores the screen, and hands the result to `resume_after_editor`.
+    pub suspend_for: Option<(String, String)>,
     pub quit: bool,
     /// When set, q/Esc will not quit until this instant. Armed by back
     /// navigation so a duplicate key buffered while a slow tick/draw delayed
@@ -2030,6 +2056,7 @@ impl App {
             update_prompted: false,
             restart_exe: None,
             exec_on_exit: None,
+            suspend_for: None,
             quit: false,
             ignore_quit_until: None,
         };
@@ -5333,6 +5360,7 @@ impl App {
     fn apply_changes_files(&mut self, name: String, files: Vec<StatusEntry>, preserve_marks: bool) {
         let tree = self.file_tree;
         self.sync_dirty_count(&name, &files);
+        self.reconcile_resolver(&name, &files);
         if preserve_marks {
             let old_path = {
                 let c = &self.changes;
@@ -5354,7 +5382,14 @@ impl App {
             c.rows = build_rows(&files, tree, &self.collapsed_folders);
             c.files = files;
             c.marked = new_marked;
-            c.selected = c.selected.min(c.rows.len().saturating_sub(1));
+            // Follow the file, not the row number: a file appearing or
+            // disappearing above the cursor would otherwise silently swap
+            // the diff on screen for a neighbour's.
+            c.selected = old_path
+                .as_deref()
+                .and_then(|p| row_for_path(&c.rows, &c.files, p))
+                .unwrap_or(c.selected)
+                .min(c.rows.len().saturating_sub(1));
             c.name = name;
             c.last_refresh = Instant::now();
             let new_path = current_file_index(&c.rows, c.selected)
@@ -7953,6 +7988,7 @@ impl App {
             file: 0,
             current: None,
             loading: None,
+            current_mtime: None,
         });
         self.load_resolver_file();
         // The resolver *is* the changes pane, so opening one means putting that
@@ -7998,6 +8034,7 @@ impl App {
             file: 0,
             current: None,
             loading: None,
+            current_mtime: None,
         }))
     }
 
@@ -8124,21 +8161,27 @@ impl App {
         // triggered it, and a test run must never be left waiting on a thread:
         // read inline for them, exactly as `start_update_check` does.
         if cfg!(test) {
+            let mtime = file_mtime(&cx.dir.join(&path));
             let file = read_resolver_file(&cx, &path);
             self.apply_resolver_load(ResolverLoad {
                 generation,
                 path,
                 file,
+                mtime,
             });
             return;
         }
         let (tx, rx) = channel::<ResolverLoad>();
         std::thread::spawn(move || {
+            // Stat before the read: a write that lands between the two is then
+            // seen as a change on the next refresh rather than missed.
+            let mtime = file_mtime(&cx.dir.join(&path));
             let file = read_resolver_file(&cx, &path);
             let _ = tx.send(ResolverLoad {
                 generation,
                 path,
                 file,
+                mtime,
             });
         });
         self.resolver_pending = Some(Task::new(rx));
@@ -8167,7 +8210,84 @@ impl App {
                 return;
             }
             r.current = load.file;
+            r.current_mtime = load.mtime;
             r.loading = None;
+        }
+    }
+
+    /// Folds a fresh status listing for the resolver's worktree into the
+    /// resolver, so conflicts settled outside wtm show up without pressing `r`:
+    /// a file staged from a terminal or a mergetool flips to resolved, one
+    /// edited in another editor is re-read, a rebase that moved on to its next
+    /// conflicting commit gets those files listed, and an operation finished
+    /// (or aborted) elsewhere hands the pane back. Runs on every status
+    /// refresh, which is already once a second while the resolver is on screen.
+    fn reconcile_resolver(&mut self, name: &str, files: &[StatusEntry]) {
+        let Some(r) = &mut self.resolver else {
+            return;
+        };
+        if r.target != name {
+            return;
+        }
+        let unmerged: Vec<&str> = files
+            .iter()
+            .filter(|e| git::is_conflict_code(&e.code))
+            .map(|e| e.path.as_str())
+            .collect();
+        let before_resolved = r.resolved.clone();
+        // A file is resolved exactly when git no longer lists it as unmerged;
+        // that is what every in-app resolution ends in too, so nothing the
+        // user staged here is undone by deriving it from status.
+        for (path, done) in r.files.iter().zip(r.resolved.iter_mut()) {
+            *done = !unmerged.contains(&path.as_str());
+        }
+        let mut added = false;
+        for path in &unmerged {
+            if !r.files.iter().any(|f| f == path) {
+                r.files.push(path.to_string());
+                r.resolved.push(false);
+                added = true;
+            }
+        }
+        // New unmerged files mean the operation moved on (a rebase's next
+        // commit); its side labels may have changed with it.
+        if added && let Ok(cx) = ops::conflict_context(&self.ctx, name) {
+            r.cx = cx;
+        }
+        // Re-read the file under the cursor when git's view of it flipped or its
+        // bytes changed underneath the parsed hunks. Never while a read is in
+        // flight: its mtime is not known yet, and the read will bring it.
+        let reload = r.loading.is_none()
+            && match r.files.get(r.file) {
+                Some(path) => {
+                    r.resolved.get(r.file) != before_resolved.get(r.file)
+                        || r.current_mtime != file_mtime(&r.cx.dir.join(path))
+                }
+                None => false,
+            };
+        let changed = added || r.resolved != before_resolved;
+        let finished_outside = unmerged.is_empty()
+            && !matches!(r.kind, ops::ResolveKind::StashPop { .. })
+            && git::detect_in_progress(&r.cx.dir).is_none();
+        if finished_outside {
+            // Committed, continued, or aborted from a terminal: there is nothing
+            // left for `c` to do. The list's own in-progress flag would
+            // otherwise say so until its next full reload, and keep asking for
+            // a resolver that cannot be built.
+            let kind = r.kind;
+            self.resolver = None;
+            self.resolver_pending = None;
+            if let Some(wt) = self.worktrees.iter_mut().find(|w| w.name == name) {
+                wt.in_progress = None;
+            }
+            self.message = Some(format!("{} in '{name}' finished outside wtm", kind.label()));
+            return;
+        }
+        if reload {
+            self.load_resolver_file();
+        }
+        if changed && unmerged.is_empty() {
+            self.message = Some("every conflict is resolved · press c to finish".to_string());
         }
     }
 
@@ -8414,6 +8534,10 @@ impl App {
         let Some((target, path)) = target_path else {
             return;
         };
+        if let Some(editor) = self.ctx.config.conflict_editor.clone() {
+            self.open_in_conflict_editor(&editor, &target, &path);
+            return;
+        }
         let hunk = match self.resolver.as_ref().and_then(|r| r.current.as_ref()) {
             Some(rf) if at_hunk => rf.hunk,
             _ => 0,
@@ -8433,6 +8557,71 @@ impl App {
             }
             Err(e) => self.set_error(format!("{e:#}")),
         }
+    }
+
+    /// Hands the conflicted file at `path` to the configured `conflict_editor`
+    /// instead of the built-in one. A terminal editor suspends the TUI until it
+    /// exits (`tui::run` does the hand-over, then `resume_after_editor` re-reads
+    /// the file); a background editor is spawned detached and the once-a-second
+    /// status refresh re-reads the file when it changes on disk.
+    fn open_in_conflict_editor(
+        &mut self,
+        editor: &crate::config::ConflictEditor,
+        target: &str,
+        path: &str,
+    ) {
+        let Some(dir) = self.resolver.as_ref().map(|r| r.cx.dir.clone()) else {
+            return;
+        };
+        let branch = self
+            .worktrees
+            .iter()
+            .find(|w| w.name == target)
+            .and_then(|w| w.branch.clone())
+            .unwrap_or_default();
+        let file = dir.join(path).display().to_string();
+        let dir = dir.display().to_string();
+        let cmd = crate::config::expand_open_command(
+            &editor.command,
+            &crate::config::OpenCommandVars {
+                path: &file,
+                name: target,
+                branch: &branch,
+                status: "",
+            },
+        );
+        match editor.mode {
+            CommandMode::Terminal => self.suspend_for = Some((cmd, dir)),
+            CommandMode::Background => {
+                self.spawn_in_dir(&cmd, &dir, target);
+                self.message = Some(format!(
+                    "opened '{path}' in your editor · wtm re-reads it when it changes on disk"
+                ));
+            }
+        }
+    }
+
+    /// Picks up after a terminal-mode `conflict_editor` has exited and the TUI
+    /// is back on screen: the file is re-read so hunks settled in the editor
+    /// drop out of the resolver, and a failed launch is reported.
+    pub fn resume_after_editor(&mut self, result: Result<std::process::ExitStatus, String>) {
+        let path = self.resolver_current_path();
+        self.load_resolver_file();
+        match (result, path) {
+            (Err(e), _) => self.set_error(e),
+            (Ok(status), Some(path)) if !status.success() => {
+                self.message = Some(format!("editor exited with {status} · re-read '{path}'"));
+            }
+            (Ok(_), Some(path)) => {
+                self.message = Some(format!(
+                    "re-read '{path}' · a to stage it once the markers are gone"
+                ));
+            }
+            (Ok(_), None) => {}
+        }
+        // The editor may have staged or committed on its own; the next status
+        // refresh folds that in, so ask for one now rather than in a second.
+        self.refresh_diff();
     }
 
     /// Key handling while the whole-file editor is open: Ctrl+S writes the file
@@ -8674,7 +8863,8 @@ impl App {
     /// cherry-pick, or drop the popped stash) and returns to the worktree list.
     /// Errors (e.g. conflicts still unresolved) surface in the modal error popup.
     fn resolver_complete(&mut self) {
-        let Some((target, kind)) = self.resolver.as_ref().map(|r| (r.target.clone(), r.kind)) else {
+        let Some((target, kind)) = self.resolver.as_ref().map(|r| (r.target.clone(), r.kind))
+        else {
             return;
         };
         // Choices made with o/t/b live in memory until `w` writes them. Say so
@@ -8737,7 +8927,8 @@ impl App {
     /// Drops the commit a rebase stopped on and carries on with the rest.
     /// Only a rebase has anything to skip; other kinds report why not.
     fn resolver_skip_commit(&mut self) {
-        let Some((target, kind)) = self.resolver.as_ref().map(|r| (r.target.clone(), r.kind)) else {
+        let Some((target, kind)) = self.resolver.as_ref().map(|r| (r.target.clone(), r.kind))
+        else {
             return;
         };
         if kind != ops::ResolveKind::Rebase {
@@ -8769,7 +8960,8 @@ impl App {
 
     /// Aborts the in-progress operation and returns to the worktree list.
     fn abort_resolver(&mut self) {
-        let Some((target, kind)) = self.resolver.as_ref().map(|r| (r.target.clone(), r.kind)) else {
+        let Some((target, kind)) = self.resolver.as_ref().map(|r| (r.target.clone(), r.kind))
+        else {
             return;
         };
         match ops::abort_resolution(&self.ctx, &target, kind) {
@@ -12107,10 +12299,7 @@ mod tests {
         assert!(matches!(app.view, View::StashTarget { pop: true, .. }));
         press(&mut app, KeyCode::Enter);
         settle(&mut app);
-        assert!(
-            app.resolver.is_some(),
-            "conflicting pop opens the resolver"
-        );
+        assert!(app.resolver.is_some(), "conflicting pop opens the resolver");
 
         press(&mut app, KeyCode::Char('t')); // take the stashed side
         press(&mut app, KeyCode::Char('w')); // stage
@@ -13320,6 +13509,164 @@ mod tests {
         );
     }
 
+    /// Runs one status refresh for the changes pane and folds it in, the way
+    /// the once-a-second tick does while the resolver is on screen.
+    fn refresh_status_now(app: &mut App) {
+        app.refresh_diff();
+        settle_status_refresh(app);
+    }
+
+    /// A conflict fixed and staged from a terminal shows as resolved on the
+    /// next status refresh, without `r`: the file list ticks it and the hunk
+    /// pane stops showing hunks that are no longer on disk.
+    #[test]
+    fn resolver_reflects_a_file_staged_outside_wtm_without_reload() {
+        let (_tmp, mut app) = test_app();
+        let feat = into_conflict_resolver_two_files(&mut app);
+        assert_eq!(resolver(&app).resolved, vec![false, false]);
+        assert!(resolver(&app).current.is_some(), "a.txt starts with hunks");
+
+        // Ensure the mtime moves past the resolver's first read, even on a
+        // filesystem with one-second timestamps.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(feat.join("a.txt"), "fixed elsewhere\n").unwrap();
+        crate::git::stage_paths(&feat, &["a.txt".to_string()]).unwrap();
+
+        refresh_status_now(&mut app);
+        let r = resolver(&app);
+        assert_eq!(r.files, vec!["a.txt", "b.txt"], "the list keeps its rows");
+        assert_eq!(
+            r.resolved,
+            vec![true, false],
+            "git's view is the list's view"
+        );
+        assert!(
+            r.current.is_none(),
+            "the cursor's file was re-read and has no hunks left"
+        );
+        assert!(
+            crate::git::is_merging(&feat),
+            "nothing completed on the user's behalf"
+        );
+    }
+
+    /// A file edited in another editor but not yet staged is re-read too, so
+    /// the pane shows the markers are gone and points at `a` rather than
+    /// showing hunks that no longer exist.
+    #[test]
+    fn resolver_rereads_a_file_edited_outside_wtm() {
+        let (_tmp, mut app) = test_app();
+        let feat = into_conflict_resolver(&mut app);
+        assert!(resolver(&app).current.is_some());
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(feat.join("shared.txt"), "hand merged\n").unwrap();
+
+        refresh_status_now(&mut app);
+        let r = resolver(&app);
+        assert_eq!(r.resolved, vec![false], "still unmerged until staged");
+        assert!(
+            r.current.is_none(),
+            "but the markers are gone: {:?}",
+            r.current.is_some()
+        );
+        let out = render_app_rows(&mut app, 100, 30);
+        assert!(
+            out.iter().any(|l| l.contains("press a to stage it")),
+            "the pane says what is left to do: {out:#?}"
+        );
+    }
+
+    /// Choices made in the resolver are not thrown away by the refresh: a file
+    /// nobody touched keeps its in-memory hunk decisions.
+    #[test]
+    fn status_refresh_keeps_undisturbed_resolver_choices() {
+        let (_tmp, mut app) = test_app();
+        let _feat = into_conflict_resolver(&mut app);
+        press(&mut app, KeyCode::Char('t'));
+        let before: Vec<_> = resolver(&app).current.as_ref().unwrap().actions.clone();
+        assert!(before.iter().any(Option::is_some));
+        refresh_status_now(&mut app);
+        assert_eq!(resolver(&app).current.as_ref().unwrap().actions, before);
+    }
+
+    /// A merge finished from a terminal (`git commit`, or an abort) has nothing
+    /// left for the resolver to do: the pane hands itself back on the next
+    /// status refresh instead of waiting for the list's minute-long reload.
+    #[test]
+    fn resolver_closes_when_the_merge_finishes_outside_wtm() {
+        let (_tmp, mut app) = test_app();
+        let feat = into_conflict_resolver(&mut app);
+        git(&feat, &["merge", "--abort"]);
+        assert!(app.resolver.is_some(), "not yet noticed");
+
+        refresh_status_now(&mut app);
+        assert!(app.resolver.is_none(), "the abort was picked up");
+        assert_eq!(
+            app.worktrees
+                .iter()
+                .find(|w| w.name == "feature")
+                .and_then(|w| w.in_progress),
+            None,
+            "the list row no longer claims a merge in progress"
+        );
+        assert!(
+            app.message
+                .as_deref()
+                .is_some_and(|m| m.contains("finished outside wtm")),
+            "{:?}",
+            app.message
+        );
+    }
+
+    /// With a `conflict_editor` configured, `e` hands the file to it instead of
+    /// the built-in editor: a terminal editor asks `tui::run` to suspend for
+    /// it, with `{path}` expanded to the file's absolute path.
+    #[test]
+    fn resolver_edit_uses_the_configured_terminal_editor() {
+        let (_tmp, mut app) = test_app();
+        let feat = into_conflict_resolver(&mut app);
+        app.ctx.config.conflict_editor =
+            Some(crate::config::ConflictEditor::new("vi {path} # {name}"));
+
+        press(&mut app, KeyCode::Char('e'));
+        assert!(app.modal.is_none(), "the built-in editor stays closed");
+        let (cmd, dir) = app.suspend_for.take().expect("a suspend request");
+        assert_eq!(
+            cmd,
+            format!("vi {} # feature", feat.join("shared.txt").display())
+        );
+        assert_eq!(dir, feat.display().to_string());
+
+        // The editor did its job; coming back re-reads the file.
+        std::fs::write(feat.join("shared.txt"), "hand merged\n").unwrap();
+        app.resume_after_editor(Ok(std::process::Command::new("true").status().unwrap()));
+        assert!(resolver(&app).current.is_none(), "re-read after the editor");
+        settle_background(&mut app);
+    }
+
+    /// A background editor is spawned detached and the TUI stays up; the file
+    /// is picked up by the status refresh once it changes on disk.
+    #[test]
+    fn resolver_edit_uses_a_background_editor_without_suspending() {
+        let (_tmp, mut app) = test_app();
+        let _feat = into_conflict_resolver(&mut app);
+        app.ctx.config.conflict_editor = Some(
+            crate::config::ConflictEditor::new("true {path}").with_mode(CommandMode::Background),
+        );
+
+        press(&mut app, KeyCode::Char('e'));
+        assert!(app.modal.is_none());
+        assert!(app.suspend_for.is_none());
+        assert!(
+            app.message
+                .as_deref()
+                .is_some_and(|m| m.contains("re-reads it when it changes")),
+            "{:?}",
+            app.message
+        );
+    }
+
     /// `a` is the escape hatch for a conflict fixed in the user's own editor:
     /// stage exactly what is on disk. It must refuse while markers remain.
     #[test]
@@ -13406,10 +13753,7 @@ mod tests {
             "feature version\nmain version\n",
             "the edit is on disk"
         );
-        assert!(
-            resolver(&app).current.is_none(),
-            "no conflict hunks remain"
-        );
+        assert!(resolver(&app).current.is_none(), "no conflict hunks remain");
         // Saving is not staging: git still sees the path as unmerged until `w`.
         assert_eq!(
             crate::git::conflicted_files(&feat).unwrap(),
@@ -13760,7 +14104,11 @@ mod tests {
             "the editor covers the pane, so its rows take no clicks"
         );
         click(&mut app, theirs_end - 2, row);
-        assert_eq!(action(&app), before, "the hunk behind the editor is untouched");
+        assert_eq!(
+            action(&app),
+            before,
+            "the hunk behind the editor is untouched"
+        );
         assert!(
             matches!(app.modal, Some(Modal::FileEditor { .. })),
             "the editor stays open"
@@ -13842,7 +14190,8 @@ mod tests {
         );
         // Footer hints follow the pane too.
         assert!(
-            rows.iter().any(|r| r.contains("stage") && r.contains("keep")),
+            rows.iter()
+                .any(|r| r.contains("stage") && r.contains("keep")),
             "resolver hints, not diff hints: {:#?}",
             rows.last()
         );
@@ -14687,7 +15036,10 @@ mod tests {
         app.tab = Tab::Branches;
         app.ensure_branches();
         settle_branches(&mut app);
-        assert!(app.branches.len() > 3, "need a few branches to move between");
+        assert!(
+            app.branches.len() > 3,
+            "need a few branches to move between"
+        );
 
         // A reload starts with the cursor at the top…
         app.branch_selected = 0;
@@ -16427,6 +16779,55 @@ mod tests {
         assert_eq!(app.changes.files[file].path, "pkg/deep/a.txt");
     }
 
+    /// The changed-file cursor follows the file, not the row number: a file
+    /// that appears (or disappears) above it on a refresh must not swap the
+    /// diff on screen for a neighbour's.
+    #[test]
+    fn changes_cursor_stays_on_its_file_when_another_file_changes() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("m.txt"), "m\n").unwrap();
+        app.refresh();
+        app.selected = app.worktrees.iter().position(|w| w.is_main).unwrap();
+        goto_tab(&mut app, Tab::Changes);
+        settle_diff(&mut app);
+        let on = |app: &App| {
+            current_file_index(&app.changes.rows, app.changes.selected)
+                .map(|i| app.changes.files[i].path.clone())
+        };
+        // The test repo's own `.wtm.toml` is untracked and sorts first; put
+        // the cursor on the file this test is about.
+        app.changes.selected =
+            row_for_path(&app.changes.rows, &app.changes.files, "m.txt").expect("m.txt listed");
+        app.load_diff_content(true);
+        settle_diff(&mut app);
+        assert_eq!(on(&app).as_deref(), Some("m.txt"));
+
+        // A new file sorts above the selected one.
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        refresh_status_now(&mut app);
+        settle_diff(&mut app);
+        assert_eq!(app.changes.files.len(), 3);
+        assert_eq!(
+            on(&app).as_deref(),
+            Some("m.txt"),
+            "cursor followed the file"
+        );
+
+        // And one above it going away moves the cursor up with the file.
+        std::fs::remove_file(root.join("a.txt")).unwrap();
+        refresh_status_now(&mut app);
+        settle_diff(&mut app);
+        assert_eq!(on(&app).as_deref(), Some("m.txt"));
+
+        // The selected file itself vanishing falls back to the same row.
+        std::fs::remove_file(root.join("m.txt")).unwrap();
+        std::fs::write(root.join("z.txt"), "z\n").unwrap();
+        refresh_status_now(&mut app);
+        settle_diff(&mut app);
+        assert_eq!(on(&app).as_deref(), Some("z.txt"));
+    }
+
     /// Opens the Changes tab on the main worktree with one changed file, cursor
     /// already on it, and the frame drawn so click geometry is recorded.
     fn changes_tab_with_one_file(app: &mut App) -> String {
@@ -16690,7 +17091,10 @@ mod tests {
             .expect("the table records a hit per visible PATH cell")
             .clone();
         let expected = app.worktrees[1].path.clone();
-        assert_eq!(hit.value, expected, "the untrimmed path is what gets copied");
+        assert_eq!(
+            hit.value, expected,
+            "the untrimmed path is what gets copied"
+        );
         platform::take_recorded();
 
         click(&mut app, hit.rect.x, hit.rect.y);
@@ -16771,6 +17175,7 @@ mod tests {
             file: 0,
             current: None,
             loading: Some("a.txt".to_string()),
+            current_mtime: None,
         });
         app.resolver_load_gen = 7;
 
@@ -16779,6 +17184,7 @@ mod tests {
             generation: 6,
             path: "a.txt".to_string(),
             file: None,
+            mtime: None,
         });
         assert_eq!(
             resolver(&app).loading.as_deref(),
@@ -16791,6 +17197,7 @@ mod tests {
             generation: 7,
             path: "b.txt".to_string(),
             file: None,
+            mtime: None,
         });
         assert_eq!(resolver(&app).loading.as_deref(), Some("a.txt"));
 
@@ -16799,6 +17206,7 @@ mod tests {
             generation: 7,
             path: "a.txt".to_string(),
             file: None,
+            mtime: None,
         });
         assert!(resolver(&app).loading.is_none());
     }
@@ -16833,7 +17241,10 @@ mod tests {
         app.resolver_move_file(-1);
         assert_eq!(resolver(&app).file, 0);
         assert_eq!(
-            resolver(&app).current.as_ref().map(|rf| rf.file.path.clone()),
+            resolver(&app)
+                .current
+                .as_ref()
+                .map(|rf| rf.file.path.clone()),
             Some(first)
         );
     }

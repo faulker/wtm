@@ -583,7 +583,8 @@ pub const RESOLVER: &[Binding] = &[
         "edit the whole file, full screen, with the cursor on the hunk you are \
          looking at; line numbers on the left, scrolls in every direction \
          (arrows, PgUp/PgDn, or the wheel), Ctrl+S saves to disk and re-reads \
-         it, Esc discards",
+         it, Esc discards. With conflict_editor set, opens the file in that \
+         editor instead and re-reads it afterwards",
     ),
     both(
         "⇧E",

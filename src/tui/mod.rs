@@ -46,23 +46,14 @@ pub fn run(ctx: Ctx) -> Result<()> {
     let mut app = App::new(ctx)?;
     let mut terminal = ratatui::init();
     // Mouse reporting lets the diff, log, and resolver views respond to clicks
-    // and the scroll wheel.
-    let _ = write_stdout(MOUSE_ON);
-    // On terminals that support the Kitty keyboard protocol (Ghostty, kitty,
-    // WezTerm, foot, recent iTerm2) this makes modified keys like Shift+Up/Down
-    // report their modifier reliably instead of looking like a bare arrow key.
+    // and the scroll wheel. On terminals that support the Kitty keyboard
+    // protocol (Ghostty, kitty, WezTerm, foot, recent iTerm2) the enhancement
+    // flags make modified keys like Shift+Up/Down report their modifier
+    // reliably instead of looking like a bare arrow key.
     let enhanced = matches!(supports_keyboard_enhancement(), Ok(true));
-    if enhanced {
-        let _ = execute!(
-            std::io::stdout(),
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        );
-    }
-    let result = event_loop(&mut terminal, &mut app);
-    if enhanced {
-        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
-    }
-    let _ = write_stdout(MOUSE_OFF);
+    enter_extras(enhanced);
+    let result = event_loop(&mut terminal, &mut app, enhanced);
+    leave_extras(enhanced);
     ratatui::restore();
     result?;
     if let Some(exe) = &app.restart_exe {
@@ -73,6 +64,49 @@ pub fn run(ctx: Ctx) -> Result<()> {
         return exec_in_terminal(cmd, dir);
     }
     Ok(())
+}
+
+/// Turns on what `ratatui::init` leaves off: mouse reporting, and the Kitty
+/// keyboard protocol where the terminal has it.
+fn enter_extras(enhanced: bool) {
+    let _ = write_stdout(MOUSE_ON);
+    if enhanced {
+        let _ = execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
+}
+
+/// Undoes [`enter_extras`], before `ratatui::restore` hands the terminal back.
+fn leave_extras(enhanced: bool) {
+    if enhanced {
+        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
+    let _ = write_stdout(MOUSE_OFF);
+}
+
+/// Runs a terminal-mode `conflict_editor` with the TUI suspended: the terminal
+/// is restored so the editor gets it to itself, and once the editor exits the
+/// TUI is set up again, redrawn from scratch, and told how it went.
+fn suspend_for_editor(
+    terminal: &mut DefaultTerminal,
+    enhanced: bool,
+    cmd: &str,
+    dir: &str,
+) -> Result<std::process::ExitStatus, String> {
+    leave_extras(enhanced);
+    ratatui::restore();
+    let result = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(dir)
+        .status()
+        .map_err(|e| format!("failed to run '{cmd}' in {dir}: {e}"));
+    *terminal = ratatui::init();
+    enter_extras(enhanced);
+    let _ = terminal.clear();
+    result
 }
 
 /// Writes a terminal control string straight to stdout, flushed. Used for the
@@ -116,8 +150,15 @@ const PARKED_POLL: Duration = Duration::from_millis(2000);
 
 /// Draw/input loop. Polls with a timeout so background create progress keeps
 /// the screen updating even without keypresses.
-fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
+fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, enhanced: bool) -> Result<()> {
     while !app.quit {
+        // A terminal editor asked for the screen: give it up, wait, take it
+        // back. Done here rather than in the key handler so the app never
+        // touches the terminal itself.
+        if let Some((cmd, dir)) = app.suspend_for.take() {
+            let result = suspend_for_editor(terminal, enhanced, &cmd, &dir);
+            app.resume_after_editor(result);
+        }
         // Drain any already-queued input before tick/draw. A slow refresh or
         // syntect pass must not delay Back/q; otherwise a second press buffered
         // during the stall can quit once the pop finally lands.

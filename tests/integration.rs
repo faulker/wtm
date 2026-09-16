@@ -2145,6 +2145,51 @@ fn diff_line_numbers_setting_round_trips() {
     assert_eq!(shown["diff_line_numbers"]["source"], "repo");
 }
 
+/// `conflict_editor` is unset by default (the built-in editor), takes a bare
+/// template that runs in the terminal or a `{ command, mode }` table for a
+/// background editor, and `get` prints just the template.
+#[test]
+fn conflict_editor_setting_round_trips() {
+    let (tmp, repo) = setup_repo();
+    let global = tmp.path().join("global.toml");
+
+    let shown = stdout_json(&wtm_global(&repo, &["config", "show", "--json"], &global));
+    assert!(shown["conflict_editor"]["value"].is_null());
+    assert_eq!(shown["conflict_editor"]["source"], "default");
+
+    wtm_global(
+        &repo,
+        &["config", "set", "-g", "conflict_editor", "nvim {path}"],
+        &global,
+    );
+    let shown = stdout_json(&wtm_global(&repo, &["config", "show", "--json"], &global));
+    assert_eq!(shown["conflict_editor"]["value"]["command"], "nvim {path}");
+    assert_eq!(shown["conflict_editor"]["value"]["mode"], "terminal");
+    assert_eq!(shown["conflict_editor"]["source"], "global");
+    let got = wtm_global(&repo, &["config", "get", "conflict_editor"], &global);
+    assert_eq!(String::from_utf8_lossy(&got.stdout).trim(), "nvim {path}");
+
+    // A repo-level table wins and carries its mode.
+    wtm_global(
+        &repo,
+        &[
+            "config",
+            "set",
+            "conflict_editor",
+            r#"{ command = "code {path}", mode = "background" }"#,
+        ],
+        &global,
+    );
+    let shown = stdout_json(&wtm_global(&repo, &["config", "show", "--json"], &global));
+    assert_eq!(shown["conflict_editor"]["value"]["command"], "code {path}");
+    assert_eq!(shown["conflict_editor"]["value"]["mode"], "background");
+    assert_eq!(shown["conflict_editor"]["source"], "repo");
+
+    wtm_global(&repo, &["config", "unset", "conflict_editor"], &global);
+    let shown = stdout_json(&wtm_global(&repo, &["config", "show", "--json"], &global));
+    assert_eq!(shown["conflict_editor"]["source"], "global");
+}
+
 /// Open commands layer instead of overriding: a command in the global config
 /// is offered alongside the repo's own, and a `{ command, mode }` entry keeps
 /// its run mode through a load.

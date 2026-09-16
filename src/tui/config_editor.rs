@@ -15,7 +15,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
 use super::app::TextInput;
 use super::highlight::{self, DIFF_THEMES};
-use crate::config::{self, OpenCommand};
+use crate::config::{self, ConflictEditor, OpenCommand};
 use crate::settings::{self, RepoConfigFields};
 
 /// Rows holding an editable value (worktree_dir, open_command, setup.copy,
@@ -40,9 +40,12 @@ pub const LAYOUT_ROW: usize = TEXT_ROWS + 2;
 pub const BRANCHES_REFRESH_ROW: usize = TEXT_ROWS + 3;
 /// Index of the diff line-number gutter toggle.
 pub const DIFF_LINE_NUMBERS_ROW: usize = TEXT_ROWS + 4;
+/// Index of the conflict resolver's external editor: Enter edits the command
+/// template, Space flips it between terminal and background mode.
+pub const CONFLICT_EDITOR_ROW: usize = TEXT_ROWS + 5;
 /// Number of setting rows, text fields plus the cycle rows, the Branches
-/// refresh timeout, and the diff line-number toggle.
-pub const FIELD_ROWS: usize = TEXT_ROWS + 5;
+/// refresh timeout, the diff line-number toggle, and the conflict editor.
+pub const FIELD_ROWS: usize = TEXT_ROWS + 6;
 /// Index of the "check for updates now" row.
 pub const CHECK_ROW: usize = FIELD_ROWS;
 /// Total selectable rows.
@@ -506,7 +509,21 @@ impl ConfigEditor {
             LAYOUT_ROW => &self.fields.worktrees_layout,
             BRANCHES_REFRESH_ROW => &self.fields.branches_refresh_mins,
             DIFF_LINE_NUMBERS_ROW => &self.fields.diff_line_numbers,
+            CONFLICT_EDITOR_ROW => self
+                .fields
+                .conflict_editor
+                .as_ref()
+                .map_or("", |e| e.command.as_str()),
             _ => "",
+        }
+    }
+
+    /// The `conflict_editor` row's value as one line: the template and, when
+    /// it is set, the mode it runs in.
+    pub fn conflict_editor_summary(&self) -> String {
+        match &self.fields.conflict_editor {
+            Some(e) => format!("{}  ({})", e.command, e.mode.as_str()),
+            None => String::new(),
         }
     }
 
@@ -570,8 +587,34 @@ impl ConfigEditor {
             LAYOUT_ROW => self.fields.worktrees_layout = value,
             BRANCHES_REFRESH_ROW => self.fields.branches_refresh_mins = value,
             DIFF_LINE_NUMBERS_ROW => self.fields.diff_line_numbers = value,
+            // A cleared template goes back to the built-in editor; a new one
+            // keeps whatever mode was already chosen.
+            CONFLICT_EDITOR_ROW => {
+                self.fields.conflict_editor = if value.is_empty() {
+                    None
+                } else {
+                    let mode = self
+                        .fields
+                        .conflict_editor
+                        .as_ref()
+                        .map_or(config::CommandMode::Terminal, |e| e.mode);
+                    Some(ConflictEditor::new(value).with_mode(mode))
+                }
+            }
             // List rows are edited as lists, never as one text value.
             _ => {}
+        }
+    }
+
+    /// Flips the conflict editor between taking over the terminal and running
+    /// detached. Nothing to flip while the built-in editor is in use.
+    fn toggle_conflict_editor_mode(&mut self) -> bool {
+        match &mut self.fields.conflict_editor {
+            Some(e) => {
+                e.mode = e.mode.toggled();
+                true
+            }
+            None => false,
         }
     }
 
@@ -743,6 +786,11 @@ impl ConfigEditor {
                 self.cycle_worktrees_layout();
                 return self.save_fields(message);
             }
+            KeyCode::Char(' ') if self.selected == CONFLICT_EDITOR_ROW => {
+                if self.toggle_conflict_editor_mode() {
+                    return self.save_fields(message);
+                }
+            }
             // List rows open their own editor rather than a text input, so an
             // entry containing a comma stays one item.
             KeyCode::Enter if self.selected == OPEN_COMMAND_ROW => {
@@ -761,7 +809,9 @@ impl ConfigEditor {
                 ))
             }
             KeyCode::Enter
-                if self.selected < TEXT_ROWS || self.selected == BRANCHES_REFRESH_ROW =>
+                if self.selected < TEXT_ROWS
+                    || self.selected == BRANCHES_REFRESH_ROW
+                    || self.selected == CONFLICT_EDITOR_ROW =>
             {
                 // Prefill with the effective default when the field is unset so
                 // the user sees what they are changing from.
@@ -842,6 +892,49 @@ mod tests {
             ed.fields.auto_update_check, "",
             "third press returns to the inherited default"
         );
+    }
+
+    /// The conflict editor row edits its template as text and flips its run
+    /// mode with Space; clearing the template goes back to the built-in editor.
+    #[test]
+    fn conflict_editor_row_edits_template_and_toggles_mode() {
+        let mut ed = editor();
+        ed.selected = CONFLICT_EDITOR_ROW;
+        // Nothing configured: Space has nothing to flip and opens no input.
+        press(&mut ed, KeyCode::Char(' '));
+        assert_eq!(ed.fields.conflict_editor, None);
+        assert!(ed.editing.is_none());
+        press(&mut ed, KeyCode::Enter);
+        for c in "hx {path}".chars() {
+            press(&mut ed, KeyCode::Char(c));
+        }
+        press(&mut ed, KeyCode::Enter);
+        assert_eq!(
+            ed.fields.conflict_editor,
+            Some(ConflictEditor::new("hx {path}")),
+            "a typed template runs in the terminal by default"
+        );
+        press(&mut ed, KeyCode::Char(' '));
+        assert_eq!(
+            ed.fields.conflict_editor.as_ref().unwrap().mode,
+            config::CommandMode::Background
+        );
+        assert_eq!(ed.conflict_editor_summary(), "hx {path}  (background)");
+        // Retyping keeps the chosen mode; clearing drops the setting.
+        press(&mut ed, KeyCode::Enter);
+        press(&mut ed, KeyCode::End);
+        press(&mut ed, KeyCode::Char('!'));
+        press(&mut ed, KeyCode::Enter);
+        assert_eq!(
+            ed.fields.conflict_editor,
+            Some(ConflictEditor::new("hx {path}!").with_mode(config::CommandMode::Background))
+        );
+        press(&mut ed, KeyCode::Enter);
+        for _ in 0.."hx {path}!".len() {
+            press(&mut ed, KeyCode::Backspace);
+        }
+        press(&mut ed, KeyCode::Enter);
+        assert_eq!(ed.fields.conflict_editor, None);
     }
 
     #[test]

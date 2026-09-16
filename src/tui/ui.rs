@@ -19,10 +19,10 @@ use super::app::{
     upstream_rows,
 };
 use super::config_editor::{
-    BRANCHES_REFRESH_ROW, CHECK_ROW, COPY_ROW, ConfigEditor, DIFF_LINE_NUMBERS_ROW, FIELD_ROWS,
-    LAYOUT_ROW, OPEN_COMMAND_ROW, OpenCommandEditor, RUN_ROW, StringListEditor,
-    THEME_PREVIEW_SAMPLE_LINES, THEME_ROW, UPDATE_ROW, check_line, form_lines, line_of_row,
-    preview_line,
+    BRANCHES_REFRESH_ROW, CHECK_ROW, CONFLICT_EDITOR_ROW, COPY_ROW, ConfigEditor,
+    DIFF_LINE_NUMBERS_ROW, FIELD_ROWS, LAYOUT_ROW, OPEN_COMMAND_ROW, OpenCommandEditor, RUN_ROW,
+    StringListEditor, THEME_PREVIEW_SAMPLE_LINES, THEME_ROW, UPDATE_ROW, check_line, form_lines,
+    line_of_row, preview_line,
 };
 use super::help::{self, Binding, HelpTab};
 use super::highlight;
@@ -165,6 +165,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                             r.loading.as_deref(),
                             app.resolver_scroll,
                             app.resolver_follow,
+                            true,
                         )
                     };
                     app.apply_resolver_draw(out.scroll, out.max_scroll, out.page, out.hits);
@@ -919,6 +920,7 @@ fn draw_worktrees_three_panel(frame: &mut Frame, area: Rect, app: &mut App) -> O
             r.loading.as_deref(),
             app.resolver_scroll,
             app.resolver_follow,
+            files_focused,
         );
         app.files_list = out.list;
         app.apply_resolver_draw(out.scroll, out.max_scroll, out.page, out.hits);
@@ -2720,6 +2722,7 @@ fn draw_settings_tab(
         "worktrees_layout",
         "branches_refresh_mins",
         "diff_line_numbers",
+        "conflict_editor",
     ];
     // Keep each description to one line at the form width (78) so wrapping
     // cannot desync [`line_of_row`] from what is drawn.
@@ -2733,6 +2736,7 @@ fn draw_settings_tab(
         "Worktrees tab layout. Three panels add files + diff. Enter cycles.",
         "Minutes the Branches tab keeps its list before refreshing.",
         "Show a line-number gutter beside the diff. Enter cycles.",
+        "Editor the resolver's e key uses ({path}). Enter edits, Space flips mode.",
     ];
     let mut lines: Vec<Line> = Vec::new();
 
@@ -2836,6 +2840,13 @@ fn draw_settings_tab(
             }
             _ if row == RUN_ROW && !editor.fields.run.is_empty() => {
                 spans.push(Span::styled(editor.run_summary(), highlight))
+            }
+            _ if row == CONFLICT_EDITOR_ROW => {
+                spans.push(if editor.fields.conflict_editor.is_some() {
+                    Span::styled(editor.conflict_editor_summary(), highlight)
+                } else {
+                    Span::styled("(default: built-in editor)".to_string(), highlight.dim())
+                })
             }
             _ if editor.field(row).is_empty() => {
                 spans.push(Span::styled("(default)".to_string(), highlight.dim()))
@@ -4924,7 +4935,11 @@ fn cell_text(text: &str, width: usize) -> String {
 
 /// The lines FINAL holds for a hunk, each tagged with the side it came from so
 /// a mixed resolution shows at a glance which lines are whose.
-fn final_lines(ours: &str, theirs: &str, action: Option<&ResolutionAction>) -> Vec<(String, Color)> {
+fn final_lines(
+    ours: &str,
+    theirs: &str,
+    action: Option<&ResolutionAction>,
+) -> Vec<(String, Color)> {
     let ours_lines = || {
         ours.lines()
             .map(|l| (l.to_string(), OURS_COLOR))
@@ -4989,10 +5004,7 @@ fn push_hunk_columns(lines: &mut Vec<Line<'static>>, h: &HunkColumns) {
             format!("[t] THEIRS · {} ▶", h.theirs_label),
         ),
         sep(),
-        Span::styled(
-            cell_text("FINAL", w),
-            Style::new().fg(theme::RESULT).bold(),
-        ),
+        Span::styled(cell_text("FINAL", w), Style::new().fg(theme::RESULT).bold()),
         sep(),
         head(
             ours_state,
@@ -5006,10 +5018,7 @@ fn push_hunk_columns(lines: &mut Vec<Line<'static>>, h: &HunkColumns) {
     let result = final_lines(h.ours, h.theirs, h.action);
     // An undecided hunk says so in FINAL rather than leaving the column blank:
     // the empty middle is exactly what the user has to act on.
-    let placeholder = [(
-        "⟨ nothing chosen — t / o / b ⟩".to_string(),
-        theme::WARNING,
-    )];
+    let placeholder = [("⟨ nothing chosen — t / o / b ⟩".to_string(), theme::WARNING)];
     let result: &[(String, Color)] = if h.action.is_none() {
         &placeholder
     } else if result.is_empty() {
@@ -5091,6 +5100,9 @@ fn draw_conflict_resolver(
     loading: Option<&str>,
     scroll: u16,
     follow: bool,
+    // Whether the conflicted-file list owns the keyboard, so its chrome lights
+    // up the same way the changed-file and commit panels do when focused.
+    focused: bool,
 ) -> ResolverDraw {
     let [list_area, detail_area] =
         Layout::horizontal([Constraint::Length(36), Constraint::Min(20)]).areas(area);
@@ -5118,7 +5130,7 @@ fn draw_conflict_resolver(
             ListItem::new(Line::from(vec![mark, Span::styled(path.clone(), name)]))
         })
         .collect();
-    let block = panel(format!("conflicts · {target}"));
+    let block = focus_panel(format!("conflicts · {target}"), focused);
     let inner = block.inner(list_area);
     let list = List::new(items)
         .block(block)
@@ -5166,21 +5178,31 @@ fn draw_conflict_resolver(
     }
 
     let Some(rf) = current else {
+        // No markers left on disk, but git only counts the file resolved once
+        // it is staged. A file fixed in another editor sits in that gap, and
+        // the pane has to say which state it is in rather than call both
+        // "resolved".
+        let staged = resolved.get(file).copied().unwrap_or(false);
+        let (status, next) = if staged {
+            (
+                "  ✓ resolved — no conflicts remain in this file",
+                "  press c to complete once every file is done",
+            )
+        } else {
+            (
+                "  ✓ no conflict markers remain in this file",
+                "  press a to stage it as resolved (or r to re-read it)",
+            )
+        };
         let para = Paragraph::new(vec![
             Line::from(""),
-            Line::styled(
-                "  ✓ resolved — no conflicts remain in this file",
-                Style::new().fg(theme::SUCCESS),
-            ),
+            Line::styled(status, Style::new().fg(theme::SUCCESS)),
             Line::from(""),
             Line::styled(
                 format!("  incoming from {} · {source_label}", incoming_source(kind)),
                 Style::new().dim(),
             ),
-            Line::styled(
-                "  press c to complete once every file is done",
-                Style::new().dim(),
-            ),
+            Line::styled(next, Style::new().dim()),
         ]);
         frame.render_widget(para, inner);
         return ResolverDraw {
@@ -5876,7 +5898,10 @@ mod tests {
             .unwrap();
         let buf = terminal.backend().buffer().clone();
         let hash_fg = |line: &str, y: u16| {
-            let x = line.find("1a2b3c4").or_else(|| line.find("5d6e7f8")).unwrap() as u16;
+            let x = line
+                .find("1a2b3c4")
+                .or_else(|| line.find("5d6e7f8"))
+                .unwrap() as u16;
             buf[(x, y)].style().fg
         };
         let text: Vec<String> = (0..5)
@@ -5904,6 +5929,7 @@ mod tests {
                 Some("src/lib.rs"),
                 0,
                 false,
+                true,
             );
         });
         let screen = out.join("\n");
@@ -5913,10 +5939,7 @@ mod tests {
             "a loading file must not be called resolved: {out:#?}"
         );
         // The row being read is marked in the file list too.
-        assert!(
-            out.iter().any(|l| l.contains("⟳ src/lib.rs")),
-            "{out:#?}"
-        );
+        assert!(out.iter().any(|l| l.contains("⟳ src/lib.rs")), "{out:#?}");
     }
 
     /// The footer and the help panel now read the same bindings, so a help-only
@@ -6005,7 +6028,10 @@ mod tests {
         });
         assert!(out[0].contains("commits · main · tree"), "{out:#?}");
         // A marked commit, its art, then the hash abbreviated to 9 chars.
-        assert!(out[1].contains("[x] ●  1a2b3c4d5 merge feature"), "{out:#?}");
+        assert!(
+            out[1].contains("[x] ●  1a2b3c4d5 merge feature"),
+            "{out:#?}"
+        );
         // The connector must sit under the commit's lane rather than under the
         // checkbox column. Both searches skip the panel's left border, which is
         // itself a `│`.
@@ -6353,6 +6379,42 @@ mod tests {
             !second[HELP_KEY_COL..].starts_with(' '),
             "indent should be exact, not deeper: {second:?}"
         );
+    }
+
+    /// The resolver's conflicted-file list is a focus target in the three-panel
+    /// layout, so its border must light up like the changed-file and commit
+    /// panels do instead of staying dim whichever panel owns the keyboard.
+    #[test]
+    fn resolver_file_list_lights_up_when_focused() {
+        let border_fg = |focused: bool| {
+            let mut terminal = Terminal::new(TestBackend::new(78, 8)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw_conflict_resolver(
+                        frame,
+                        frame.area(),
+                        "wt",
+                        "feature/login",
+                        &ResolveKind::Merge,
+                        &["src/main.rs".to_string()],
+                        &[false],
+                        0,
+                        None,
+                        None,
+                        0,
+                        false,
+                        focused,
+                    );
+                })
+                .unwrap();
+            terminal.backend().buffer()[(0, 0)].style().fg
+        };
+        assert_eq!(
+            border_fg(true),
+            Some(ACCENT),
+            "focused list uses the accent"
+        );
+        assert_eq!(border_fg(false), Some(BORDER), "unfocused list stays dim");
     }
 
     #[test]
@@ -6992,6 +7054,7 @@ mod tests {
                 None,
                 scroll,
                 follow,
+                true,
             );
         })
     }
@@ -7300,10 +7363,7 @@ mod tests {
     fn resolver_final_column_says_when_nothing_is_chosen() {
         let rf = resolver_file(vec![None, None], 0);
         let out = render_resolver_at(150, 30, ResolveKind::Merge, &rf, 0, true);
-        assert!(
-            out.iter().any(|r| r.contains("nothing chosen")),
-            "{out:#?}"
-        );
+        assert!(out.iter().any(|r| r.contains("nothing chosen")), "{out:#?}");
     }
 
     /// A narrow pane can't fit three columns of code, so it keeps the stacked

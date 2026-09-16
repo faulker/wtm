@@ -94,11 +94,12 @@ wtm config set --global diff_theme ocean          # Eighties (default), Mocha, O
 wtm config set --global worktrees_layout three_panel   # Worktrees tab: two_panel (default) or three_panel
 wtm config set --global branches_refresh_mins 10       # Branches tab cache timeout in minutes (default 10)
 wtm config set --global diff_line_numbers false        # hide the diff pane's line-number gutter (on by default)
+wtm config set --global conflict_editor "nvim {path}"  # resolver's e key opens files here instead of the built-in editor
 wtm config unset setup.copy      # back to the default (or the global value)
 wtm config path                  # where the config files live
 ```
 
-`diff_theme` and `worktrees_layout` can also be cycled on the Settings tab. Both are saved globally, like `auto_update_check`. `branches_refresh_mins` (default 10) is how long the Branches tab keeps its cached list; `r` on that tab always reloads immediately. `diff_line_numbers` (on by default) toggles the line-number gutter in the diff pane.
+`diff_theme` and `worktrees_layout` can also be cycled on the Settings tab. Both are saved globally, like `auto_update_check`. `branches_refresh_mins` (default 10) is how long the Branches tab keeps its cached list; `r` on that tab always reloads immediately. `diff_line_numbers` (on by default) toggles the line-number gutter in the diff pane. `conflict_editor` is the editor the conflict resolver's `e` key opens a file in, as a shell template with `{path}` (the file's absolute path), `{name}`, and `{branch}`; unset, wtm uses its built-in editor. A bare template takes over the terminal (wtm suspends and comes back when the editor exits); `{ command = "code {path}", mode = "background" }` spawns a GUI editor detached instead, and the resolver re-reads the file when it changes on disk.
 
 ### Where worktrees go: `worktree_dir`
 
@@ -143,6 +144,11 @@ diff_theme = "eighties"
 worktrees_layout = "two_panel"
 # Line-number gutter in the diff pane. Usually set globally.
 diff_line_numbers = true
+# Editor the conflict resolver's `e` key opens a file in; unset means the
+# built-in one. Same shape as one open_command entry, with `{path}` the file,
+# except a bare string runs in the terminal (an editor nearly always wants
+# it); give mode = "background" for a detached GUI editor.
+conflict_editor = "nvim {path}"
 
 [setup]
 # Files copied from the main worktree into the new one (if they exist).
@@ -363,9 +369,9 @@ Switching files costs a file read and nothing more (the worktree is resolved onc
 
 `←`/`→` move between files, `↑`/`↓` between hunks; `o`/`t` keep ours/theirs for the current hunk, `b`/`⇧B` **keep both** (ours-then-theirs or reversed, on separate lines), `⇧O`/`⇧T` take the whole file's side. The pane scrolls on its own with `⇧↑`/`⇧↓`, `⇧J`/`⇧K`, `PgUp`/`PgDn`, `g`/`⇧G`, or the wheel, and `↑`/`↓` fall through to scrolling once the cursor is on the first or last hunk, so a hunk taller than the screen still reads to the end. The mouse works throughout: the wheel steps the file list and scrolls the hunks, a click picks a file or a hunk, and a click on a hunk's THEIRS or OURS column takes that side.
 
-`e` and `⇧E` open the **whole file**, full screen, conflict markers and all, for the fixes per-hunk choices can't express (interleaving both sides, fixing an import list, deleting a stray line). `e` puts the cursor on the hunk you were looking at; `⇧E` opens at the top. Choices you have already made are written to disk first, so you edit the file as it really stands. The editor takes the entire frame, numbers every line down the left, highlights the conflict markers with each side in its resolver colour, and scrolls in both directions with the arrows, `PgUp`/`PgDn`, or the mouse wheel (a notch moves the cursor three lines, and the view follows it). `Ctrl+S` saves and re-reads the file, so any hunks the edit settled drop out of the list; `Esc` discards.
+`e` and `⇧E` open the **whole file**, full screen, conflict markers and all, for the fixes per-hunk choices can't express (interleaving both sides, fixing an import list, deleting a stray line). `e` puts the cursor on the hunk you were looking at; `⇧E` opens at the top. Choices you have already made are written to disk first, so you edit the file as it really stands. The editor takes the entire frame, numbers every line down the left, highlights the conflict markers with each side in its resolver colour, and scrolls in both directions with the arrows, `PgUp`/`PgDn`, or the mouse wheel (a notch moves the cursor three lines, and the view follows it). `Ctrl+S` saves and re-reads the file, so any hunks the edit settled drop out of the list; `Esc` discards. Set `conflict_editor` to use your own editor instead: a terminal editor gets the screen until it exits and the file is re-read when wtm comes back, a background one is spawned detached and the file is re-read when it changes on disk.
 
-Choosing a side with `o`/`t`/`b` **records the choice, it does not write it**. The pinned legend counts how many choices are still unwritten, the status line says the same on every press, and `c` refuses in those words rather than passing along git's bare "unmerged paths". `w` (or `Enter`) is what saves the file and, once every hunk is decided, stages it as resolved. If you fixed a conflict **in your own editor** instead, `a` marks the file resolved using exactly what is on disk (it refuses while conflict markers remain), and `r` re-reads the conflicts from disk to pick up changes made outside wtm.
+Choosing a side with `o`/`t`/`b` **records the choice, it does not write it**. The pinned legend counts how many choices are still unwritten, the status line says the same on every press, and `c` refuses in those words rather than passing along git's bare "unmerged paths". `w` (or `Enter`) is what saves the file and, once every hunk is decided, stages it as resolved. If you fixed a conflict **in your own editor** instead, `a` marks the file resolved using exactly what is on disk (it refuses while conflict markers remain). Work done outside wtm shows up on its own: the once-a-second status refresh ticks a file you staged from a terminal, re-reads the file under the cursor when it changes on disk, lists the next commit's files when a rebase moves on, and hands the pane back when the operation is finished or aborted elsewhere. `r` still forces a re-read on the spot.
 
 `c` completes the operation (commit the merge, continue the rebase or cherry-pick, or drop the popped stash), `s` **skips** the commit a rebase stopped on, and `x` then `y` aborts and restores the worktree. `Esc`/`q` backs out to the worktree list and leaves the operation in progress; `Enter` on that worktree (or the `⚠ Changes` tab) walks straight back in where you left off.
 

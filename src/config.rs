@@ -238,6 +238,60 @@ impl<'de> Deserialize<'de> for OpenCommandList {
     }
 }
 
+/// The editor the conflict resolver's `e` key hands a conflicted file to, in
+/// place of wtm's built-in one. Same shape as a single `open_command` entry
+/// (a template with `{path}` and a run mode), with one difference: a bare
+/// string runs in [`CommandMode::Terminal`], since an editor nearly always
+/// wants the terminal. wtm suspends for it and re-reads the file when it
+/// exits. A `{ command, mode = "background" }` table spawns it detached (a GUI
+/// editor without `--wait`), and the file is re-read when it changes on disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConflictEditor {
+    /// Shell template; `{path}` is the conflicted file's absolute path,
+    /// `{name}` and `{branch}` the worktree's.
+    pub command: String,
+    pub mode: CommandMode,
+}
+
+impl ConflictEditor {
+    /// A terminal-mode editor, the shape a bare TOML string loads as.
+    pub fn new(command: impl Into<String>) -> ConflictEditor {
+        ConflictEditor {
+            command: command.into(),
+            mode: CommandMode::Terminal,
+        }
+    }
+
+    pub fn with_mode(mut self, mode: CommandMode) -> ConflictEditor {
+        self.mode = mode;
+        self
+    }
+}
+
+impl<'de> Deserialize<'de> for ConflictEditor {
+    /// Accepts `"nvim {path}"` or `{ command = "code {path}", mode = "background" }`.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Table {
+            command: String,
+            mode: Option<CommandMode>,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Entry {
+            Plain(String),
+            Table(Table),
+        }
+        Ok(match Entry::deserialize(deserializer)? {
+            Entry::Plain(command) => ConflictEditor::new(command),
+            Entry::Table(t) => {
+                ConflictEditor::new(t.command).with_mode(t.mode.unwrap_or(CommandMode::Terminal))
+            }
+        })
+    }
+}
+
 /// Raw contents of one config file. Every field is optional so a file can set
 /// only what it cares about and inherit the rest.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -263,6 +317,9 @@ pub struct FileConfig {
     /// Whether the diff pane draws a line-number gutter. Unset means
     /// [`DEFAULT_DIFF_LINE_NUMBERS`].
     pub diff_line_numbers: Option<bool>,
+    /// Editor the conflict resolver's `e` key opens a file in. Unset means
+    /// wtm's built-in editor.
+    pub conflict_editor: Option<ConflictEditor>,
     pub setup: Option<FileSetup>,
     /// Runtime map of worktree branch → creation base ref, written by
     /// `wtm create`. Not a user-facing setting; ignored by [`Config::merge`].
@@ -328,6 +385,9 @@ pub struct Config {
     /// [`DEFAULT_DIFF_LINE_NUMBERS`].
     pub diff_line_numbers: Option<bool>,
     pub diff_line_numbers_source: Source,
+    /// Raw `conflict_editor` setting; `None` means the built-in editor.
+    pub conflict_editor: Option<ConflictEditor>,
+    pub conflict_editor_source: Source,
     pub setup: Setup,
     pub copy_source: Source,
     pub run_source: Source,
@@ -359,6 +419,8 @@ impl Default for Config {
             branches_refresh_mins_source: Source::Default,
             diff_line_numbers: None,
             diff_line_numbers_source: Source::Default,
+            conflict_editor: None,
+            conflict_editor_source: Source::Default,
             setup: Setup::default(),
             copy_source: Source::Default,
             run_source: Source::Default,
@@ -413,6 +475,8 @@ impl Config {
             pick(global.branches_refresh_mins, repo.branches_refresh_mins);
         let (diff_line_numbers, diff_line_numbers_source) =
             pick(global.diff_line_numbers, repo.diff_line_numbers);
+        let (conflict_editor, conflict_editor_source) =
+            pick(global.conflict_editor, repo.conflict_editor);
         let global_setup = global.setup.unwrap_or_default();
         let repo_setup = repo.setup.unwrap_or_default();
         let (copy, copy_source) = pick(global_setup.copy, repo_setup.copy);
@@ -432,6 +496,8 @@ impl Config {
             branches_refresh_mins_source,
             diff_line_numbers,
             diff_line_numbers_source,
+            conflict_editor,
+            conflict_editor_source,
             setup: Setup {
                 copy: copy.unwrap_or_default(),
                 run: run.unwrap_or_default(),
@@ -743,6 +809,37 @@ mod tests {
                 "cursor {path}".into(),
             ]))
         );
+    }
+
+    /// `conflict_editor` takes one entry in either spelling. A bare string is
+    /// a terminal-mode editor (the opposite default from `open_command`, since
+    /// an editor almost always needs the terminal); a table can opt out.
+    #[test]
+    fn parses_conflict_editor_as_string_or_table() {
+        let bare: FileConfig = toml::from_str(r#"conflict_editor = "nvim {path}""#).unwrap();
+        assert_eq!(
+            bare.conflict_editor,
+            Some(ConflictEditor::new("nvim {path}"))
+        );
+        assert_eq!(
+            bare.conflict_editor.as_ref().unwrap().mode,
+            CommandMode::Terminal
+        );
+        let table: FileConfig =
+            toml::from_str(r#"conflict_editor = { command = "code {path}", mode = "background" }"#)
+                .unwrap();
+        assert_eq!(
+            table.conflict_editor,
+            Some(ConflictEditor::new("code {path}").with_mode(CommandMode::Background))
+        );
+        assert!(
+            toml::from_str::<FileConfig>(r#"conflict_editor = { mode = "terminal" }"#).is_err()
+        );
+        // Unset means the built-in editor, and a repo file overrides global.
+        assert_eq!(Config::default().conflict_editor, None);
+        let merged = Config::merge(bare, table);
+        assert_eq!(merged.conflict_editor_source, Source::Repo);
+        assert_eq!(merged.conflict_editor.unwrap().command, "code {path}");
     }
 
     /// A `{ command, mode }` table carries its run mode; a bare string beside
