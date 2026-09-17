@@ -4539,7 +4539,7 @@ fn draw_open_command_pick(
     .areas(inner);
     frame.render_widget(
         Paragraph::new(Line::from(
-            "this is what will run · ▶ closes wtm and runs in this terminal".dim(),
+            "this is what will run · ▶ runs in this terminal, wtm comes back after".dim(),
         )),
         head_area,
     );

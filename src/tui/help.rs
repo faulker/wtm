@@ -402,7 +402,11 @@ pub const DIFF: &[Binding] = &[
         "discard all",
         "discard every uncommitted change in the worktree",
     ),
-    both("i", "ignore", "add the file or a glob to .gitignore"),
+    both(
+        "i",
+        "ignore",
+        "add the file, a glob, or a typed pattern to .gitignore",
+    ),
     both("t", "tree/flat", "toggle folder tree vs. flat file list"),
     both("?", "help", "show this help"),
     both("q", "back", "back to the worktrees list"),

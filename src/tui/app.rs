@@ -632,8 +632,11 @@ pub enum ModalAction {
     /// the Changes tab's worktree can differ.
     DiscardAllChanges { name: String },
     /// Add to `.gitignore`: option 0 ignores the exact `file`, option 1 the
-    /// derived `pattern`.
+    /// derived `pattern`, option 2 opens `IgnoreCustom` to type one by hand.
     IgnorePath { file: String, pattern: String },
+    /// The typed-by-hand `.gitignore` pattern; the prompt's submitted text is
+    /// added verbatim (blank cancels).
+    IgnoreCustom,
     /// Copy the diff panel's file path: option 0 copies `relative` (relative to
     /// the worktree root), option 1 the absolute `full` path.
     CopyPath { relative: String, full: String },
@@ -1606,6 +1609,18 @@ impl RowList {
             && row < self.inner.y + self.inner.height
     }
 
+    /// Whether (`col`, `row`) is anywhere on the panel drawn around this list:
+    /// the content rect plus the rounded border and one column of padding that
+    /// `ui::panel` wraps every list in. Used so a click on a panel's border,
+    /// title, or the blank space under its last row still moves the focus
+    /// there, without asking the renderer to record a second rect.
+    fn panel_contains(&self, col: u16, row: u16) -> bool {
+        col >= self.inner.x.saturating_sub(2)
+            && col < self.inner.x + self.inner.width + 2
+            && row >= self.inner.y.saturating_sub(1)
+            && row < self.inner.y + self.inner.height + 1
+    }
+
     /// Row index at screen position (`col`, `row`), or `None` when the click
     /// falls outside the list's data rows.
     fn hit(&self, col: u16, row: u16) -> Option<usize> {
@@ -1736,6 +1751,28 @@ impl Default for ChangesTab {
             last_refresh: Instant::now(),
         }
     }
+}
+
+/// A shell command that needs this terminal to itself: the TUI is torn down
+/// while it runs and rebuilt once it exits. What happens on the way back
+/// depends on `reason`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Suspend {
+    pub cmd: String,
+    /// Working directory the command runs in.
+    pub dir: String,
+    pub reason: SuspendReason,
+}
+
+/// Why the TUI gave up the terminal, so `resume_after_suspend` knows what to
+/// re-read once it is back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SuspendReason {
+    /// A terminal-mode `conflict_editor`: the conflicted file is re-read.
+    ConflictEditor,
+    /// A terminal-mode `open_command` on the named worktree: the worktree list
+    /// and status are refreshed, since the command may have changed anything.
+    OpenCommand { name: String },
 }
 
 pub struct App {
@@ -1949,15 +1986,10 @@ pub struct App {
     /// Set by a completed self-update: the binary `tui::run` should hand over to
     /// once the terminal is restored.
     pub restart_exe: Option<PathBuf>,
-    /// Set by a `CommandMode::Terminal` open command: the shell command and the
-    /// worktree directory to run it in. `tui::run` executes it after restoring
-    /// the terminal, so an interactive program gets this terminal to itself.
-    pub exec_on_exit: Option<(String, String)>,
-    /// Set by a terminal-mode `conflict_editor`: the shell command and the
-    /// worktree directory to run it in. Unlike `exec_on_exit` the TUI comes
-    /// back: `tui::run` suspends the terminal, waits for the editor to exit,
-    /// restores the screen, and hands the result to `resume_after_editor`.
-    pub suspend_for: Option<(String, String)>,
+    /// Set by a terminal-mode `conflict_editor` or open command: `tui::run`
+    /// suspends the terminal, runs the command, waits for it to exit, restores
+    /// the screen, and hands the result to `resume_after_suspend`.
+    pub suspend_for: Option<Suspend>,
     pub quit: bool,
     /// When set, q/Esc will not quit until this instant. Armed by back
     /// navigation so a duplicate key buffered while a slow tick/draw delayed
@@ -2055,7 +2087,6 @@ impl App {
             update_available: None,
             update_prompted: false,
             restart_exe: None,
-            exec_on_exit: None,
             suspend_for: None,
             quit: false,
             ignore_quit_until: None,
@@ -2985,7 +3016,22 @@ impl App {
             }
             ModalAction::IgnorePath { file, pattern } => {
                 if let ModalResult::Confirmed(idx) = result {
-                    let p = if idx == 0 { file } else { pattern };
+                    match idx {
+                        0 => self.add_ignore(&file),
+                        1 => self.add_ignore(&pattern),
+                        _ => self.push_prompt(
+                            "ignore pattern",
+                            TextInput::with_value(pattern),
+                            "edit the pattern, Enter adds it to .gitignore",
+                            ModalAction::IgnoreCustom,
+                        ),
+                    }
+                }
+            }
+            ModalAction::IgnoreCustom => {
+                if let ModalResult::Submitted(p) = result
+                    && !p.is_empty()
+                {
                     self.add_ignore(&p);
                 }
             }
@@ -3414,6 +3460,7 @@ impl App {
         let options = vec![
             ConfirmOption::new(format!("{exact}: {file}")),
             ConfirmOption::new(format!("{glob}: {pattern}")),
+            ConfirmOption::new("custom pattern..."),
         ];
         self.push_confirm(
             "ignore",
@@ -4740,7 +4787,31 @@ impl App {
             }
             return;
         }
+        // A click anywhere else on the file panel (its border, title, or the
+        // blank space under the last row) still moves the focus there, so
+        // switching panels with the mouse never depends on hitting a row.
+        // `files_list` is only recorded for the three-panel home view with no
+        // overlay up, so this can't steal a click from a dialog.
+        if self
+            .files_list
+            .is_some_and(|rl| rl.panel_contains(col, row))
+        {
+            self.worktrees_focus = WorktreesFocus::Files;
+            // Not a row, so not half of a double click on one.
+            self.last_click = None;
+            return;
+        }
         let Some(idx) = self.row_list.and_then(|rl| rl.hit(col, row)) else {
+            // Same for the worktree table: a click on its panel outside the
+            // rows takes the focus back without moving the selection.
+            if self.modal.is_none()
+                && matches!(self.view, View::List)
+                && self.tab == Tab::Worktrees
+                && self.row_list.is_some_and(|rl| rl.panel_contains(col, row))
+            {
+                self.worktrees_focus = WorktreesFocus::List;
+                self.last_click = None;
+            }
             return;
         };
         // A confirm modal sits on top of everything else, so a hit while one
@@ -5895,8 +5966,13 @@ impl App {
         match command.mode {
             CommandMode::Background => self.spawn_in_dir(&cmd, path, name),
             CommandMode::Terminal => {
-                self.exec_on_exit = Some((cmd, path.to_string()));
-                self.quit = true;
+                self.suspend_for = Some(Suspend {
+                    cmd,
+                    dir: path.to_string(),
+                    reason: SuspendReason::OpenCommand {
+                        name: name.to_string(),
+                    },
+                });
             }
         }
     }
@@ -8591,7 +8667,13 @@ impl App {
             },
         );
         match editor.mode {
-            CommandMode::Terminal => self.suspend_for = Some((cmd, dir)),
+            CommandMode::Terminal => {
+                self.suspend_for = Some(Suspend {
+                    cmd,
+                    dir,
+                    reason: SuspendReason::ConflictEditor,
+                })
+            }
             CommandMode::Background => {
                 self.spawn_in_dir(&cmd, &dir, target);
                 self.message = Some(format!(
@@ -8601,10 +8683,42 @@ impl App {
         }
     }
 
+    /// Picks up after a suspended command has exited and the TUI is back on
+    /// screen. Routes on why the terminal was given up.
+    pub fn resume_after_suspend(
+        &mut self,
+        reason: SuspendReason,
+        result: Result<std::process::ExitStatus, String>,
+    ) {
+        match reason {
+            SuspendReason::ConflictEditor => self.resume_after_editor(result),
+            SuspendReason::OpenCommand { name } => self.resume_after_open_command(&name, result),
+        }
+    }
+
+    /// Back from a terminal-mode open command: whatever it did to the worktree
+    /// (commits, checkouts, new files) is picked up by a full reload, and a
+    /// failed launch or non-zero exit is reported.
+    fn resume_after_open_command(
+        &mut self,
+        name: &str,
+        result: Result<std::process::ExitStatus, String>,
+    ) {
+        match result {
+            Err(e) => self.set_error(e),
+            Ok(status) if !status.success() => {
+                self.message = Some(format!("command on '{name}' exited with {status}"));
+            }
+            Ok(_) => self.message = Some(format!("back from '{name}'")),
+        }
+        self.refresh();
+        self.refresh_diff();
+    }
+
     /// Picks up after a terminal-mode `conflict_editor` has exited and the TUI
     /// is back on screen: the file is re-read so hunks settled in the editor
     /// drop out of the resolver, and a failed launch is reported.
-    pub fn resume_after_editor(&mut self, result: Result<std::process::ExitStatus, String>) {
+    fn resume_after_editor(&mut self, result: Result<std::process::ExitStatus, String>) {
         let path = self.resolver_current_path();
         self.load_resolver_file();
         match (result, path) {
@@ -11128,6 +11242,73 @@ mod tests {
         assert_eq!(app.tab, Tab::Changes);
     }
 
+    /// The third ignore option opens a prompt prefilled with the derived
+    /// pattern, so a hand-written one (`logs/**`, `*.tmp`) is one edit away.
+    /// A blank submission adds nothing.
+    #[test]
+    fn diff_view_i_custom_pattern_prompts_for_text() {
+        let (_tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        std::fs::write(root.join("debug.log"), "noise\n").unwrap();
+        app.refresh();
+        app.selected = 0;
+
+        press(&mut app, KeyCode::Enter);
+        select_diff_file(&mut app, "debug.log");
+        press(&mut app, KeyCode::Char('i'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        match &app.modal {
+            Some(Modal::Prompt {
+                input,
+                action: ModalAction::IgnoreCustom,
+                ..
+            }) => assert_eq!(
+                input.as_str(),
+                "*.log",
+                "prefilled with the derived pattern"
+            ),
+            _ => panic!("expected the custom-pattern prompt"),
+        }
+
+        // Replace the prefill with something the derived options can't offer.
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        type_str(&mut app, "**/*.log");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.modal.is_none(), "prompt closed after submitting");
+        let gitignore = std::fs::read_to_string(root.join(".gitignore")).unwrap();
+        assert!(
+            gitignore.lines().any(|l| l == "**/*.log"),
+            "custom pattern written: {gitignore}"
+        );
+        assert!(
+            !gitignore.lines().any(|l| l == "*.log"),
+            "the prefill was replaced, not added: {gitignore}"
+        );
+
+        // Blank Enter is a no-op rather than an empty .gitignore line. (The
+        // ignored file has dropped out of the list, so the cursor now sits on
+        // whatever file is next; the prefill is cleared whatever it is.)
+        press(&mut app, KeyCode::Char('i'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        let prefill = match &app.modal {
+            Some(Modal::Prompt { input, .. }) => input.as_str().chars().count(),
+            _ => panic!("expected the custom-pattern prompt"),
+        };
+        for _ in 0..prefill {
+            press(&mut app, KeyCode::Backspace);
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(app.modal.is_none());
+        let after = std::fs::read_to_string(root.join(".gitignore")).unwrap();
+        assert_eq!(after, gitignore, "blank submission adds nothing");
+    }
+
     #[test]
     fn diff_view_i_can_ignore_single_file_and_esc_cancels() {
         let (_tmp, mut app) = test_app();
@@ -12878,10 +13059,10 @@ mod tests {
     }
 
     /// A terminal-mode command doesn't spawn anything from inside the TUI: it
-    /// records what to run and quits, so `tui::run` can hand this terminal over
-    /// once ratatui has restored it.
+    /// asks `tui::run` to suspend for it, and the TUI comes back once the
+    /// command exits, with the worktree list reloaded.
     #[test]
-    fn a_terminal_mode_command_quits_and_hands_over_the_terminal() {
+    fn a_terminal_mode_command_suspends_the_tui_and_comes_back() {
         let (_tmp, mut app) = test_app();
         add_and_select_worktree(&mut app, "feature");
         let path = app.worktrees[app.selected].path.clone();
@@ -12889,12 +13070,41 @@ mod tests {
             vec![OpenCommand::new("nvim {path}").with_mode(CommandMode::Terminal)];
         press(&mut app, KeyCode::Char('o'));
         press(&mut app, KeyCode::Enter);
-        assert!(app.quit, "the TUI stands down for a terminal command");
+        assert!(!app.quit, "the TUI suspends rather than quitting");
+        let suspend = app.suspend_for.take().expect("a suspend request");
         assert_eq!(
-            app.exec_on_exit,
-            Some((format!("nvim {path}"), path.clone())),
+            suspend,
+            Suspend {
+                cmd: format!("nvim {path}"),
+                dir: path.clone(),
+                reason: SuspendReason::OpenCommand {
+                    name: "feature".into()
+                },
+            },
             "the expanded command and its directory are handed off"
         );
+
+        // Coming back reloads and reports; a non-zero exit is surfaced.
+        std::fs::write(Path::new(&path).join("made-in-editor.txt"), "x").unwrap();
+        app.resume_after_suspend(
+            suspend.reason.clone(),
+            Ok(std::process::Command::new("true").status().unwrap()),
+        );
+        assert!(!app.quit);
+        assert_eq!(app.message.as_deref(), Some("back from 'feature'"));
+        app.resume_after_suspend(
+            suspend.reason,
+            Ok(std::process::Command::new("false").status().unwrap()),
+        );
+        assert!(
+            app.message
+                .as_deref()
+                .unwrap()
+                .starts_with("command on 'feature' exited with"),
+            "{:?}",
+            app.message
+        );
+        settle_background(&mut app);
     }
 
     /// A background command is the opposite: it spawns detached and the TUI
@@ -12907,7 +13117,7 @@ mod tests {
         press(&mut app, KeyCode::Char('o'));
         press(&mut app, KeyCode::Enter);
         assert!(!app.quit);
-        assert!(app.exec_on_exit.is_none());
+        assert!(app.suspend_for.is_none());
     }
 
     /// `g` and `t` in the command editor flip the two per-command toggles, and
@@ -13631,16 +13841,20 @@ mod tests {
 
         press(&mut app, KeyCode::Char('e'));
         assert!(app.modal.is_none(), "the built-in editor stays closed");
-        let (cmd, dir) = app.suspend_for.take().expect("a suspend request");
+        let suspend = app.suspend_for.take().expect("a suspend request");
         assert_eq!(
-            cmd,
+            suspend.cmd,
             format!("vi {} # feature", feat.join("shared.txt").display())
         );
-        assert_eq!(dir, feat.display().to_string());
+        assert_eq!(suspend.dir, feat.display().to_string());
+        assert_eq!(suspend.reason, SuspendReason::ConflictEditor);
 
         // The editor did its job; coming back re-reads the file.
         std::fs::write(feat.join("shared.txt"), "hand merged\n").unwrap();
-        app.resume_after_editor(Ok(std::process::Command::new("true").status().unwrap()));
+        app.resume_after_suspend(
+            suspend.reason,
+            Ok(std::process::Command::new("true").status().unwrap()),
+        );
         assert!(resolver(&app).current.is_none(), "re-read after the editor");
         settle_background(&mut app);
     }
@@ -17631,6 +17845,48 @@ mod tests {
             .expect("the worktree list records its geometry");
         click(&mut app, list.inner.x + 1, list.inner.y + list.header);
         assert_eq!(app.worktrees_focus, WorktreesFocus::List);
+    }
+
+    /// Focus follows a click anywhere on a panel, not just on one of its rows:
+    /// the border, the title, and the blank space under the last row all
+    /// count, and none of them move the selection.
+    #[test]
+    fn three_panel_clicks_anywhere_on_a_panel_focus_it() {
+        let (_tmp, mut app) = three_panel_app();
+        let files = app.files_list.expect("the file panel records its geometry");
+        assert_eq!(app.worktrees_focus, WorktreesFocus::List);
+        let before = app.changes.selected;
+
+        // Blank space below the last file row.
+        click(
+            &mut app,
+            files.inner.x + 1,
+            files.inner.y + files.inner.height - 1,
+        );
+        assert_eq!(app.worktrees_focus, WorktreesFocus::Files);
+        assert_eq!(
+            app.changes.selected, before,
+            "no row hit, so no selection change"
+        );
+        assert!(
+            app.last_click.is_none(),
+            "a focus click is never half a double click"
+        );
+
+        // Back to the list via its top border/title row.
+        render_app(&mut app, 100, 30);
+        let list = app
+            .row_list
+            .expect("the worktree list records its geometry");
+        let selected = app.selected;
+        click(&mut app, list.inner.x + 5, list.inner.y - 1);
+        assert_eq!(app.worktrees_focus, WorktreesFocus::List);
+        assert_eq!(app.selected, selected);
+
+        // And the file panel's own top border takes it back again.
+        render_app(&mut app, 100, 30);
+        click(&mut app, files.inner.x + 5, files.inner.y - 1);
+        assert_eq!(app.worktrees_focus, WorktreesFocus::Files);
     }
 
     /// Too short a terminal falls back to two panels, which brings the Changes

@@ -132,7 +132,7 @@ worktree_dir = "sibling"
 # entries are either a bare template or a `{ command, mode }` table;
 # `{path}`, `{name}`, `{branch}`, and `{status}` expand before it runs.
 # mode = "background" (default) spawns it detached and leaves wtm up;
-# mode = "terminal" closes wtm and hands this terminal to the command.
+# mode = "terminal" hands this terminal to the command; wtm comes back when it exits.
 # Commands in the *global* config are offered in every repo, alongside a
 # repo's own list rather than instead of it.
 open_command = ["open {path}", { command = "nvim {path}", mode = "terminal" }]
@@ -253,7 +253,7 @@ The TUI is meant to be left open all day, so it paces itself: it redraws on your
 
 ### Three-panel layout
 
-The default Worktrees tab is `two_panel` (list plus the changed-file preview). `wtm config set --global worktrees_layout three_panel` (or the `worktrees_layout` row on the Settings tab) swaps that for a **three-panel** layout: a compact scrollable worktree list on top, and the Changes tab's file list and syntax-highlighted diff filling the space below it.
+The default Worktrees tab is `two_panel` (list plus the changed-file preview). `wtm config set --global worktrees_layout three_panel` (or the `worktrees_layout` row on the Settings tab) swaps that for a **three-panel** layout: a compact scrollable worktree list on top, and the Changes tab's file list and syntax-highlighted diff filling the space below it. `Enter` moves the keyboard focus down to the file list and `q`/`Esc` brings it back up; with the mouse, clicking anywhere on a panel (a row, its border, or the empty space) focuses it.
 
 When the highlighted worktree is clean, that bottom area shows the branch's commit list instead (navigate and open a commit the same way as Branches → Enter). The branch name in that panel's title is click-to-copy. The commits the branch added since it forked are drawn bold on a tinted band, and the panel title counts them (`3 on this branch`), so its own work reads apart from the history it inherited. The same marking is on the full-screen log (`l`) and the Branches tab's commit history.
 
@@ -267,7 +267,7 @@ The Changes tab is folded away while this layout is on (it's already on screen).
 
 `Enter` on a worktree opens the Changes tab. Files are grouped under their folders on the left (`[x]`/`[ ]`/`[~]` shows how much of a folder is marked), and the selected file's diff is syntax-highlighted on the right (`⇧←`/`⇧→` or `H`/`L` scroll it horizontally; `⇧↑`/`⇧↓` or `J`/`K` scroll vertically). Diffs load in the background, so switching files never freezes the UI. New files inside brand-new folders are listed too. Updates live as files change; `r` refreshes now. `t` switches the file list between the folder tree and a flat path list.
 
-From here you can mark files with `Space`, commit them with `c`, pull/push with `p`/`⇧P`, stash one (`s`) or all marked (`⇧S`) files, undo a file's changes with `u` (a brand-new file has no committed version, so it points you at delete instead), delete it with `d`, or add it to `.gitignore` with `i` (exact path or a glob). `←`/`→` (or `h`/`l`) collapse and expand the folder under the cursor (`←` on a file jumps to its parent); `Enter` toggles a folder, and on a file row opens it in whatever app your OS opens that file type with. Double-clicking a row does the same. The mouse wheel scrolls whichever panel it's over.
+From here you can mark files with `Space`, commit them with `c`, pull/push with `p`/`⇧P`, stash one (`s`) or all marked (`⇧S`) files, undo a file's changes with `u` (a brand-new file has no committed version, so it points you at delete instead), delete it with `d`, or add it to `.gitignore` with `i` (exact path, a derived glob, or a pattern you type yourself). `←`/`→` (or `h`/`l`) collapse and expand the folder under the cursor (`←` on a file jumps to its parent); `Enter` toggles a folder, and on a file row opens it in whatever app your OS opens that file type with. Double-clicking a row does the same. The mouse wheel scrolls whichever panel it's over.
 
 Clicking the path in the diff panel's title copies it to the clipboard, asking first whether you want it relative to the worktree (`r`) or the full path (`f`).
 
@@ -326,7 +326,7 @@ On the worktree list:
 | `n` | new worktree |
 | `d` | delete the selected worktree: folder-only (keeps the branch) or folder + branch. Uncommitted changes: stash them or discard. If the branch can't be safely deleted you're offered a force delete; forcing a branch that's checked out elsewhere first switches that worktree to the repo's default branch |
 | `c` | commit |
-| `o` / `e` | open: run a configured `open_command`. Any configured commands open a picker listing each one already expanded (`{path}`, `{name}`, `{branch}`, `{status}`). `mode = "terminal"` (marked `▶`) closes wtm and runs in this terminal; the default `background` mode spawns detached. With none configured it prompts for a one-off |
+| `o` / `e` | open: run a configured `open_command`. Any configured commands open a picker listing each one already expanded (`{path}`, `{name}`, `{branch}`, `{status}`). `mode = "terminal"` (marked `▶`) runs in this terminal, and wtm comes back (reloaded) when the command exits; the default `background` mode spawns detached. With none configured it prompts for a one-off |
 | `u` | update: refresh the default branch from its upstream, then merge it in (or fast-forward in place). Offers to stash local changes first. On conflict, opens the conflict resolver |
 | `s` | Stash tab |
 | `m` | move uncommitted changes into another worktree you pick; refuses if the destination isn't clean |

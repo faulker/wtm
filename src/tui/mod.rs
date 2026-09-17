@@ -39,9 +39,10 @@ use app::App;
 
 /// Runs the interactive TUI until the user quits.
 ///
-/// A self-update sets `App::restart_exe` and a terminal-mode open command sets
-/// `App::exec_on_exit`; both hand-offs happen here, after the terminal has been
-/// restored, so the program that takes over starts from a clean terminal.
+/// A self-update sets `App::restart_exe`; the hand-off happens here, after the
+/// terminal has been restored, so the new binary starts from a clean terminal.
+/// Terminal-mode commands (a `conflict_editor` or an `open_command`) don't end
+/// the run: the event loop suspends the TUI for them and comes back.
 pub fn run(ctx: Ctx) -> Result<()> {
     let mut app = App::new(ctx)?;
     let mut terminal = ratatui::init();
@@ -59,9 +60,6 @@ pub fn run(ctx: Ctx) -> Result<()> {
     if let Some(exe) = &app.restart_exe {
         println!("restarting {}", exe.display());
         crate::update::restart(exe)?;
-    }
-    if let Some((cmd, dir)) = &app.exec_on_exit {
-        return exec_in_terminal(cmd, dir);
     }
     Ok(())
 }
@@ -86,10 +84,11 @@ fn leave_extras(enhanced: bool) {
     let _ = write_stdout(MOUSE_OFF);
 }
 
-/// Runs a terminal-mode `conflict_editor` with the TUI suspended: the terminal
-/// is restored so the editor gets it to itself, and once the editor exits the
-/// TUI is set up again, redrawn from scratch, and told how it went.
-fn suspend_for_editor(
+/// Runs a terminal-mode command (a `conflict_editor` or an `open_command`)
+/// with the TUI suspended: the terminal is restored so the program gets it to
+/// itself, and once it exits the TUI is set up again, redrawn from scratch,
+/// and told how it went.
+fn suspend_for_command(
     terminal: &mut DefaultTerminal,
     enhanced: bool,
     cmd: &str,
@@ -119,20 +118,6 @@ fn write_stdout(s: &str) -> std::io::Result<()> {
     out.flush()
 }
 
-/// Runs a `CommandMode::Terminal` open command in place of the TUI, inheriting
-/// this (already restored) terminal so an interactive program can use it. wtm
-/// exits with the command's own status.
-fn exec_in_terminal(cmd: &str, dir: &str) -> Result<()> {
-    use anyhow::Context;
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .current_dir(dir)
-        .status()
-        .with_context(|| format!("failed to run '{cmd}' in {dir}"))?;
-    std::process::exit(status.code().unwrap_or(0));
-}
-
 /// How long the loop waits for input while something on screen is moving: a
 /// spinner frame, or a background result a tick has to pick up.
 const ACTIVE_POLL: Duration = Duration::from_millis(100);
@@ -152,12 +137,12 @@ const PARKED_POLL: Duration = Duration::from_millis(2000);
 /// the screen updating even without keypresses.
 fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, enhanced: bool) -> Result<()> {
     while !app.quit {
-        // A terminal editor asked for the screen: give it up, wait, take it
+        // A terminal program asked for the screen: give it up, wait, take it
         // back. Done here rather than in the key handler so the app never
         // touches the terminal itself.
-        if let Some((cmd, dir)) = app.suspend_for.take() {
-            let result = suspend_for_editor(terminal, enhanced, &cmd, &dir);
-            app.resume_after_editor(result);
+        if let Some(suspend) = app.suspend_for.take() {
+            let result = suspend_for_command(terminal, enhanced, &suspend.cmd, &suspend.dir);
+            app.resume_after_suspend(suspend.reason, result);
         }
         // Drain any already-queued input before tick/draw. A slow refresh or
         // syntect pass must not delay Back/q; otherwise a second press buffered

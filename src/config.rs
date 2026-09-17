@@ -113,8 +113,9 @@ pub enum CommandMode {
     /// mode for GUI tools (`cursor {path}`) that don't need this terminal.
     #[default]
     Background,
-    /// The TUI shuts down and hands this terminal to the command, so an
-    /// interactive program (`nvim {path}`, `claude`) can use it directly.
+    /// The TUI suspends and hands this terminal to the command, so an
+    /// interactive program (`nvim {path}`, `claude`) can use it directly; the
+    /// TUI comes back, reloaded, once the command exits.
     Terminal,
 }
 
