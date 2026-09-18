@@ -37,7 +37,7 @@ use crate::config::{
 };
 use crate::conflict::{ConflictSegment, ResolutionAction};
 use crate::git::{GraphLine, StatusEntry};
-use crate::ops::{BranchListItem, ResolveKind};
+use crate::ops::{BranchListItem, ResolveKind, WorktreeInfo};
 use crate::update::{CURRENT_VERSION, Release};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -508,10 +508,25 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &mut App) {
     ]);
     // The right slot is wide enough for the message (or count), and is drawn
     // right-aligned so it never overlaps the app badge.
+    let deleting = app.deleting_names();
     let right = match &app.message {
         // Errors now show as a modal popup (see `draw_error_popup`), so every
         // message reaching the header is a plain status/info line.
         Some(msg) => Line::styled(format!("{msg} "), Style::new().fg(theme::WARNING).bold()),
+        // A removal in flight keeps its progress in the header for as long as
+        // it runs, unlike an ordinary message, which times out.
+        None if !deleting.is_empty() => Line::styled(
+            format!(
+                "{} removing {}… ",
+                spinner_glyph(app.tick_count),
+                deleting
+                    .iter()
+                    .map(|n| format!("'{n}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Style::new().fg(theme::WARNING).bold(),
+        ),
         None => Line::styled(
             format!("({count} worktree{}) ", if count == 1 { "" } else { "s" }),
             Style::new().dim(),
@@ -686,14 +701,70 @@ fn in_progress_label(kind: &ResolveKind) -> &'static str {
 }
 
 /// Fixed column widths of the worktree table, shared by the layout constraints
-/// and by the path-truncation budget derived from them.
-const CHANGES_W: u16 = 14;
+/// and by the path-truncation budget derived from them. CHANGES grows with its
+/// widest cell (see `changes_cell_width`) but never below this.
+const CHANGES_MIN_W: u16 = 14;
 const UPSTREAM_W: u16 = 9;
 const FLAGS_W: u16 = 30;
 const MIN_PATH_W: u16 = 20;
 const COLUMN_SPACING: u16 = 1;
 /// Width of the row cursor drawn by `highlight_symbol` ("▌ ").
 const HIGHLIGHT_SYMBOL_W: u16 = 2;
+
+/// Glyphs of the CHANGES column: changed files, lines added, lines removed.
+const FILES_ICON: char = '⎘';
+const ADDED_ICON: char = '+';
+const DELETED_ICON: char = '−';
+
+/// The CHANGES cell for one row. A worktree being removed shows a spinner
+/// instead of counts that are about to stop meaning anything; an unmerged
+/// file outranks the plain counts (the worktree is stopped mid-operation and
+/// needs attention, not just edits); otherwise files, lines added, and lines
+/// removed each get their own glyph and colour so the three read at a glance.
+fn changes_cell(wt: &WorktreeInfo, deleting: bool, tick: u64) -> Line<'static> {
+    if deleting {
+        return Line::from(Span::styled(
+            format!("{} deleting…", spinner_glyph(tick)),
+            Style::new().fg(theme::DANGER).bold(),
+        ));
+    }
+    if wt.conflicted > 0 {
+        return Line::from(Span::styled(
+            format!("⚠ {} conflict{}", wt.conflicted, plural(wt.conflicted)),
+            Style::new().fg(theme::DANGER).bold(),
+        ));
+    }
+    if wt.dirty == 0 {
+        return Line::from(Span::styled("clean", Style::new().fg(theme::SUCCESS)));
+    }
+    Line::from(vec![
+        Span::styled(
+            format!("{FILES_ICON} {}", wt.dirty),
+            Style::new().fg(theme::WARNING),
+        ),
+        Span::raw(", "),
+        Span::styled(
+            format!("{ADDED_ICON}{}", wt.added),
+            Style::new().fg(theme::SUCCESS),
+        ),
+        Span::raw(", "),
+        Span::styled(
+            format!("{DELETED_ICON}{}", wt.deleted),
+            Style::new().fg(theme::DANGER),
+        ),
+    ])
+}
+
+/// Width of the CHANGES column: wide enough for its widest cell, so a big
+/// line count never gets clipped, and never narrower than `CHANGES_MIN_W`.
+fn changes_cell_width(app: &App) -> u16 {
+    app.worktrees
+        .iter()
+        .map(|wt| changes_cell(wt, app.is_deleting(&wt.name), 0).width() as u16)
+        .max()
+        .unwrap_or(0)
+        .max(CHANGES_MIN_W)
+}
 
 /// The worktree table. `focused` is false when another panel owns the keyboard
 /// (the three-panel layout's file list), which dims the row highlight so it is
@@ -706,18 +777,20 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) -> Opt
         .max()
         .unwrap_or(10)
         .max(10) as u16;
+    let changes_w = changes_cell_width(app);
     let block = focus_panel("worktrees", focused);
     let inner = block.inner(area);
     // Mirror the table's own horizontal layout so the path can be trimmed from
     // the front before ratatui would clip it from the back: the highlight
     // symbol column, the four fixed columns, and one space between all five.
     let path_w = inner.width.saturating_sub(
-        HIGHLIGHT_SYMBOL_W + name_w + CHANGES_W + UPSTREAM_W + FLAGS_W + COLUMN_SPACING * 4,
+        HIGHLIGHT_SYMBOL_W + name_w + changes_w + UPSTREAM_W + FLAGS_W + COLUMN_SPACING * 4,
     ) as usize;
     let rows: Vec<Row> = app
         .worktrees
         .iter()
         .map(|wt| {
+            let deleting = app.is_deleting(&wt.name);
             let name = Line::from(vec![
                 Span::styled(wt.name.clone(), Style::new().bold()),
                 if wt.is_main {
@@ -726,22 +799,7 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) -> Opt
                     Span::raw("")
                 },
             ]);
-            // An unmerged file outranks the plain dirty count: it means the
-            // worktree is stopped mid-operation and needs attention, not just
-            // that it has edits.
-            let changes = if wt.conflicted > 0 {
-                Span::styled(
-                    format!("⚠ {} conflict{}", wt.conflicted, plural(wt.conflicted)),
-                    Style::new().fg(theme::DANGER).bold(),
-                )
-            } else if wt.dirty > 0 {
-                Span::styled(
-                    format!("{} changed", wt.dirty),
-                    Style::new().fg(theme::WARNING),
-                )
-            } else {
-                Span::styled("clean".to_string(), Style::new().fg(theme::SUCCESS))
-            };
+            let changes = changes_cell(wt, deleting, app.tick_count);
             let upstream = match wt.ahead_behind {
                 Some(ab) => Span::styled(
                     format!("↑{} ↓{}", ab.ahead, ab.behind),
@@ -761,7 +819,7 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) -> Opt
                 flag_spans.push(Span::raw(" "));
             }
             flag_spans.extend(status_flag_spans(&wt.flag_labels()));
-            Row::new(vec![
+            let row = Row::new(vec![
                 Cell::from(name),
                 Cell::from(changes),
                 Cell::from(upstream),
@@ -770,7 +828,10 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) -> Opt
                     truncate_start(&wt.path, path_w),
                     Style::new().dim(),
                 )),
-            ])
+            ]);
+            // A row on its way out is greyed as a whole, so the eye skips it
+            // the way the key handler does.
+            if deleting { row.dim() } else { row }
         })
         .collect();
 
@@ -778,7 +839,7 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) -> Opt
         rows,
         [
             Constraint::Length(name_w),
-            Constraint::Length(CHANGES_W),
+            Constraint::Length(changes_w),
             Constraint::Length(UPSTREAM_W),
             Constraint::Length(FLAGS_W),
             Constraint::Min(MIN_PATH_W),
@@ -805,7 +866,7 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) -> Opt
     let path_x = inner.x
         + HIGHLIGHT_SYMBOL_W
         + name_w
-        + CHANGES_W
+        + changes_w
         + UPSTREAM_W
         + FLAGS_W
         + COLUMN_SPACING * 4;
@@ -6565,6 +6626,55 @@ mod tests {
         assert_eq!(truncate_middle("anything", 1), "…");
     }
 
+    /// A `WorktreeInfo` with only the CHANGES-column fields set.
+    fn changes_info(dirty: usize, added: usize, deleted: usize, conflicted: usize) -> WorktreeInfo {
+        WorktreeInfo {
+            name: "wt".into(),
+            branch: Some("wt".into()),
+            path: "/tmp/wt".into(),
+            is_main: false,
+            dirty,
+            added,
+            deleted,
+            ahead_behind: None,
+            locked: false,
+            merged: false,
+            created_from: None,
+            changed_from_base: false,
+            behind_base: false,
+            conflicted,
+            in_progress: None,
+        }
+    }
+
+    /// The CHANGES cell spells out files, lines added, and lines removed with
+    /// a glyph each, and falls back to the plain states for a clean or
+    /// conflicted tree.
+    #[test]
+    fn changes_cell_shows_file_and_line_counts() {
+        assert_eq!(
+            line_text(&changes_cell(&changes_info(3, 120, 8, 0), false, 0)),
+            "⎘ 3, +120, −8"
+        );
+        assert_eq!(
+            line_text(&changes_cell(&changes_info(0, 0, 0, 0), false, 0)),
+            "clean"
+        );
+        assert_eq!(
+            line_text(&changes_cell(&changes_info(4, 1, 1, 2), false, 0)),
+            "⚠ 2 conflicts"
+        );
+    }
+
+    /// A worktree being removed shows a spinner in place of counts that are
+    /// about to stop meaning anything, whatever state it was in.
+    #[test]
+    fn changes_cell_marks_a_deleting_worktree() {
+        let text = line_text(&changes_cell(&changes_info(3, 120, 8, 0), true, 0));
+        assert!(text.ends_with(" deleting…"), "{text}");
+        assert!(text.starts_with(spinner_glyph(0)), "{text}");
+    }
+
     /// The path budget `draw_list` computes must match the width ratatui
     /// actually hands the PATH column, or the front-truncated path gets clipped
     /// at the back again. Rebuilds the same table and counts the cell.
@@ -6575,7 +6685,7 @@ mod tests {
         let block = focus_panel("worktrees", true);
         let inner = block.inner(Rect::new(0, 0, width, 4));
         let budget = inner.width.saturating_sub(
-            HIGHLIGHT_SYMBOL_W + name_w + CHANGES_W + UPSTREAM_W + FLAGS_W + COLUMN_SPACING * 4,
+            HIGHLIGHT_SYMBOL_W + name_w + CHANGES_MIN_W + UPSTREAM_W + FLAGS_W + COLUMN_SPACING * 4,
         ) as usize;
         let filler = "x".repeat(200);
         let out = render(width, 4, |frame, area| {
@@ -6589,7 +6699,7 @@ mod tests {
                 ])],
                 [
                     Constraint::Length(name_w),
-                    Constraint::Length(CHANGES_W),
+                    Constraint::Length(CHANGES_MIN_W),
                     Constraint::Length(UPSTREAM_W),
                     Constraint::Length(FLAGS_W),
                     Constraint::Min(MIN_PATH_W),

@@ -34,12 +34,14 @@ pub fn print_list(infos: &[WorktreeInfo]) {
         .unwrap_or(4)
         .max(4);
     println!(
-        "{:<name_w$}  {:<10}  {:<10}  {:<28}  PATH",
-        "NAME", "DIRTY", "UPSTREAM", "FLAGS"
+        "{:<name_w$}  {:<18}  {:<10}  {:<28}  PATH",
+        "NAME", "CHANGES", "UPSTREAM", "FLAGS"
     );
     for info in infos {
+        // Same shape as the TUI's CHANGES column: files, lines added, lines
+        // removed.
         let dirty = if info.dirty > 0 {
-            format!("{} file(s)", info.dirty)
+            format!("{} file(s) +{} -{}", info.dirty, info.added, info.deleted)
         } else {
             "clean".to_string()
         };
@@ -53,7 +55,7 @@ pub fn print_list(infos: &[WorktreeInfo]) {
         }
         let flags = format_flags(&info.flag_labels());
         println!(
-            "{name:<name_w$}  {dirty:<10}  {upstream:<10}  {flags:<28}  {}",
+            "{name:<name_w$}  {dirty:<18}  {upstream:<10}  {flags:<28}  {}",
             info.path
         );
     }

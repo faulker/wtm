@@ -672,6 +672,84 @@ pub fn diff(dir: &Path) -> Result<String> {
     run(dir, &["diff", "HEAD"])
 }
 
+/// Lines added and removed by a worktree's uncommitted changes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct LineStats {
+    pub added: usize,
+    pub deleted: usize,
+}
+
+/// Line counts for the uncommitted changes in `dir`: tracked files via
+/// `git diff --numstat HEAD` (staged + unstaged), plus every untracked file in
+/// `status` counted whole, since `diff HEAD` cannot see files git does not know
+/// about. Binary files (which numstat reports as `-`) count as zero lines.
+pub fn line_stats(dir: &Path, status: &[StatusEntry]) -> Result<LineStats> {
+    // An unborn HEAD (fresh `git init`, nothing committed) has no tree to diff
+    // against; index-vs-empty-tree plus worktree-vs-index covers the same
+    // changes there.
+    let numstat = match run(dir, &["diff", "--numstat", "HEAD"]) {
+        Ok(out) => out,
+        Err(_) => {
+            let cached = run(dir, &["diff", "--numstat", "--cached"])?;
+            let unstaged = run(dir, &["diff", "--numstat"])?;
+            format!("{cached}\n{unstaged}")
+        }
+    };
+    let mut stats = parse_numstat(&numstat);
+    for entry in status.iter().filter(|e| e.code == "??") {
+        stats.added += count_file_lines(&dir.join(&entry.path));
+    }
+    Ok(stats)
+}
+
+/// Sums `git diff --numstat` output (`added<TAB>deleted<TAB>path` per line).
+/// Binary files show `-` in both columns and are skipped.
+pub fn parse_numstat(out: &str) -> LineStats {
+    let mut stats = LineStats::default();
+    for line in out.lines() {
+        let mut cols = line.split('\t');
+        let (Some(a), Some(d)) = (cols.next(), cols.next()) else {
+            continue;
+        };
+        stats.added += a.parse::<usize>().unwrap_or(0);
+        stats.deleted += d.parse::<usize>().unwrap_or(0);
+    }
+    stats
+}
+
+/// Number of lines in an untracked file, counted the way numstat would count
+/// a newly added file: one per newline, plus one for an unterminated last
+/// line. Files git would call binary (a NUL in the first 8 KiB) count as zero,
+/// and an unreadable file (deleted between status and here) counts as zero
+/// rather than failing the whole listing.
+fn count_file_lines(path: &Path) -> usize {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return 0;
+    };
+    let mut buf = [0u8; 8192];
+    let mut lines = 0;
+    let mut last = b'\n';
+    let mut first_chunk = true;
+    loop {
+        let n = match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => return 0,
+        };
+        if first_chunk && buf[..n].contains(&0) {
+            return 0;
+        }
+        first_chunk = false;
+        lines += buf[..n].iter().filter(|b| **b == b'\n').count();
+        last = buf[n - 1];
+    }
+    if last != b'\n' {
+        lines += 1;
+    }
+    lines
+}
+
 /// Unified diff of a single `path`. Untracked files are diffed against
 /// `/dev/null` so their whole contents show as additions.
 pub fn diff_file(dir: &Path, path: &str, untracked: bool) -> Result<String> {
@@ -1932,6 +2010,69 @@ mod tests {
         std::fs::write(repo.join("shared.txt"), "main version\n").unwrap();
         run(repo, &["commit", "-am", "main edit"]).unwrap();
         run(repo, &["checkout", "feature"]).unwrap();
+    }
+
+    /// Line counts cover staged, unstaged, and untracked changes alike, and
+    /// an untracked file's unterminated last line still counts as a line.
+    #[test]
+    fn line_stats_count_tracked_and_untracked_changes() {
+        let (_tmp, repo) = temp_repo();
+        std::fs::write(repo.join("a.txt"), "1\n2\n3\n").unwrap();
+        run(&repo, &["add", "a.txt"]).unwrap();
+        run(&repo, &["commit", "-m", "a"]).unwrap();
+        assert_eq!(
+            line_stats(&repo, &status(&repo).unwrap()).unwrap(),
+            LineStats::default(),
+            "a clean tree has nothing to count"
+        );
+        // Unstaged: drop one line, add two.
+        std::fs::write(repo.join("a.txt"), "1\n3\n4\n5\n").unwrap();
+        // Staged: a new file.
+        std::fs::write(repo.join("b.txt"), "x\n").unwrap();
+        run(&repo, &["add", "b.txt"]).unwrap();
+        // Untracked, no trailing newline; and a binary that counts as zero.
+        std::fs::write(repo.join("c.txt"), "p\nq").unwrap();
+        std::fs::write(repo.join("blob.bin"), b"\x00\n\n\n").unwrap();
+        let stats = line_stats(&repo, &status(&repo).unwrap()).unwrap();
+        assert_eq!(
+            stats,
+            LineStats {
+                added: 2 + 1 + 2,
+                deleted: 1
+            }
+        );
+    }
+
+    /// A fresh `git init` with nothing committed has no HEAD to diff against;
+    /// the index-plus-worktree fallback still counts the staged file.
+    #[test]
+    fn line_stats_handle_an_unborn_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("fresh");
+        std::fs::create_dir(&repo).unwrap();
+        run(&repo, &["init", "-b", "main"]).unwrap();
+        std::fs::write(repo.join("a.txt"), "1\n2\n").unwrap();
+        run(&repo, &["add", "a.txt"]).unwrap();
+        let stats = line_stats(&repo, &status(&repo).unwrap()).unwrap();
+        assert_eq!(
+            stats,
+            LineStats {
+                added: 2,
+                deleted: 0
+            }
+        );
+    }
+
+    #[test]
+    fn parse_numstat_skips_binary_rows() {
+        let stats = parse_numstat("3\t1\ta.rs\n-\t-\timg.png\n0\t4\tb.rs\n");
+        assert_eq!(
+            stats,
+            LineStats {
+                added: 3,
+                deleted: 5
+            }
+        );
     }
 
     #[test]

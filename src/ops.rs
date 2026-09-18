@@ -62,6 +62,11 @@ pub struct WorktreeInfo {
     pub is_main: bool,
     /// Number of changed files (staged + unstaged + untracked).
     pub dirty: usize,
+    /// Lines added across those files (untracked files count whole; binary
+    /// files count as zero).
+    pub added: usize,
+    /// Lines removed across those files.
+    pub deleted: usize,
     /// Ahead/behind upstream; `null` when no upstream is configured.
     pub ahead_behind: Option<AheadBehind>,
     pub locked: bool,
@@ -260,20 +265,28 @@ pub fn list(ctx: &Ctx) -> Result<Vec<WorktreeInfo>> {
         // A worktree directory can disappear out from under git (deleted by
         // hand); report it rather than failing the whole listing.
         let exists = wt.path.exists();
-        let (dirty, conflicted, ahead_behind, in_progress) = if exists {
+        let (dirty, conflicted, lines, ahead_behind, in_progress) = if exists {
             let status = git::status(&wt.path)?;
             let conflicted = status
                 .iter()
                 .filter(|e| git::is_conflict_code(&e.code))
                 .count();
+            // Only worth a numstat when something changed; a clean tree is
+            // the common case in a long list.
+            let lines = if status.is_empty() {
+                git::LineStats::default()
+            } else {
+                git::line_stats(&wt.path, &status)?
+            };
             (
                 status.len(),
                 conflicted,
+                lines,
                 git::ahead_behind(&wt.path)?,
                 detect_resolve_kind_in(&wt.path),
             )
         } else {
-            (0, 0, None, None)
+            (0, 0, git::LineStats::default(), None, None)
         };
         // Whether this worktree's branch has been merged into the default
         // branch. Skip the main worktree and the default branch itself (nothing
@@ -304,6 +317,8 @@ pub fn list(ctx: &Ctx) -> Result<Vec<WorktreeInfo>> {
             path: wt.path.to_string_lossy().to_string(),
             is_main,
             dirty,
+            added: lines.added,
+            deleted: lines.deleted,
             ahead_behind,
             locked: wt.is_locked,
             merged,

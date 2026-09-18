@@ -129,6 +129,19 @@ fn create_list_status_diff_remove_roundtrip() {
     assert_eq!(status["changes"][0]["path"], "README.md");
     let diff = stdout_json(&wtm(&repo, &["diff", "feature-x", "--json"]));
     assert!(diff["diff"].as_str().unwrap().contains("-hello"));
+    // list: the edit (one line swapped) plus an untracked two-line file show
+    // up as file and line counts.
+    std::fs::write(wt_path.join("notes.txt"), "one\ntwo").unwrap();
+    let list = stdout_json(&wtm(&repo, &["list", "--json"]));
+    let feat = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["name"] == "feature-x")
+        .unwrap();
+    assert_eq!(feat["dirty"], 2);
+    assert_eq!(feat["added"], 3);
+    assert_eq!(feat["deleted"], 1);
 
     // remove: refuses while dirty, succeeds with --force
     let out = wtm(&repo, &["remove", "feature-x", "--json"]);

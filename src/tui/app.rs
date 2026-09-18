@@ -172,6 +172,17 @@ impl<T> Task<T> {
     }
 }
 
+/// A worktree removal running on a background thread. The row stays in the
+/// list marked as deleting, and every other worktree stays usable while git
+/// works; `poll_deletes` applies the outcome once it lands.
+pub struct Deleting {
+    pub name: String,
+    /// Branch to delete on the main thread once the folder is gone, so a
+    /// refused delete can still open the force prompt. `None` keeps the branch.
+    branch: Option<String>,
+    rx: Task<Result<WorktreeInfo, String>>,
+}
+
 /// How often the diff view recomputes itself to pick up outside edits while the
 /// user is actively driving the app.
 const DIFF_REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
@@ -299,7 +310,22 @@ type CommitsPending = Option<(
     CommitsLoadKey,
     Task<Result<(Vec<GraphLine>, Vec<bool>), String>>,
 )>;
-type StatusRefreshPending = Option<(u64, String, bool, Task<Result<Vec<StatusEntry>, String>>)>;
+type StatusRefreshPending = Option<(u64, String, bool, Task<Result<StatusLoad, String>>)>;
+
+/// What a background `ops::status` hands back: the changed files plus the
+/// line counts that go with them, so the list row and the panel it feeds
+/// update together.
+type StatusLoad = (Vec<StatusEntry>, git::LineStats);
+
+/// Shapes an `ops::status` result into a `StatusLoad`, lifting the line
+/// counts `ops::list` already computed off the worktree's info.
+fn status_load((info, files): (WorktreeInfo, Vec<StatusEntry>)) -> StatusLoad {
+    let lines = git::LineStats {
+        added: info.added,
+        deleted: info.deleted,
+    };
+    (files, lines)
+}
 type StashPending = Option<(String, Task<Result<Vec<StashEntry>, String>>)>;
 type CommitFilesPending = Option<(String, Task<Result<Vec<StatusEntry>, String>>)>;
 
@@ -1289,13 +1315,6 @@ pub enum BusyThen {
     Pull {
         name: String,
     },
-    /// After a backgrounded worktree removal succeeds, delete its branch on the
-    /// main thread (so a refused delete can open the force prompt). Carries the
-    /// worktree name and the branch to delete.
-    DeleteBranch {
-        name: String,
-        branch: String,
-    },
     /// After a merge/update/cherry-pick/stash-pop finishes, check the target for
     /// conflicts: open the resolver when any remain, otherwise report the clean
     /// result. Carries the worktree name, a label for what was applied, and the
@@ -1789,7 +1808,7 @@ pub struct App {
     /// `selected` index the result belongs to; `poll_preview_load` drops
     /// results that no longer match so fast navigation never applies a stale
     /// list. Drained each tick, mirroring `branches_pending`.
-    preview_pending: Option<(usize, Task<Vec<StatusEntry>>)>,
+    preview_pending: Option<(usize, Task<StatusLoad>)>,
     /// First visible row of the changed-file preview, so a worktree with more
     /// changes than the panel is tall can be scrolled through in place.
     pub preview_scroll: usize,
@@ -1854,6 +1873,9 @@ pub struct App {
     /// Bumped whenever a status refresh or async `load_changes` starts; results
     /// with a stale token are ignored.
     status_refresh_gen: u64,
+    /// Worktree removals in flight, oldest first. Never modal: the list keeps
+    /// taking keys for every other row. Drained by `poll_deletes` each tick.
+    pub deleting: Vec<Deleting>,
     /// Background `ops::stash_list` for the Stash tab. The `String` is the
     /// worktree name the result belongs to.
     stash_pending: StashPending,
@@ -2044,6 +2066,7 @@ impl App {
             commits_pending: None,
             status_refresh_pending: None,
             status_refresh_gen: 0,
+            deleting: Vec::new(),
             stash_pending: None,
             branches: Vec::new(),
             branches_all: Vec::new(),
@@ -2406,6 +2429,7 @@ impl App {
             || self.commit_files_pending.is_some()
             || self.commits_pending.is_some()
             || self.status_refresh_pending.is_some()
+            || !self.deleting.is_empty()
             || self.stash_pending.is_some()
             || self.branches_pending.is_some()
             || self.resolver_pending.is_some()
@@ -2438,6 +2462,7 @@ impl App {
         // of conflicts never blocks the event loop on a file read.
         self.poll_resolver_load();
         self.poll_status_refresh();
+        self.poll_deletes();
         self.poll_stash_load();
         // The commit dialog opens before its file list exists, so drain that
         // load here too; it is view-dependent but cheap to check.
@@ -2452,10 +2477,7 @@ impl App {
                 };
                 // A success lands in the header's status line; a failure pops up
                 // the modal error box instead, since git errors are often
-                // multi-line and unreadable truncated to one line. The
-                // DeleteBranch follow-up is special: on success it proceeds to
-                // the (possibly force-prompting) branch delete rather than
-                // showing a message here.
+                // multi-line and unreadable truncated to one line.
                 match (result, then) {
                     // The new binary is in place: quit so `tui::run` can
                     // restore the terminal and hand over to it.
@@ -2463,10 +2485,6 @@ impl App {
                         self.message = Some(m);
                         self.restart_exe = Some(exe);
                         self.quit = true;
-                    }
-                    (Ok(_), BusyThen::DeleteBranch { name, branch }) => {
-                        self.refresh();
-                        self.delete_branch_step(name, branch);
                     }
                     // A merge/update landed: open the resolver if it left
                     // conflicts, otherwise show its clean-result message.
@@ -2507,9 +2525,7 @@ impl App {
                                     self.refresh_diff();
                                 }
                             }
-                            BusyThen::DeleteBranch { .. }
-                            | BusyThen::Resolve { .. }
-                            | BusyThen::Restart { .. } => {}
+                            BusyThen::Resolve { .. } | BusyThen::Restart { .. } => {}
                             BusyThen::Stash(name) => self.reload_stash_tab(name),
                             BusyThen::Branch => {
                                 self.load_branches();
@@ -3937,6 +3953,26 @@ impl App {
     }
 
     fn on_worktrees_tab_key(&mut self, key: KeyEvent) {
+        // A row being removed takes no per-worktree command: its folder is
+        // disappearing under whatever the command would run. Navigation,
+        // refresh, and the repo-wide keys (new, fetch) still work.
+        if let Some(name) = self
+            .selected_worktree()
+            .filter(|w| self.is_deleting(&w.name))
+            .map(|w| w.name.clone())
+        {
+            let allowed = matches!(
+                key.code,
+                KeyCode::Char('q' | 'j' | 'k' | 'J' | 'K' | 'H' | 'L' | 'r' | 'n' | 'f')
+                    | KeyCode::Esc
+                    | KeyCode::Up
+                    | KeyCode::Down
+            );
+            if !allowed {
+                self.message = Some(format!("'{name}' is being removed"));
+                return;
+            }
+        }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.request_quit(),
             // Three-panel: the panel below the list is the diff, scrolled
@@ -4192,13 +4228,18 @@ impl App {
             self.set_error(format!("no worktree named '{name}'"));
             return false;
         }
+        if self.is_deleting(&name) {
+            self.message = Some(format!("'{name}' is being removed"));
+            return false;
+        }
         // Fast path: the Worktrees preview already holds this worktree's status.
         if self
             .preview_for
             .is_some_and(|i| self.worktrees.get(i).is_some_and(|w| w.name == name))
         {
             let files = self.worktree_preview.clone();
-            self.apply_changes_files(name, files, false);
+            let lines = self.line_stats_of(&name);
+            self.apply_changes_files(name, files, lines, false);
             return true;
         }
         self.start_status_refresh(name, false);
@@ -5348,6 +5389,11 @@ impl App {
             self.realign_changes_after_list_reload();
             return;
         }
+        // Its folder is going away under us; the list reload that follows the
+        // delete realigns the pane.
+        if self.is_deleting(&name) {
+            return;
+        }
         self.start_status_refresh(name, true);
     }
 
@@ -5385,7 +5431,7 @@ impl App {
         let name_for_thread = name.clone();
         std::thread::spawn(move || {
             let result = ops::status(&ctx, &name_for_thread)
-                .map(|(_, files)| files)
+                .map(status_load)
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
         });
@@ -5409,7 +5455,7 @@ impl App {
             return;
         }
         match result {
-            Ok(files) => self.apply_changes_files(name, files, preserve),
+            Ok((files, lines)) => self.apply_changes_files(name, files, lines, preserve),
             Err(e) => {
                 if !self.worktrees.iter().any(|w| w.name == name) {
                     self.realign_changes_after_list_reload();
@@ -5428,9 +5474,15 @@ impl App {
     /// Installs `files` into the changes pane for `name`. When `preserve_marks`
     /// is true, keeps marks/cursor/scroll semantics of `refresh_diff`; otherwise
     /// resets like a fresh `load_changes`.
-    fn apply_changes_files(&mut self, name: String, files: Vec<StatusEntry>, preserve_marks: bool) {
+    fn apply_changes_files(
+        &mut self,
+        name: String,
+        files: Vec<StatusEntry>,
+        lines: git::LineStats,
+        preserve_marks: bool,
+    ) {
         let tree = self.file_tree;
-        self.sync_dirty_count(&name, &files);
+        self.sync_dirty_count(&name, &files, lines);
         self.reconcile_resolver(&name, &files);
         if preserve_marks {
             let old_path = {
@@ -6900,10 +6952,10 @@ impl App {
         let (tx, rx) = channel();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
-            let files = ops::status(&ctx, &name)
-                .map(|(_, files)| files)
+            let load = ops::status(&ctx, &name)
+                .map(status_load)
                 .unwrap_or_default();
-            let _ = tx.send(files);
+            let _ = tx.send(load);
         });
         self.preview_pending = Some((selected, Task::new(rx)));
     }
@@ -6916,7 +6968,7 @@ impl App {
             return;
         };
         let idx = *idx;
-        let Some(files) = task.poll_latest() else {
+        let Some((files, lines)) = task.poll_latest() else {
             return;
         };
         self.preview_pending = None;
@@ -6926,7 +6978,7 @@ impl App {
             return;
         }
         if let Some(name) = self.worktrees.get(idx).map(|w| w.name.clone()) {
-            self.sync_dirty_count(&name, &files);
+            self.sync_dirty_count(&name, &files, lines);
         }
         self.worktree_preview = files;
         self.preview_for = Some(idx);
@@ -6944,11 +6996,13 @@ impl App {
     /// beside them caught up. The counts are derived from the same
     /// `git::status` listing `ops::list` derives them from, so this never
     /// disagrees with what the next full reload computes.
-    fn sync_dirty_count(&mut self, name: &str, files: &[StatusEntry]) {
+    fn sync_dirty_count(&mut self, name: &str, files: &[StatusEntry], lines: git::LineStats) {
         let Some(wt) = self.worktrees.iter_mut().find(|w| w.name == name) else {
             return;
         };
         wt.dirty = files.len();
+        wt.added = lines.added;
+        wt.deleted = lines.deleted;
         wt.conflicted = files
             .iter()
             .filter(|e| git::is_conflict_code(&e.code))
@@ -9849,10 +9903,12 @@ impl App {
         }
     }
 
-    /// Removes the worktree folder and, when requested, deletes its branch. A
-    /// folder-only removal is backgrounded through the Busy overlay; a branch
-    /// delete runs synchronously so an unmerged or checked-out-elsewhere
-    /// refusal can open the force prompt instead of failing silently.
+    /// Removes the worktree folder on a background thread and, when requested,
+    /// deletes its branch once the folder is gone. Never blocks the screen:
+    /// the row is marked as deleting (`is_deleting`) and the user keeps
+    /// working with the other worktrees until `poll_deletes` reports the
+    /// outcome. The branch delete itself runs on the main thread so an
+    /// unmerged or checked-out-elsewhere refusal can open the force prompt.
     fn do_delete(
         &mut self,
         name: String,
@@ -9860,38 +9916,107 @@ impl App {
         delete_branch: bool,
         force: bool,
     ) {
-        match (delete_branch, branch) {
-            // Remove the folder in the background (the slow part), then delete
-            // the branch on the main thread once it lands (see the DeleteBranch
-            // follow-up in tick), so an unmerged or checked-out-elsewhere
-            // refusal can still open the force prompt. Backgrounding keeps the
-            // spinner moving instead of freezing the UI while git works.
-            (true, Some(branch)) => {
-                let thread_name = name.clone();
-                self.start_busy(
-                    format!("removing '{name}' and branch '{branch}'…"),
-                    BusyThen::DeleteBranch {
-                        name: name.clone(),
-                        branch,
-                    },
-                    move |ctx| {
-                        ops::remove_worktree_only(ctx, &thread_name, force)
-                            .map(|_| String::new())
-                            .map_err(|e| format!("{e:#}"))
-                    },
-                );
+        if self.is_deleting(&name) {
+            return;
+        }
+        let (tx, rx) = channel();
+        let ctx = self.ctx.clone();
+        let thread_name = name.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(
+                ops::remove_worktree_only(&ctx, &thread_name, force).map_err(|e| format!("{e:#}")),
+            );
+        });
+        self.deleting.push(Deleting {
+            name: name.clone(),
+            branch: if delete_branch { branch } else { None },
+            rx: Task::new(rx),
+        });
+        // The delete was confirmed from a modal or a drilled-in screen; land
+        // back on the list, where the row shows its progress.
+        self.go_root();
+        self.detach_from_deleting(&name);
+    }
+
+    /// Line counts the list currently holds for `name` (zero when unknown).
+    fn line_stats_of(&self, name: &str) -> git::LineStats {
+        self.worktrees
+            .iter()
+            .find(|w| w.name == name)
+            .map(|w| git::LineStats {
+                added: w.added,
+                deleted: w.deleted,
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether a removal of the worktree named `name` is in flight.
+    pub fn is_deleting(&self, name: &str) -> bool {
+        self.deleting.iter().any(|d| d.name == name)
+    }
+
+    /// Names of the worktrees being removed, oldest first, for the header's
+    /// status line.
+    pub fn deleting_names(&self) -> Vec<&str> {
+        self.deleting.iter().map(|d| d.name.as_str()).collect()
+    }
+
+    /// Moves the cursor and the changes pane off a worktree that is being
+    /// removed. Its folder disappears under any status or diff load, so
+    /// nothing may keep pointing at it; the neighbouring row is the natural
+    /// place to continue from.
+    fn detach_from_deleting(&mut self, name: &str) {
+        if self
+            .worktrees
+            .get(self.selected)
+            .is_some_and(|w| w.name == name)
+        {
+            let next = (self.selected + 1..self.worktrees.len())
+                .chain((0..self.selected).rev())
+                .find(|&i| !self.is_deleting(&self.worktrees[i].name));
+            if let Some(i) = next {
+                self.selected = i;
+                self.preview_scroll = 0;
+                self.preview_for = None;
+                self.preview_pending = None;
             }
-            // Folder-only removal (branch kept, or a detached worktree).
-            _ => {
-                let thread_name = name.clone();
-                self.start_busy(format!("removing '{name}'…"), BusyThen::List, move |ctx| {
-                    ops::remove_worktree_only(ctx, &thread_name, force)
-                        .map(|info| match &info.branch {
-                            Some(_) => format!("removed '{}' (branch kept)", info.name),
-                            None => format!("removed '{}'", info.name),
-                        })
-                        .map_err(|e| format!("{e:#}"))
-                });
+        }
+        if self.changes.name == name {
+            self.changes = ChangesTab::default();
+            self.resolver = None;
+            self.worktree_commits = None;
+            self.commits_pending = None;
+            self.status_refresh_pending = None;
+            if self.tab == Tab::Changes {
+                self.tab = Tab::Worktrees;
+            }
+            self.worktrees_focus = WorktreesFocus::List;
+        }
+    }
+
+    /// Applies finished background removals. A folder-only removal reports
+    /// its result here; a removal that also drops the branch continues into
+    /// `delete_branch_step`. Either way the list reloads so the row goes.
+    fn poll_deletes(&mut self) {
+        let mut done = Vec::new();
+        for (i, d) in self.deleting.iter().enumerate() {
+            if let Some(result) = d.rx.poll_latest() {
+                done.push((i, result));
+            }
+        }
+        // Remove from the back so earlier indices stay valid.
+        for (i, result) in done.into_iter().rev() {
+            let Deleting { name, branch, .. } = self.deleting.remove(i);
+            self.refresh();
+            match (result, branch) {
+                (Ok(_), Some(branch)) => self.delete_branch_step(name, branch),
+                (Ok(info), None) => {
+                    self.message = Some(match &info.branch {
+                        Some(_) => format!("removed '{}' (branch kept)", info.name),
+                        None => format!("removed '{}'", info.name),
+                    });
+                }
+                (Err(e), _) => self.set_error(e),
             }
         }
     }
@@ -10139,7 +10264,7 @@ mod tests {
     /// can assert on the settled state after a backgrounded action.
     fn settle(app: &mut App) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while matches!(app.view, View::Busy { .. }) {
+        while matches!(app.view, View::Busy { .. }) || !app.deleting.is_empty() {
             app.tick();
             assert!(std::time::Instant::now() < deadline, "busy op timed out");
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -15452,21 +15577,91 @@ mod tests {
         assert!(!crate::git::branch_exists(&app.ctx.repo_root, "dropme"));
     }
 
+    /// Confirming a delete hands the removal to a background thread without
+    /// taking over the screen: the list stays interactive, the row is marked
+    /// as deleting, and the cursor steps off it so the neighbouring worktree
+    /// is ready to work with.
     #[test]
-    fn delete_runs_through_the_busy_overlay() {
+    fn delete_runs_in_the_background_without_a_modal() {
         let (_tmp, mut app) = test_app();
         add_and_select_worktree(&mut app, "later");
         press(&mut app, KeyCode::Char('d'));
-        // Confirming hands the removal to a background thread, so the overlay
-        // shows immediately rather than freezing the UI.
         press(&mut app, KeyCode::Enter);
         assert!(
-            matches!(app.view, View::Busy { .. }),
-            "delete should be backgrounded"
+            matches!(app.view, View::List),
+            "delete must not open a busy overlay"
         );
+        assert!(app.is_deleting("later"));
+        assert_eq!(app.deleting_names(), vec!["later"]);
+        assert!(
+            app.worktrees.iter().any(|w| w.name == "later"),
+            "the row stays listed while the removal runs"
+        );
+        assert_ne!(
+            app.selected_worktree().map(|w| w.name.as_str()),
+            Some("later"),
+            "cursor should move off the deleting row"
+        );
+        assert!(app.needs_fast_tick(), "spinner must keep animating");
         settle(&mut app);
-        assert!(matches!(app.view, View::List));
+        assert!(app.deleting.is_empty());
         assert!(!app.worktrees.iter().any(|w| w.name == "later"));
+        assert_eq!(
+            app.message.as_deref(),
+            Some("removed 'later' (branch kept)")
+        );
+    }
+
+    /// While a row is being removed, per-worktree commands on it are refused
+    /// with a status message instead of running against a vanishing folder,
+    /// while navigation and the other rows keep working.
+    #[test]
+    fn deleting_row_refuses_worktree_commands_but_keeps_navigation() {
+        let (_tmp, mut app) = test_app();
+        add_and_select_worktree(&mut app, "going");
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.is_deleting("going"));
+        // Step back onto the deleting row and try to open its changes.
+        app.selected = app
+            .worktrees
+            .iter()
+            .position(|w| w.name == "going")
+            .unwrap();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.tab, Tab::Worktrees);
+        assert_eq!(app.message.as_deref(), Some("'going' is being removed"));
+        press(&mut app, KeyCode::Char('d'));
+        assert!(
+            app.modal.is_none(),
+            "no second delete prompt for a deleting row"
+        );
+        // Navigation still moves the cursor.
+        let before = app.selected;
+        press(&mut app, KeyCode::Up);
+        assert_ne!(app.selected, before);
+        settle(&mut app);
+        assert!(!app.worktrees.iter().any(|w| w.name == "going"));
+    }
+
+    /// A delete started while the Changes tab shows that worktree drops the
+    /// pane back to the Worktrees tab straight away, so no diff refresh runs
+    /// against the disappearing folder.
+    #[test]
+    fn delete_detaches_the_changes_tab_from_the_deleting_worktree() {
+        let (_tmp, mut app) = test_app();
+        app.three_panel = false;
+        add_and_select_worktree(&mut app, "shown");
+        goto_tab(&mut app, Tab::Changes);
+        assert_eq!(app.changes.name, "shown");
+        app.tab = Tab::Worktrees;
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.is_deleting("shown"));
+        assert_ne!(app.changes.name, "shown");
+        assert_eq!(app.tab, Tab::Worktrees);
+        settle(&mut app);
+        assert!(app.error.is_none(), "unexpected error: {:?}", app.error);
     }
 
     /// After a folder-only delete, Changes/three-panel must not keep the removed
@@ -15509,7 +15704,8 @@ mod tests {
         );
     }
 
-    /// Folder+branch delete has the same stale-Changes hazard via DeleteBranch.
+    /// Folder+branch delete has the same stale-Changes hazard via the branch
+    /// follow-up in `poll_deletes`.
     #[test]
     fn delete_with_branch_realigns_changes_without_not_found() {
         let (_tmp, mut app) = test_app();

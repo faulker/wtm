@@ -169,7 +169,7 @@ Worktrees are addressed by branch name (or directory name when detached). Every 
 ```sh
 wtm init [--force]                    # guided setup, writes .wtm.toml
 wtm create <branch> [--from <base>]   # new worktree; creates the branch if needed, runs setup
-wtm list                              # all worktrees with dirty count and ahead/behind
+wtm list                              # all worktrees with change/line counts and ahead/behind
 wtm remove <name> [--force] [--delete-branch]
 wtm rename <name> <new-name>          # rename a worktree: renames its branch and moves the folder
 wtm status <name>                     # changed files in a worktree
@@ -241,7 +241,7 @@ The same conflict flow covers five sources: `merge`, `rebase`, `update`, `cherry
 
 Run `wtm` inside a repo. If the repo isn't initialized yet, the setup wizard opens first (see [Settings](#settings)); once `.wtm.toml` exists you get the worktree list.
 
-Each worktree shows its change count, ahead/behind, and a **FLAGS** column: `unpushed` / `pushed` / `behind` for where the branch's commits stand against the remote, `same` / `changed` / `outdated` vs the comparison base (recorded `[created_from]` in `.wtm.toml` when present, otherwise the repo default branch, with a merge-base fallback when that tip is missing), `✓merged` when fully merged into the default branch (safe to clean up), and `locked` for a locked worktree. Worktrees and Branches both flag `✓merged`.
+Each worktree's **CHANGES** column reads `⎘ files, +lines added, −lines removed` (untracked files count whole, binary files as zero), or `clean`. Beside it are ahead/behind and a **FLAGS** column: `unpushed` / `pushed` / `behind` for where the branch's commits stand against the remote, `same` / `changed` / `outdated` vs the comparison base (recorded `[created_from]` in `.wtm.toml` when present, otherwise the repo default branch, with a merge-base fallback when that tip is missing), `✓merged` when fully merged into the default branch (safe to clean up), and `locked` for a locked worktree. Worktrees and Branches both flag `✓merged`.
 
 The panel underneath the list shows the changed files of whichever worktree you have selected, so you can see what an agent has been up to without leaving the list. When there are more files than fit, `⇧↑`/`⇧↓` or the mouse wheel over the panel scroll it, and the border shows your position (`10-18/27`). Lists that scroll (worktrees, branches, stashes) mark the overflow with `▲`/`▼` in the left border. Clicking a file there opens it on the Changes tab.
 
@@ -324,7 +324,7 @@ On the worktree list:
 | `⇧↑`/`⇧↓` | scroll the changed-file panel below the table |
 | `Enter` | Changes tab for the selected worktree (or focus the bottom panel in three-panel layout) |
 | `n` | new worktree |
-| `d` | delete the selected worktree: folder-only (keeps the branch) or folder + branch. Uncommitted changes: stash them or discard. If the branch can't be safely deleted you're offered a force delete; forcing a branch that's checked out elsewhere first switches that worktree to the repo's default branch |
+| `d` | delete the selected worktree: folder-only (keeps the branch) or folder + branch. Uncommitted changes: stash them or discard. The removal runs in the background: the row greys out with a `deleting…` spinner and the header reports `removing '<name>'…` while you keep working with the other worktrees. If the branch can't be safely deleted you're offered a force delete; forcing a branch that's checked out elsewhere first switches that worktree to the repo's default branch |
 | `c` | commit |
 | `o` / `e` | open: run a configured `open_command`. Any configured commands open a picker listing each one already expanded (`{path}`, `{name}`, `{branch}`, `{status}`). `mode = "terminal"` (marked `▶`) runs in this terminal, and wtm comes back (reloaded) when the command exits; the default `background` mode spawns detached. With none configured it prompts for a one-off |
 | `u` | update: refresh the default branch from its upstream, then merge it in (or fast-forward in place). Offers to stash local changes first. On conflict, opens the conflict resolver |
