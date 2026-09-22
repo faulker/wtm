@@ -14,8 +14,8 @@ use ratatui::widgets::{
 
 use super::app::{
     App, BranchRow, CheckoutCandidate, CherryTarget, CommitFocus, ConfirmOption, CopyHit,
-    CreateOutcome, DiffRow, LogMode, Modal, ResolverFile, ResolverHits, RowList, Tab, TextInput,
-    UpstreamRow, View, WorktreesFocus, branch_display_rows, branch_row_of, filtered_candidates,
+    CreateOutcome, DiffRow, LogMode, Modal, ResolverFile, ResolverHits, RowList, StashFocus, Tab,
+    TextInput, UpstreamRow, View, WorktreesFocus, branch_display_rows, branch_row_of, filtered_candidates,
     upstream_rows,
 };
 use super::config_editor::{
@@ -252,6 +252,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 frame, main, name, files, marked, *cursor, input, body, focus, *loading,
             )
         }
+        View::Stash {
+            name,
+            files,
+            marked,
+            cursor,
+            input,
+            focus,
+            loading,
+            ..
+        } => {
+            overlay_hit = draw_stash_dialog(
+                frame, main, name, files, marked, *cursor, input, focus, *loading,
+            )
+        }
         View::Switch {
             name,
             branches,
@@ -367,6 +381,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         | View::Log { .. }
         | View::BranchCommits { .. } => list_hit,
         View::Commit { .. }
+        | View::Stash { .. }
         | View::Switch { .. }
         | View::CherryPick { .. }
         | View::MergePick { .. }
@@ -1528,6 +1543,15 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 hint("Enter", "new line"),
                 hint("Tab", "pick files"),
                 hint("^S", "commit"),
+                hint("Esc", "cancel"),
+            ],
+        },
+        View::Stash { focus, .. } => match focus {
+            StashFocus::Files => help::STASH_FILES,
+            StashFocus::Message => &[
+                hint("type", "stash message"),
+                hint("Tab", "pick files"),
+                hint("Enter", "stash"),
                 hint("Esc", "cancel"),
             ],
         },
@@ -3210,6 +3234,58 @@ fn draw_string_list(frame: &mut Frame, area: Rect, list: &StringListEditor) {
     frame.render_widget(Paragraph::new(Line::from(hint.dim())), hint_area);
 }
 
+/// The tick-box file list both the commit and the stash dialog are built
+/// around: `[x]`/`[ ]`, the status code, and the path, with the cursor row
+/// highlighted only while the list has focus. Returns the row map so clicks
+/// land on the file the user aimed at, scrolling included.
+fn draw_file_checklist(
+    frame: &mut Frame,
+    area: Rect,
+    files: &[StatusEntry],
+    marked: &[bool],
+    cursor: usize,
+    focused: bool,
+) -> RowList {
+    let items: Vec<ListItem> = files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let checked = marked.get(i).copied().unwrap_or(false);
+            let check = if checked {
+                Span::styled("[x] ", Style::new().fg(theme::SUCCESS))
+            } else {
+                Span::styled("[ ] ", Style::new().dim())
+            };
+            ListItem::new(Line::from(vec![
+                check,
+                Span::styled(format!("{:<3}", f.code.trim()), status_style(&f.code)),
+                Span::raw(f.path.clone()),
+            ]))
+        })
+        .collect();
+    // Both symbols are one column wide on purpose: ratatui indents every row
+    // by the highlight symbol's width, so a wider blank would shift the whole
+    // list sideways each time the pane gained or lost focus.
+    let mut list = List::new(items);
+    if focused {
+        list = list
+            .highlight_style(Style::new().bg(SELECTION_BG).bold())
+            .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
+    } else {
+        list = list.highlight_symbol(" ");
+    }
+    let mut state = ListState::default().with_selected(Some(cursor));
+    frame.render_stateful_widget(list, area, &mut state);
+    // The popup shows at most 10 rows; ListState scrolls so the cursor file
+    // stays on screen and clicks map onto that window.
+    RowList {
+        inner: area,
+        header: 0,
+        offset: state.offset(),
+        len: files.len(),
+    }
+}
+
 /// Rows the commit dialog's body box occupies, borders included.
 const COMMIT_BODY_ROWS: u16 = 7;
 
@@ -3290,41 +3366,7 @@ fn draw_commit(
         // Nothing to click while the list is a placeholder.
         return None;
     }
-    let items: Vec<ListItem> = files
-        .iter()
-        .enumerate()
-        .map(|(i, f)| {
-            let checked = marked.get(i).copied().unwrap_or(false);
-            let check = if checked {
-                Span::styled("[x] ", Style::new().fg(theme::SUCCESS))
-            } else {
-                Span::styled("[ ] ", Style::new().dim())
-            };
-            ListItem::new(Line::from(vec![
-                check,
-                Span::styled(format!("{:<3}", f.code.trim()), status_style(&f.code)),
-                Span::raw(f.path.clone()),
-            ]))
-        })
-        .collect();
-    let mut list = List::new(items);
-    if files_focused {
-        list = list
-            .highlight_style(Style::new().bg(SELECTION_BG).bold())
-            .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
-    } else {
-        list = list.highlight_symbol("  ");
-    }
-    let mut state = ListState::default().with_selected(Some(cursor));
-    frame.render_stateful_widget(list, files_area, &mut state);
-    // The popup shows at most 10 rows; ListState scrolls so the cursor file
-    // stays on screen and clicks map onto that window.
-    let list_hit = RowList {
-        inner: files_area,
-        header: 0,
-        offset: state.offset(),
-        len: files.len(),
-    };
+    let list_hit = draw_file_checklist(frame, files_area, files, marked, cursor, files_focused);
 
     draw_commit_fields(
         frame,
@@ -3343,6 +3385,102 @@ fn draw_commit(
         loading,
     );
     Some(list_hit)
+}
+
+/// Stash dialog: the same checklist the commit dialog uses (all files ticked
+/// by default) over a single optional-message field. Unticking a file leaves
+/// it in the working tree, so the count in the hint line is what will actually
+/// be stashed.
+#[allow(clippy::too_many_arguments)]
+fn draw_stash_dialog(
+    frame: &mut Frame,
+    area: Rect,
+    name: &str,
+    files: &[StatusEntry],
+    marked: &[bool],
+    cursor: usize,
+    input: &super::app::TextInput,
+    focus: &StashFocus,
+    loading: bool,
+) -> Option<RowList> {
+    /// The three single-row fields: the label, the message, and the hint.
+    const CHROME: u16 = 3;
+    // One placeholder row while the list loads, so the dialog does not jump
+    // from empty to full height as the load lands.
+    let list_rows = (files.len() as u16).clamp(1, 10);
+    let popup = centered(area, 72, list_rows + CHROME + 3);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(dialog_panel(format!("stash · {name}")), popup);
+    let inner = popup.inner(ratatui::layout::Margin::new(2, 1));
+    // A short terminal clamps the popup: the file list gives way first (it
+    // scrolls to its cursor), never the message field below it.
+    let files_rows = inner.height.saturating_sub(CHROME);
+    let [files_area, label_area, prompt_area, hint_area] = Layout::vertical([
+        Constraint::Length(files_rows),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    // `git status` runs off-thread, so the list is empty for the first frames
+    // of a large changeset. Say so rather than showing an empty pane.
+    let list_hit = if loading {
+        frame.render_widget(
+            Paragraph::new(Line::from("reading changes…".dim())),
+            files_area,
+        );
+        None
+    } else {
+        Some(draw_file_checklist(
+            frame,
+            files_area,
+            files,
+            marked,
+            cursor,
+            *focus == StashFocus::Files,
+        ))
+    };
+
+    let message_focused = *focus == StashFocus::Message;
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "Stash message (optional):",
+            if message_focused {
+                Style::new().fg(ACCENT).bold()
+            } else {
+                Style::new().dim()
+            },
+        )),
+        label_area,
+    );
+    frame.render_widget(
+        Paragraph::new(prompt_line_windowed(
+            input.as_str(),
+            input.cursor,
+            prompt_area.width,
+        )),
+        prompt_area,
+    );
+
+    let counts = if loading {
+        "reading changes…".to_string()
+    } else {
+        let selected = marked.iter().filter(|m| **m).count();
+        format!(
+            "{selected}/{} file{}",
+            files.len(),
+            if files.len() == 1 { "" } else { "s" }
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            format!("{counts} · Tab switches pane · Space toggles · Enter stashes"),
+            Style::new().dim(),
+        )),
+        hint_area,
+    );
+    list_hit
 }
 
 /// The commit dialog's lower half: the subject label and field, the body label
@@ -6012,7 +6150,8 @@ mod tests {
         assert_eq!(
             line,
             "⇥ tabs  Enter changes  n new  b switch branch  c commit  o open  \
-             s stash  p pull  ⇧P push  l log  d delete  x resolve  ? help  q quit"
+             s stash  ⇧S stash changes  p pull  ⇧P push  l log  d delete  \
+             x resolve  ? help  q quit"
         );
         // `u`, `e`, `m`, `f`, `⇧R` and the cursor keys are documented in help
         // but have no footer label, so they are absent above.

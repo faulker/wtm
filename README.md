@@ -312,7 +312,7 @@ From here:
 
 ![The Stash tab listing two stash entries for a worktree, each with its message and branch](docs/images/tui-stash.png)
 
-`s` opens the Stash tab. Stashes are shared across the whole repo, so popping or applying one asks which worktree to put it into (defaulting to the worktree the tab was opened from). `s` stashes the selected worktree's current changes (optional message); `p`/`a` pop/apply the selected entry; `x` drops it. `Enter` on an entry browses the files it changed. A pop that conflicts opens the conflict resolver.
+`s` opens the Stash tab (`⇧S` on the worktree list opens the same stash dialog directly, without the trip through the tab). Stashes are shared across the whole repo, so popping or applying one asks which worktree to put it into (defaulting to the worktree the tab was opened from). `s` opens the stash dialog for the worktree's current changes: a tick-box file list like the commit dialog's, everything ticked by default, `Space` toggles one and `a` toggles all, `Tab` moves to the optional message, and `Enter` stashes what's ticked (unticked files stay in the working tree). `p`/`a` pop/apply the selected entry; `x` drops it. `Enter` on an entry browses the files it changed. A pop that conflicts opens the conflict resolver.
 
 ### Keys
 
@@ -329,6 +329,7 @@ On the worktree list:
 | `o` / `e` | open: run a configured `open_command`. Any configured commands open a picker listing each one already expanded (`{path}`, `{name}`, `{branch}`, `{status}`). `mode = "terminal"` (marked `▶`) runs in this terminal, and wtm comes back (reloaded) when the command exits; the default `background` mode spawns detached. With none configured it prompts for a one-off |
 | `u` | update: refresh the default branch from its upstream, then merge it in (or fast-forward in place). Offers to stash local changes first. On conflict, opens the conflict resolver |
 | `s` | Stash tab |
+| `⇧S` | stash the selected worktree's changes without leaving the list. Opens the stash dialog: every changed file starts ticked, `Space` unticks the ones you want to keep in the working tree, and the message is optional. A clean worktree says so instead |
 | `m` | move uncommitted changes into another worktree you pick; refuses if the destination isn't clean |
 | `p` | pull (fast-forward only). If the branch has diverged, offers to retry with a rebase |
 | `⇧P` | push; publishes with `-u` when there's no upstream |

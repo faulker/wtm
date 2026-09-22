@@ -327,7 +327,7 @@ fn status_load((info, files): (WorktreeInfo, Vec<StatusEntry>)) -> StatusLoad {
     (files, lines)
 }
 type StashPending = Option<(String, Task<Result<Vec<StashEntry>, String>>)>;
-type CommitFilesPending = Option<(String, Task<Result<Vec<StatusEntry>, String>>)>;
+type DialogFilesPending = Option<(String, Task<Result<Vec<StatusEntry>, String>>)>;
 
 /// Index of the first row holding a commit, skipping any leading art-only rows.
 /// 0 when there are none (an empty list has nothing to select anyway).
@@ -719,8 +719,6 @@ pub enum ModalAction {
     /// Delete a branch. The option index maps back through
     /// `BranchDeleteTarget::choices`, which is what decided the option list.
     BranchDelete(BranchDeleteTarget),
-    /// Stash the worktree's changes with the submitted (optional) message.
-    StashPush { name: String },
     /// Drop the stash entry `index` on `name` (option 0 confirms).
     StashDrop { name: String, index: Option<u32> },
     /// Abort the in-progress operation in the conflict resolver (option 0).
@@ -863,7 +861,28 @@ pub enum View {
         /// Changes tab, which already has the files in hand.
         loading: bool,
         /// A submit pressed while `loading`, replayed by
-        /// `poll_commit_files_load` once the files arrive.
+        /// `poll_dialog_files_load` once the files arrive.
+        submit_pending: bool,
+    },
+    /// Stash flow: pick which uncommitted files to stash (all ticked by
+    /// default) and type an optional message. Unticking a file leaves it in
+    /// the working tree, which is what makes this more than the old one-line
+    /// message prompt. Focus alternates between the file list and the message.
+    Stash {
+        name: String,
+        files: Vec<StatusEntry>,
+        /// Whether each file goes into the stash, parallel with `files`.
+        marked: Vec<bool>,
+        /// Cursor into `files` while the file list has focus.
+        cursor: usize,
+        /// Optional stash message.
+        input: TextInput,
+        focus: StashFocus,
+        /// True until the background `ops::status` load lands; `files` is empty
+        /// meanwhile and the list draws a placeholder.
+        loading: bool,
+        /// A submit pressed while `loading`, replayed by
+        /// `poll_dialog_files_load` once the files arrive.
         submit_pending: bool,
     },
     /// Picker for switching the selected worktree onto a different branch: any
@@ -1479,6 +1498,15 @@ pub enum CommitFocus {
     Body,
 }
 
+/// Which part of the stash dialog has keyboard focus.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StashFocus {
+    /// The changed-file list: ↑/↓ move, Space toggles, `a` toggles all.
+    Files,
+    /// The stash message input: typing edits the message.
+    Message,
+}
+
 /// Why a branch could not be safely deleted after its worktree was removed,
 /// used to word the force-delete prompt.
 pub enum ForceBranchReason {
@@ -1858,9 +1886,10 @@ pub struct App {
     resolver_load_gen: u64,
     /// When `Some`, the three-panel bottom area shows this commit list instead
     /// of the changes/diff panels (selected worktree is clean).
-    /// In-flight file-list load for an open commit dialog, keyed by worktree
-    /// name so a result for a dialog the user has since closed is dropped.
-    commit_files_pending: CommitFilesPending,
+    /// In-flight file-list load for an open commit or stash dialog, keyed by
+    /// worktree name so a result for a dialog the user has since closed is
+    /// dropped.
+    dialog_files_pending: DialogFilesPending,
     pub worktree_commits: Option<WorktreeCommitsPanel>,
     /// Background load for `worktree_commits`. The key identifies which
     /// worktree/branch/mode the result belongs to; `poll_commits_load` drops
@@ -2061,7 +2090,7 @@ impl App {
             resolver_hits: None,
             resolver_pending: None,
             resolver_load_gen: 0,
-            commit_files_pending: None,
+            dialog_files_pending: None,
             worktree_commits: None,
             commits_pending: None,
             status_refresh_pending: None,
@@ -2426,7 +2455,7 @@ impl App {
         matches!(self.view, View::Busy { .. } | View::Creating { .. })
             || self.changes.pending.is_some()
             || self.preview_pending.is_some()
-            || self.commit_files_pending.is_some()
+            || self.dialog_files_pending.is_some()
             || self.commits_pending.is_some()
             || self.status_refresh_pending.is_some()
             || !self.deleting.is_empty()
@@ -2466,7 +2495,7 @@ impl App {
         self.poll_stash_load();
         // The commit dialog opens before its file list exists, so drain that
         // load here too; it is view-dependent but cheap to check.
-        self.poll_commit_files_load();
+        self.poll_dialog_files_load();
         if let View::Busy { rx, .. } = &self.view {
             if let Some(result) = rx.poll_latest() {
                 // Pull the follow-up out of the view so we can mutate self, then
@@ -2674,6 +2703,10 @@ impl App {
                 focus: CommitFocus::Message | CommitFocus::Body,
                 ..
             } => true,
+            View::Stash {
+                focus: StashFocus::Message,
+                ..
+            } => true,
             View::Switch { .. } | View::RunCommand { .. } | View::RenameWorktree { .. } => true,
             View::Creating { done: false, .. } => true,
             View::List => self.tab == Tab::Settings && self.settings.is_typing(),
@@ -2875,6 +2908,7 @@ impl App {
                 WizardOutcome::Continue => {}
             },
             View::Commit { .. } => self.on_commit_key(key),
+            View::Stash { .. } => self.on_stash_dialog_key(key),
             View::Switch { .. } => self.on_switch_key(key),
             View::Log { .. } => self.on_log_key(key),
             View::CommitDiff { .. } | View::StashDiff { .. } => self.on_file_browser_key(key),
@@ -3212,12 +3246,6 @@ impl App {
                     Some(BranchDeleteChoice::Cancel) | None => {
                         self.message = Some(format!("kept branch '{}'", target.name));
                     }
-                }
-            }
-            ModalAction::StashPush { name } => {
-                if let ModalResult::Submitted(msg) = result {
-                    let msg = if msg.is_empty() { None } else { Some(msg) };
-                    self.stash_push(name, msg);
                 }
             }
             ModalAction::StashDrop { name, index } => {
@@ -4015,6 +4043,10 @@ impl App {
             KeyCode::Char('c') => self.open_commit(),
             KeyCode::Char('o') | KeyCode::Char('e') => self.run_open_command(),
             KeyCode::Char('s') => self.open_stash_tab(),
+            // Making a stash is the one stash command that needs no entry
+            // under the cursor, so it is bound here too: ⇧S stashes the
+            // selected worktree without the detour through the Stash tab.
+            KeyCode::Char('S') => self.open_stash_dialog_for_selected(),
             KeyCode::Char('m') => self.open_move_changes_pick(),
             KeyCode::Char('p') => self.start_pull(),
             KeyCode::Char('P') => self.start_push(),
@@ -4571,6 +4603,21 @@ impl App {
                     *cursor = cursor.saturating_sub(1);
                 }
             }
+            View::Stash {
+                files,
+                cursor,
+                focus,
+                ..
+            } if over_list => {
+                *focus = StashFocus::Files;
+                if down {
+                    if *cursor + 1 < files.len() {
+                        *cursor += 1;
+                    }
+                } else {
+                    *cursor = cursor.saturating_sub(1);
+                }
+            }
             _ => {}
         }
     }
@@ -4930,6 +4977,19 @@ impl App {
                 {
                     *cursor = idx;
                     *focus = CommitFocus::Files;
+                }
+            }
+            View::Stash { .. } => {
+                if let View::Stash {
+                    cursor,
+                    focus,
+                    files,
+                    ..
+                } = &mut self.view
+                    && idx < files.len()
+                {
+                    *cursor = idx;
+                    *focus = StashFocus::Files;
                 }
             }
             // Commit lists: a click lands the cursor on a commit row (art-only
@@ -6075,13 +6135,14 @@ impl App {
             loading: true,
             submit_pending: false,
         });
-        self.load_commit_files(name);
+        self.load_dialog_files(name);
     }
 
-    /// Fetches the commit dialog's changed-file list on a background thread,
-    /// the same shape as `load_worktree_preview`. `poll_commit_files_load`
-    /// applies it once it lands.
-    fn load_commit_files(&mut self, name: String) {
+    /// Fetches a file-picking dialog's changed-file list on a background
+    /// thread, the same shape as `load_worktree_preview`. Serves both the
+    /// commit and the stash dialog; `poll_dialog_files_load` applies the
+    /// result to whichever one is open.
+    fn load_dialog_files(&mut self, name: String) {
         let (tx, rx) = channel();
         let ctx = self.ctx.clone();
         let key = name.clone();
@@ -6092,65 +6153,73 @@ impl App {
                     .map_err(|e| format!("{e:#}")),
             );
         });
-        self.commit_files_pending = Some((key, Task::new(rx)));
+        self.dialog_files_pending = Some((key, Task::new(rx)));
     }
 
-    /// Applies a finished commit-dialog file load, then replays a submit the
-    /// user pressed while it was still running. A result for a dialog that has
-    /// since closed (or moved to another worktree) is dropped.
-    fn poll_commit_files_load(&mut self) {
-        let Some((name, task)) = &self.commit_files_pending else {
+    /// Applies a finished commit- or stash-dialog file load, then replays a
+    /// submit the user pressed while it was still running. A result for a
+    /// dialog that has since closed (or moved to another worktree) is dropped.
+    fn poll_dialog_files_load(&mut self) {
+        let Some((name, task)) = &self.dialog_files_pending else {
             return;
         };
         let name = name.clone();
         let Some(result) = task.poll_latest() else {
             return;
         };
-        self.commit_files_pending = None;
-        let View::Commit {
-            name: open_name, ..
-        } = &self.view
-        else {
-            return;
+        self.dialog_files_pending = None;
+        let open_name = match &self.view {
+            View::Commit { name, .. } | View::Stash { name, .. } => name.clone(),
+            _ => return,
         };
-        if *open_name != name {
+        if open_name != name {
             return;
         }
-        match result {
-            Ok(loaded) => {
-                let View::Commit {
-                    files,
-                    marked,
-                    cursor,
-                    loading,
-                    submit_pending,
-                    ..
-                } = &mut self.view
-                else {
-                    return;
-                };
-                *marked = vec![true; loaded.len()];
-                *files = loaded;
-                *cursor = (*cursor).min(files.len().saturating_sub(1));
-                *loading = false;
-                let replay = std::mem::take(submit_pending);
-                if replay {
-                    self.do_commit();
-                }
-            }
+        let loaded = match result {
+            Ok(loaded) => loaded,
             Err(e) => {
                 // Nothing to show the dialog for; close it the way the old
                 // synchronous load did on error.
                 self.navigate_back();
                 self.set_error(e);
+                return;
+            }
+        };
+        let (View::Commit {
+            files,
+            marked,
+            cursor,
+            loading,
+            submit_pending,
+            ..
+        }
+        | View::Stash {
+            files,
+            marked,
+            cursor,
+            loading,
+            submit_pending,
+            ..
+        }) = &mut self.view
+        else {
+            return;
+        };
+        *marked = vec![true; loaded.len()];
+        *files = loaded;
+        *cursor = (*cursor).min(files.len().saturating_sub(1));
+        *loading = false;
+        if std::mem::take(submit_pending) {
+            match self.view {
+                View::Commit { .. } => self.do_commit(),
+                _ => self.do_stash(),
             }
         }
     }
 
-    /// Whether an open commit dialog is still waiting on its file list.
+    /// Whether an open commit or stash dialog is still waiting on its files.
     #[cfg(test)]
-    fn commit_files_loading(&self) -> bool {
-        self.commit_files_pending.is_some()
+    fn dialog_files_loading(&self) -> bool {
+        self.dialog_files_pending.is_some()
     }
 
     /// Drives the commit dialog. The file list and message input each own a
@@ -6234,7 +6303,7 @@ impl App {
 
     /// Handles a submit from the commit dialog. While the file list is still
     /// loading there is nothing to commit yet, so the submit is remembered and
-    /// `poll_commit_files_load` replays it the moment the files land. The
+    /// `poll_dialog_files_load` replays it the moment the files land. The
     /// empty-message guard still runs first, so a blank subject is rejected
     /// straight away rather than after the wait.
     fn submit_commit(&mut self, loading: bool) {
@@ -6490,12 +6559,7 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.stash_selected = self.stash_selected.saturating_sub(1)
             }
-            KeyCode::Char('s') => self.push_prompt(
-                "stash message (optional)",
-                TextInput::default(),
-                "blank Enter stashes without a message",
-                ModalAction::StashPush { name },
-            ),
+            KeyCode::Char('s') => self.open_stash_dialog(name),
             KeyCode::Char('p') => self.open_stash_target_pick(true),
             KeyCode::Char('a') => self.open_stash_target_pick(false),
             KeyCode::Char('x') => {
@@ -6780,14 +6844,173 @@ impl App {
         );
     }
 
-    /// Stashes the worktree's current changes with an optional message.
-    fn stash_push(&mut self, name: String, message: Option<String>) {
+    /// Opens the stash dialog for the worktree under the cursor on the
+    /// Worktrees tab. A clean worktree says so rather than opening a dialog
+    /// with nothing in it.
+    fn open_stash_dialog_for_selected(&mut self) {
+        let Some((name, dirty)) = self.selected_worktree().map(|w| (w.name.clone(), w.dirty))
+        else {
+            return;
+        };
+        if dirty == 0 {
+            self.message = Some(format!("'{name}' has no uncommitted changes"));
+            return;
+        }
+        self.open_stash_dialog(name);
+    }
+
+    /// Opens the stash dialog for `name`: every uncommitted file ticked, with
+    /// an optional message. Shared by the Worktrees tab (⇧S) and the Stash tab
+    /// (s). Like the commit dialog it opens on the spot and fills its file list
+    /// behind itself, because `ops::status` is too slow to hold the UI thread
+    /// for on a large changeset.
+    fn open_stash_dialog(&mut self, name: String) {
+        self.push_screen(View::Stash {
+            name: name.clone(),
+            files: Vec::new(),
+            marked: Vec::new(),
+            cursor: 0,
+            input: TextInput::default(),
+            focus: StashFocus::Message,
+            loading: true,
+            submit_pending: false,
+        });
+        self.load_dialog_files(name);
+    }
+
+    /// Drives the stash dialog: Tab swaps pane, Space/`a` tick files, Enter
+    /// (or Ctrl+S) stashes what is ticked, Esc backs out.
+    fn on_stash_dialog_key(&mut self, key: KeyEvent) {
+        let View::Stash {
+            files,
+            marked,
+            cursor,
+            input,
+            focus,
+            loading,
+            ..
+        } = &mut self.view
+        else {
+            return;
+        };
+        let loading = *loading;
+        match key.code {
+            KeyCode::Esc => {
+                self.navigate_back();
+                return;
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                *focus = match focus {
+                    StashFocus::Files => StashFocus::Message,
+                    StashFocus::Message => StashFocus::Files,
+                };
+                return;
+            }
+            // Ctrl+S submits from either pane, matching the commit dialog.
+            KeyCode::Char('s' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.submit_stash(loading);
+                return;
+            }
+            KeyCode::Enter => {
+                self.submit_stash(loading);
+                return;
+            }
+            _ => {}
+        }
+        match focus {
+            StashFocus::Files => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if *cursor + 1 < files.len() {
+                        *cursor += 1;
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => *cursor = cursor.saturating_sub(1),
+                KeyCode::Char(' ') => {
+                    if let Some(m) = marked.get_mut(*cursor) {
+                        *m = !*m;
+                    }
+                }
+                KeyCode::Char('a') => {
+                    let all_on = marked.iter().all(|m| *m);
+                    marked.iter_mut().for_each(|m| *m = !all_on);
+                }
+                _ => {}
+            },
+            StashFocus::Message => {
+                input.on_key(key);
+            }
+        }
+    }
+
+    /// Handles a submit from the stash dialog. While the file list is still
+    /// loading there is nothing to tick yet, so the submit is remembered and
+    /// `poll_dialog_files_load` replays it once the files land.
+    fn submit_stash(&mut self, loading: bool) {
+        if !loading {
+            self.do_stash();
+            return;
+        }
+        let View::Stash { submit_pending, .. } = &mut self.view else {
+            return;
+        };
+        *submit_pending = true;
+        self.message = Some("stashing once changes finish loading…".to_string());
+    }
+
+    /// Stashes the files ticked in the stash dialog. Ticking everything stashes
+    /// the whole worktree (`git stash push -u`); a subset goes through
+    /// pathspecs so the unticked files stay in the working tree. Unticking
+    /// everything is reported rather than silently stashing nothing.
+    fn do_stash(&mut self) {
+        let View::Stash {
+            name,
+            files,
+            marked,
+            input,
+            ..
+        } = &self.view
+        else {
+            return;
+        };
+        let message = input.trimmed();
+        let message = (!message.is_empty()).then_some(message);
+        if files.is_empty() {
+            self.message = Some(format!("'{name}' has no uncommitted changes"));
+            return;
+        }
+        let paths: Vec<String> = files
+            .iter()
+            .zip(marked.iter())
+            .filter(|(_, m)| **m)
+            .map(|(f, _)| f.path.clone())
+            .collect();
+        if paths.is_empty() {
+            self.message = Some("no files selected; press Space to tick files".to_string());
+            return;
+        }
+        let partial = paths.len() < files.len();
+        let name = name.clone();
+        self.stash_push(name, message, partial.then_some(paths));
+    }
+
+    /// Stashes a worktree's changes with an optional message. `paths` limits
+    /// the stash to those files, leaving the rest in the working tree; `None`
+    /// stashes everything.
+    fn stash_push(&mut self, name: String, message: Option<String>, paths: Option<Vec<String>>) {
+        let count = paths.as_ref().map(Vec::len);
         self.start_busy(
             "stashing…".to_string(),
             BusyThen::Stash(name.clone()),
             move |ctx| {
-                ops::stash_push(ctx, &name, message.as_deref())
-                    .map(|_| format!("stashed changes in '{name}'"))
+                let result = match &paths {
+                    Some(paths) => ops::stash_push_paths(ctx, &name, paths, message.as_deref()),
+                    None => ops::stash_push(ctx, &name, message.as_deref()),
+                };
+                result
+                    .map(|_| match count {
+                        Some(n) => format!("stashed {n} file(s) in '{name}'"),
+                        None => format!("stashed changes in '{name}'"),
+                    })
                     .map_err(|e| format!("{e:#}"))
             },
         );
@@ -10233,13 +10456,13 @@ mod tests {
     }
 
     /// Waits out an in-flight Stash tab list load.
-    /// Drives `poll_commit_files_load` until an open commit dialog has its file
+    /// Drives `poll_dialog_files_load` until an open commit dialog has its file
     /// list. A no-op when nothing is in flight, so it is safe to call after any
     /// path that opens the dialog.
-    fn settle_commit_files(app: &mut App) {
+    fn settle_dialog_files(app: &mut App) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while app.commit_files_loading() {
-            app.poll_commit_files_load();
+        while app.dialog_files_loading() {
+            app.poll_dialog_files_load();
             assert!(
                 std::time::Instant::now() < deadline,
                 "commit file list load timed out"
@@ -11259,7 +11482,7 @@ mod tests {
         app.refresh();
         app.selected = 0;
         press(&mut app, KeyCode::Char('c')); // opens the commit view
-        settle_commit_files(&mut app);
+        settle_dialog_files(&mut app);
         assert!(matches!(app.view, View::Commit { .. }));
 
         let len = match &app.view {
@@ -11520,7 +11743,7 @@ mod tests {
         app.refresh();
         app.selected = 0;
         press(&mut app, KeyCode::Char('c'));
-        settle_commit_files(&mut app);
+        settle_dialog_files(&mut app);
         press(&mut app, KeyCode::BackTab);
         match &app.view {
             View::Commit { files, focus, .. } => {
@@ -11547,7 +11770,7 @@ mod tests {
         app.refresh();
         app.selected = 0;
         press(&mut app, KeyCode::Char('c'));
-        settle_commit_files(&mut app);
+        settle_dialog_files(&mut app);
         let len = match &app.view {
             View::Commit { files, .. } => files.len(),
             _ => panic!("expected the commit dialog"),
@@ -12247,7 +12470,7 @@ mod tests {
         dirty_main(&mut app);
         assert!(app.worktrees[0].dirty > 0);
         press(&mut app, KeyCode::Char('c'));
-        settle_commit_files(&mut app);
+        settle_dialog_files(&mut app);
         assert!(matches!(app.view, View::Commit { .. }));
         type_str(&mut app, "add scratch");
         press(&mut app, KeyCode::Enter);
@@ -12309,7 +12532,7 @@ mod tests {
         let (_tmp, mut app) = test_app();
         rename_folder_on_main(&mut app);
         press(&mut app, KeyCode::Char('c'));
-        settle_commit_files(&mut app);
+        settle_dialog_files(&mut app);
         type_str(&mut app, "move folder");
         press(&mut app, KeyCode::Enter);
         assert!(
@@ -12396,7 +12619,7 @@ mod tests {
         dirty_main(&mut app);
         let dir = app.worktrees[0].path.clone();
         press(&mut app, KeyCode::Char('c'));
-        settle_commit_files(&mut app);
+        settle_dialog_files(&mut app);
         type_str(&mut app, "add scratch");
 
         press(&mut app, KeyCode::Tab); // message -> body
@@ -12444,7 +12667,7 @@ mod tests {
         dirty_main(&mut app);
         let dir = app.worktrees[0].path.clone();
         press(&mut app, KeyCode::Char('c'));
-        settle_commit_files(&mut app);
+        settle_dialog_files(&mut app);
         type_str(&mut app, "just a subject");
         press(&mut app, KeyCode::Enter);
         settle(&mut app);
@@ -12490,6 +12713,7 @@ mod tests {
         assert_eq!(app.tab, Tab::Stash);
         // Stash the current changes with a message.
         press(&mut app, KeyCode::Char('s'));
+        settle_dialog_files(&mut app); // the stash dialog loads its files off-thread
         type_str(&mut app, "wip");
         press(&mut app, KeyCode::Enter);
         settle(&mut app);
@@ -12511,6 +12735,178 @@ mod tests {
         assert!(app.worktrees[0].dirty > 0, "pop restores the change");
     }
 
+    /// Commits `f.txt` and leaves it (plus an untracked `g.txt`) modified, so
+    /// the stash dialog opens on a two-file changeset.
+    fn two_dirty_files(app: &mut App) {
+        std::fs::write(app.ctx.repo_root.join("f.txt"), "one\n").unwrap();
+        git(&app.ctx.repo_root, &["add", "-A"]);
+        git(&app.ctx.repo_root, &["commit", "-m", "add f"]);
+        std::fs::write(app.ctx.repo_root.join("f.txt"), "two\n").unwrap();
+        std::fs::write(app.ctx.repo_root.join("g.txt"), "new\n").unwrap();
+        app.refresh();
+        app.selected = 0;
+    }
+
+    /// Opens the stash dialog with ⇧S and waits out the background file load,
+    /// returning the paths in the order the dialog lists them.
+    fn open_stash_dialog(app: &mut App) -> Vec<String> {
+        press(app, KeyCode::Char('S'));
+        settle_dialog_files(app);
+        match &app.view {
+            View::Stash { files, marked, .. } => {
+                assert!(marked.iter().all(|m| *m), "every file starts ticked");
+                files.iter().map(|f| f.path.clone()).collect()
+            }
+            _ => panic!("expected the stash dialog"),
+        }
+    }
+
+    /// Moves the stash dialog's cursor onto `path` and unticks it.
+    fn untick(app: &mut App, path: &str) {
+        press(app, KeyCode::Tab);
+        let idx = match &app.view {
+            View::Stash { files, .. } => files.iter().position(|f| f.path == path).unwrap(),
+            _ => panic!("expected the stash dialog"),
+        };
+        for _ in 0..idx {
+            press(app, KeyCode::Down);
+        }
+        press(app, KeyCode::Char(' '));
+    }
+
+    /// ⇧S on the Worktrees tab opens the stash dialog and stashes everything
+    /// ticked (all of it, by default), without leaving the tab.
+    #[test]
+    fn shift_s_stashes_from_the_worktrees_tab() {
+        let (_tmp, mut app) = test_app();
+        two_dirty_files(&mut app);
+
+        let files = open_stash_dialog(&mut app);
+        assert_eq!(files.len(), 2, "both changed files are listed: {files:?}");
+        // Focus starts on the message, so it can be typed while the list loads.
+        type_str(&mut app, "from the list");
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+
+        assert_eq!(app.tab, Tab::Worktrees, "stashing stays on the tab");
+        assert!(matches!(app.view, View::List), "the dialog is closed");
+        assert_eq!(app.worktrees[0].dirty, 0, "the tree is clean afterwards");
+        // The stash is real, and the Stash tab shows it when the user does go
+        // there (the push already reloaded the list in the background).
+        goto_tab(&mut app, Tab::Stash);
+        assert_eq!(app.stash_entries.len(), 1);
+        assert!(app.stash_entries[0].message.contains("from the list"));
+    }
+
+    /// Tab between the message and the file list must not move the file rows
+    /// sideways: ratatui indents every row by the highlight symbol's width, so
+    /// the focused and unfocused symbols have to be the same width.
+    #[test]
+    fn stash_dialog_file_rows_hold_their_column_across_focus() {
+        let (_tmp, mut app) = test_app();
+        two_dirty_files(&mut app);
+        open_stash_dialog(&mut app);
+
+        // Screen column, not byte offset: the box-drawing borders to the left
+        // are three bytes each.
+        let column_of = |app: &mut App| {
+            render_app_rows(app, 100, 32)
+                .iter()
+                .find_map(|row| row.find("[x] ").map(|b| row[..b].chars().count()))
+                .expect("a ticked file row is on screen")
+        };
+        // Focus starts on the message, so this is the unfocused list.
+        let unfocused = column_of(&mut app);
+        press(&mut app, KeyCode::Tab);
+        let focused = column_of(&mut app);
+        assert_eq!(
+            focused, unfocused,
+            "the file rows shifted when the list took focus"
+        );
+    }
+
+    /// Unticking a file leaves it in the working tree: only the ticked one is
+    /// stashed, and the stash's own file list holds just that file.
+    #[test]
+    fn stash_dialog_leaves_unticked_files_in_the_worktree() {
+        let (_tmp, mut app) = test_app();
+        two_dirty_files(&mut app);
+
+        open_stash_dialog(&mut app);
+        untick(&mut app, "g.txt");
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+
+        assert_eq!(app.worktrees[0].dirty, 1, "g.txt stayed behind");
+        assert_eq!(
+            std::fs::read_to_string(app.ctx.repo_root.join("g.txt")).unwrap(),
+            "new\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(app.ctx.repo_root.join("f.txt")).unwrap(),
+            "one\n",
+            "the stashed file is back at its committed contents"
+        );
+        let stashed = ops::stash_files(&app.ctx, &app.worktrees[0].name, 0).unwrap();
+        let paths: Vec<&str> = stashed.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["f.txt"], "only the ticked file went in");
+    }
+
+    /// Unticking everything is reported rather than stashing nothing; the
+    /// dialog stays open so the ticks can be fixed.
+    #[test]
+    fn stash_dialog_refuses_an_empty_selection() {
+        let (_tmp, mut app) = test_app();
+        two_dirty_files(&mut app);
+
+        open_stash_dialog(&mut app);
+        press(&mut app, KeyCode::Tab);
+        // `a` with everything ticked unticks the lot.
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Enter);
+
+        assert!(
+            matches!(app.view, View::Stash { .. }),
+            "the dialog stays open"
+        );
+        assert!(
+            app.message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no files selected"),
+            "{:?}",
+            app.message
+        );
+        assert_eq!(app.worktrees[0].dirty, 2, "nothing was stashed");
+    }
+
+    /// A clean worktree says so instead of opening a dialog with nothing in it.
+    #[test]
+    fn shift_s_on_a_clean_worktree_reports_instead_of_prompting() {
+        let (_tmp, mut app) = test_app();
+        // `build_app` leaves `.wtm.toml` untracked; commit it so the worktree
+        // really is clean.
+        git(&app.ctx.repo_root, &["add", "-A"]);
+        git(&app.ctx.repo_root, &["commit", "-m", "init wtm"]);
+        app.refresh();
+        app.selected = 0;
+        assert_eq!(app.worktrees[0].dirty, 0);
+
+        press(&mut app, KeyCode::Char('S'));
+        assert!(
+            matches!(app.view, View::List),
+            "no dialog for a clean worktree"
+        );
+        assert!(
+            app.message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no uncommitted changes"),
+            "{:?}",
+            app.message
+        );
+    }
+
     /// `a` opens a destination picker (stashes are repo-global, not tied to
     /// one worktree) rather than applying straight into the tab's worktree;
     /// picking a target still applies the stash there.
@@ -12530,6 +12926,7 @@ mod tests {
         press(&mut app, KeyCode::Char('s'));
         assert_eq!(app.tab, Tab::Stash);
         press(&mut app, KeyCode::Char('s'));
+        settle_dialog_files(&mut app); // the stash dialog loads its files off-thread
         press(&mut app, KeyCode::Enter); // stash, no message
         settle(&mut app);
         assert_eq!(app.stash_entries.len(), 1);
@@ -12593,6 +12990,7 @@ mod tests {
 
         press(&mut app, KeyCode::Char('s'));
         press(&mut app, KeyCode::Char('s'));
+        settle_dialog_files(&mut app); // the stash dialog loads its files off-thread
         press(&mut app, KeyCode::Enter); // stash, no message
         settle(&mut app);
         assert_eq!(app.stash_entries.len(), 1);
@@ -12640,6 +13038,7 @@ mod tests {
 
         press(&mut app, KeyCode::Char('s'));
         press(&mut app, KeyCode::Char('s'));
+        settle_dialog_files(&mut app); // the stash dialog loads its files off-thread
         press(&mut app, KeyCode::Enter); // stash, no message
         settle(&mut app);
         press(&mut app, KeyCode::Char('x')); // arm drop
@@ -16795,6 +17194,7 @@ mod tests {
             press(&mut app, KeyCode::Char('s'));
             draw(&mut app); // stash table (empty)
             press(&mut app, KeyCode::Char('s'));
+            settle_dialog_files(&mut app); // the stash dialog loads its files off-thread
             type_str(&mut app, "msg");
             draw(&mut app); // stash message input
             press(&mut app, KeyCode::Enter);
@@ -17828,6 +18228,7 @@ mod tests {
 
         press(&mut app, KeyCode::Char('s')); // the Stash tab
         press(&mut app, KeyCode::Char('s')); // stash the change
+        settle_dialog_files(&mut app); // the stash dialog loads its files off-thread
         press(&mut app, KeyCode::Enter); // no message
         settle(&mut app);
         assert_eq!(app.stash_entries.len(), 1);
@@ -18543,14 +18944,14 @@ mod tests {
             }
             _ => panic!("expected the commit dialog"),
         }
-        assert!(app.commit_files_loading(), "status runs off-thread");
+        assert!(app.dialog_files_loading(), "status runs off-thread");
         // The placeholder, not an empty file pane, is what reaches the screen.
         let screen = render_app_rows(&mut app, 100, 30).join("\n");
         assert!(screen.contains("reading changes"), "{screen}");
 
         // Typing works while the load is still in flight.
         type_str(&mut app, "wip");
-        settle_commit_files(&mut app);
+        settle_dialog_files(&mut app);
         match &app.view {
             View::Commit {
                 files,
@@ -18586,7 +18987,7 @@ mod tests {
             }
             _ => panic!("expected the commit dialog"),
         }
-        settle_commit_files(&mut app);
+        settle_dialog_files(&mut app);
         settle_busy(&mut app);
         assert!(
             app.message.as_deref().unwrap().starts_with("committed"),
@@ -18626,7 +19027,7 @@ mod tests {
         app.refresh();
         app.selected = 0;
         app.open_commit();
-        settle_commit_files(&mut app);
+        settle_dialog_files(&mut app);
         type_str(&mut app, "subject that must survive");
         press(&mut app, KeyCode::Tab); // Message -> Body
         type_str(&mut app, "body too");
@@ -18667,7 +19068,7 @@ mod tests {
         app.refresh();
         app.selected = 0;
         app.open_commit();
-        settle_commit_files(&mut app);
+        settle_dialog_files(&mut app);
         type_str(&mut app, "real commit");
         press(&mut app, KeyCode::Enter);
         settle_busy(&mut app);

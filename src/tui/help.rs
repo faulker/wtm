@@ -107,7 +107,7 @@ impl HelpTab {
                 Tab::Changes | Tab::Stash => HelpTab::Changes,
                 Tab::Settings => HelpTab::Basics,
             },
-            View::Commit { .. } => HelpTab::Changes,
+            View::Commit { .. } | View::Stash { .. } => HelpTab::Changes,
             View::BranchCommits { .. }
             | View::CherryPick { .. }
             | View::Log { .. }
@@ -194,6 +194,11 @@ pub const WORKTREES: &[Binding] = &[
     ),
     help_only("e", "same as o: run a configured open_command"),
     both("s", "stash", "stash tab (stash/pop/apply/drop)"),
+    both(
+        "⇧S",
+        "stash changes",
+        "stash the selected worktree's changes without leaving the tab: tick the files to include and add an optional message",
+    ),
     help_only(
         "m",
         "move the worktree's uncommitted changes into another worktree",
@@ -421,6 +426,17 @@ pub const COMMIT_FILES: &[Binding] = &[
     both("Esc", "cancel", "cancel without committing"),
 ];
 
+/// The stash dialog's file list, the commit dialog's checklist with the stash
+/// wording: unticking a file leaves it in the working tree.
+pub const STASH_FILES: &[Binding] = &[
+    both("↑/↓", "file", "move the file cursor"),
+    both("Space", "toggle", "include or exclude the highlighted file"),
+    both("a", "all/none", "include or exclude every file"),
+    both("Tab", "message", "jump to the stash message"),
+    both("Enter", "stash", "stash the included files"),
+    both("Esc", "cancel", "cancel without stashing"),
+];
+
 pub const STASH_LIST: &[Binding] = &[
     both("↑/↓", "select", "select a stash entry"),
     both(
@@ -428,7 +444,11 @@ pub const STASH_LIST: &[Binding] = &[
         "browse",
         "browse the files and diffs in the selected stash",
     ),
-    both("s", "stash", "stash the worktree's current changes"),
+    both(
+        "s",
+        "stash",
+        "stash the worktree's current changes: tick the files to include and add an optional message",
+    ),
     both(
         "p",
         "pop",
@@ -710,6 +730,14 @@ const CHANGES_SECTIONS: &[Section] = &[
         notes: &[
             "while typing the message, F1 opens this help ('?' types a '?')",
             "a folder rename with only one side marked asks whether to include the other side.",
+        ],
+    },
+    Section {
+        heading: "stash dialog  (⇧S on the worktree list, or s on the stash tab)",
+        bindings: STASH_FILES,
+        notes: &[
+            "every changed file starts ticked; unticking one leaves it in the",
+            "working tree instead of stashing it.",
         ],
     },
     Section {
