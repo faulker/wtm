@@ -459,7 +459,7 @@ pub const STASH_LIST: &[Binding] = &[
         "apply",
         "pick a worktree to apply the selected stash into, keeping it",
     ),
-    both("x", "drop", "drop the selected stash"),
+    both("d", "delete", "delete (drop) the selected stash"),
     both("q", "quit", "quit"),
 ];
 

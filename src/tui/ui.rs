@@ -15,8 +15,8 @@ use ratatui::widgets::{
 use super::app::{
     App, BranchRow, CheckoutCandidate, CherryTarget, CommitFocus, ConfirmOption, CopyHit,
     CreateOutcome, DiffRow, LogMode, Modal, ResolverFile, ResolverHits, RowList, StashFocus, Tab,
-    TextInput, UpstreamRow, View, WorktreesFocus, branch_display_rows, branch_row_of, filtered_candidates,
-    upstream_rows,
+    TextInput, UpstreamRow, View, WorktreesFocus, branch_display_rows, branch_row_of,
+    filtered_candidates, upstream_rows,
 };
 use super::config_editor::{
     BRANCHES_REFRESH_ROW, CHECK_ROW, CONFLICT_EDITOR_ROW, COPY_ROW, ConfigEditor,

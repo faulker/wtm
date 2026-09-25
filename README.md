@@ -312,7 +312,7 @@ From here:
 
 ![The Stash tab listing two stash entries for a worktree, each with its message and branch](docs/images/tui-stash.png)
 
-`s` opens the Stash tab (`⇧S` on the worktree list opens the same stash dialog directly, without the trip through the tab). Stashes are shared across the whole repo, so popping or applying one asks which worktree to put it into (defaulting to the worktree the tab was opened from). `s` opens the stash dialog for the worktree's current changes: a tick-box file list like the commit dialog's, everything ticked by default, `Space` toggles one and `a` toggles all, `Tab` moves to the optional message, and `Enter` stashes what's ticked (unticked files stay in the working tree). `p`/`a` pop/apply the selected entry; `x` drops it. `Enter` on an entry browses the files it changed. A pop that conflicts opens the conflict resolver.
+`s` opens the Stash tab (`⇧S` on the worktree list opens the same stash dialog directly, without the trip through the tab). Stashes are shared across the whole repo, so popping or applying one asks which worktree to put it into (defaulting to the worktree the tab was opened from). `s` opens the stash dialog for the worktree's current changes: a tick-box file list like the commit dialog's, everything ticked by default, `Space` toggles one and `a` toggles all, `Tab` moves to the optional message, and `Enter` stashes what's ticked (unticked files stay in the working tree). `p`/`a` pop/apply the selected entry; `d` deletes (drops) it. `Enter` on an entry browses the files it changed. A pop that conflicts opens the conflict resolver.
 
 ### Keys
 

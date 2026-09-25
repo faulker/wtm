@@ -1905,6 +1905,10 @@ pub struct App {
     /// Worktree removals in flight, oldest first. Never modal: the list keeps
     /// taking keys for every other row. Drained by `poll_deletes` each tick.
     pub deleting: Vec<Deleting>,
+    /// Force-delete prompts for branches git refused to drop after their
+    /// folder was removed, waiting for the user to be back on the list with no
+    /// modal open, so a finished delete never interrupts another task.
+    pub pending_force_branch: Vec<(String, ForceBranchReason)>,
     /// Background `ops::stash_list` for the Stash tab. The `String` is the
     /// worktree name the result belongs to.
     stash_pending: StashPending,
@@ -2096,6 +2100,7 @@ impl App {
             status_refresh_pending: None,
             status_refresh_gen: 0,
             deleting: Vec::new(),
+            pending_force_branch: Vec::new(),
             stash_pending: None,
             branches: Vec::new(),
             branches_all: Vec::new(),
@@ -2492,6 +2497,7 @@ impl App {
         self.poll_resolver_load();
         self.poll_status_refresh();
         self.poll_deletes();
+        self.open_pending_force_branch();
         self.poll_stash_load();
         // The commit dialog opens before its file list exists, so drain that
         // load here too; it is view-dependent but cheap to check.
@@ -6562,7 +6568,7 @@ impl App {
             KeyCode::Char('s') => self.open_stash_dialog(name),
             KeyCode::Char('p') => self.open_stash_target_pick(true),
             KeyCode::Char('a') => self.open_stash_target_pick(false),
-            KeyCode::Char('x') => {
+            KeyCode::Char('d') => {
                 if !self.stash_entries.is_empty() {
                     self.open_stash_drop_modal(name, index);
                 }
@@ -10244,31 +10250,40 @@ impl App {
         }
     }
 
-    /// After the folder is removed, attempts a safe branch delete and routes to
-    /// the matching force prompt when git refuses.
+    /// After the folder is removed, attempts a safe branch delete and queues
+    /// the matching force prompt when git refuses. Runs from `tick` whatever
+    /// the user is doing, so it leaves the current view alone: the list was
+    /// already reloaded by `poll_deletes`.
     fn delete_branch_step(&mut self, name: String, branch: String) {
         match ops::try_delete_branch(&self.ctx, &branch) {
             Ok(ops::DeleteBranchOutcome::Deleted) => {
                 self.message = Some(format!("removed '{name}' and branch '{branch}'"));
-                self.go_root();
-                self.refresh();
             }
             Ok(ops::DeleteBranchOutcome::NotMerged) => {
-                // Refresh so the now-removed folder drops from the list behind
-                // the popup.
-                self.refresh();
-                self.open_force_branch_modal(branch, ForceBranchReason::NotMerged);
+                self.pending_force_branch
+                    .push((branch, ForceBranchReason::NotMerged));
             }
             Ok(ops::DeleteBranchOutcome::CheckedOutElsewhere(other)) => {
-                self.refresh();
-                self.open_force_branch_modal(branch, ForceBranchReason::CheckedOutElsewhere(other));
+                self.pending_force_branch
+                    .push((branch, ForceBranchReason::CheckedOutElsewhere(other)));
             }
-            Err(e) => {
-                self.set_error(format!("{e:#}"));
-                self.go_root();
-                self.refresh();
-            }
+            Err(e) => self.set_error(format!("{e:#}")),
         }
+    }
+
+    /// Opens the oldest queued force-delete prompt once the user is on the
+    /// list with nothing else open. Waiting keeps a delete that lands during a
+    /// create (or any other screen) from yanking the user out of it.
+    fn open_pending_force_branch(&mut self) {
+        if self.pending_force_branch.is_empty()
+            || !matches!(self.view, View::List)
+            || self.modal.is_some()
+            || self.error.is_some()
+        {
+            return;
+        }
+        let (branch, reason) = self.pending_force_branch.remove(0);
+        self.open_force_branch_modal(branch, reason);
     }
 }
 
@@ -13041,7 +13056,9 @@ mod tests {
         settle_dialog_files(&mut app); // the stash dialog loads its files off-thread
         press(&mut app, KeyCode::Enter); // stash, no message
         settle(&mut app);
-        press(&mut app, KeyCode::Char('x')); // arm drop
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.modal.is_none(), "x no longer drops; d does");
+        press(&mut app, KeyCode::Char('d')); // arm drop
         assert!(matches!(
             app.modal,
             Some(Modal::Confirm {
@@ -17037,6 +17054,71 @@ mod tests {
         // It belongs to the global config, not to this repo.
         let repo = std::fs::read_to_string(app.ctx.repo_root.join(".wtm.toml")).unwrap();
         assert!(!repo.contains("auto_update_check"), "{repo}");
+    }
+
+    /// A delete started before a create keeps reporting while the create's
+    /// setup is still running: the removal lands, the header status clears,
+    /// and the create screen is left alone rather than being swapped for the
+    /// list. A branch git refuses to drop waits to prompt until the user is
+    /// back on the list.
+    #[test]
+    fn delete_finishes_while_a_create_is_running() {
+        // (also delete the branch, give the branch unmerged work)
+        for (with_branch, unmerged) in [(false, false), (true, false), (true, true)] {
+            let (_tmp, mut app) = test_app();
+            add_and_select_worktree(&mut app, "gone");
+            if unmerged {
+                let path = app.worktrees[app.selected].path.clone();
+                std::fs::write(Path::new(&path).join("f.txt"), "x\n").unwrap();
+                git(Path::new(&path), &["add", "."]);
+                git(Path::new(&path), &["commit", "-m", "unmerged work"]);
+            }
+            press(&mut app, KeyCode::Char('d'));
+            if with_branch {
+                press(&mut app, KeyCode::Down); // folder and branch
+            }
+            press(&mut app, KeyCode::Enter);
+            assert!(app.is_deleting("gone"));
+
+            app.ctx.config.setup.run = vec!["sleep 30".to_string()];
+            press(&mut app, KeyCode::Char('n'));
+            type_str(&mut app, "fresh");
+            press(&mut app, KeyCode::Enter);
+            assert!(matches!(app.view, View::Creating { .. }));
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !app.deleting.is_empty() {
+                app.tick();
+                assert!(std::time::Instant::now() < deadline, "delete never landed");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(!app.worktrees.iter().any(|w| w.name == "gone"));
+            assert_eq!(
+                crate::git::branch_exists(&app.ctx.repo_root, "gone"),
+                !with_branch || unmerged
+            );
+            match &app.view {
+                View::Creating { done, .. } => assert!(!done, "create should still be running"),
+                _ => panic!("the delete result must not close the create screen"),
+            }
+            assert!(app.modal.is_none(), "no prompt may cover the create screen");
+
+            // Kill the stuck setup so the test doesn't leave `sleep` behind,
+            // then return to the list, where a refused branch now prompts.
+            ctrl_c(&mut app);
+            ctrl_c(&mut app);
+            wait_creating(&mut app, |_, done| done);
+            press(&mut app, KeyCode::Enter);
+            app.tick();
+            let prompted = matches!(
+                &app.modal,
+                Some(Modal::Confirm {
+                    action: ModalAction::ForceBranch { branch },
+                    ..
+                }) if branch == "gone"
+            );
+            assert_eq!(prompted, unmerged);
+        }
     }
 
     #[test]
