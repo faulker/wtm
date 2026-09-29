@@ -117,6 +117,7 @@ impl HelpTab {
             View::MoveChanges { .. } => HelpTab::Worktrees,
             View::OpenCommand { .. } => HelpTab::Worktrees,
             View::StashTarget { .. } => HelpTab::Changes,
+            View::StashApply { .. } => HelpTab::Worktrees,
             _ => HelpTab::Basics,
         }
     }
@@ -193,11 +194,15 @@ pub const WORKTREES: &[Binding] = &[
         "pick a configured open_command to run for the selected worktree; the picker previews each command with {path}, {name}, {branch}, and {status} filled in, and prompts for a one-off when none is set",
     ),
     help_only("e", "same as o: run a configured open_command"),
-    both("s", "stash", "stash tab (stash/pop/apply/drop)"),
+    both(
+        "s",
+        "stash",
+        "stash the selected worktree's changes without leaving the tab: tick the files to include and add an optional message",
+    ),
     both(
         "⇧S",
-        "stash changes",
-        "stash the selected worktree's changes without leaving the tab: tick the files to include and add an optional message",
+        "apply stash",
+        "pick any stash in the repo and apply it to the selected worktree (the stash is kept)",
     ),
     help_only(
         "m",
@@ -733,7 +738,7 @@ const CHANGES_SECTIONS: &[Section] = &[
         ],
     },
     Section {
-        heading: "stash dialog  (⇧S on the worktree list, or s on the stash tab)",
+        heading: "stash dialog  (s on the worktree list or the stash tab)",
         bindings: STASH_FILES,
         notes: &[
             "every changed file starts ticked; unticking one leaves it in the",

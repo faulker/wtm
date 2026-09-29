@@ -194,6 +194,11 @@ const DIFF_REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
 /// keypress both bring it back to the fast schedule.
 const IDLE_DIFF_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 
+/// How long the file cursor must rest on a file before its diff loads. Short
+/// enough to feel immediate once the user stops, long enough that scrolling
+/// past files never computes their diffs.
+const DIFF_LOAD_DELAY: Duration = Duration::from_millis(1000);
+
 /// No key or mouse event for this long means nobody is driving the app, so the
 /// background schedules back off (see `App::is_idle`).
 const IDLE_AFTER: Duration = Duration::from_secs(20);
@@ -1038,6 +1043,16 @@ pub enum View {
         /// Cursor into `targets`.
         selected: usize,
     },
+    /// Stash picker opened by ⇧S on the Worktrees tab: lists every stash in
+    /// the repo and applies the chosen one into worktree `name`, keeping the
+    /// entry. The rows are the Stash tab's list (`App::stash_entries`), loaded
+    /// in the background by the same loader.
+    StashApply {
+        /// Worktree the stash is applied into.
+        name: String,
+        /// Cursor into `App::stash_entries`.
+        selected: usize,
+    },
     /// Picker for the remote branch a local branch tracks, opened by `u` on the
     /// Branches tab and `t` on the Worktrees tab (for the selected worktree's
     /// branch). Row 0 removes tracking (only offered when there is some);
@@ -1773,6 +1788,10 @@ pub struct ChangesTab {
     /// True while a load for a *different* file is in flight, so the UI can show
     /// "loading…" instead of the previous file's stale diff.
     pub loading_new: bool,
+    /// When a cursor move's diff load is due. Moving the file cursor waits
+    /// for it to rest on a file (`App::diff_load_delay`) before computing the
+    /// diff, so scrolling past files doesn't spawn a `git diff` for each one.
+    pub load_due: Option<Instant>,
     pub scroll: u16,
     /// Horizontal offset into the diff pane (Shift+←/→ or H/L).
     pub h_scroll: u16,
@@ -1793,6 +1812,7 @@ impl Default for ChangesTab {
             load_gen: 0,
             pending: None,
             loading_new: false,
+            load_due: None,
             scroll: 0,
             h_scroll: 0,
             last_refresh: Instant::now(),
@@ -2000,6 +2020,10 @@ pub struct App {
     /// left open in a background tab stops redrawing and stops shelling out to
     /// git ten and one times a second respectively.
     pub last_input: Instant,
+    /// How long the file cursor must rest on a file before its diff loads.
+    /// Zero under test, so tests that move the cursor see the load start at
+    /// once, as they always have.
+    pub diff_load_delay: Duration,
     /// Whether commit history is drawn as a graph or a flat list, shared by the
     /// log and branch-commit views. Toggled with `t`.
     pub log_mode: LogMode,
@@ -2132,6 +2156,11 @@ impl App {
             worktree_base,
             tick_count: 0,
             last_input: Instant::now(),
+            diff_load_delay: if cfg!(test) {
+                Duration::ZERO
+            } else {
+                DIFF_LOAD_DELAY
+            },
             log_mode: LogMode::Tree,
             file_tree: true,
             collapsed_folders: HashSet::new(),
@@ -2596,6 +2625,13 @@ impl App {
         let diff_on_screen =
             self.tab == Tab::Changes || (self.tab == Tab::Worktrees && self.three_panel);
         if diff_on_screen && matches!(self.view, View::List) {
+            if self
+                .changes
+                .load_due
+                .is_some_and(|due| Instant::now() >= due)
+            {
+                self.load_diff_content(true);
+            }
             self.poll_diff_load();
             // Every refresh is a `git status` plus a `git diff`. Second-by-
             // second is right while the user is working the pane and pure
@@ -2926,6 +2962,7 @@ impl App {
             View::OpenCommand { .. } => self.on_open_command_key(key),
             View::UpstreamPick { .. } => self.on_upstream_pick_key(key),
             View::StashTarget { .. } => self.on_stash_target_key(key),
+            View::StashApply { .. } => self.on_stash_apply_key(key),
             // A background op owns the screen until tick() drains its result.
             View::Busy { .. } => {}
         }
@@ -4048,11 +4085,11 @@ impl App {
             KeyCode::Char('n') => self.open_create(),
             KeyCode::Char('c') => self.open_commit(),
             KeyCode::Char('o') | KeyCode::Char('e') => self.run_open_command(),
-            KeyCode::Char('s') => self.open_stash_tab(),
             // Making a stash is the one stash command that needs no entry
-            // under the cursor, so it is bound here too: ⇧S stashes the
-            // selected worktree without the detour through the Stash tab.
-            KeyCode::Char('S') => self.open_stash_dialog_for_selected(),
+            // under the cursor, so `s` stashes the selected worktree right
+            // here; ⇧S picks a stash to apply into it.
+            KeyCode::Char('s') => self.open_stash_dialog_for_selected(),
+            KeyCode::Char('S') => self.open_stash_apply_pick(),
             KeyCode::Char('m') => self.open_move_changes_pick(),
             KeyCode::Char('p') => self.start_pull(),
             KeyCode::Char('P') => self.start_push(),
@@ -4323,6 +4360,26 @@ impl App {
         self.load_diff_content(true);
     }
 
+    /// Loads the diff for the file under a cursor that just moved, once the
+    /// cursor has rested there for `diff_load_delay`. Until then the pane shows
+    /// the loading placeholder and any in-flight load is abandoned, so holding
+    /// ↓ through a long file list never shells out to `git diff` per file.
+    /// `tick` starts the load when it comes due.
+    fn schedule_diff_load(&mut self) {
+        let c = &mut self.changes;
+        let on_file = current_file_index(&c.rows, c.selected).is_some();
+        if self.diff_load_delay.is_zero() || !on_file {
+            self.load_diff_content(true);
+            return;
+        }
+        c.load_gen = c.load_gen.wrapping_add(1);
+        c.pending = None;
+        c.loading_new = true;
+        c.scroll = 0;
+        c.h_scroll = 0;
+        c.load_due = Some(Instant::now() + self.diff_load_delay);
+    }
+
     /// Loads the diff text for the file under the cursor into the Diff view.
     /// When the cursor sits on a folder row there is no diff to show, so the
     /// content is cleared. `reset_scroll` sends the viewport back to the top
@@ -4331,6 +4388,7 @@ impl App {
     /// doesn't yank the user back to the top of the file they're reading.
     fn load_diff_content(&mut self, reset_scroll: bool) {
         let c = &mut self.changes;
+        c.load_due = None;
         let entry = current_file_index(&c.rows, c.selected).and_then(|i| c.files.get(i).cloned());
         let name = c.name.clone();
         // A folder (or empty) row has no diff; clear it synchronously and cancel
@@ -4499,7 +4557,7 @@ impl App {
                         (c.selected > 0).then(|| c.selected -= 1)
                     };
                     if moved.is_some() {
-                        self.load_diff_content(true);
+                        self.schedule_diff_load();
                     }
                 }
             } else if over_list {
@@ -4562,7 +4620,7 @@ impl App {
                     (c.selected > 0).then(|| c.selected -= 1)
                 };
                 if moved.is_some() {
-                    self.load_diff_content(true);
+                    self.schedule_diff_load();
                 }
             } else {
                 c.scroll = delta(c.scroll);
@@ -5070,6 +5128,14 @@ impl App {
                     *selected = idx;
                 }
             }
+            View::StashApply { .. } => {
+                let len = self.stash_entries.len();
+                if let View::StashApply { selected, .. } = &mut self.view
+                    && idx < len
+                {
+                    *selected = idx;
+                }
+            }
             // The wizard's rows are drawn per-step, so the click target
             // depends on which step (and, for Review, whether it's mid-edit)
             // is currently on screen.
@@ -5151,13 +5217,13 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => {
                 if *selected + 1 < rows.len() {
                     *selected += 1;
-                    self.load_diff_content(true);
+                    self.schedule_diff_load();
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 if *selected > 0 {
                     *selected -= 1;
-                    self.load_diff_content(true);
+                    self.schedule_diff_load();
                 }
             }
             KeyCode::Home | KeyCode::Char('g') => {
@@ -5406,7 +5472,7 @@ impl App {
         if is_browser {
             self.load_file_browser_diff_content(true);
         } else {
-            self.load_diff_content(true);
+            self.schedule_diff_load();
         }
     }
 
@@ -5584,7 +5650,11 @@ impl App {
             let new_path = current_file_index(&c.rows, c.selected)
                 .and_then(|i| c.files.get(i))
                 .map(|f| f.path.clone());
-            self.load_diff_content(new_path != old_path);
+            // A cursor still waiting out its load delay keeps waiting; the
+            // refresh must not load the file the user may be scrolling past.
+            if self.changes.load_due.is_none() || new_path != old_path {
+                self.load_diff_content(new_path != old_path);
+            }
         } else {
             let marked = vec![true; files.len()];
             let rows = build_rows(&files, tree, &self.collapsed_folders);
@@ -6545,9 +6615,9 @@ impl App {
         }
     }
 
-    /// Whether the Stash tab is waiting on a background list load.
-    #[cfg(test)]
-    fn stash_loading(&self) -> bool {
+    /// Whether the Stash tab is waiting on a background list load. The ⇧S
+    /// stash picker reads it to say "loading" rather than "no stashes".
+    pub fn stash_loading(&self) -> bool {
         self.stash_pending.is_some()
     }
 
@@ -6850,6 +6920,45 @@ impl App {
         );
     }
 
+    /// Opens the stash picker for the worktree under the cursor on the
+    /// Worktrees tab (⇧S). Stashes are repo-global, so the list is the same one
+    /// the Stash tab shows; it reloads in the background while the picker is
+    /// up and the picker reads it from `stash_entries`.
+    fn open_stash_apply_pick(&mut self) {
+        let Some(name) = self.selected_worktree().map(|w| w.name.clone()) else {
+            return;
+        };
+        self.reload_stash_tab(name.clone());
+        self.stash_selected = 0;
+        self.push_screen(View::StashApply { name, selected: 0 });
+    }
+
+    /// Keys for the ⇧S stash picker: move the cursor, Enter applies the
+    /// highlighted stash into the picker's worktree, Esc/q closes it.
+    fn on_stash_apply_key(&mut self, key: KeyEvent) {
+        let len = self.stash_entries.len();
+        let View::StashApply { name, selected } = &mut self.view else {
+            return;
+        };
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                if *selected + 1 < len {
+                    *selected += 1;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+            KeyCode::Enter => {
+                let name = name.clone();
+                let Some(index) = self.stash_entries.get(*selected).map(|e| e.index) else {
+                    return;
+                };
+                self.stash_action("apply", name, Some(index));
+            }
+            KeyCode::Esc | KeyCode::Char('q') => self.navigate_back(),
+            _ => {}
+        }
+    }
+
     /// Opens the stash dialog for the worktree under the cursor on the
     /// Worktrees tab. A clean worktree says so rather than opening a dialog
     /// with nothing in it.
@@ -6866,7 +6975,7 @@ impl App {
     }
 
     /// Opens the stash dialog for `name`: every uncommitted file ticked, with
-    /// an optional message. Shared by the Worktrees tab (⇧S) and the Stash tab
+    /// an optional message. Shared by the Worktrees tab (s) and the Stash tab
     /// (s). Like the commit dialog it opens on the spot and fills its file list
     /// behind itself, because `ops::status` is too slow to hold the UI thread
     /// for on a large changeset.
@@ -12724,7 +12833,7 @@ mod tests {
         app.refresh();
         app.selected = 0;
 
-        press(&mut app, KeyCode::Char('s'));
+        goto_tab(&mut app, Tab::Stash);
         assert_eq!(app.tab, Tab::Stash);
         // Stash the current changes with a message.
         press(&mut app, KeyCode::Char('s'));
@@ -12762,10 +12871,10 @@ mod tests {
         app.selected = 0;
     }
 
-    /// Opens the stash dialog with ⇧S and waits out the background file load,
+    /// Opens the stash dialog with `s` and waits out the background file load,
     /// returning the paths in the order the dialog lists them.
     fn open_stash_dialog(app: &mut App) -> Vec<String> {
-        press(app, KeyCode::Char('S'));
+        press(app, KeyCode::Char('s'));
         settle_dialog_files(app);
         match &app.view {
             View::Stash { files, marked, .. } => {
@@ -12789,10 +12898,10 @@ mod tests {
         press(app, KeyCode::Char(' '));
     }
 
-    /// ⇧S on the Worktrees tab opens the stash dialog and stashes everything
+    /// `s` on the Worktrees tab opens the stash dialog and stashes everything
     /// ticked (all of it, by default), without leaving the tab.
     #[test]
-    fn shift_s_stashes_from_the_worktrees_tab() {
+    fn s_stashes_from_the_worktrees_tab() {
         let (_tmp, mut app) = test_app();
         two_dirty_files(&mut app);
 
@@ -12811,6 +12920,63 @@ mod tests {
         goto_tab(&mut app, Tab::Stash);
         assert_eq!(app.stash_entries.len(), 1);
         assert!(app.stash_entries[0].message.contains("from the list"));
+    }
+
+    /// ⇧S on the Worktrees tab lists every stash in the repo and applies the
+    /// picked one into the selected worktree, keeping the stash.
+    #[test]
+    fn shift_s_applies_a_picked_stash_to_the_selected_worktree() {
+        let (_tmp, mut app) = test_app();
+        two_dirty_files(&mut app);
+        git(&app.ctx.repo_root, &["stash", "push", "-u", "-m", "older"]);
+        std::fs::write(app.ctx.repo_root.join("f.txt"), "three\n").unwrap();
+        git(&app.ctx.repo_root, &["stash", "push", "-m", "newer"]);
+        app.refresh();
+        assert_eq!(app.worktrees[0].dirty, 0);
+
+        press(&mut app, KeyCode::Char('S'));
+        settle_stash(&mut app);
+        assert!(matches!(app.view, View::StashApply { .. }));
+        let rows = render_app_rows(&mut app, 100, 30);
+        assert!(
+            rows.iter().any(|r| r.contains("stash@{1} On ")),
+            "{rows:#?}"
+        );
+
+        // stash@{0} is "newer"; step down to "older" and apply it.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+
+        assert_eq!(app.tab, Tab::Worktrees, "applying stays on the tab");
+        assert!(matches!(app.view, View::List), "the picker is closed");
+        let root = app.ctx.repo_root.clone();
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "two\n"
+        );
+        assert!(
+            root.join("g.txt").exists(),
+            "the untracked file came back too"
+        );
+        assert_eq!(app.stash_entries.len(), 2, "apply keeps the stash");
+    }
+
+    /// With no stashes the picker says so, Enter does nothing, and Esc closes it.
+    #[test]
+    fn shift_s_with_no_stashes_shows_an_empty_picker() {
+        let (_tmp, mut app) = test_app();
+        press(&mut app, KeyCode::Char('S'));
+        settle_stash(&mut app);
+        let rows = render_app_rows(&mut app, 100, 30);
+        assert!(
+            rows.iter().any(|r| r.contains("no stashes in this repo")),
+            "{rows:#?}"
+        );
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.view, View::StashApply { .. }));
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.view, View::List));
     }
 
     /// Tab between the message and the file list must not move the file rows
@@ -12897,7 +13063,7 @@ mod tests {
 
     /// A clean worktree says so instead of opening a dialog with nothing in it.
     #[test]
-    fn shift_s_on_a_clean_worktree_reports_instead_of_prompting() {
+    fn s_on_a_clean_worktree_reports_instead_of_prompting() {
         let (_tmp, mut app) = test_app();
         // `build_app` leaves `.wtm.toml` untracked; commit it so the worktree
         // really is clean.
@@ -12907,7 +13073,7 @@ mod tests {
         app.selected = 0;
         assert_eq!(app.worktrees[0].dirty, 0);
 
-        press(&mut app, KeyCode::Char('S'));
+        press(&mut app, KeyCode::Char('s'));
         assert!(
             matches!(app.view, View::List),
             "no dialog for a clean worktree"
@@ -12938,7 +13104,7 @@ mod tests {
         app.refresh();
         app.selected = app.worktrees.iter().position(|w| w.is_main).unwrap();
 
-        press(&mut app, KeyCode::Char('s'));
+        goto_tab(&mut app, Tab::Stash);
         assert_eq!(app.tab, Tab::Stash);
         press(&mut app, KeyCode::Char('s'));
         settle_dialog_files(&mut app); // the stash dialog loads its files off-thread
@@ -13003,7 +13169,7 @@ mod tests {
         app.refresh();
         app.selected = 0;
 
-        press(&mut app, KeyCode::Char('s'));
+        goto_tab(&mut app, Tab::Stash);
         press(&mut app, KeyCode::Char('s'));
         settle_dialog_files(&mut app); // the stash dialog loads its files off-thread
         press(&mut app, KeyCode::Enter); // stash, no message
@@ -13051,7 +13217,7 @@ mod tests {
         app.refresh();
         app.selected = 0;
 
-        press(&mut app, KeyCode::Char('s'));
+        goto_tab(&mut app, Tab::Stash);
         press(&mut app, KeyCode::Char('s'));
         settle_dialog_files(&mut app); // the stash dialog loads its files off-thread
         press(&mut app, KeyCode::Enter); // stash, no message
@@ -17273,7 +17439,7 @@ mod tests {
             press(&mut app, KeyCode::Esc);
 
             // Stash tab and its sub-modes.
-            press(&mut app, KeyCode::Char('s'));
+            goto_tab(&mut app, Tab::Stash);
             draw(&mut app); // stash table (empty)
             press(&mut app, KeyCode::Char('s'));
             settle_dialog_files(&mut app); // the stash dialog loads its files off-thread
@@ -18308,7 +18474,7 @@ mod tests {
         app.refresh();
         app.selected = app.worktrees.iter().position(|w| w.is_main).unwrap();
 
-        press(&mut app, KeyCode::Char('s')); // the Stash tab
+        goto_tab(&mut app, Tab::Stash); // the Stash tab
         press(&mut app, KeyCode::Char('s')); // stash the change
         settle_dialog_files(&mut app); // the stash dialog loads its files off-thread
         press(&mut app, KeyCode::Enter); // no message
@@ -18461,6 +18627,47 @@ mod tests {
         press(&mut app, KeyCode::Down);
         assert_eq!(app.changes.selected, 1, "the file cursor moved");
         assert_eq!(app.selected, worktree_cursor, "the worktree cursor did not");
+    }
+
+    /// Scrolling through the file panel doesn't compute a diff for every file
+    /// passed: each move restarts the wait, and only the file the cursor
+    /// rests on loads once the delay is up.
+    #[test]
+    fn three_panel_files_diff_waits_for_the_cursor_to_rest() {
+        let (_tmp, mut app) = three_panel_app();
+        let root = app.ctx.repo_root.clone();
+        write_changed_files(&root, 5);
+        app.refresh();
+        app.selected = app.worktrees.iter().position(|w| w.is_main).unwrap();
+        render_app(&mut app, 100, 30);
+        settle_preview(&mut app);
+        press(&mut app, KeyCode::Enter);
+        settle_diff(&mut app);
+        app.diff_load_delay = Duration::from_secs(60);
+
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        app.tick();
+        assert!(
+            app.changes.pending.is_none(),
+            "no diff is computed mid-scroll"
+        );
+        assert!(
+            app.changes.loading_new,
+            "the pane shows the loading placeholder"
+        );
+        assert!(app.changes.load_due.is_some());
+
+        // The cursor has rested long enough: the next tick starts the load for
+        // the file under it, and only that file.
+        app.changes.load_due = Some(Instant::now());
+        app.tick();
+        settle_diff(&mut app);
+        let c = &app.changes;
+        let path = current_file_index(&c.rows, c.selected).map(|i| c.files[i].path.clone());
+        assert_eq!(c.content_path, path, "the rested-on file's diff loaded");
+        assert!(c.load_due.is_none());
+        assert!(!c.loading_new);
     }
 
     /// The Changes tab is folded into the Worktrees tab, so it is skipped by

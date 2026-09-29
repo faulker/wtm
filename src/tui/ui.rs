@@ -354,6 +354,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             selected,
             ..
         } => overlay_hit = draw_stash_target_pick(frame, main, *pop, label, targets, *selected),
+        View::StashApply { name, selected } => {
+            overlay_hit = draw_stash_apply_pick(frame, main, app, name, *selected)
+        }
         _ => {}
     }
 
@@ -390,6 +393,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         | View::OpenCommand { .. }
         | View::UpstreamPick { .. }
         | View::StashTarget { .. }
+        | View::StashApply { .. }
         | View::Setup(_) => overlay_hit,
         _ => None,
     };
@@ -1527,6 +1531,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         ],
         View::StashTarget { .. } => &[
             hint("↑/↓", "pick worktree"),
+            hint("Enter", "apply"),
+            hint("Esc", "cancel"),
+        ],
+        View::StashApply { .. } => &[
+            hint("↑/↓", "pick stash"),
             hint("Enter", "apply"),
             hint("Esc", "cancel"),
         ],
@@ -4837,6 +4846,72 @@ fn draw_stash_target_pick(
     })
 }
 
+/// The ⇧S stash picker: every stash in the repo, newest first, with Enter
+/// applying the highlighted one into worktree `name`. Reads the list from the
+/// Stash tab's `stash_entries`, which loads in the background, so it says
+/// "loading" until that lands.
+fn draw_stash_apply_pick(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    name: &str,
+    selected: usize,
+) -> Option<RowList> {
+    let entries = &app.stash_entries;
+    let rows = entries.len().clamp(1, 12) as u16;
+    let popup = centered(area, 72, rows + 5);
+    frame.render_widget(Clear, popup);
+    let block = dialog_panel(format!("apply a stash into {name}"));
+    frame.render_widget(&block, popup);
+    let inner = block.inner(popup);
+    let [head_area, list_area, hint_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from("which stash? (it's kept after applying)".dim())),
+        head_area,
+    );
+    if entries.is_empty() {
+        let text = if app.stash_loading() {
+            "loading stashes…"
+        } else {
+            "no stashes in this repo"
+        };
+        frame.render_widget(Paragraph::new(Line::from(text.dim())), list_area);
+    } else {
+        let items: Vec<ListItem> = entries
+            .iter()
+            .map(|e| {
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("stash@{{{}}} ", e.index), Style::new().fg(ACCENT)),
+                    Span::raw(e.message.clone()),
+                    Span::styled(format!(" ({})", e.branch), Style::new().dim()),
+                ]))
+            })
+            .collect();
+        let list = List::new(items)
+            .highlight_style(Style::new().bg(SELECTION_BG).bold())
+            .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)));
+        let mut state = ListState::default().with_selected(Some(selected.min(entries.len() - 1)));
+        frame.render_stateful_widget(list, list_area, &mut state);
+        frame.render_widget(
+            Paragraph::new(Line::from("↑/↓ pick · Enter apply · Esc cancel".dim())),
+            hint_area,
+        );
+        return Some(RowList {
+            inner: list_area,
+            header: 0,
+            offset: state.offset(),
+            len: entries.len(),
+        });
+    }
+    frame.render_widget(Paragraph::new(Line::from("Esc cancel".dim())), hint_area);
+    None
+}
+
 /// The upstream picker: a type-to-filter prompt over the repo's
 /// remote-tracking refs, with a "stop tracking" row on top when the branch
 /// already has an upstream. The branch's current upstream is named in the
@@ -6150,7 +6225,7 @@ mod tests {
         assert_eq!(
             line,
             "⇥ tabs  Enter changes  n new  b switch branch  c commit  o open  \
-             s stash  ⇧S stash changes  p pull  ⇧P push  l log  d delete  \
+             s stash  ⇧S apply stash  p pull  ⇧P push  l log  d delete  \
              x resolve  ? help  q quit"
         );
         // `u`, `e`, `m`, `f`, `⇧R` and the cursor keys are documented in help
