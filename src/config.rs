@@ -34,6 +34,14 @@ pub const DEFAULT_DIFF_THEME: &str = "eighties";
 /// own, in minutes. Manual `r` and mutations still refresh immediately.
 pub const DEFAULT_BRANCHES_REFRESH_MINS: u64 = 10;
 
+/// Worktree rows the three-panel Worktrees layout shows when
+/// `worktrees_list_rows` isn't set. The list scrolls past this.
+pub const DEFAULT_WORKTREES_LIST_ROWS: u16 = 6;
+
+/// Largest `worktrees_list_rows` accepted. The TUI still shrinks the list on
+/// short terminals so the files and diff panels keep a usable height.
+pub const MAX_WORKTREES_LIST_ROWS: u16 = 50;
+
 /// Whether the diff pane draws a line-number gutter when `diff_line_numbers`
 /// isn't set anywhere. On by default: the numbers make it possible to talk
 /// about a diff by line, and the gutter is narrow.
@@ -315,6 +323,9 @@ pub struct FileConfig {
     /// Minutes the Branches tab may keep a cached list before refreshing.
     /// Unset means [`DEFAULT_BRANCHES_REFRESH_MINS`].
     pub branches_refresh_mins: Option<u64>,
+    /// Worktree rows the three-panel Worktrees layout shows. Unset means
+    /// [`DEFAULT_WORKTREES_LIST_ROWS`].
+    pub worktrees_list_rows: Option<u16>,
     /// Whether the diff pane draws a line-number gutter. Unset means
     /// [`DEFAULT_DIFF_LINE_NUMBERS`].
     pub diff_line_numbers: Option<bool>,
@@ -382,6 +393,10 @@ pub struct Config {
     /// [`DEFAULT_BRANCHES_REFRESH_MINS`].
     pub branches_refresh_mins: Option<u64>,
     pub branches_refresh_mins_source: Source,
+    /// Raw `worktrees_list_rows` setting; `None` means
+    /// [`DEFAULT_WORKTREES_LIST_ROWS`].
+    pub worktrees_list_rows: Option<u16>,
+    pub worktrees_list_rows_source: Source,
     /// Raw `diff_line_numbers` setting; `None` means
     /// [`DEFAULT_DIFF_LINE_NUMBERS`].
     pub diff_line_numbers: Option<bool>,
@@ -418,6 +433,8 @@ impl Default for Config {
             worktrees_layout_source: Source::Default,
             branches_refresh_mins: None,
             branches_refresh_mins_source: Source::Default,
+            worktrees_list_rows: None,
+            worktrees_list_rows_source: Source::Default,
             diff_line_numbers: None,
             diff_line_numbers_source: Source::Default,
             conflict_editor: None,
@@ -474,6 +491,8 @@ impl Config {
             pick(global.worktrees_layout, repo.worktrees_layout);
         let (branches_refresh_mins, branches_refresh_mins_source) =
             pick(global.branches_refresh_mins, repo.branches_refresh_mins);
+        let (worktrees_list_rows, worktrees_list_rows_source) =
+            pick(global.worktrees_list_rows, repo.worktrees_list_rows);
         let (diff_line_numbers, diff_line_numbers_source) =
             pick(global.diff_line_numbers, repo.diff_line_numbers);
         let (conflict_editor, conflict_editor_source) =
@@ -495,6 +514,8 @@ impl Config {
             worktrees_layout_source,
             branches_refresh_mins,
             branches_refresh_mins_source,
+            worktrees_list_rows,
+            worktrees_list_rows_source,
             diff_line_numbers,
             diff_line_numbers_source,
             conflict_editor,
@@ -531,6 +552,14 @@ impl Config {
     pub fn branches_refresh_mins(&self) -> u64 {
         self.branches_refresh_mins
             .unwrap_or(DEFAULT_BRANCHES_REFRESH_MINS)
+    }
+
+    /// Worktree rows the three-panel Worktrees layout shows, clamped to
+    /// `1..=MAX_WORKTREES_LIST_ROWS` so a hand-edited file can't break layout.
+    pub fn worktrees_list_rows(&self) -> u16 {
+        self.worktrees_list_rows
+            .unwrap_or(DEFAULT_WORKTREES_LIST_ROWS)
+            .clamp(1, MAX_WORKTREES_LIST_ROWS)
     }
 
     /// Whether the diff pane draws its line-number gutter.
@@ -997,6 +1026,25 @@ mod tests {
         let cfg = Config::merge(global, repo);
         assert!(cfg.auto_update_check());
         assert_eq!(cfg.auto_update_check_source, Source::Repo);
+    }
+
+    #[test]
+    fn worktrees_list_rows_defaults_merges_and_clamps() {
+        assert_eq!(
+            Config::default().worktrees_list_rows(),
+            DEFAULT_WORKTREES_LIST_ROWS
+        );
+        let global: FileConfig = toml::from_str("worktrees_list_rows = 9").unwrap();
+        let cfg = Config::merge(global.clone(), FileConfig::default());
+        assert_eq!(cfg.worktrees_list_rows(), 9);
+        assert_eq!(cfg.worktrees_list_rows_source, Source::Global);
+        let repo: FileConfig = toml::from_str("worktrees_list_rows = 0").unwrap();
+        let cfg = Config::merge(global, repo);
+        assert_eq!(cfg.worktrees_list_rows_source, Source::Repo);
+        assert_eq!(cfg.worktrees_list_rows(), 1, "0 clamps up to one row");
+        let huge: FileConfig = toml::from_str("worktrees_list_rows = 999").unwrap();
+        let cfg = Config::merge(huge, FileConfig::default());
+        assert_eq!(cfg.worktrees_list_rows(), MAX_WORKTREES_LIST_ROWS);
     }
 
     #[test]

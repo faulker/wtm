@@ -36,16 +36,19 @@ pub const UPDATE_ROW: usize = TEXT_ROWS;
 pub const THEME_ROW: usize = TEXT_ROWS + 1;
 /// Index of the Worktrees-tab layout cycle row.
 pub const LAYOUT_ROW: usize = TEXT_ROWS + 2;
+/// Index of the three-panel worktree list height (editable row count).
+pub const LIST_ROWS_ROW: usize = TEXT_ROWS + 3;
 /// Index of the Branches-tab cache timeout (editable minutes).
-pub const BRANCHES_REFRESH_ROW: usize = TEXT_ROWS + 3;
+pub const BRANCHES_REFRESH_ROW: usize = TEXT_ROWS + 4;
 /// Index of the diff line-number gutter toggle.
-pub const DIFF_LINE_NUMBERS_ROW: usize = TEXT_ROWS + 4;
+pub const DIFF_LINE_NUMBERS_ROW: usize = TEXT_ROWS + 5;
 /// Index of the conflict resolver's external editor: Enter edits the command
 /// template, Space flips it between terminal and background mode.
-pub const CONFLICT_EDITOR_ROW: usize = TEXT_ROWS + 5;
-/// Number of setting rows, text fields plus the cycle rows, the Branches
-/// refresh timeout, the diff line-number toggle, and the conflict editor.
-pub const FIELD_ROWS: usize = TEXT_ROWS + 6;
+pub const CONFLICT_EDITOR_ROW: usize = TEXT_ROWS + 6;
+/// Number of setting rows, text fields plus the cycle rows, the worktree list
+/// height, the Branches refresh timeout, the diff line-number toggle, and the
+/// conflict editor.
+pub const FIELD_ROWS: usize = TEXT_ROWS + 7;
 /// Index of the "check for updates now" row.
 pub const CHECK_ROW: usize = FIELD_ROWS;
 /// Total selectable rows.
@@ -507,6 +510,7 @@ impl ConfigEditor {
             UPDATE_ROW => &self.fields.auto_update_check,
             THEME_ROW => &self.fields.diff_theme,
             LAYOUT_ROW => &self.fields.worktrees_layout,
+            LIST_ROWS_ROW => &self.fields.worktrees_list_rows,
             BRANCHES_REFRESH_ROW => &self.fields.branches_refresh_mins,
             DIFF_LINE_NUMBERS_ROW => &self.fields.diff_line_numbers,
             CONFLICT_EDITOR_ROW => self
@@ -585,6 +589,7 @@ impl ConfigEditor {
             UPDATE_ROW => self.fields.auto_update_check = value,
             THEME_ROW => self.fields.diff_theme = value,
             LAYOUT_ROW => self.fields.worktrees_layout = value,
+            LIST_ROWS_ROW => self.fields.worktrees_list_rows = value,
             BRANCHES_REFRESH_ROW => self.fields.branches_refresh_mins = value,
             DIFF_LINE_NUMBERS_ROW => self.fields.diff_line_numbers = value,
             // A cleared template goes back to the built-in editor; a new one
@@ -810,6 +815,7 @@ impl ConfigEditor {
             }
             KeyCode::Enter
                 if self.selected < TEXT_ROWS
+                    || self.selected == LIST_ROWS_ROW
                     || self.selected == BRANCHES_REFRESH_ROW
                     || self.selected == CONFLICT_EDITOR_ROW =>
             {
@@ -819,6 +825,10 @@ impl ConfigEditor {
                     && self.fields.branches_refresh_mins.is_empty()
                 {
                     config::DEFAULT_BRANCHES_REFRESH_MINS.to_string()
+                } else if self.selected == LIST_ROWS_ROW
+                    && self.fields.worktrees_list_rows.is_empty()
+                {
+                    config::DEFAULT_WORKTREES_LIST_ROWS.to_string()
                 } else {
                     self.field(self.selected).to_string()
                 };
@@ -968,6 +978,25 @@ mod tests {
             ed.fields.worktrees_layout, "",
             "the inherited default stays reachable"
         );
+    }
+
+    /// The list-height row opens a text input prefilled with the default when
+    /// unset, and a committed number lands in the field.
+    #[test]
+    fn list_rows_row_edits_a_number_prefilled_with_the_default() {
+        let mut ed = editor();
+        ed.selected = LIST_ROWS_ROW;
+        press(&mut ed, KeyCode::Enter);
+        let input = ed.editing.as_ref().expect("Enter opens a text input");
+        assert_eq!(
+            input.trimmed(),
+            config::DEFAULT_WORKTREES_LIST_ROWS.to_string()
+        );
+        press(&mut ed, KeyCode::Backspace);
+        press(&mut ed, KeyCode::Char('9'));
+        press(&mut ed, KeyCode::Enter);
+        assert_eq!(ed.fields.worktrees_list_rows, "9");
+        assert!(ed.editing.is_none());
     }
 
     /// Types `text` into whatever input is open, one key at a time.

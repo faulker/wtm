@@ -20,9 +20,9 @@ use super::app::{
 };
 use super::config_editor::{
     BRANCHES_REFRESH_ROW, CHECK_ROW, CONFLICT_EDITOR_ROW, COPY_ROW, ConfigEditor,
-    DIFF_LINE_NUMBERS_ROW, FIELD_ROWS, LAYOUT_ROW, OPEN_COMMAND_ROW, OpenCommandEditor, RUN_ROW,
-    StringListEditor, THEME_PREVIEW_SAMPLE_LINES, THEME_ROW, UPDATE_ROW, check_line, form_lines,
-    line_of_row, preview_line,
+    DIFF_LINE_NUMBERS_ROW, FIELD_ROWS, LAYOUT_ROW, LIST_ROWS_ROW, OPEN_COMMAND_ROW,
+    OpenCommandEditor, RUN_ROW, StringListEditor, THEME_PREVIEW_SAMPLE_LINES, THEME_ROW,
+    UPDATE_ROW, check_line, form_lines, line_of_row, preview_line,
 };
 use super::help::{self, Binding, HelpTab};
 use super::highlight;
@@ -32,8 +32,9 @@ use super::setup::{
 use super::theme::{self, ACCENT, BORDER, DIALOG_BG, DIALOG_BORDER, GRAPH_COLORS, SELECTION_BG};
 use crate::config::{
     CommandMode, DEFAULT_AUTO_UPDATE_CHECK, DEFAULT_BRANCHES_REFRESH_MINS,
-    DEFAULT_DIFF_LINE_NUMBERS, DEFAULT_DIFF_THEME, DEFAULT_LOCATION, LOCATION_PRESETS, OpenCommand,
-    OpenCommandVars, WorktreesLayout, expand_open_command, worktrees_layout_label,
+    DEFAULT_DIFF_LINE_NUMBERS, DEFAULT_DIFF_THEME, DEFAULT_LOCATION, DEFAULT_WORKTREES_LIST_ROWS,
+    LOCATION_PRESETS, OpenCommand, OpenCommandVars, WorktreesLayout, expand_open_command,
+    worktrees_layout_label,
 };
 use crate::conflict::{ConflictSegment, ResolutionAction};
 use crate::git::{GraphLine, StatusEntry};
@@ -650,14 +651,24 @@ const fn hint(key: &'static str, label: &'static str) -> Binding {
     }
 }
 
-/// Height the three-panel Worktrees layout gives the worktree list: four rows
-/// plus the table header and the panel's borders.
-const THREE_PANEL_LIST_HEIGHT: u16 = 7;
+/// Lines the three-panel worktree list spends on its table header and the
+/// panel's borders, on top of the `worktrees_list_rows` setting.
+const THREE_PANEL_LIST_CHROME: u16 = 3;
 
-/// Shortest body the three-panel layout is drawn in: the worktree list plus
-/// enough room for a file list and diff worth reading. Below this the tab falls
-/// back to two panels.
-const THREE_PANEL_MIN_HEIGHT: u16 = THREE_PANEL_LIST_HEIGHT + 7;
+/// Height kept for the file list and diff under the three-panel worktree list,
+/// however many worktree rows are configured.
+const THREE_PANEL_CHANGES_MIN_HEIGHT: u16 = 7;
+
+/// Shortest body the three-panel layout is drawn in: a four-row worktree list
+/// plus enough room for a file list and diff worth reading. Below this the tab
+/// falls back to two panels.
+const THREE_PANEL_MIN_HEIGHT: u16 = 4 + THREE_PANEL_LIST_CHROME + THREE_PANEL_CHANGES_MIN_HEIGHT;
+
+/// Height of the three-panel worktree list: the configured rows plus chrome,
+/// shrunk on short terminals so the changes panels keep their minimum.
+fn three_panel_list_height(rows: u16, body_height: u16) -> u16 {
+    (rows + THREE_PANEL_LIST_CHROME).min(body_height.saturating_sub(THREE_PANEL_CHANGES_MIN_HEIGHT))
+}
 
 /// Row highlight for a selectable list, dimmed when the panel doesn't hold the
 /// keyboard so only one cursor on screen looks live.
@@ -971,11 +982,9 @@ fn draw_worktrees_tab(frame: &mut Frame, area: Rect, app: &mut App) -> Option<Ro
 /// the Changes tab's changed-file list and diff filling the space below it, so
 /// the highlighted worktree's changes are readable without leaving the tab.
 fn draw_worktrees_three_panel(frame: &mut Frame, area: Rect, app: &mut App) -> Option<RowList> {
-    let [list_area, changes_area] = Layout::vertical([
-        Constraint::Length(THREE_PANEL_LIST_HEIGHT),
-        Constraint::Min(1),
-    ])
-    .areas(area);
+    let list_height = three_panel_list_height(app.ctx.config.worktrees_list_rows(), area.height);
+    let [list_area, changes_area] =
+        Layout::vertical([Constraint::Length(list_height), Constraint::Min(1)]).areas(area);
     let focus = app.worktrees_focus;
     let row_list = draw_list(frame, list_area, app, focus == WorktreesFocus::List);
     // Status runs off-thread; never call `ops::status` on the render path. Its
@@ -2814,6 +2823,7 @@ fn draw_settings_tab(
         "auto_update_check",
         "diff_theme",
         "worktrees_layout",
+        "worktrees_list_rows",
         "branches_refresh_mins",
         "diff_line_numbers",
         "conflict_editor",
@@ -2828,6 +2838,7 @@ fn draw_settings_tab(
         "Check GitHub for a newer wtm when the TUI starts. Enter cycles.",
         "Syntax colours in the diff pane. Enter cycles themes.",
         "Worktrees tab layout. Three panels add files + diff. Enter cycles.",
+        "Worktree rows shown in the three-panel list (1-50). Enter edits.",
         "Minutes the Branches tab keeps its list before refreshing.",
         "Show a line-number gutter beside the diff. Enter cycles.",
         "Editor the resolver's e key uses ({path}). Enter edits, Space flips mode.",
@@ -2913,6 +2924,14 @@ fn draw_settings_tab(
                             "off"
                         }
                     ),
+                },
+                highlight,
+            )),
+            _ if row == LIST_ROWS_ROW => spans.push(Span::styled(
+                if editor.fields.worktrees_list_rows.is_empty() {
+                    format!("(default: {DEFAULT_WORKTREES_LIST_ROWS})")
+                } else {
+                    editor.fields.worktrees_list_rows.clone()
                 },
                 highlight,
             )),
@@ -6009,14 +6028,32 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::super::config_editor::{
-        BRANCHES_REFRESH_ROW, COPY_ROW, LAYOUT_ROW, OPEN_COMMAND_ROW, RUN_ROW, StringListEditor,
-        StringListKind, THEME_ROW, UPDATE_ROW, check_line, line_of_row, preview_line,
-        theme_preview_label_line, theme_preview_line, version_line,
+        BRANCHES_REFRESH_ROW, COPY_ROW, LAYOUT_ROW, LIST_ROWS_ROW, OPEN_COMMAND_ROW, RUN_ROW,
+        StringListEditor, StringListKind, THEME_ROW, UPDATE_ROW, check_line, line_of_row,
+        preview_line, theme_preview_label_line, theme_preview_line, version_line,
     };
     use super::*;
     use crate::git::LogEntry;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    /// The three-panel list is the configured rows plus header and borders,
+    /// but never squeezes the files + diff panels below their minimum.
+    #[test]
+    fn three_panel_list_height_follows_setting_and_yields_on_short_terminals() {
+        assert_eq!(three_panel_list_height(6, 50), 9);
+        assert_eq!(three_panel_list_height(20, 50), 23);
+        assert_eq!(
+            three_panel_list_height(40, 30),
+            30 - THREE_PANEL_CHANGES_MIN_HEIGHT,
+            "a tall setting shrinks to leave the changes panels their room"
+        );
+        // At the fallback threshold the default list still fits in full.
+        assert_eq!(
+            three_panel_list_height(4, THREE_PANEL_MIN_HEIGHT),
+            4 + THREE_PANEL_LIST_CHROME
+        );
+    }
 
     /// Renders `draw` into an off-screen terminal and returns what each row of
     /// the buffer reads as, so a test can assert on the drawn output.
@@ -6369,6 +6406,7 @@ mod tests {
             (UPDATE_ROW, "auto_update_check"),
             (THEME_ROW, "diff_theme"),
             (LAYOUT_ROW, "worktrees_layout"),
+            (LIST_ROWS_ROW, "worktrees_list_rows"),
             (BRANCHES_REFRESH_ROW, "branches_refresh_mins"),
         ] {
             let offset = line_of_row(row);
@@ -6392,6 +6430,11 @@ mod tests {
             line(line_of_row(LAYOUT_ROW)).contains("default: two panels"),
             "{:?}",
             line(line_of_row(LAYOUT_ROW))
+        );
+        assert!(
+            line(line_of_row(LIST_ROWS_ROW)).contains("default: 6"),
+            "{:?}",
+            line(line_of_row(LIST_ROWS_ROW))
         );
         assert!(
             line(line_of_row(BRANCHES_REFRESH_ROW)).contains("default: 10"),

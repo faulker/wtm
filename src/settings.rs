@@ -49,6 +49,10 @@ const KEYS: &[(&str, &str)] = &[
         "minutes the Branches tab keeps its list before refreshing (default 10)",
     ),
     (
+        "worktrees_list_rows",
+        "worktree rows the three-panel Worktrees tab shows (1-50, default 6)",
+    ),
+    (
         "diff_line_numbers",
         "show a line-number gutter in the diff pane (true/false, default true)",
     ),
@@ -228,6 +232,7 @@ pub fn repo_config_fields(
     let diff_theme = effective_diff_theme(global_config, &cfg);
     let worktrees_layout = effective_worktrees_layout(global_config, &cfg);
     let branches_refresh_mins = effective_branches_refresh_mins(global_config, &cfg);
+    let worktrees_list_rows = effective_worktrees_list_rows(global_config, &cfg);
     let diff_line_numbers = effective_diff_line_numbers(global_config, &cfg);
     let conflict_editor =
         Config::merge(load_global_file(global_config), cfg.clone()).conflict_editor;
@@ -262,6 +267,7 @@ pub fn repo_config_fields(
         diff_theme,
         worktrees_layout,
         branches_refresh_mins,
+        worktrees_list_rows,
         diff_line_numbers,
         conflict_editor,
         copy,
@@ -322,6 +328,16 @@ fn effective_branches_refresh_mins(global_config: Option<&Path>, repo: &FileConf
     }
 }
 
+/// Effective `worktrees_list_rows` for the editor: `""` when the built-in
+/// default applies, otherwise the row count the TUI draws.
+fn effective_worktrees_list_rows(global_config: Option<&Path>, repo: &FileConfig) -> String {
+    let merged = Config::merge(load_global_file(global_config), repo.clone());
+    match merged.worktrees_list_rows_source {
+        config::Source::Default => String::new(),
+        _ => merged.worktrees_list_rows().to_string(),
+    }
+}
+
 /// Effective `diff_line_numbers` for the editor: `""` when the built-in default
 /// applies, otherwise `"true"`/`"false"`.
 fn effective_diff_line_numbers(global_config: Option<&Path>, repo: &FileConfig) -> String {
@@ -350,6 +366,9 @@ pub struct RepoConfigFields {
     /// Minutes the Branches tab caches its list, or `""` for the default;
     /// lives in the global config.
     pub branches_refresh_mins: String,
+    /// Worktree rows the three-panel list shows, or `""` for the default;
+    /// lives in the global config.
+    pub worktrees_list_rows: String,
     /// `""`, `"true"`, or `"false"`; lives in the global config.
     pub diff_line_numbers: String,
     /// The resolver's external editor, `None` for the built-in one; lives in
@@ -393,6 +412,7 @@ pub fn save_config_edits(
     apply_unset(&mut doc, "diff_theme")?;
     apply_unset(&mut doc, "worktrees_layout")?;
     apply_unset(&mut doc, "branches_refresh_mins")?;
+    apply_unset(&mut doc, "worktrees_list_rows")?;
     apply_unset(&mut doc, "diff_line_numbers")?;
     apply_unset(&mut doc, "conflict_editor")?;
     save_doc(&file, &doc)?;
@@ -401,6 +421,7 @@ pub fn save_config_edits(
         save_global_setting(path, "diff_theme", &fields.diff_theme)?;
         save_global_setting(path, "worktrees_layout", &fields.worktrees_layout)?;
         save_global_setting(path, "branches_refresh_mins", &fields.branches_refresh_mins)?;
+        save_global_setting(path, "worktrees_list_rows", &fields.worktrees_list_rows)?;
         save_global_setting(path, "diff_line_numbers", &fields.diff_line_numbers)?;
         save_global_conflict_editor(path, fields.conflict_editor.as_ref())?;
         save_global_commands(path, &global_cmds)?;
@@ -605,6 +626,10 @@ fn show(cwd: &Path, json: bool) -> Result<()> {
                 "value": cfg.branches_refresh_mins(),
                 "source": cfg.branches_refresh_mins_source,
             },
+            "worktrees_list_rows": {
+                "value": cfg.worktrees_list_rows(),
+                "source": cfg.worktrees_list_rows_source,
+            },
             "diff_line_numbers": {
                 "value": cfg.diff_line_numbers(),
                 "source": cfg.diff_line_numbers_source,
@@ -662,6 +687,11 @@ fn show(cwd: &Path, json: bool) -> Result<()> {
         "  branches_refresh_mins = {}   ({})",
         cfg.branches_refresh_mins(),
         cfg.branches_refresh_mins_source
+    );
+    println!(
+        "  worktrees_list_rows = {}   ({})",
+        cfg.worktrees_list_rows(),
+        cfg.worktrees_list_rows_source
     );
     println!(
         "  diff_line_numbers = {}   ({})",
@@ -725,6 +755,7 @@ fn get(cwd: &Path, key: &str, json: bool) -> Result<()> {
         "diff_theme" => json!(cfg.diff_theme()),
         "worktrees_layout" => json!(cfg.worktrees_layout().as_str()),
         "branches_refresh_mins" => json!(cfg.branches_refresh_mins()),
+        "worktrees_list_rows" => json!(cfg.worktrees_list_rows()),
         "diff_line_numbers" => json!(cfg.diff_line_numbers()),
         // `get` prints the template; `--json` on `show` keeps the mode.
         "conflict_editor" => json!(
@@ -1059,6 +1090,10 @@ fn apply_set(doc: &mut DocumentMut, key: &str, raw: &str) -> Result<()> {
             let mins = parse_branches_refresh_mins(raw)?;
             doc["branches_refresh_mins"] = toml_value(mins as i64);
         }
+        "worktrees_list_rows" => {
+            let rows = parse_worktrees_list_rows(raw)?;
+            doc["worktrees_list_rows"] = toml_value(i64::from(rows));
+        }
         "diff_line_numbers" => {
             doc["diff_line_numbers"] = toml_value(parse_bool(raw)?);
         }
@@ -1086,6 +1121,7 @@ fn apply_unset(doc: &mut DocumentMut, key: &str) -> Result<bool> {
         "diff_theme" => doc.remove("diff_theme").is_some(),
         "worktrees_layout" => doc.remove("worktrees_layout").is_some(),
         "branches_refresh_mins" => doc.remove("branches_refresh_mins").is_some(),
+        "worktrees_list_rows" => doc.remove("worktrees_list_rows").is_some(),
         "diff_line_numbers" => doc.remove("diff_line_numbers").is_some(),
         "conflict_editor" => doc.remove("conflict_editor").is_some(),
         "setup.copy" | "setup.run" => {
@@ -1175,6 +1211,22 @@ fn parse_branches_refresh_mins(raw: &str) -> Result<u64> {
         bail!("branches_refresh_mins must be at least 1");
     }
     Ok(mins)
+}
+
+/// Parses the three-panel worktree list's row count, rejecting values outside
+/// `1..=MAX_WORKTREES_LIST_ROWS`.
+fn parse_worktrees_list_rows(raw: &str) -> Result<u16> {
+    let rows: u16 = raw
+        .trim()
+        .parse()
+        .with_context(|| format!("expected a number of rows, got {raw:?}"))?;
+    if !(1..=config::MAX_WORKTREES_LIST_ROWS).contains(&rows) {
+        bail!(
+            "worktrees_list_rows must be between 1 and {}",
+            config::MAX_WORKTREES_LIST_ROWS
+        );
+    }
+    Ok(rows)
 }
 
 /// Splits a comma-separated value into trimmed, non-empty items.
@@ -1469,6 +1521,7 @@ mod tests {
             diff_theme: String::new(),
             worktrees_layout: String::new(),
             branches_refresh_mins: String::new(),
+            worktrees_list_rows: String::new(),
             diff_line_numbers: String::new(),
             conflict_editor: None,
             copy: copy.iter().map(|s| (*s).to_string()).collect(),
@@ -1848,6 +1901,59 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("number of minutes"), "{err}");
+    }
+
+    #[test]
+    fn setting_worktrees_list_rows_writes_an_integer_in_range() {
+        let mut doc = DocumentMut::new();
+        apply_set(&mut doc, "worktrees_list_rows", "10").unwrap();
+        assert_eq!(doc.to_string().trim(), "worktrees_list_rows = 10");
+        let cfg: FileConfig = toml::from_str(&doc.to_string()).unwrap();
+        assert_eq!(cfg.worktrees_list_rows, Some(10));
+        assert!(apply_unset(&mut doc, "worktrees_list_rows").unwrap());
+        assert_eq!(doc.to_string().trim(), "");
+
+        for bad in ["0", "51"] {
+            let err = apply_set(&mut doc, "worktrees_list_rows", bad)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("between 1 and 50"), "{err}");
+        }
+        let err = apply_set(&mut doc, "worktrees_list_rows", "tall")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("number of rows"), "{err}");
+    }
+
+    #[test]
+    fn worktrees_list_rows_round_trips_through_the_global_config() {
+        let dir = tempfile::tempdir().unwrap();
+        // A stale repo override must be dropped when Settings saves.
+        std::fs::write(dir.path().join(CONFIG_FILE), "worktrees_list_rows = 3\n").unwrap();
+        let global = dir.path().join("global.toml");
+
+        let mut edits = fields("", &[], &[], &[]);
+        edits.worktrees_list_rows = "12".to_string();
+        save_config_edits(dir.path(), Some(&global), &edits).unwrap();
+
+        assert_eq!(
+            FileConfig::load(&global).unwrap().worktrees_list_rows,
+            Some(12)
+        );
+        let repo = FileConfig::load(&dir.path().join(CONFIG_FILE)).unwrap();
+        assert_eq!(repo.worktrees_list_rows, None);
+        let read = repo_config_fields(dir.path(), Some(&global)).unwrap();
+        assert_eq!(read.worktrees_list_rows, "12");
+
+        edits.worktrees_list_rows = String::new();
+        save_config_edits(dir.path(), Some(&global), &edits).unwrap();
+        assert_eq!(FileConfig::load(&global).unwrap().worktrees_list_rows, None);
+        assert_eq!(
+            repo_config_fields(dir.path(), Some(&global))
+                .unwrap()
+                .worktrees_list_rows,
+            ""
+        );
     }
 
     #[test]
