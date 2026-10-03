@@ -57,6 +57,11 @@ const KEYS: &[(&str, &str)] = &[
         "show a line-number gutter in the diff pane (true/false, default true)",
     ),
     (
+        "pull_before_create",
+        "pull the source branch from its upstream before creating a worktree \
+         from it (true/false, default true)",
+    ),
+    (
         "conflict_editor",
         "editor the conflict resolver's e key opens a file in; a shell template \
          with {path} (the file), {name}, {branch}. Runs in this terminal; give \
@@ -234,6 +239,7 @@ pub fn repo_config_fields(
     let branches_refresh_mins = effective_branches_refresh_mins(global_config, &cfg);
     let worktrees_list_rows = effective_worktrees_list_rows(global_config, &cfg);
     let diff_line_numbers = effective_diff_line_numbers(global_config, &cfg);
+    let pull_before_create = effective_pull_before_create(global_config, &cfg);
     let conflict_editor =
         Config::merge(load_global_file(global_config), cfg.clone()).conflict_editor;
     let setup = cfg.setup.clone().unwrap_or_default();
@@ -269,6 +275,7 @@ pub fn repo_config_fields(
         branches_refresh_mins,
         worktrees_list_rows,
         diff_line_numbers,
+        pull_before_create,
         conflict_editor,
         copy,
         run,
@@ -338,6 +345,16 @@ fn effective_worktrees_list_rows(global_config: Option<&Path>, repo: &FileConfig
     }
 }
 
+/// Effective `pull_before_create` for the editor: `""` when the built-in
+/// default applies, otherwise `"true"`/`"false"`.
+fn effective_pull_before_create(global_config: Option<&Path>, repo: &FileConfig) -> String {
+    let merged = Config::merge(load_global_file(global_config), repo.clone());
+    match merged.pull_before_create_source {
+        config::Source::Default => String::new(),
+        _ => merged.pull_before_create().to_string(),
+    }
+}
+
 /// Effective `diff_line_numbers` for the editor: `""` when the built-in default
 /// applies, otherwise `"true"`/`"false"`.
 fn effective_diff_line_numbers(global_config: Option<&Path>, repo: &FileConfig) -> String {
@@ -371,6 +388,8 @@ pub struct RepoConfigFields {
     pub worktrees_list_rows: String,
     /// `""`, `"true"`, or `"false"`; lives in the global config.
     pub diff_line_numbers: String,
+    /// `""`, `"true"`, or `"false"`; lives in the global config.
+    pub pull_before_create: String,
     /// The resolver's external editor, `None` for the built-in one; lives in
     /// the global config.
     pub conflict_editor: Option<ConflictEditor>,
@@ -414,6 +433,7 @@ pub fn save_config_edits(
     apply_unset(&mut doc, "branches_refresh_mins")?;
     apply_unset(&mut doc, "worktrees_list_rows")?;
     apply_unset(&mut doc, "diff_line_numbers")?;
+    apply_unset(&mut doc, "pull_before_create")?;
     apply_unset(&mut doc, "conflict_editor")?;
     save_doc(&file, &doc)?;
     if let Some(path) = global_config {
@@ -423,6 +443,7 @@ pub fn save_config_edits(
         save_global_setting(path, "branches_refresh_mins", &fields.branches_refresh_mins)?;
         save_global_setting(path, "worktrees_list_rows", &fields.worktrees_list_rows)?;
         save_global_setting(path, "diff_line_numbers", &fields.diff_line_numbers)?;
+        save_global_setting(path, "pull_before_create", &fields.pull_before_create)?;
         save_global_conflict_editor(path, fields.conflict_editor.as_ref())?;
         save_global_commands(path, &global_cmds)?;
     }
@@ -634,6 +655,10 @@ fn show(cwd: &Path, json: bool) -> Result<()> {
                 "value": cfg.diff_line_numbers(),
                 "source": cfg.diff_line_numbers_source,
             },
+            "pull_before_create": {
+                "value": cfg.pull_before_create(),
+                "source": cfg.pull_before_create_source,
+            },
             "conflict_editor": {
                 "value": cfg.conflict_editor,
                 "source": cfg.conflict_editor_source,
@@ -698,6 +723,11 @@ fn show(cwd: &Path, json: bool) -> Result<()> {
         cfg.diff_line_numbers(),
         cfg.diff_line_numbers_source
     );
+    println!(
+        "  pull_before_create = {}   ({})",
+        cfg.pull_before_create(),
+        cfg.pull_before_create_source
+    );
     match &cfg.conflict_editor {
         Some(editor) => println!(
             "  conflict_editor = {:?}   ({}, {})",
@@ -757,6 +787,7 @@ fn get(cwd: &Path, key: &str, json: bool) -> Result<()> {
         "branches_refresh_mins" => json!(cfg.branches_refresh_mins()),
         "worktrees_list_rows" => json!(cfg.worktrees_list_rows()),
         "diff_line_numbers" => json!(cfg.diff_line_numbers()),
+        "pull_before_create" => json!(cfg.pull_before_create()),
         // `get` prints the template; `--json` on `show` keeps the mode.
         "conflict_editor" => json!(
             cfg.conflict_editor
@@ -1097,6 +1128,9 @@ fn apply_set(doc: &mut DocumentMut, key: &str, raw: &str) -> Result<()> {
         "diff_line_numbers" => {
             doc["diff_line_numbers"] = toml_value(parse_bool(raw)?);
         }
+        "pull_before_create" => {
+            doc["pull_before_create"] = toml_value(parse_bool(raw)?);
+        }
         "conflict_editor" => set_conflict_editor(doc, &parse_conflict_editor(raw)?),
         "setup.copy" | "setup.run" => {
             let sub = key.strip_prefix("setup.").unwrap();
@@ -1123,6 +1157,7 @@ fn apply_unset(doc: &mut DocumentMut, key: &str) -> Result<bool> {
         "branches_refresh_mins" => doc.remove("branches_refresh_mins").is_some(),
         "worktrees_list_rows" => doc.remove("worktrees_list_rows").is_some(),
         "diff_line_numbers" => doc.remove("diff_line_numbers").is_some(),
+        "pull_before_create" => doc.remove("pull_before_create").is_some(),
         "conflict_editor" => doc.remove("conflict_editor").is_some(),
         "setup.copy" | "setup.run" => {
             let sub = key.strip_prefix("setup.").unwrap();
@@ -1523,6 +1558,7 @@ mod tests {
             branches_refresh_mins: String::new(),
             worktrees_list_rows: String::new(),
             diff_line_numbers: String::new(),
+            pull_before_create: String::new(),
             conflict_editor: None,
             copy: copy.iter().map(|s| (*s).to_string()).collect(),
             run: run.iter().map(|s| (*s).to_string()).collect(),

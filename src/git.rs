@@ -1248,6 +1248,13 @@ pub fn push_delete(dir: &Path, remote: &str, branch: &str) -> Result<String> {
     run(dir, &["push", remote, "--delete", branch])
 }
 
+/// Deletes the local remote-tracking ref `<remote>/<branch>` without touching
+/// the remote. Used to drop a stale ref whose branch is already gone upstream.
+pub fn delete_remote_tracking_ref(dir: &Path, remote: &str, branch: &str) -> Result<()> {
+    run(dir, &["branch", "-d", "-r", &format!("{remote}/{branch}")])?;
+    Ok(())
+}
+
 /// Names of the repository's configured remotes.
 pub fn remotes(dir: &Path) -> Result<Vec<String>> {
     let out = run(dir, &["remote"])?;

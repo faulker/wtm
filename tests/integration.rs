@@ -1542,6 +1542,59 @@ fn log_shows_recent_commits_with_limit() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("commit 3"));
 }
 
+/// Sets up `feature` tracking origin/feature, then has a teammate push a new
+/// commit to it, so the local branch is one commit behind its upstream.
+fn branch_behind_origin(tmp: &Path, repo: &Path) {
+    let bare = bare_repo(tmp);
+    git(repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    git(repo, &["push", "-u", "origin", "main"]);
+    git(repo, &["branch", "feature"]);
+    git(repo, &["push", "-u", "origin", "feature"]);
+    let clone = tmp.join("teammate");
+    git(
+        tmp,
+        &["clone", "-b", "feature", bare.to_str().unwrap(), clone.to_str().unwrap()],
+    );
+    git(&clone, &["config", "user.email", "t@e.st"]);
+    git(&clone, &["config", "user.name", "t"]);
+    git(&clone, &["commit", "--allow-empty", "-m", "teammate work"]);
+    git(&clone, &["push", "origin", "feature"]);
+}
+
+/// Subject line of the commit checked out in `dir`.
+fn head_subject(dir: &Path) -> String {
+    let out = Command::new("git")
+        .args(["log", "-1", "--format=%s"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn create_pulls_an_existing_branch_from_its_upstream_first() {
+    let (tmp, repo) = setup_repo();
+    branch_behind_origin(tmp.path(), &repo);
+
+    let created = stdout_json(&wtm(&repo, &["create", "feature", "--json"]));
+    assert_eq!(created["pull"]["ok"], true, "{created}");
+    let wt_path = PathBuf::from(created["path"].as_str().unwrap());
+    assert_eq!(head_subject(&wt_path), "teammate work");
+}
+
+#[test]
+fn create_skips_the_pull_when_pull_before_create_is_off() {
+    let (tmp, repo) = setup_repo();
+    branch_behind_origin(tmp.path(), &repo);
+    let out = wtm(&repo, &["config", "set", "pull_before_create", "false"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let created = stdout_json(&wtm(&repo, &["create", "feature", "--json"]));
+    assert!(created["pull"].is_null(), "{created}");
+    let wt_path = PathBuf::from(created["path"].as_str().unwrap());
+    assert_ne!(head_subject(&wt_path), "teammate work");
+}
+
 #[test]
 fn create_tracks_a_branch_that_exists_only_on_origin() {
     let (tmp, repo) = setup_repo();

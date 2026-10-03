@@ -20,7 +20,7 @@ use super::app::{
 };
 use super::config_editor::{
     BRANCHES_REFRESH_ROW, CHECK_ROW, CONFLICT_EDITOR_ROW, COPY_ROW, ConfigEditor,
-    DIFF_LINE_NUMBERS_ROW, FIELD_ROWS, LAYOUT_ROW, LIST_ROWS_ROW, OPEN_COMMAND_ROW,
+    DIFF_LINE_NUMBERS_ROW, FIELD_ROWS, PULL_BEFORE_CREATE_ROW, LAYOUT_ROW, LIST_ROWS_ROW, OPEN_COMMAND_ROW,
     OpenCommandEditor, RUN_ROW, StringListEditor, THEME_PREVIEW_SAMPLE_LINES, THEME_ROW,
     UPDATE_ROW, check_line, form_lines, line_of_row, preview_line,
 };
@@ -32,7 +32,7 @@ use super::setup::{
 use super::theme::{self, ACCENT, BORDER, DIALOG_BG, DIALOG_BORDER, GRAPH_COLORS, SELECTION_BG};
 use crate::config::{
     CommandMode, DEFAULT_AUTO_UPDATE_CHECK, DEFAULT_BRANCHES_REFRESH_MINS,
-    DEFAULT_DIFF_LINE_NUMBERS, DEFAULT_DIFF_THEME, DEFAULT_LOCATION, DEFAULT_WORKTREES_LIST_ROWS,
+    DEFAULT_DIFF_LINE_NUMBERS, DEFAULT_DIFF_THEME, DEFAULT_PULL_BEFORE_CREATE, DEFAULT_LOCATION, DEFAULT_WORKTREES_LIST_ROWS,
     LOCATION_PRESETS, OpenCommand, OpenCommandVars, WorktreesLayout, expand_open_command,
     worktrees_layout_label,
 };
@@ -810,6 +810,13 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) -> Opt
     let changes_w = changes_cell_width(app);
     let block = focus_panel("worktrees", focused);
     let inner = block.inner(area);
+    // The start-up list loads in the background; say so rather than drawing
+    // an empty table that reads as "no worktrees".
+    if app.worktrees_first_load() {
+        frame.render_widget(Paragraph::new(Line::from("loading worktrees…".dim())), inner);
+        frame.render_widget(block, area);
+        return None;
+    }
     // Mirror the table's own horizontal layout so the path can be trimmed from
     // the front before ratatui would clip it from the back: the highlight
     // symbol column, the four fixed columns, and one space between all five.
@@ -2826,6 +2833,7 @@ fn draw_settings_tab(
         "worktrees_list_rows",
         "branches_refresh_mins",
         "diff_line_numbers",
+        "pull_before_create",
         "conflict_editor",
     ];
     // Keep each description to one line at the form width (78) so wrapping
@@ -2841,6 +2849,7 @@ fn draw_settings_tab(
         "Worktree rows shown in the three-panel list (1-50). Enter edits.",
         "Minutes the Branches tab keeps its list before refreshing.",
         "Show a line-number gutter beside the diff. Enter cycles.",
+        "Pull a branch from its upstream before creating a worktree. Enter cycles.",
         "Editor the resolver's e key uses ({path}). Enter edits, Space flips mode.",
     ];
     let mut lines: Vec<Line> = Vec::new();
@@ -2919,6 +2928,21 @@ fn draw_settings_tab(
                     _ => format!(
                         "(default: {})",
                         if DEFAULT_DIFF_LINE_NUMBERS {
+                            "on"
+                        } else {
+                            "off"
+                        }
+                    ),
+                },
+                highlight,
+            )),
+            _ if row == PULL_BEFORE_CREATE_ROW => spans.push(Span::styled(
+                match editor.fields.pull_before_create.as_str() {
+                    "true" => "on".to_string(),
+                    "false" => "off".to_string(),
+                    _ => format!(
+                        "(default: {})",
+                        if DEFAULT_PULL_BEFORE_CREATE {
                             "on"
                         } else {
                             "off"
@@ -6391,7 +6415,7 @@ mod tests {
     #[test]
     fn settings_tab_draws_rows_where_the_click_decoder_expects_them() {
         let editor = settings_editor("false");
-        let out = render(90, 48, |frame, area| {
+        let out = render(90, 52, |frame, area| {
             draw_settings_tab(frame, area, &editor, None);
         });
         // The form starts after the panel border and one blank spacer line.
@@ -6499,7 +6523,7 @@ mod tests {
     fn settings_tab_theme_preview_follows_the_selected_theme() {
         let mut editor = settings_editor("");
         editor.fields.diff_theme = "ocean".to_string();
-        let out = render(90, 48, |frame, area| {
+        let out = render(90, 52, |frame, area| {
             draw_settings_tab(frame, area, &editor, None);
         });
         let label = &out[2 + theme_preview_label_line()];
@@ -6514,7 +6538,7 @@ mod tests {
     fn settings_tab_shows_the_version_and_any_update() {
         let editor = settings_editor("");
         // With nothing newer found, the version line says so.
-        let out = render(90, 48, |frame, area| {
+        let out = render(90, 52, |frame, area| {
             draw_settings_tab(frame, area, &editor, None);
         });
         let ver = &out[2 + version_line()];
@@ -6532,7 +6556,7 @@ mod tests {
             version: "9.9.9".to_string(),
             url: String::new(),
         };
-        let out = render(90, 48, |frame, area| {
+        let out = render(90, 52, |frame, area| {
             draw_settings_tab(frame, area, &editor, Some(&release));
         });
         let ver = &out[2 + version_line()];
@@ -6553,7 +6577,7 @@ mod tests {
         list.selected = 1;
         editor.open_list = Some(list);
         let hit = std::cell::Cell::new(true);
-        let out = render(90, 48, |frame, area| {
+        let out = render(90, 52, |frame, area| {
             hit.set(draw_settings_tab(frame, area, &editor, None).is_some());
         });
         let text = out.join("\n");
@@ -6574,7 +6598,7 @@ mod tests {
             OpenCommand::new("cursor {path}"),
             OpenCommand::new("open {path}"),
         ];
-        let out = render(90, 48, |frame, area| {
+        let out = render(90, 52, |frame, area| {
             draw_settings_tab(frame, area, &editor, None);
         });
         let row = &out[2 + line_of_row(OPEN_COMMAND_ROW)];
@@ -6590,7 +6614,7 @@ mod tests {
         list.selected = 1;
         editor.string_list = Some(list);
         let hit = std::cell::Cell::new(true);
-        let out = render(90, 48, |frame, area| {
+        let out = render(90, 52, |frame, area| {
             hit.set(draw_settings_tab(frame, area, &editor, None).is_some());
         });
         let text = out.join("\n");
@@ -6612,7 +6636,7 @@ mod tests {
             StringListKind::Copy,
             editor.fields.copy.clone(),
         ));
-        let out = render(90, 48, |frame, area| {
+        let out = render(90, 52, |frame, area| {
             draw_settings_tab(frame, area, &editor, None);
         });
         let text = out.join("\n");
@@ -6626,7 +6650,7 @@ mod tests {
         let mut editor = settings_editor("");
         editor.fields.copy = vec![".env".to_string(), ".env.local".to_string()];
         editor.fields.run = vec!["npm ci".to_string(), "npm run build".to_string()];
-        let out = render(90, 48, |frame, area| {
+        let out = render(90, 52, |frame, area| {
             draw_settings_tab(frame, area, &editor, None);
         });
         let copy = &out[2 + line_of_row(COPY_ROW)];

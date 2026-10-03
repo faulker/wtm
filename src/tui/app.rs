@@ -1948,6 +1948,12 @@ pub struct App {
     /// (potentially many git invocations behind) branch list never blocks
     /// the tab switch. Drained by `poll_branches_load` each tick.
     branches_pending: Option<Task<Result<ops::BranchListResult, String>>>,
+    /// A worktree-list reload (`ops::list`) running on a background thread.
+    /// The list runs several git commands per worktree, which on a cold disk
+    /// cache or a big checkout can take many seconds, so the start-up load and
+    /// the timed auto refresh never run it on the UI thread. Drained by
+    /// `poll_worktrees_load` each tick.
+    worktrees_pending: Option<Task<Result<Vec<WorktreeInfo>, String>>>,
     /// When the current `branches` cache was last filled. `None` means never
     /// loaded (or invalidated); the next `ensure_branches` will kick off a load.
     branches_loaded_at: Option<Instant>,
@@ -2131,6 +2137,7 @@ impl App {
             show_archived: false,
             branch_selected: 0,
             branches_pending: None,
+            worktrees_pending: None,
             branches_loaded_at: None,
             stash_name: String::new(),
             stash_entries: Vec::new(),
@@ -2177,8 +2184,15 @@ impl App {
             quit: false,
             ignore_quit_until: None,
         };
+        // The first frame must not wait on the worktree list: draw at once and
+        // let the list fill in when the background load lands. Tests load it
+        // synchronously so they can assert on the list straight away.
         if initialized {
-            app.refresh();
+            if cfg!(test) {
+                app.refresh();
+            } else {
+                app.load_worktrees();
+            }
         }
         // Apply the configured diff theme before the first frame so Settings and
         // the highlighter agree without waiting for a save.
@@ -2354,6 +2368,8 @@ impl App {
     /// Reloads the worktree list, keeping the selection in bounds.
     pub fn refresh(&mut self) {
         self.last_auto_refresh = Instant::now();
+        // This synchronous load supersedes any background one still running.
+        self.worktrees_pending = None;
         match ops::list(&self.ctx) {
             Ok(wts) => {
                 self.worktrees = wts;
@@ -2415,22 +2431,67 @@ impl App {
             return;
         }
         self.last_auto_refresh = Instant::now();
-        if let Ok(wts) = ops::list(&self.ctx) {
-            let current = self.selected_worktree().map(|w| w.name.clone());
-            self.worktrees = wts;
-            self.selected = current
-                .and_then(|name| self.worktrees.iter().position(|w| w.name == name))
-                .unwrap_or(self.selected)
-                .min(self.worktrees.len().saturating_sub(1));
-            // Worktree paths/names may have shifted; invalidate the preview so
-            // the next draw reloads status for the (possibly new) selection.
-            self.preview_for = None;
-            self.preview_pending = None;
+        if self.worktrees_pending.is_none() {
+            self.load_worktrees();
         }
         // Branches use their own cache timeout (`branches_refresh_mins`); only
         // refresh them here when the cache has gone stale while the tab is open.
         if self.tab == Tab::Branches {
             self.ensure_branches();
+        }
+    }
+
+    /// Starts an `ops::list` reload on a background thread; the result is
+    /// applied by `poll_worktrees_load`.
+    fn load_worktrees(&mut self) {
+        let (tx, rx) = channel();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(ops::list(&ctx).map_err(|e| format!("{e:#}")));
+        });
+        self.worktrees_pending = Some(Task::new(rx));
+    }
+
+    /// Whether the worktree list is still on its first load: nothing to show
+    /// yet and a load in flight. The renderer shows a loading line meanwhile.
+    pub fn worktrees_first_load(&self) -> bool {
+        self.worktrees_pending.is_some() && self.worktrees.is_empty()
+    }
+
+    /// Applies a finished background worktree-list load, keeping the cursor on
+    /// the worktree it was on by name. A refresh result waits while an overlay
+    /// or modal is up, since those read the list under the cursor; the first
+    /// load always lands. Only the first load reports an error: an unattended
+    /// refresh failing should not interrupt with a popup (`r` still reports).
+    fn poll_worktrees_load(&mut self) {
+        let Some(task) = &self.worktrees_pending else {
+            return;
+        };
+        let first = self.worktrees.is_empty();
+        if !first && (!matches!(self.view, View::List) || self.modal.is_some()) {
+            return;
+        }
+        let Some(result) = task.poll_latest() else {
+            return;
+        };
+        self.worktrees_pending = None;
+        match result {
+            Ok(wts) => {
+                let current = self.selected_worktree().map(|w| w.name.clone());
+                self.worktrees = wts;
+                self.selected = current
+                    .and_then(|name| self.worktrees.iter().position(|w| w.name == name))
+                    .unwrap_or(self.selected)
+                    .min(self.worktrees.len().saturating_sub(1));
+                // Worktree paths/names may have shifted; invalidate the preview
+                // so the next draw reloads status for the (possibly new)
+                // selection.
+                self.preview_for = None;
+                self.preview_pending = None;
+                self.realign_changes_after_list_reload();
+            }
+            Err(e) if first => self.set_error(e),
+            Err(_) => {}
         }
     }
 
@@ -2495,6 +2556,7 @@ impl App {
             || !self.deleting.is_empty()
             || self.stash_pending.is_some()
             || self.branches_pending.is_some()
+            || self.worktrees_pending.is_some()
             || self.resolver_pending.is_some()
             || self.update_check.is_some()
             // A status message auto-clears on a timer, so keep ticking until it
@@ -2508,6 +2570,7 @@ impl App {
         self.tick_count = self.tick_count.wrapping_add(1);
         self.expire_message();
         self.auto_refresh();
+        self.poll_worktrees_load();
         // The update check is view-independent: drain it every tick so a check
         // that lands while the user is deep in a diff still prompts once they
         // come back to the list.
@@ -4595,6 +4658,18 @@ impl App {
                     self.selected -= 1;
                     self.preview_scroll = 0;
                 }
+            }
+            return;
+        }
+        // Branches tab: the branch table is the whole tab, so the wheel steps
+        // the branch cursor like the arrow keys wherever the pointer is.
+        if matches!(self.view, View::List) && self.tab == Tab::Branches {
+            if down {
+                if self.branch_selected + 1 < self.branches.len() {
+                    self.branch_selected += 1;
+                }
+            } else {
+                self.branch_selected = self.branch_selected.saturating_sub(1);
             }
             return;
         }
@@ -10497,6 +10572,60 @@ mod tests {
         settle_stash(app);
     }
 
+    /// Waits out an in-flight background worktree-list load.
+    fn settle_worktrees(app: &mut App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.worktrees_pending.is_some() {
+            app.poll_worktrees_load();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worktree load timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// The start-up list load runs off the UI thread: until it lands the app
+    /// reports a first load (the renderer shows "loading worktrees…"), and the
+    /// list fills in once it does.
+    #[test]
+    fn worktree_list_loads_in_the_background() {
+        let (_tmp, mut app) = test_app();
+        app.worktrees.clear();
+        app.load_worktrees();
+        assert!(app.worktrees_first_load());
+        assert!(app.needs_fast_tick(), "ticks fast while the load is pending");
+        settle_worktrees(&mut app);
+        assert!(!app.worktrees_first_load());
+        assert!(!app.worktrees.is_empty());
+        assert!(app.error.is_none(), "unexpected error: {:?}", app.error);
+    }
+
+    /// A background refresh result holds off while a modal is open, so it
+    /// cannot change the list a confirm is reading, and lands once it closes.
+    #[test]
+    fn worktree_refresh_waits_for_an_open_modal() {
+        let (_tmp, mut app) = test_app();
+        let before = app.worktrees.len();
+        let mut ghost = app.worktrees[0].clone();
+        ghost.name = "ghost".to_string();
+        app.worktrees = vec![ghost];
+        app.load_worktrees();
+        app.modal = Some(Modal::Confirm {
+            title: String::new(),
+            body: Vec::new(),
+            options: vec![ConfirmOption::new("ok")],
+            selected: 0,
+            action: ModalAction::ResolverAbort,
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        app.poll_worktrees_load();
+        assert_eq!(app.worktrees[0].name, "ghost", "applied under a modal");
+        app.modal = None;
+        settle_worktrees(&mut app);
+        assert_eq!(app.worktrees.len(), before);
+    }
+
     /// Opens the Settings tab the same way the tab bar / `select_tab` does.
     fn goto_settings(app: &mut App) {
         app.select_tab(Tab::Settings);
@@ -16038,6 +16167,7 @@ mod tests {
 
         app.last_auto_refresh = Instant::now() - AUTO_REFRESH_INTERVAL;
         app.tick();
+        settle_worktrees(&mut app);
         assert!(!app.worktrees.is_empty(), "expected the list to reload");
 
         press(&mut app, KeyCode::Tab);
@@ -16691,6 +16821,67 @@ mod tests {
             remote_still_there,
             "local-only delete must spare the remote"
         );
+    }
+
+    /// A remote-only row whose branch was already deleted on the remote (a
+    /// stale, unpruned tracking ref) deletes cleanly: the stale ref is dropped
+    /// instead of surfacing git's "remote ref does not exist".
+    #[test]
+    fn deleting_a_stale_remote_only_branch_drops_the_tracking_ref() {
+        let (tmp, mut app) = test_app();
+        let root = app.ctx.repo_root.clone();
+        let bare = tmp.path().join("origin.git");
+        git(
+            tmp.path(),
+            &["init", "--bare", "-b", "main", bare.to_str().unwrap()],
+        );
+        git(&root, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git(&root, &["push", "-u", "origin", "main"]);
+        git(&root, &["branch", "gone"]);
+        git(&root, &["push", "origin", "gone"]);
+        git(&root, &["branch", "-D", "gone"]);
+        // Deleted on the remote behind our back; origin/gone is now stale.
+        git(&bare, &["branch", "-D", "gone"]);
+
+        goto_tab(&mut app, Tab::Branches);
+        app.branch_selected = app
+            .branches
+            .iter()
+            .position(|b| b.name == "gone" && b.remote.is_some())
+            .expect("the stale remote-only row should be listed");
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Enter);
+        settle_branches(&mut app);
+        assert!(app.error.is_none(), "unexpected error: {:?}", app.error);
+        let tracking_left = std::process::Command::new("git")
+            .args(["show-ref", "--verify", "--quiet", "refs/remotes/origin/gone"])
+            .current_dir(&root)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(!tracking_left, "the stale tracking ref should be gone");
+        assert!(app.branches.iter().all(|b| b.name != "gone"));
+    }
+
+    /// The wheel steps the Branches tab cursor like the arrow keys.
+    #[test]
+    fn scroll_wheel_steps_the_branch_cursor() {
+        let (_tmp, mut app) = test_app();
+        goto_tab(&mut app, Tab::Branches);
+        app.branches = vec![
+            branch_item("a", None),
+            branch_item("b", None),
+            branch_item("c", None),
+        ];
+        app.branch_selected = 0;
+        scroll_wheel(&mut app, MouseEventKind::ScrollDown);
+        assert_eq!(app.branch_selected, 1);
+        scroll_wheel(&mut app, MouseEventKind::ScrollDown);
+        scroll_wheel(&mut app, MouseEventKind::ScrollDown);
+        assert_eq!(app.branch_selected, 2, "stops at the last branch");
+        scroll_wheel(&mut app, MouseEventKind::ScrollUp);
+        assert_eq!(app.branch_selected, 1);
     }
 
     /// A pull refused because the branch diverged opens the rebase prompt

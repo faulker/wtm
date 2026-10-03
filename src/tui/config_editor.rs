@@ -42,13 +42,15 @@ pub const LIST_ROWS_ROW: usize = TEXT_ROWS + 3;
 pub const BRANCHES_REFRESH_ROW: usize = TEXT_ROWS + 4;
 /// Index of the diff line-number gutter toggle.
 pub const DIFF_LINE_NUMBERS_ROW: usize = TEXT_ROWS + 5;
+/// Index of the pull-before-create toggle.
+pub const PULL_BEFORE_CREATE_ROW: usize = TEXT_ROWS + 6;
 /// Index of the conflict resolver's external editor: Enter edits the command
 /// template, Space flips it between terminal and background mode.
-pub const CONFLICT_EDITOR_ROW: usize = TEXT_ROWS + 6;
+pub const CONFLICT_EDITOR_ROW: usize = TEXT_ROWS + 7;
 /// Number of setting rows, text fields plus the cycle rows, the worktree list
-/// height, the Branches refresh timeout, the diff line-number toggle, and the
-/// conflict editor.
-pub const FIELD_ROWS: usize = TEXT_ROWS + 7;
+/// height, the Branches refresh timeout, the diff line-number and
+/// pull-before-create toggles, and the conflict editor.
+pub const FIELD_ROWS: usize = TEXT_ROWS + 8;
 /// Index of the "check for updates now" row.
 pub const CHECK_ROW: usize = FIELD_ROWS;
 /// Total selectable rows.
@@ -513,6 +515,7 @@ impl ConfigEditor {
             LIST_ROWS_ROW => &self.fields.worktrees_list_rows,
             BRANCHES_REFRESH_ROW => &self.fields.branches_refresh_mins,
             DIFF_LINE_NUMBERS_ROW => &self.fields.diff_line_numbers,
+            PULL_BEFORE_CREATE_ROW => &self.fields.pull_before_create,
             CONFLICT_EDITOR_ROW => self
                 .fields
                 .conflict_editor
@@ -592,6 +595,7 @@ impl ConfigEditor {
             LIST_ROWS_ROW => self.fields.worktrees_list_rows = value,
             BRANCHES_REFRESH_ROW => self.fields.branches_refresh_mins = value,
             DIFF_LINE_NUMBERS_ROW => self.fields.diff_line_numbers = value,
+            PULL_BEFORE_CREATE_ROW => self.fields.pull_before_create = value,
             // A cleared template goes back to the built-in editor; a new one
             // keeps whatever mode was already chosen.
             CONFLICT_EDITOR_ROW => {
@@ -637,6 +641,16 @@ impl ConfigEditor {
     /// inherited default (on) stays reachable rather than being a one-way door.
     fn cycle_diff_line_numbers(&mut self) {
         self.fields.diff_line_numbers = match self.fields.diff_line_numbers.as_str() {
+            "true" => "false".to_string(),
+            "false" => String::new(),
+            _ => "true".to_string(),
+        };
+    }
+
+    /// Cycles pull-before-create through default → on → off, keeping the
+    /// inherited default (on) reachable.
+    fn cycle_pull_before_create(&mut self) {
+        self.fields.pull_before_create = match self.fields.pull_before_create.as_str() {
             "true" => "false".to_string(),
             "false" => String::new(),
             _ => "true".to_string(),
@@ -785,6 +799,10 @@ impl ConfigEditor {
             }
             KeyCode::Enter | KeyCode::Char(' ') if self.selected == DIFF_LINE_NUMBERS_ROW => {
                 self.cycle_diff_line_numbers();
+                return self.save_fields(message);
+            }
+            KeyCode::Enter | KeyCode::Char(' ') if self.selected == PULL_BEFORE_CREATE_ROW => {
+                self.cycle_pull_before_create();
                 return self.save_fields(message);
             }
             KeyCode::Enter | KeyCode::Char(' ') if self.selected == LAYOUT_ROW => {

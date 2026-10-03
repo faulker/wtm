@@ -152,6 +152,10 @@ pub struct CreateResult {
     /// Remote ref the new branch was based on (e.g. "origin/feature") when a
     /// matching remote branch was pulled down; `None` for a fresh local branch.
     pub tracked_remote: Option<String>,
+    /// The pull of the source branch run before the worktree was added (see
+    /// `pull_before_create`); `None` when no pull was attempted. A failed pull
+    /// is reported here but never fails the create.
+    pub pull: Option<SetupStep>,
     pub setup: Vec<SetupStep>,
     /// True when every setup step succeeded.
     pub setup_ok: bool,
@@ -256,11 +260,10 @@ pub fn list(ctx: &Ctx) -> Result<Vec<WorktreeInfo>> {
     };
     // Creation bases recorded by `create` in `.wtm.toml` `[created_from]`.
     let created_from_map = crate::config::load_created_from(&ctx.repo_root).unwrap_or_default();
-    let mut infos = Vec::with_capacity(wts.len());
-    for wt in wts {
-        if wt.is_bare {
-            continue;
-        }
+    // Each worktree costs several git invocations (status, numstat,
+    // ahead/behind, merge and base checks), so inspect them in parallel; on a
+    // cold disk cache a sequential pass over many worktrees took seconds.
+    let inspect = |wt: git::Worktree| -> Result<WorktreeInfo> {
         let is_main = wt.path == ctx.repo_root;
         // A worktree directory can disappear out from under git (deleted by
         // hand); report it rather than failing the whole listing.
@@ -311,7 +314,7 @@ pub fn list(ctx: &Ctx) -> Result<Vec<WorktreeInfo>> {
             }
             _ => (None, false, false),
         };
-        infos.push(WorktreeInfo {
+        Ok(WorktreeInfo {
             name: worktree_name(&wt.branch, &wt.path),
             branch: wt.branch,
             path: wt.path.to_string_lossy().to_string(),
@@ -327,9 +330,19 @@ pub fn list(ctx: &Ctx) -> Result<Vec<WorktreeInfo>> {
             behind_base,
             conflicted,
             in_progress,
-        });
-    }
-    Ok(infos)
+        })
+    };
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = wts
+            .into_iter()
+            .filter(|wt| !wt.is_bare)
+            .map(|wt| scope.spawn(|| inspect(wt)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("worktree inspection panicked"))
+            .collect()
+    })
 }
 
 /// How a branch tip was compared for `same`/`changed`/`outdated`.
@@ -603,6 +616,20 @@ pub fn create(
     } else {
         None
     };
+    let pull = if ctx.config.pull_before_create() {
+        let source = if create_branch {
+            match base.as_deref() {
+                Some("HEAD") => git::head_branch(&ctx.repo_root).ok().flatten(),
+                Some(b) if git::branch_exists(&ctx.repo_root, b) => Some(b.to_string()),
+                _ => None,
+            }
+        } else {
+            Some(branch.to_string())
+        };
+        source.and_then(|s| pull_source_branch(ctx, &s, &mut progress))
+    } else {
+        None
+    };
     git::worktree_add(&ctx.repo_root, &path, branch, base.as_deref())?;
 
     // Persist the creation base so `list` can flag unique commits / out-of-date
@@ -660,8 +687,39 @@ pub fn create(
         path: path.to_string_lossy().to_string(),
         created_branch: create_branch,
         tracked_remote,
+        pull,
         setup,
         setup_ok,
+    })
+}
+
+/// Fast-forwards local branch `branch` from its upstream ahead of a create, so
+/// the new worktree starts from the latest remote work. Returns `None` when the
+/// branch has no upstream (nothing to pull). A failure (offline, diverged,
+/// dirty checkout) is reported in the returned step rather than aborting the
+/// create, since the local branch is still a valid starting point.
+fn pull_source_branch(
+    ctx: &Ctx,
+    branch: &str,
+    progress: &mut impl FnMut(&str),
+) -> Option<SetupStep> {
+    let (remote, remote_branch) = git::branch_upstream(&ctx.repo_root, branch).ok()??;
+    progress(&format!("pulling '{branch}' from {remote}/{remote_branch}"));
+    let step = format!("pull {branch}");
+    Some(match branch_pull(ctx, branch) {
+        Ok(r) => SetupStep {
+            step,
+            ok: true,
+            detail: r.already_up_to_date.then(|| "already up to date".to_string()),
+        },
+        Err(e) => {
+            progress(&format!("pull failed, continuing without it: {e:#}"));
+            SetupStep {
+                step,
+                ok: false,
+                detail: Some(format!("{e:#}")),
+            }
+        }
     })
 }
 
@@ -1751,7 +1809,16 @@ pub fn branch_delete_where(
     let mut remote_deleted = None;
     if scope != DeleteScope::Local {
         let (remote, remote_branch) = branch_remote_ref(ctx, name)?;
-        git::push_delete(&ctx.repo_root, &remote, &remote_branch)?;
+        match git::push_delete(&ctx.repo_root, &remote, &remote_branch) {
+            Ok(_) => {}
+            // The branch is already gone on the remote and the row came from a
+            // stale remote-tracking ref (deleted elsewhere, never pruned).
+            // Dropping that ref leaves things the way the user asked for.
+            Err(e) if e.to_string().contains("remote ref does not exist") => {
+                git::delete_remote_tracking_ref(&ctx.repo_root, &remote, &remote_branch)?;
+            }
+            Err(e) => return Err(e.into()),
+        }
         remote_deleted = Some(remote);
     }
     // Archiving a deleted branch would keep a dangling entry around forever.

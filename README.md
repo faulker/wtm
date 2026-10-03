@@ -95,12 +95,13 @@ wtm config set --global worktrees_layout three_panel   # Worktrees tab: two_pane
 wtm config set --global worktrees_list_rows 10         # worktree rows in the three-panel list (1-50, default 6)
 wtm config set --global branches_refresh_mins 10       # Branches tab cache timeout in minutes (default 10)
 wtm config set --global diff_line_numbers false        # hide the diff pane's line-number gutter (on by default)
+wtm config set --global pull_before_create false       # don't pull the source branch before creating a worktree (on by default)
 wtm config set --global conflict_editor "nvim {path}"  # resolver's e key opens files here instead of the built-in editor
 wtm config unset setup.copy      # back to the default (or the global value)
 wtm config path                  # where the config files live
 ```
 
-`diff_theme` and `worktrees_layout` can also be cycled on the Settings tab. Both are saved globally, like `auto_update_check`. `worktrees_list_rows` (default 6) sets how many worktrees the three-panel list shows before it scrolls; it is edited on the Settings tab too, and shrinks on short terminals so the files and diff keep room. `branches_refresh_mins` (default 10) is how long the Branches tab keeps its cached list; `r` on that tab always reloads immediately. `diff_line_numbers` (on by default) toggles the line-number gutter in the diff pane. `conflict_editor` is the editor the conflict resolver's `e` key opens a file in, as a shell template with `{path}` (the file's absolute path), `{name}`, and `{branch}`; unset, wtm uses its built-in editor. A bare template takes over the terminal (wtm suspends and comes back when the editor exits); `{ command = "code {path}", mode = "background" }` spawns a GUI editor detached instead, and the resolver re-reads the file when it changes on disk.
+`diff_theme` and `worktrees_layout` can also be cycled on the Settings tab. Both are saved globally, like `auto_update_check`. `worktrees_list_rows` (default 6) sets how many worktrees the three-panel list shows before it scrolls; it is edited on the Settings tab too, and shrinks on short terminals so the files and diff keep room. `branches_refresh_mins` (default 10) is how long the Branches tab keeps its cached list; `r` on that tab always reloads immediately. `diff_line_numbers` (on by default) toggles the line-number gutter in the diff pane. `pull_before_create` (on by default) fast-forwards the branch a new worktree comes from (the branch being checked out, the `--from` branch, or the current branch) from its upstream before creating it; a failed pull (offline, diverged) is reported but doesn't stop the create. `conflict_editor` is the editor the conflict resolver's `e` key opens a file in, as a shell template with `{path}` (the file's absolute path), `{name}`, and `{branch}`; unset, wtm uses its built-in editor. A bare template takes over the terminal (wtm suspends and comes back when the editor exits); `{ command = "code {path}", mode = "background" }` spawns a GUI editor detached instead, and the resolver re-reads the file when it changes on disk.
 
 ### Where worktrees go: `worktree_dir`
 
@@ -145,6 +146,8 @@ diff_theme = "eighties"
 worktrees_layout = "two_panel"
 # Line-number gutter in the diff pane. Usually set globally.
 diff_line_numbers = true
+# Pull the source branch from its upstream before creating a worktree.
+pull_before_create = true
 # Editor the conflict resolver's `e` key opens a file in; unset means the
 # built-in one. Same shape as one open_command entry, with `{path}` the file,
 # except a bare string runs in the terminal (an editor nearly always wants

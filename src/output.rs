@@ -85,7 +85,7 @@ pub fn print_create(result: &CreateResult) {
     if let Some(remote) = &result.tracked_remote {
         println!("  tracking remote branch {remote}");
     }
-    for step in &result.setup {
+    for step in result.pull.iter().chain(&result.setup) {
         let mark = if step.ok { "ok" } else { "FAILED" };
         match &step.detail {
             Some(detail) => println!("  [{mark}] {} ({detail})", step.step),

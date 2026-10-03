@@ -47,6 +47,11 @@ pub const MAX_WORKTREES_LIST_ROWS: u16 = 50;
 /// about a diff by line, and the gutter is narrow.
 pub const DEFAULT_DIFF_LINE_NUMBERS: bool = true;
 
+/// Whether creating a worktree from a local branch fast-forwards that branch
+/// from its upstream first, when `pull_before_create` isn't set anywhere. On by
+/// default so a new worktree starts from the latest remote work.
+pub const DEFAULT_PULL_BEFORE_CREATE: bool = true;
+
 /// How the TUI's Worktrees tab is laid out.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -329,6 +334,9 @@ pub struct FileConfig {
     /// Whether the diff pane draws a line-number gutter. Unset means
     /// [`DEFAULT_DIFF_LINE_NUMBERS`].
     pub diff_line_numbers: Option<bool>,
+    /// Whether `create` pulls the source branch first. Unset means
+    /// [`DEFAULT_PULL_BEFORE_CREATE`].
+    pub pull_before_create: Option<bool>,
     /// Editor the conflict resolver's `e` key opens a file in. Unset means
     /// wtm's built-in editor.
     pub conflict_editor: Option<ConflictEditor>,
@@ -401,6 +409,10 @@ pub struct Config {
     /// [`DEFAULT_DIFF_LINE_NUMBERS`].
     pub diff_line_numbers: Option<bool>,
     pub diff_line_numbers_source: Source,
+    /// Raw `pull_before_create` setting; `None` means
+    /// [`DEFAULT_PULL_BEFORE_CREATE`].
+    pub pull_before_create: Option<bool>,
+    pub pull_before_create_source: Source,
     /// Raw `conflict_editor` setting; `None` means the built-in editor.
     pub conflict_editor: Option<ConflictEditor>,
     pub conflict_editor_source: Source,
@@ -437,6 +449,8 @@ impl Default for Config {
             worktrees_list_rows_source: Source::Default,
             diff_line_numbers: None,
             diff_line_numbers_source: Source::Default,
+            pull_before_create: None,
+            pull_before_create_source: Source::Default,
             conflict_editor: None,
             conflict_editor_source: Source::Default,
             setup: Setup::default(),
@@ -495,6 +509,8 @@ impl Config {
             pick(global.worktrees_list_rows, repo.worktrees_list_rows);
         let (diff_line_numbers, diff_line_numbers_source) =
             pick(global.diff_line_numbers, repo.diff_line_numbers);
+        let (pull_before_create, pull_before_create_source) =
+            pick(global.pull_before_create, repo.pull_before_create);
         let (conflict_editor, conflict_editor_source) =
             pick(global.conflict_editor, repo.conflict_editor);
         let global_setup = global.setup.unwrap_or_default();
@@ -518,6 +534,8 @@ impl Config {
             worktrees_list_rows_source,
             diff_line_numbers,
             diff_line_numbers_source,
+            pull_before_create,
+            pull_before_create_source,
             conflict_editor,
             conflict_editor_source,
             setup: Setup {
@@ -565,6 +583,12 @@ impl Config {
     /// Whether the diff pane draws its line-number gutter.
     pub fn diff_line_numbers(&self) -> bool {
         self.diff_line_numbers.unwrap_or(DEFAULT_DIFF_LINE_NUMBERS)
+    }
+
+    /// Whether `create` fast-forwards the source branch from its upstream
+    /// before adding the worktree.
+    pub fn pull_before_create(&self) -> bool {
+        self.pull_before_create.unwrap_or(DEFAULT_PULL_BEFORE_CREATE)
     }
 
     /// Absolute directory new worktrees are created under for a repo rooted
@@ -925,6 +949,15 @@ mod tests {
         let merged = Config::merge(FileConfig::default(), repo);
         assert!(!merged.diff_line_numbers());
         assert_eq!(merged.diff_line_numbers_source, Source::Repo);
+    }
+
+    #[test]
+    fn pull_before_create_defaults_to_on() {
+        assert!(Config::default().pull_before_create());
+        let global: FileConfig = toml::from_str("pull_before_create = false").unwrap();
+        let merged = Config::merge(global, FileConfig::default());
+        assert!(!merged.pull_before_create());
+        assert_eq!(merged.pull_before_create_source, Source::Global);
     }
 
     #[test]
