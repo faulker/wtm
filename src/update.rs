@@ -166,7 +166,6 @@ fn tag_from_release_url(url: &str) -> Option<String> {
 pub fn target_triple() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => Some("aarch64-apple-darwin"),
-        ("macos", "x86_64") => Some("x86_64-apple-darwin"),
         ("linux", "x86_64") => Some("x86_64-unknown-linux-gnu"),
         ("linux", "aarch64") => Some("aarch64-unknown-linux-gnu"),
         _ => None,
@@ -616,10 +615,12 @@ ccc333  ./nested/wtm-v1.0.0-aarch64-unknown-linux-gnu.tar.gz
 
     #[test]
     fn target_triple_is_known_on_supported_platforms() {
-        // The release workflow builds macOS and Linux on both architectures;
-        // anywhere else must report no triple rather than guess one.
-        let expected = matches!(std::env::consts::OS, "macos" | "linux")
-            && matches!(std::env::consts::ARCH, "x86_64" | "aarch64");
+        // The release workflow builds Apple Silicon macOS and Linux on both
+        // architectures; anywhere else must report no triple rather than guess one.
+        let expected = matches!(
+            (std::env::consts::OS, std::env::consts::ARCH),
+            ("macos", "aarch64") | ("linux", "x86_64" | "aarch64")
+        );
         assert_eq!(target_triple().is_some(), expected);
     }
 

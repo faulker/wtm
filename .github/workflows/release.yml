@@ -87,9 +87,6 @@ jobs:
           - name: macOS ARM64 (Apple Silicon)
             runner: macos-latest
             target: aarch64-apple-darwin
-          - name: macOS x86_64 (Intel)
-            runner: macos-latest
-            target: x86_64-apple-darwin
           - name: Linux x86_64
             runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu

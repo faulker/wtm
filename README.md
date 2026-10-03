@@ -18,7 +18,7 @@ Three ways to use it:
 
 Requires `git` on your PATH.
 
-Install the latest release (macOS Apple Silicon/Intel, Linux x86_64/ARM64):
+Install the latest release (macOS Apple Silicon, Linux x86_64/ARM64):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/faulker/wtm/main/install.sh | bash
